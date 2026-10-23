@@ -28,3 +28,10 @@ target_link_libraries(g0_5_collective_handoff_probe PRIVATE Synapse hcl pthread 
 
 add_executable(g0_7_distinct144_prequeue_probe probes/g0_7_distinct144_prequeue_probe.cpp)
 target_link_libraries(g0_7_distinct144_prequeue_probe PRIVATE Synapse hcl pthread dl)
+
+add_executable(rt_1_2_3_runtime_gaps_probe probes/rt_1_2_3_runtime_gaps_probe.cpp)
+target_link_libraries(rt_1_2_3_runtime_gaps_probe PRIVATE Synapse hcl pthread dl)
+
+add_executable(gaudirt_runtime_unit_tests tests/runtime_unit_tests.cpp)
+target_link_libraries(gaudirt_runtime_unit_tests PRIVATE Synapse hcl pthread dl)
+

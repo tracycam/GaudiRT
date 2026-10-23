@@ -1,51 +1,62 @@
-# Gate 0 实验总结与路线裁决报告（`gate0-20261023`）
+# Gate 0 与运行时缺口验证报告（`gate0-20261023`）
 
 - **实验环境**：`192.168.100.153`（8 × Intel Gaudi2，`hl-smi` 8 卡空闲，SDK `1.24.2-481` / `79e284b`）
-- **控制条件**：所有真机探针统一锁死 `uclamp_min = 1024`（`host_policy.hpp`），禁用一切 Profiler / `LD_PRELOAD` 插桩，采用 ABBA 交错采样与相同起止事件边界（`[first_op_start, last_op_end]`）。
+- **控制条件**：所有真机探针统一锁死 `uclamp_min = 1024`（[`host_policy.hpp`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/include/gaudirt/common/host_policy.hpp)），禁用一切 Profiler / `LD_PRELOAD` 插桩，采用 ABBA 交错采样与相同起止事件边界（`[first_op_start, last_op_end]`）。
 
 ---
 
-## 一、Gate 0 七项门禁实验核心结论总览
+## 一、模块职责边界重申（撤下跨界项，聚焦运行时核心）
 
-| 门禁编号 | 实验名称与产物文件 | 实测核心指标 | 路线裁决与物理结论 |
+根据架构职责划分：
+1. **`gaudi-kernels`**：负责 TPC/MME 内核、算子融合、权重量化（如 `o_proj` FP8）、1-core TPC 算子多核化与 SRAM 分块。原本列为 P1（算子融合）与 P2（`o_proj` 量化）的工作**已从 `GaudiRT` 主线中正式撤下**，`GaudiRT` 将 [`g0-6-recipe-roofline-audit.json`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/evidence/gate0-20261023/g0-6-recipe-roofline-audit.json) 作为定位证据移交 `gaudi-kernels`。
+2. **`Bridge / vLLM runner`**：负责框架接入、模型构图、输入准备、采样和请求调度。`GaudiRT` 将 [`g0-3-4-host-and-path-audit.json`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/evidence/gate0-20261023/g0-3-4-host-and-path-audit.json) 中定位的 3 处 `use_async_scheduling` 快路径退出门禁移交上层。
+3. **`GaudiRT`**：严格聚焦**面向编译产物的通用运行时执行能力**——实例化与重放、计算和通信统一提交、在途资源管理、完成回收与背压。
+
+---
+
+## 二、`GaudiRT` 三大已验证运行时缺口（`RT-1 / RT-2 / RT-3`）与真机实测收益
+
+产物文件：
+- 探针源码：[`probes/rt_1_2_3_runtime_gaps_probe.cpp`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/probes/rt_1_2_3_runtime_gaps_probe.cpp)
+- 运行时核心头文件：
+  - [`include/gaudirt/runtime/unified_region_lowerer.hpp`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/include/gaudirt/runtime/unified_region_lowerer.hpp)
+  - [`include/gaudirt/runtime/generation_epoch_tracker.hpp`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/include/gaudirt/runtime/generation_epoch_tracker.hpp)
+  - [`include/gaudirt/runtime/inflight_credit_manager.hpp`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/include/gaudirt/runtime/inflight_credit_manager.hpp)
+  - [`include/gaudirt/runtime/compiled_region_executor.hpp`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/include/gaudirt/runtime/compiled_region_executor.hpp)
+- 单元测试：[`tests/runtime_unit_tests.cpp`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/tests/runtime_unit_tests.cpp)
+- 8 卡实测数据：[`evidence/gate0-20261023/rt-1-2-3-runtime-gaps.json`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/evidence/gate0-20261023/rt-1-2-3-runtime-gaps.json)
+
+### 1. `RT-1`：混合命令单流统一降维（消除 `Command 5` 跨流断层与 `~0.77 ms` 早期设备气泡）
+- **缺口成因**：70 层生产模型单步 `286` 个命令中，`command 5`（第 1 层 Attention `o_proj` + `AllGather`）是唯一同时含 `compute: true` 与 `collectives: 1` 的混合命令。现有 `NativeDependencyPlan` 与 `PreparedRegionProgram::compile` 将其视为屏障，把单步切分为 `Region 0 [0..4]`、`Command 5`（旧路径回退，通信被迫切到 `comm_stream`）和 `Region 1 [6..285]`，在步首设备最饥饿阶段插入 `leave()`、`publish(Region 0)`、跨流等待与二次 `2,392` 地址扫描，造成 8 卡一致的 `644 ~ 806 µs` 早期设备气泡。
+- **`GaudiRT` 机制（[`UnifiedRegionLowerer`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/include/gaudirt/runtime/unified_region_lowerer.hpp)）**：校验混合命令内部 `compute_writes` 到 `collective_reads` 的 RAW 闭合性后，将其正交拆解为 `Compute` + `Collective` 两个原子子调用，使 `286` 个命令（`287` 个子调用：`145` 计算 + `142` 通信）合并为 **`1` 个统一 Region（`[0..285]`，`coalesced_collectives: 141/142 -> 142/142`）**。
+- **8 卡 ABBA 实测结果**：
+  - 早期窗口（`Commands 0..7`）设备执行跨度：8 卡从 **`751.23 ~ 754.63 µs`** 降至 **`159.40 ~ 161.23 µs`**，每卡稳定消除 **`591.83 ~ 594.31 µs`（`~0.59 ms`）** 的早期跨流与主机断层气泡；
+  - 整步（`286` 命令）设备执行跨度：8 卡净省 **`600.84 ~ 1,076.45 µs/步`**。
+
+### 2. `RT-2`：`O(1)` 代数守卫绑定预检与单 Epoch 围栏（消除每步 `2,392` 绑定/地址扫描）
+- **缺口成因**：现有运行时在每步入口遍历 `2,392` 个 `RetainedTensorBinding::matches`，并在每个 Region 进出时对 `2,392` 个依赖地址执行 `events_by_addr_` 哈希表查找（`get_wait_events`）与生产者覆盖/线性数组移除（`add_producer` $\to$ `remove_device_ptr`），导致每步 `enq0` 前主机侧迟滞 `~0.95 ms`。
+- **`GaudiRT` 机制（[`GenerationEpochTracker`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/include/gaudirt/runtime/generation_epoch_tracker.hpp)）**：当静态图绑定代数（`binding_generation_`）与外部流写入代数（`external_stream_epoch_`）未变时，将绑定检查、同流重放入口等待和出口事件发布全部收敛为 **`O(1)` 代数核验 + 单个步尾 Epoch 事件记录**。
+- **真机 ABBA 实测结果**：
+  - 2,392 绑定预检 + 2-Region 事件表维护耗时从 **`990.44 µs`** 降至 **`1.07 µs`**，单步净省 **`989.37 µs`（`923.9x` 加速）**；
+  - 8 卡整步主机提交耗时从 `3,833.85 ~ 5,475.77 µs` 降至 `3,091.17 ~ 4,383.02 µs`，每步净省 **`734.36 ~ 1,092.75 µs`**。
+
+### 3. `RT-3`：Recipe 复用拓扑下的在途 Chunk 信用管理与确定性背压
+- **缺口成因**：`libSynapse.so` 的 `MappedMemMgr` 遵循精确守恒律：
+  $$\text{first\_block\_idx}(N_{\text{distinct}}) = 575 - 2\,N_{\text{distinct}}$$
+  虽然 70 层生产模型每步发射 `145` 次计算，但轨迹审计证实每步仅使用 **`12` 个不同 `synRecipeHandle`**（MoE 与 Attention 跨层复用同一编译产物）。因此真实模型的无阻塞在途上限并非 144 独立 Recipe 假设下的 `287` 次，而是 $575 - 2\times 12 = \mathbf{551}$ 次（**`3.80` 个完整步**）。但当连续预排步数达到 `K = 4`（`580` 次 > `551`）且缺乏信用管理时，仍会在第 `552` 次调用（`idx = 551`）处撞上 `waitForCompletionCopy` 硬阻塞。
+- **`GaudiRT` 机制（[`InFlightCreditManager`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/include/gaudirt/runtime/inflight_credit_manager.hpp)）**：实时追踪在途不同 `synRecipeHandle` 引用计数（$2\,N_{\text{distinct}}$）与在途 Launch 数（$N_{\text{in\_flight}}$），在每步入口通过 `synEventQuery` 非阻塞回收已完成步的 `145` 个信用，并在信用不足时于**步边界**执行确定性同步等待。
+- **真机实测结果**：
+  - 12-Recipe 复用拓扑（`145` 计算/步）无节流测试：理论预测 `first_block_idx = 551`，真机实测 **`551`（零误差，`3.80` 步）**，验证 `K = 1, 2, 3` 步（`145, 290, 435` 次计算）在不触发任何阻塞的情况下可一次排入；
+  - 开启 `InFlightCreditManager` 后测试 `K = 1, 2, 3, 4` 步（最高 `580` 次 Launch）：全程 **`mid_step_waitForCompletionCopy_blocks = 0`**，峰值占用 Chunk 稳定受控在 `314 <= 559`，单次 Launch 最大耗时仅 **`39.59 µs`**。
+
+---
+
+## 三、前期 Gate 0 基础探针结论归档（`G0-1` ~ `G0-7`）
+
+| 门禁编号 | 实验名称与产物文件 | 实测核心指标 | 归属模块与结论 |
 | :--- | :--- | :--- | :--- |
-| **`G0-1` & `G0-7`** | **相同边界普通 vs 预排队跨度对比 & 144 独立 Recipe（`3,068` 绑定/步）逐级预排队容量定律**<br/>[`g0-7-distinct144-prequeue.json`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/evidence/gate0-20261023/g0-7-distinct144-prequeue.json)<br/>[`g0_7_distinct144_prequeue_probe.cpp`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/probes/g0_7_distinct144_prequeue_probe.cpp) | • **发现 `MappedMemMgr` 精确整数守恒定律**：<br/>$$\text{first\_block\_idx}(N_{\text{distinct}}) = 575 - 2\,N_{\text{distinct}}$$<br/>实测 5 个点完全吻合（零误差）：<br/>$N=1 \to \mathbf{573}$；$N=36 \to \mathbf{503}$；$N=72 \to \mathbf{431}$；$N=140 \to \mathbf{295}$；$N=144 \to \mathbf{287}$。<br/>• **144 独立 Recipe（`3,068` 绑定 + `141` FP32 AllGather）逐级预排队**：<br/>- `1 步`（`144` 计算）：**`0` 阻塞**（提交 `4.53 ms`，Gate 仍在执行，设备反馈 `token/pos/KV/EOS` 校验通过）；<br/>- `2 步`（`288` 计算）：在第 **288 次**计算提交（`idx = 287`，第 2 步最后 1 个 Recipe）触发 `waitForCompletionCopy` 阻塞（`128.77 ms`）；<br/>- `3 步 / 4 步`：同样在 `idx = 287` 处阻塞。<br/>• **相同边界 `[first_op_start, last_op_end]` 跨度对比**：<br/>- 当计算很轻（`< 4 ms`）使主机提交（`4.05 ms`）慢于设备执行时，普通跨度 `4,411.40 µs` vs 预排队跨度 `2,120.97 µs`，差值 **`2,290.43 µs`**；<br/>- 当计算跨度接近生产模型（`12.49 ms` 计算 > `3.24 ms` 主机提交）时，普通跨度 `13,977.93 µs` vs 预排队跨度 `13,848.63 µs`，差值仅 **`129.30 µs`**。 | **关键突破**：<br/>1. 彻底证实小图（1~2 个 Recipe 重复，`573/571` 次上限）**不能**推导出真实 144-Recipe 模型的“三步安全”。每个在途独立 `synRecipeHandle` 额外占用 **2 个非 Patchable 槽位**，使 144 独立 Recipe 的动态槽位上限从 `573` 降至 **`287`（恰好差 1 次提交满 2 步）**。<br/>2. **工程推论**：若做单步双缓冲重叠（在途 $\le 1$ 步 = `144` 次 $\ll 287$），无需改 Recipe 数量即 100% 安全；若需 **2 步完整预排队**（`280` 次提交），只需合并 4 个零散小 Recipe 使每步计算 Recipe 数从 `144` 降至 **`140`**（此时上限升至 $575 - 280 = \mathbf{295} \ge 280$）。 |
-| **`G0-2`** | **Launch 成本正交解耦（固定节点改绑定 / 固定绑定改节点）与 SRAM `RMW` 容量上限**<br/>[`g0-2-launch-sram.json`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/evidence/gate0-20261023/g0-2-launch-sram.json)<br/>[`g0_2_launch_and_sram_probe.cpp`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/probes/g0_2_launch_and_sram_probe.cpp) | • **正交解耦单次 `synLaunchWithExternalEventsExt` 成本**：<br/>- 固定 `bindings = 3`，`nodes = 1, 4, 8, 16, 32`：P50 为 `6.584, 6.571, 6.846, 7.106, 7.180 µs` $\to$ **纯节点斜率仅 `0.019 µs / node`**；<br/>- 固定 `nodes = 16`，`bindings = 3, 8, 16, 24, 32`：P50 为 `7.163, 8.117, 9.929, 11.987, 13.736 µs` $\to$ **纯绑定斜率 `0.227 µs / binding`**。<br/>- 精确经验公式：$$\text{Launch}(\mu\text{s}) \approx 6.20 + 0.227\,N_{\text{bind}} + 0.019\,N_{\text{node}}$$<br/>代入生产模型每步 `144` Recipe、`3,068` 总绑定、`~1,210` 节点：预测纯 C++ Launch 总耗时为 **`1,612.2 µs`（`11.19 µs / recipe`）**。<br/>• **SRAM `RMW` 对照与容量边界**：<br/>- `rmw = false` 时，从 `2 KB` 到 `24 MB` 全部落入 `DRAM_WORKSPACE`（`workspace = size + 256`）；<br/>- `rmw = true` 时，**`2 KB` 至 `16 MiB`（`16,777,216 B`）** 100% 驻留 SRAM（`workspace = 256 B`），在 `12 MiB` / `16 MiB` 分别节省 **`5.89 µs`** / **`9.83 µs`**；超过 `16 MiB`（`20 MiB`、`24 MiB`）在 `synNodeCreate` 阶段直接返回 `synFail (26)`。 | 1. 证实单次 Launch 的可变开销几乎全部来自 **Persistent Tensor 绑定与地址校验/Patching（`0.227 µs/绑定`）**，而与子图内部节点数基本无关（`0.019 µs/节点`）。<br/>2. 证实跨算子中间张量若未显式置于同一子图的 `RMW` Section（$\le 16\text{ MiB}$）或未在单 TPC Kernel 内寄存器融合，即使只有 `2 KB`（单 Token 激活 `12 KB` ~ `24 KB`）也会往返 HBM Workspace。 |
-| **`G0-3` & `G0-4`** | **主循环主机阶段剖析与 `async_scheduling` 路径门禁审计**<br/>[`g0-3-4-host-and-path-audit.json`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/evidence/gate0-20261023/g0-3-4-host-and-path-audit.json)<br/>[`g0_3_4_host_and_path_audit.py`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/scripts/g0_3_4_host_and_path_audit.py) | • **3 处 `use_async_scheduling` 门禁定位**：<br/>1. [`decode_graph.py:77`](file:///home/rate/llm/Gaudi-LLM/gaudi-kernels-public/python/gaudi_kernels/serving/decode_graph.py#L77)：`if ... or runner.use_async_scheduling ...: return False`，直接退出整步 `StepGraphCapture` 快路径；<br/>2. [`runner.py:424`](file:///home/rate/llm/Gaudi-LLM/gaudi-kernels-public/python/gaudi_kernels/serving/runner.py#L424)：禁用 `_prepared_decode_input` 缓存，退回逐张量构建；<br/>3. [`runner.py:666`](file:///home/rate/llm/Gaudi-LLM/gaudi-kernels-public/python/gaudi_kernels/serving/runner.py#L666)：`sample_tokens` 走 `_ pending_async_Verify` 分支。<br/>• **`uclamp=1024` 8 卡主机阶段分解**：<br/>- 高 QoS 稳态步长 `11.306 / 11.323 ms`（对比 `uclamp=0` 的 `13.194 / 13.371 ms`，净省 **`1.97 ms/步`**）；<br/>- 设备首尾总跨度中位数 **`10.671 ms`**（8 卡范围 `10.175 ~ 10.751 ms`）；<br/>- 步间主机准备 + 采样回传净跨度约 **`~0.64 ms`**（其中 `_prepare_decode_inputs` 命中缓存时仅 **`26.1 µs`**，末尾 `copy_d2h` 同步等待 + 采样回传约 `0.55 ~ 0.61 ms`）。 | 1. 严格验证了用户指出的第 2 条原则：**绝不能用直接打开 `async_scheduling=True` 的劣化结果否定异步重叠或设备反馈**，因为现有代码会在 `decode_graph.py:77` 退出 `StepGraphCapture`。<br/>2. 若要测试异步重叠或设备侧反馈，必须在**保持 `StepGraphCapture` 准入与 `_prepared_decode_input` 缓存开启**的前提下对比。 |
-| **`G0-5`** | **8 卡集合通信交错跨度与 `FP32 AllGather` vs `AllReduce` 对比**<br/>[`g0-5-collective-handoff.json`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/evidence/gate0-20261023/g0-5-collective-handoff.json)<br/>[`g0_5_collective_handoff_probe.cpp`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/probes/g0_5_collective_handoff_probe.cpp) | • **纯连续 `141` 次 8 卡集合通信对比（`6144` 元素）**：<br/>- `BF16 hcclAllReduce (12 KB)`：总跨度 **`2,651.00 µs`（`18.80 µs / 次`）**；<br/>- `BF16 hcclAllGather (12 KB -> 96 KB)`：总跨度 **`1,350.51 µs`（`9.58 µs / 次`）**；<br/>- `FP32 hcclAllGather (24 KB -> 192 KB，生产模型实际采用)`：总跨度 **`1,455.78 µs`（`10.32 µs / 次`）**，主机提交 **`987.12 µs`（`7.00 µs / 次`）**。<br/>• **与 `144` 个计算 Recipe 交错时的边际设备耗时（`FP32 AllGather`）**：<br/>- `0` 次通信：`12,488.06 µs`；<br/>- `35` 次通信：`12,950.76 µs`（`+462.70 µs`，**`13.22 µs / 次`**）；<br/>- `70` 次通信：`13,320.15 µs`（`+832.09 µs`，**`11.89 µs / 次`**）；<br/>- `141` 次通信：`13,968.85 µs`（`+1,480.79 µs`，**`10.50 µs / 次`**）。 | 1. 证实生产模型选用的 `FP32 hcclAllGather`（`10.32 µs/次`）比 `BF16 hcclAllReduce`（`18.80 µs/次`）快 **45%（每步省 `1.20 ms`）**，因为省去了两阶段规约的第二轮环网通信。<br/>2. 当主机提交领先于设备执行时，`141` 次交错 `FP32 AllGather` 的边际设备跨度增量（`1,480.79 µs` = `10.50 µs/次`）与纯连续通信跨度（`1,455.78 µs` = `10.32 µs/次`）仅差 **`25.01 µs`（`0.18 µs/次`）**！说明硬件 `EventNetwork`（ARC 内部 SOB 信令）本身的 Compute $\leftrightarrow$ NIC 切换开销极低（`< 0.2 µs/次`），生产模型中观察到的跨 Recipe 空隙主要来自 **8 卡负载微偏斜等待 + 通信后紧跟的独立 `pf_sum` / `rmsnorm` Kernel 启动延迟**。 |
-| **`G0-6`** | **70 层生产模型 `144` 个 Recipe 算子级 Roofline 审计与 `2.056 ms` 子图内空泡定位**<br/>[`g0-6-recipe-roofline-audit.json`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/evidence/gate0-20261023/g0-6-recipe-roofline-audit.json)<br/>[`g0_6_recipe_roofline_audit.py`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/scripts/g0_6_recipe_roofline_audit.py) | • **算子执行耗时 vs 85% 有效 HBM Roofline（`2.08 TB/s`）**：<br/>1. **`moe_gp_scale_tail`（`948.50 µs` TPC）+ `moe_down_broadcast`（`711.05 µs` TPC）**：合计 **`1,659.55 µs`（纯 TPC）**，超出其 `1.38 GB` 权重有效 Roofline（`662.67 µs`）达 **`+996.89 µs`（`~1.00 ms`）**，是全模型第一大算子级超额来源！<br/>2. **`o_proj_bf16`（`913.37 µs`，其中 MME `861.59 µs`）**：读取 `1.76 GB` BF16 权重，已达 85% 有效 Roofline（`845.91 µs`）的 **92.6%（实测带宽 `1.93 TB/s`）**！继续微调 BF16 GEMM 最多只有 `< 70 µs` 空间；唯有将其权重压缩为 **FP8 / MXFP4** 才能释放 **`420 ~ 630 µs/步`** 的物理带宽时间。<br/>3. **注意力 + 归一化 + 通信本地规约 + MoE 路由/重排小 TPC Kernel 群**：<br/>- `rmsnorm_residual` (`274.22 µs`) + `rmsnorm_input` (`253.78 µs`) = **`528.00 µs`**；<br/>- `tp_local_sum (pf_sum)` = **`321.55 µs`**（`141` 次调用）；<br/>- `moe_combine` (`234.67 µs`) + `moe_compact_gate` (`210.89 µs`) + `router_topk/post8` (`308.84 µs`) = **`754.40 µs`**；<br/>- `qkv_neumaier_reduce` (`134.58 µs`) + `qkv_post_rope_cache` (`157.88 µs`) = **`292.46 µs`**。<br/>• **精确查明 `2.056 ms` 子图内无计算空泡（Intra-Recipe Bubble）的物理来源**：<br/>它**不是**单个长停顿，而是每个 Recipe 内部相邻 TPC/MME 节点之间每次 **`1.6 ~ 2.5 µs` 的引擎切换与片上同步空隙**在 70 层上的累加：<br/>- `moe_gp_scale_tail(TPC) -> moe_compact_gate(TPC)`：**`171.24 µs`**（`2.48 µs × 69`）<br/>- `moe_down_broadcast(TPC) -> moe_combine(TPC)`：**`135.58 µs`**（`1.96 µs × 69`）<br/>- `qkv_neumaier_reduce(TPC) -> qkv_post_rope_cache(TPC)`：**`135.30 µs`**（`1.93 µs × 70`）<br/>- `rmsnorm_residual(TPC) -> dense_mlp_gate(MME)`：**`129.83 µs`**（`1.88 µs × 69`）<br/>- `o_proj_bf16/pf_sum(TPC) -> rmsnorm_residual(TPC)`：**`129.17 µs`**（`1.85 µs × 70`）<br/>- `other(TPC) -> router_topk(TPC)`：**`122.88 µs`**（`1.78 µs × 69`）<br/>- `rmsnorm_input(TPC) -> qkv_fp8_bmm(MME)`：**`122.76 µs`**<br/>- `attn_swa128(TPC) -> o_proj_bf16(MME)`：**`112.16 µs`**（`1.87 µs × 60`）<br/>- `moe_compact_gate(TPC) -> moe_down_broadcast(TPC)`：**`111.38 µs`**（`1.61 µs × 69`）<br/>- `tp_local_sum(TPC) -> rmsnorm_input(TPC)`：**`107.26 µs`**（`1.82 µs × 59`） | **直接给出最高 ROI 的算子融合靶点**：<br/>每合并一对相邻 TPC Kernel，不仅省掉中间张量读写与第二个 Kernel 的格栅启动耗时，还**直接消灭这对节点之间 `110 ~ 170 µs/步` 的子图内切换空泡**！ |
-
----
-
-## 二、基于 Gate 0 证据的最小补丁优先级排序（Gate 1 实施清单）
-
-根据 Gate 0 的定量证据，我们**正式放弃外部私有 ABI 驻留实例后端（Conditional Direction D）**——因为在 `uclamp=1024` 与生产计算跨度下，纯主机 Launch 追赶差值仅 `~0.13 ms`，且私有 ABI 存在完成计数/池回收错位的高危维护成本。
-
-真正的端到端收益集中在以下 **4 个高确定性、零私有 ABI 依赖的最小补丁方向**（按预期净收益排序）：
-
-### 优先级 P1：MoE 与 Attention 相邻 TPC 算子对内联融合（同时砍掉 `~2.1 ms` 小 TPC 算子耗时 + `~0.8 ms` 子图内切换空泡）
-在 [`gaudi-kernels-public`](file:///home/rate/llm/Gaudi-LLM/gaudi-kernels-public) 现有自定义 TPC Kernel 基础上做单 Kernel 级融合：
-1. **`pf_sum_bf16` + `residual_rmsnorm` / `input_rmsnorm` 融合**：
-   - 现状：`AllGather(FP32, [8, B, 6144])` 之后先跑 `pf_sum_bf16`（`321.55 µs / 141 次`），写回 BF16 张量后再间隔 `1.85 µs` 启动 `residual_rmsnorm` / `input_rmsnorm`（`528.00 µs / 140 次`），加切换空泡共 **`~1,086 µs/步`**。
-   - 改法：让 `residual_rmsnorm` 与 `input_rmsnorm` 直接以 `AllGather` 输出的 `[8, B, 6144]` FP32 缓冲区为输入，在 TPC 寄存器内完成 8-rank FP32 求和 + 残差相加 + RMSNorm 平方和规约与量化输出。
-   - **预期收益**：省去 `140` 次 `pf_sum` 独立 Kernel 及其 `~236 µs` 节点间切换空泡，预计净省 **`350 ~ 480 µs/步`**。
-2. **`moe_gp_scale_tail` + `ub_compact_gate` 融合，以及 `downact_direct_down_broadcast` + `pf_combine_f32` 融合**：
-   - 现状：`moe_gp_scale_tail -> ub_compact_gate` 之间有 **`171.24 µs`** 空泡 + `ub_compact_gate` 自身 `210.89 µs`；`moe_down_broadcast -> moe_combine` 之间有 **`135.58 µs`** 空泡 + `moe_combine` 自身 `234.67 µs`。
-   - 改法：在 MoE gate-up 尾处理与 down-projection 累加阶段消除独立重排/规约 Kernel 边界。
-   - **预期收益**：预计净省 **`400 ~ 600 µs/步`**。
-3. **`qkv_neumaier_reduce` + `qkv_post_rope_cache` 融合**：
-   - 现状：`neumaier_reduce` (`134.58 µs`) $\to$ 空泡 (`135.30 µs`) $\to$ `qkv_post_rope_cache` (`157.88 µs`)，合计 **`427.76 µs/步`**。
-   - 改法：在单次 TPC 调度内完成 QKV 分块规约、RoPE 旋转与 KV Cache 写入。
-   - **预期收益**：预计净省 **`180 ~ 250 µs/步`**。
-
-### 优先级 P2：`o_proj` 权重 FP8 量化路径（突破 `1.76 GB` BF16 权重带宽硬墙）
-- 现状：`G0-6` 证明 `o_proj_bf16`（`913.37 µs`）已达 85% 有效 HBM 带宽上限（`1.93 TB/s`），占全模型每步权重读取量的 **33.8%（`1.76 GB / 5.20 GB`）**。
-- 改法：复用 `qkv_fp8_bmm` 已验证的 Block-FP8 路径，将 70 层 `o_proj` 切换为 FP8 权重（`1.76 GB -> 0.88 GB`）。
-- **预期收益**：直接削减 `0.88 GB/步` HBM 读取，理论释放 `~420 µs` HBM 带宽时间，扣除量化开销后预计净省 **`300 ~ 400 µs/步`**。
-
-### 优先级 P3：合并 4 个零散小 Recipe（`144 -> 140` 计算 Recipe/步）并保持 `StepGraphCapture` 内单步/双步异步流水
-- 现状：`G0-7` 证明 `MappedMemMgr` 遵循 $\text{first\_block\_idx} = 575 - 2\,N_{\text{distinct}}$。当前 `144` 个独立计算 Recipe 的在途上限为 **`287` 次**（恰好比 2 步 `288` 次少 1 次！），且 `decode_graph.py:77` 在 `use_async_scheduling=True` 时错误退出了 `StepGraphCapture`。
-- 改法：
-  1. 将首尾 4 个零散小计算命令（绑定数分别为 `16, 4, 2, 4`）并入相邻层 Recipe，使每步独立计算 Recipe 数从 `144` 降至 **`140`**，在途安全上限从 `287` 升至 **`295`（$\ge 280$，彻底解锁 2 步无阻塞预排队）**；
-  2. 在 `decode_graph.py` 内部支持保持 `StepGraphCapture` 与 `_prepared_decode_input` 缓存开启的 1 步流水重叠（隐藏步尾 `~0.55 ms` 的 D2H 采样同步与输入准备）。
-- **预期收益**：消除步间主机同步暴露 **`400 ~ 550 µs/步`**。
+| **`G0-1` & `G0-7`** | **在途 `MappedMemMgr` 守恒定律发现**<br/>[`g0-7-distinct144-prequeue.json`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/evidence/gate0-20261023/g0-7-distinct144-prequeue.json) | 5 组独立 Recipe 数测试点零误差验证 $\text{first\_block\_idx}(N_{\text{distinct}}) = 575 - 2\,N_{\text{distinct}}$（`573, 503, 431, 295, 287`）。 | **归属 `GaudiRT`（`RT-3`）**：直接转化为 [`InFlightCreditManager`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/include/gaudirt/runtime/inflight_credit_manager.hpp) 的信用预算定律。 |
+| **`G0-2`** | **Launch 成本正交解耦与 SRAM `RMW` 容量上限**<br/>[`g0-2-launch-sram.json`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/evidence/gate0-20261023/g0-2-launch-sram.json) | • $\text{Launch}(\mu\text{s}) \approx 6.20 + 0.227\,N_{\text{bind}} + 0.019\,N_{\text{node}}$；<br/>• SRAM `RMW=true` 容量上限为 **`16 MiB`**（`20 MiB` 返回 `synFail`）。 | **基础物理参数**：支撑 `GaudiRT` Launch 开销建模，SRAM 边界移交 `gaudi-kernels`。 |
+| **`G0-3` & `G0-4`** | **`async_scheduling` 路径门禁与 `uclamp=1024` 主机剖析**<br/>[`g0-3-4-host-and-path-audit.json`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/evidence/gate0-20261023/g0-3-4-host-and-path-audit.json) | 定位 `decode_graph.py:77`、`runner.py:424`、`runner.py:666` 三处因 `use_async_scheduling` 退出 `StepGraphCapture` 的门禁。 | **移交 `Bridge / vLLM runner`**：后续异步或设备反馈必须在保持 `StepGraphCapture` 快路径下开启。 |
+| **`G0-5`** | **8 卡集合通信交错跨度与 `FP32 AllGather` 对比**<br/>[`g0-5-collective-handoff.json`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/evidence/gate0-20261023/g0-5-collective-handoff.json) | `FP32 hcclAllGather` 单次 `10.32 µs`（比 `BF16 AllReduce` 快 45%）；连续提交时硬件 `EventNetwork` 交接边际开销仅 `0.18 µs/次`。 | **归属 `GaudiRT`（`RT-1`）**：证明只要消除 `Command 5` 跨流断层、保持同流连续提交，HCL 交接开销极小。 |
+| **`G0-6`** | **70 层 144 Recipe 算子级 Roofline 与子图内空泡审计**<br/>[`g0-6-recipe-roofline-audit.json`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/evidence/gate0-20261023/g0-6-recipe-roofline-audit.json) | 定位 MoE TPC 算子超额（`+1.00 ms`）、`o_proj` BF16 带宽墙（`913 µs`，达 Roofline 92.6%）及 1-core TPC 算子导致的子图内切换空泡。 | **移交 `gaudi-kernels`**：作为算子库内核优化与量化改造的定量依据，脱离 `GaudiRT` 主线。 |

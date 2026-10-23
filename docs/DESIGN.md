@@ -1,108 +1,107 @@
-# GaudiRT 架构设计规范（Evidence-Driven Architecture & Gated Freeze Specification）
+# GaudiRT 架构设计规范（Evidence-Driven Runtime Architecture & Boundary Specification）
 
-> **核心定位与防膨胀铁律（Anti-Bloat Mandate）**：
-> 基于 [`software-autopsy.md`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/docs/software-autopsy.md) 与三轮真机/反汇编/源码复核（归档清单见 [`GaudiRT/evidence/README.md`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/evidence/README.md)）：
-> 1. 70 层 TP8 模型在锁定高性能 CPU 策略（全线程 `uclamp = 1024`）下的无插桩基线为 **`11.31 ~ 11.32 ms/step`（`86.9 ~ 88.4 TPS`）**，主机提交（`5.18 ~ 5.40 ms`）已与设备执行跨度（`10.48 ms`）高度重叠；
-> 2. 现有代码库已实现预绑定 `synLaunch` 区域执行器（[`NativeExecutionPlan.cpp`](file:///home/rate/llm/Gaudi-LLM/gaudi-pytorch-bridge/backend/habana_device/NativeExecutionPlan.cpp) 的 `PreparedRegionProgram`）、单份计划多步提交入口（[`BRIDGE-REPEATED-REPLAY-20261011.md`](file:///home/rate/llm/Gaudi-LLM/gaudi-kernels-public/docs/BRIDGE-REPEATED-REPLAY-20261011.md) 的 `graph.replay_many`）、C++ `synGraphHandle` + RMW SRAM 算子（[`gaudi-kernels-public`](file:///home/rate/llm/Gaudi-LLM/gaudi-kernels-public/csrc/ops/mxfp4_compact.cpp)）与固定槽位 Decode 输入缓冲（`MimoHPUWorker`）；
-> 3. 静态反汇编已证实“在 `libSynapse.so` 外部绕开 `RecipeLauncher::launch` 的驻留实例（原 `L1_B`）”会破坏 Completion Group (`CG`) 计数器、卡死按 `LongSo` 回收的内部池或迫使手写未公开 ARC 调度包，**故在设计阶段直接砍掉 `L1_B`**。
+> **模块职责边界铁律（Strict Three-Layer Responsibility Boundary）**：
 >
-> **因此，`GaudiRT` 绝不新建第三套运行时或执行器外壳。`GaudiRT` 仓库仅承载：Gate 0 硬件实测探针、证据账本、以及经门禁证明有确定性收益后直接合入 `gaudi-kernels-public` / `gaudi-pytorch-bridge` 的最小外科手术补丁。**
+> - **`gaudi-kernels`（[`/home/rate/llm/Gaudi-LLM/gaudi-kernels-public`](file:///home/rate/llm/Gaudi-LLM/gaudi-kernels-public)）**：负责 TPC/MME 内核实现、算子融合、权重量化计算（如 `o_proj` FP8）、单核 TPC 算子多核化（1-core $\to$ 24-core）与 SRAM 分块。`GaudiRT` 探针发现的算子级瓶颈（[`g0-6-recipe-roofline-audit.json`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/evidence/gate0-20261023/g0-6-recipe-roofline-audit.json)）作为证据移交算子库，**算子融合与权重量化不属于 `GaudiRT` 主线**。
+> - **`Bridge / vLLM runner`（[`/home/rate/llm/Gaudi-LLM/gaudi-pytorch-bridge`](file:///home/rate/llm/Gaudi-LLM/gaudi-pytorch-bridge)）**：负责框架接入、模型构图、输入准备、采样回传与请求调度。
+> - **`GaudiRT`（[`/home/rate/llm/Gaudi-LLM/GaudiRT`](file:///home/rate/llm/Gaudi-LLM/GaudiRT)）**：聚焦**面向编译产物的通用运行时执行能力**——编译产物实例化与重放、计算与集合通信统一提交、在途资源（`MappedMemMgr` Chunk 信用）管理、完成回收与确定性背压。复用已有机制，**只解决经过验证的运行时缺口，并产生可验证的硬件收益**，绝不把 `PreparedRegionProgram` 简单搬出来再包装一次，也不写耦合 `libSynapse.so` 私有 ABI 偏移的代码。
 
 ---
 
-## 一、现有资产映射与设计裁决总表（什么已具备、什么已砍掉、什么待验证）
+## 一、核心问题回答：现有运行时缺少什么通用能力？`GaudiRT` 以什么机制补齐？收益多少？
 
-| 模块/方向 | 现有代码库资产或反汇编事实 | 架构裁决 |
+通过对 70 层 TP8 生产轨迹（8 卡 `sdk-scope-1-rank0..7.jsonl` 及 `production70-first-principles-a/result.json`）与 [`NativeExecutionPlan.cpp`](file:///home/rate/llm/Gaudi-LLM/gaudi-pytorch-bridge/backend/habana_device/NativeExecutionPlan.cpp) / [`NativeDependencyPlan.h`](file:///home/rate/llm/Gaudi-LLM/gaudi-pytorch-bridge/backend/habana_device/NativeDependencyPlan.h) 的逐微秒对齐审计，现有运行时（`NativeExecutionPlan` + `PreparedRegionProgram`）在稳态 `11.31 ms` 步长内，真正因**运行时机制缺口**损失的设备时间集中在前 `2.0 ms`（步首主机准备停顿 `~0.95 ms` + 步中 `Command 5` 跨流断层导致的 `~0.77 ms` 早期设备气泡），外加多步在途提交缺乏精确信用背压管理。
+
+`GaudiRT` 针对这 **3 个经过验证的运行时缺口（`RT-1`、`RT-2`、`RT-3`）** 提供通用机制并完成了 8 卡 Gaudi2 真机 ABBA 验证（[`rt-1-2-3-runtime-gaps.json`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/evidence/gate0-20261023/rt-1-2-3-runtime-gaps.json)）：
+
+| 运行时缺口编号 | 现有运行时 (`NativeExecutionPlan`) 的具体缺陷 | `GaudiRT` 补齐的通用机制 | 8 卡 Gaudi2 真机实测收益 (`uclamp=1024`, ABBA) |
+| :--- | :--- | :--- | :--- |
+| **`RT-1`**<br/>**混合命令断层与跨流切分缺口** | 生产单步 `286` 个命令中，`command 5` 同时包含 `compute: true` 与 `collectives: 1`（内部 `o_proj` 写出的张量紧接着被同命令的 `AllGather` 读取）。现有 [`NativeDependencyPlan.h:67`](file:///home/rate/llm/Gaudi-LLM/gaudi-pytorch-bridge/backend/habana_device/NativeDependencyPlan.h#L67) 与 [`PreparedRegionProgram::compile`](file:///home/rate/llm/Gaudi-LLM/gaudi-pytorch-bridge/backend/habana_device/NativeExecutionPlan.cpp#L122) 拒绝混合命令，导致全步被劈成 **2 个 Region（`[0..4]` 与 `[6..285]`）**：<br/>1. 在 `command 4 -> 5 -> 6` 处触发 `leave()` + `publish(Region 0)`；<br/>2. `command 5` 退回旧 `RecipeLauncher::Launch`，其集合通信因 `replay_stream == nullptr` 被迫切到独立的 `comm_stream`（`stream 6`），插入 4 次跨流 `synEventRecord` / `synStreamWaitEvent`；<br/>3. 导致 8 卡设备在 `k=0..5` 处产生 **`644 ~ 806 µs`（均值 `~770 µs`）的早期启动气泡**。 | **[`UnifiedRegionLowerer`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/include/gaudirt/runtime/unified_region_lowerer.hpp)**：<br/>识别具有内部 RAW 依赖（`compute_writes` $\cap$ `collective_reads` $\neq \emptyset$）且无外部张量事件的混合命令，将其在编译期正交拆解为两个连续原子子调用（`SubCallKind::Compute` + `SubCallKind::Collective`），使全步 `286` 个逻辑命令（`145` 计算 + `142` 通信）100% 合并为 **`1` 个统一单流 Region（`[0..285]`，`coalesced_collectives: 141/142 -> 142/142`）**，彻底消除步中跨流切换与二次 Region 发布。 | • 早期窗口（`Commands 0..7`）设备耗时从 **`751.2 ~ 754.6 µs`** 降至 **`159.4 ~ 161.2 µs`**，8 卡一致消除 **`591.8 ~ 594.3 µs`（`~0.59 ms`）** 早期设备气泡；<br/>• 结合 `RT-2` 后，单步全图设备执行跨度净省 **`600.8 ~ 1,076.5 µs`（`0.60 ~ 1.08 ms/步`）**。 |
+| **`RT-2`**<br/>**步首/步尾 $O(N_{\text{bindings}})$ 全量预检与地址事件表扫描缺口** | 现有运行时在每步入口和每个 Region 进出时：<br/>1. 遍历 `2,391` 个 `native_boundaries_` 与 `2,392` 个 `RetainedTensorBinding::matches`；<br/>2. 在 `PreparedRegionProgram::replay` 入口对 `2,392` 个依赖地址执行 `stream_event_manager::get_wait_events` 哈希查找、排序去重；<br/>3. 在 `PreparedRegionProgram::publish` 出口对 `2,392` 个地址执行 `add_producer` 哈希查找与 `event::remove_device_ptr` 线性删除（2 个 Region 时每步执行 2 轮）。<br/>这也是生产轨迹中每步 `enq0` 前 **`863 ~ 1,018 µs` 主机发射延迟**的核心来源。 | **[`GenerationEpochTracker`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/include/gaudirt/runtime/generation_epoch_tracker.hpp)**：<br/>引入单调递增的绑定代数（`binding_generation_`）与外部流写入代数（`external_stream_epoch_`）。当静态图绑定未发生重绑且无外部流写入 Region 足迹地址时：<br/>1. 绑定校验退化为 **`O(1)` 代数比对**；<br/>2. 同流连续重放依赖硬件 FIFO 保序，免除 `2,392` 地址等待扫描；<br/>3. 步尾以 **单个 Region Epoch 事件（`O(1)`）** 替代 `2,392` 次 `events_by_addr_` 哈希更新与线性移除。 | • 独立 ABBA 实测（`2,392` 绑定与地址）：每步主机预检 + 事件表维护耗时从 **`990.44 µs`** 降至 **`1.07 µs`**，净省 **`989.37 µs/步`（加速比 `923.9x`）**；<br/>• 8 卡整步主机提交耗时净省 **`734.4 ~ 1,092.8 µs/步`**。 |
+| **`RT-3`**<br/>**Recipe 复用拓扑下的在途 Chunk 信用与确定性背压缺口** | `libSynapse.so` 的 `MappedMemMgr` 存在硬上限（每队列 `576` 个 DataChunk，门控占 `1` 个后余 `575` 个），耗尽时在 `getMappedMemoryInfo -> LaunchTracker::waitForCompletionCopy` 发生百毫秒级硬阻塞。现有运行时无在途信用感知，盲目调用 `replay_many(K)` 在超限时会在步中随机卡死主机提交线程。 | **[`InFlightCreditManager`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/include/gaudirt/runtime/inflight_credit_manager.hpp) & [`CompiledRegionExecutor`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/include/gaudirt/runtime/compiled_region_executor.hpp)**：<br/>1. 基于 `G0-7` 证明的精确硬件守恒律：<br/>$$2\,N_{\text{distinct}} + N_{\text{in\_flight}} \le 575$$<br/>2. 审计证实生产模型每步 `145` 次计算仅复用 **`12` 个不同 `synRecipeHandle`**（MoE 与 Attention 层间高度复用），故真实模型无阻塞上限为 $575 - 2\times 12 = \mathbf{551}$ 次（**`3.80` 个完整步**，而非 144 独立 Recipe 假想下的 `287` 次）；<br/>3. 按步绑定完成事件，通过 `synEventQuery` 非阻塞回收已完成步信用，并在超预算前于**步边界**执行确定性背压等待。 | • 真机复现 12-Recipe 复用拓扑（`145` 计算/步）：理论预测首次阻塞点 **`551`**，真机实测首次阻塞点 **`551`（零误差，`3.80` 步）**；<br/>• 开启 `InFlightCreditManager` 后，连续提交 `K = 1, 2, 3, 4` 步（最高 `580` 次 Launch > `551`）全程 **`mid_step_waitForCompletionCopy_blocks = 0`**，单次 Launch 最大耗时仅 **`39.59 µs`**（对比无信用管理的 `1,444.36 µs` 阻塞）。 |
+
+---
+
+## 二、现有资产映射与职责划分总表
+
+| 模块/方向 | 所属责任层 | 架构裁决 |
 | :--- | :--- | :--- |
-| **预绑定 `synLaunchTensorInfoExt` + C++ 顺序循环 (`L1_A`)** | [`NativeExecutionPlan.cpp`](file:///home/rate/llm/Gaudi-LLM/gaudi-pytorch-bridge/backend/habana_device/NativeExecutionPlan.cpp) 中的 `PreparedRegionProgram` 已实现（144 计算 + 141 通信，`adapter_replays = 0`） | **直接复用**，严禁在 `GaudiRT` 中重写第二份循环执行器。 |
-| **外部绕过 `RecipeLauncher` 的驻留实例 (`L1_B`)** | 反汇编（[`design-review-20261023/*.asm`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/evidence/design-review-20261023/recipe-launch.asm)）证实外部跳过 `QueueComputeScal::launch` 会导致 `CG` 完成计数失步、内部池轮转受阻或必须手写私有 ARC 包 | **直接砍掉（Killed at Design）**，不写任何耦合 `libSynapse.so` 私有偏移或手写 ARC 包的代码。 |
-| **Bridge 绑定预检微优化 (`98 ~ 127 µs`)** | [`CPU-DEPENDENCY-AND-OVERLAP-20261011.md:34`](file:///home/rate/llm/Gaudi-LLM/gaudi-kernels-public/docs/CPU-DEPENDENCY-AND-OVERLAP-20261011.md#L34) 已测得全步 Retained 绑定检查仅 `0.098 ~ 0.127 ms`（低于 `0.15 ms` 立项门槛） | **默认不做独立优化**（仅当 `G0-4` 在无 Profiler 下发现高于 `0.15 ms` 的主机子阶段时才处理）。 |
-| **C++ `synGraphHandle` + RMW SRAM 算子构建 (`L2`)** | [`gaudi-kernels-public/csrc/ops/`](file:///home/rate/llm/Gaudi-LLM/gaudi-kernels-public/csrc/ops/mxfp4_compact.cpp) 已具备 `bf16_linear` / `fp8_linear` / `mxfp4_linear` / `mxfp4_compact` | **复用现有算子库**；是否重构特定算子完全取决于 `G0-6` 对 144 个 Recipe 的耗时/字节审计结果。 |
-| **单步计划重复提交与有界设备状态反馈原型** | [`BOUNDED-DEVICE-FEEDBACK-20261011.md`](file:///home/rate/llm/Gaudi-LLM/gaudi-kernels-public/docs/BOUNDED-DEVICE-FEEDBACK-20261011.md)、[`BOUNDED-CAPACITY-20261011.md`](file:///home/rate/llm/Gaudi-LLM/gaudi-kernels-public/docs/BOUNDED-CAPACITY-20261011.md)、[`BRIDGE-REPEATED-REPLAY-20261011.md`](file:///home/rate/llm/Gaudi-LLM/gaudi-kernels-public/docs/BRIDGE-REPEATED-REPLAY-20261011.md) 已实现 `graph.replay_many(N)` 并验证 8 卡 $\le 3$ 步预排通过 | **复用 `replay_many` 基础**；先测零代码的 vLLM `async_scheduling`（`G0-3`），再决定是否推进模型级 $\le 3$ 步设备状态反馈（`G0-7`）。 |
+| **混合命令单流 Region 统一降维 (`RT-1`)** | **`GaudiRT`**（核心机制）$\rightarrow$ 赋能 `Bridge` | 由 [`UnifiedRegionLowerer`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/include/gaudirt/runtime/unified_region_lowerer.hpp) 实现并验证，消除 `command 5` 断层。 |
+| **代数守卫绑定预检与 `O(1)` Epoch 围栏 (`RT-2`)** | **`GaudiRT`**（核心机制）$\rightarrow$ 赋能 `Bridge` | 由 [`GenerationEpochTracker`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/include/gaudirt/runtime/generation_epoch_tracker.hpp) 实现并验证，消除每步 `2,392` 项哈希/线性扫描。 |
+| **Recipe 复用感知的在途信用与背压管理 (`RT-3`)** | **`GaudiRT`**（核心机制） | 由 [`InFlightCreditManager`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/include/gaudirt/runtime/inflight_credit_manager.hpp) 与 [`CompiledRegionExecutor`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/include/gaudirt/runtime/compiled_region_executor.hpp) 实现并验证。 |
+| **外部绕过 `RecipeLauncher` 的私有 ABI 驻留实例 (`L1_B`)** | 已否决 | 反汇编（[`design-review-20261023/*.asm`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/evidence/design-review-20261023/recipe-launch.asm)）证实破坏 `CG` 完成计数与内存池回收，**彻底砍掉**。 |
+| **TPC/MME 算子融合、1-core 算子多核化、`o_proj` FP8 量化** | **`gaudi-kernels`** | `GaudiRT` 已通过 `G0-6`（[`g0-6-recipe-roofline-audit.json`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/evidence/gate0-20261023/g0-6-recipe-roofline-audit.json)）完成证据定位并移交 `gaudi-kernels`；**从 `GaudiRT` 主线撤下**。 |
+| **`decode_graph.py` 异步调度准入与 Sampler/Input 编排** | **`Bridge / vLLM runner`** | `GaudiRT` 已通过 `G0-3/G0-4`（[`g0-3-4-host-and-path-audit.json`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/evidence/gate0-20261023/g0-3-4-host-and-path-audit.json)）定位 3 处 `use_async_scheduling` 门禁并移交上层。 |
 
 ---
 
-## 二、三大真实攻关赛道（严格对齐去重后的设备时间线）
+## 三、架构数据流与组件关系图
 
 ```mermaid
 flowchart TD
-    subgraph T["70L TP8 稳态参考时间线 (无插桩步长 11.31 ms/step @ uclamp=1024)"]
-        B_A["赛道 A 目标:<br/>物理计算 Union (5.73 ms vs 带宽下限 2.1~2.5 ms)<br/>+ Recipe 内无计算区间 (2.06 ms)"]
-        B_B["赛道 B 目标:<br/>相邻 Recipe 间无计算区间 (2.70 ms)<br/>(含 8 卡提交后 1.90 ms 交接/网络延迟 + 最慢 Rank 未提交偏斜 0.51 ms)"]
-        B_C["赛道 C 目标:<br/>Step 边界跨 Token 反馈间隙<br/>(首算子前 0.92 ms + 末算子后 0.14 ms)"]
+    subgraph Upper["上层框架与算子库 (非 GaudiRT 主线职责)"]
+        GK["gaudi-kernels:<br/>TPC/MME 内核、算子融合、o_proj 量化、SRAM 分块"]
+        BR["Bridge / vLLM Runner:<br/>模型构图、输入准备、采样与请求调度"]
     end
 
-    subgraph G0["Gate 0 门禁实验矩阵 (零生产代码，全部带二元 Kill/Continue 阈值)"]
-        G0_A["G0-6: 144 个 Recipe 耗时与字节账单审计<br/>G0-2: 固定节点/变绑定成本分离 & SRAM RMW/容量边界探针"]
-        G0_B["G0-1: 门控预排队测量 70L 纯设备步长下限<br/>G0-5: 拆解 141 次 HCL synStreamSyncHCLStreamHandle 与 RoCE 小包延迟<br/>G0-4: PreparedRegionProgram 主机子阶段 rdtsc 微拆解"]
-        G0_C["G0-3: 零代码 vLLM async_scheduling ABBA 对照<br/>G0-7: 评估多步设备状态反馈 (K <= 3) 的剩余空间"]
+    subgraph GRT["GaudiRT: 面向编译产物的通用运行时核心 (include/gaudirt/runtime/)"]
+        URL["RT-1: UnifiedRegionLowerer<br/>混合 Compute+Collective 命令内联 RAW 识别与原子拆解<br/>286 命令 -> 1 个统一 Region (145 Compute + 142 Collective)"]
+        GET["RT-2: GenerationEpochTracker<br/>O(1) 代数守卫绑定校验 + 单流 FIFO 免等待 + O(1) 步尾 Epoch 围栏<br/>替代每步 2,392 绑定/地址哈希扫描 (990 us -> 1.07 us)"]
+        ICM["RT-3: InFlightCreditManager<br/>精确守恒律: 2 * N_distinct + N_in_flight <= 575<br/>12 复用 Recipe -> 551 次上限 (3.80 步) + synEventQuery 非阻塞回收 + 步边界背压"]
+        CRE["CompiledRegionExecutor<br/>统一编译产物实例化、单步/多步重放与在途生命周期引擎"]
+        URL --> CRE
+        GET --> CRE
+        ICM --> CRE
     end
 
-    B_A ==> G0_A
-    B_B ==> G0_B
-    B_C ==> G0_C
+    subgraph HW["底层公开 SDK 接口 (零私有 ABI 偏移依赖)"]
+        SYN["libSynapse.so (synLaunchWithExternalEventsExt / synEvent*)"]
+        HCL["libhcl.so (hcclAllGather / hcclAllReduce on compute_stream)"]
+    end
+
+    GK -. "编译产物 (synRecipeHandle)" .-> URL
+    BR -. "捕获命令流与绑定快照" .-> URL
+    CRE ==> SYN
+    CRE ==> HCL
 ```
 
 ---
 
-## 三、Gate 0：瓶颈定位与候选筛选实验矩阵（零生产代码）
-
-所有 Gate 0 实验在 `192.168.100.153`（系统 SDK `1.24.2-481`）上执行，产物统一归档至 `GaudiRT/evidence/gate0-20261023/`。
-**方法学三原则**：
-1. **同起止边界对比**：不能拿不同生命周期边界（如“含输入准备/结果反馈的完整 TPOT”减去“纯设备跨度”）或不同流水重叠形态的差额直接砍掉某条路线；普通提交与预排队必须使用**相同起止事件**比较，完整 TPOT 另外测量；Gate 0 差值用于定位和排序候选瓶颈，某项优化最终是否保留由改动后的整模 ABBA 对照决定。
-2. **核验实际执行路径**：由于现有代码（[`decode_graph.py:69`](file:///home/rate/llm/Gaudi-LLM/gaudi-kernels-public/python/gaudi_kernels/serving/decode_graph.py#L69)）在开启 `async` 后会退出完整 step graph 路径并停用部分输入缓存，任何对照实验必须先记录各臂实际命中的路径（`step_graph` / `prepared_region_replays`），绝不用“因退出快路径导致的变慢”去否决异步提交或设备端反馈机制。
-3. **真模型逐级验证容量与闭环**：小图测出的 `571~573` 阻塞点不等价于真实模型 144 个大 Recipe 的在途容量；多步预排队与设备反馈必须在真实模型上按 **1 步 $\rightarrow$ 2 步 $\rightarrow$ 3 步** 逐级验证，同时检查 `token`、`position`、`KV` 与 `EOS` 闭环。
-
-| 实验编号 | 实验名称 | 实验方法与同边界测量口径 | 瓶颈判定与优先级指导 |
-| :--- | :--- | :--- | :--- |
-| **`G0-8`**<br/>*(强制前提)* | **CPU 策略与 NUMA 亲和性锁定** | 所有单卡、双卡与 8 卡实验统一开启全线程 `uclamp = 1024`（`host_policy_enabled = true`）并绑定对应 PCIe/NUMA 物理核，在输出 JSON 中记录核验结果。 | **前置必须满足**：未锁定 `uclamp = 1024` 的计时一律无效。 |
-| **`G0-9`**<br/>*(强制前提)* | **无插桩 ABBA 计时与 Profiler 隔离** | 端到端步长、TPS 与 API 耗时必须在**不加载 `libfeedback_observer_v2.so` 且不开启 SDK/CPU Trace Profiler** 的条件下按 `A -> B -> B -> A` 采集；如需硬件事件或 Trace 拆解，必须在无插桩计时完成后单独运行。 | **前置必须满足**：严禁把带 Profiler 的耗时直接当成无插桩步长。 |
-| **`G0-1`**<br/>*(同边界设备跨度)* | **70 层 TP8 普通提交 vs 预排队同起止边界对比** | 对完整一步（`144 compute + 141 collective`）对比两种模式：<br/>• **普通提交**：正常边提交边执行；<br/>• **门控预排队**：流头部先放设备 Gate，将整步排完后再释放 Gate。<br/>• **严格同边界测量**：两组均在**同一个 `[first_op_start, last_op_end]` 边界**放置 `EVENT_COLLECT_TIME` 的 `synEvent` 测量设备执行跨度，并单独记录完整端到端 TPOT。 | • 同边界跨度差 $\Delta_{\text{span}} = T_{\text{span\_normal}} - T_{\text{span\_prequeued}}$ 直接反映**单步内因主机发令不够快导致的设备等待**；<br/>• 完整 TPOT 与 $T_{\text{span\_normal}}$ 的差额则反映**跨步输入准备、采样回读与首尾交接开销**，指导赛道 B/C 的优先级。 |
-| **`G0-2`** | **Launch 成本解耦与 SRAM RMW 容量边界探针** | 纯 C++ 单卡探针，补齐两项基础物理参数：<br/>1. **解耦绑定数与节点数**：固定 `1` 个 TPC 节点，分别测 `3, 8, 16, 32` 个绑定张量；固定 `24` 个绑定，分别测 `1, 4, 8` 个节点，分离出真实的 `µs/binding` 与 `µs/node`；<br/>2. **SRAM `RMW=false` 对照与容量上限**：在 [`sram_mme_probe.cpp`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/evidence/review-20261023/sram_mme_probe.cpp) 上对比 `RMW=false` vs `RMW=true`，并按 `2 KB -> 256 KB -> 2 MB -> 8 MB -> 16 MB -> 24 MB` 递增张量大小，导出 `post.json` 查明 `allocation == "SRAM"` 的实际容量上限及 `GCFG_RMW_SECTION_MAX_SIZE_BYTES` 行为。 | • 产出无混杂的 Launch 成本公式与编译器 SRAM 分配边界表，作为算子融合设计的客观依据。 |
-| **`G0-3`** | **vLLM `async_scheduling` 路径核验与对照** | 在 70 层 TP8 模型上检查 `async_scheduling = False` 与 `True` 各自实际命中的执行路径（核实 [`decode_graph.py:69`](file:///home/rate/llm/Gaudi-LLM/gaudi-kernels-public/python/gaudi_kernels/serving/decode_graph.py#L69) 是否因 `async` 退出了完整 step graph 及输入缓存），测量两组净性能并记录路径差异。 | • 明确当前 `async_scheduling` 开关的实际路径行为；<br/>• 若因退出 step graph 导致退化，将其定位为“需在保持 step graph / prepared plan 快路径前提下支持异步提交或设备反馈”，绝不据此否定异步/设备反馈路线。 |
-| **`G0-4`** | **`PreparedRegionProgram::replay` 主机耗时 `rdtsc` 微拆解** | 在 `uclamp = 1024` 下，不使用符号拦截，仅在 `NativeExecutionPlan.cpp` 的 `PreparedRegionProgram::replay` 内部用 5 个轻量级 `rdtsc` 时间戳记录单步累计耗时：① Retained 绑定预检；② `Frame::instantiate` + `lock_addresses`；③ 区域进出 ~4 次事件同步；④ `144` 次 `synLaunch` 调用；⑤ `141` 次 `hccl` 调用。 | • 定位 Bridge 包装层在 `uclamp = 1024` 下的真实耗时分布，优先改进占比显著（如 `>= 0.15 ms/step`）或阻碍异步化的环节。 |
-| **`G0-5`** | **`2.70 ms` 通信间隙与流同步交接候选剖析** | 针对相邻 Recipe 间 `2.702 ms` 间隙（其中 `1.900 ms` 在 8 卡通信调用返回后），编写 8 卡 C++ 探针（`1.24.2-481`, `uclamp = 1024`，消息大小对齐模型 Decode 的 `12 KB` = `[1, 6144]` BF16），在相同事件边界下对比：<br/>① 连续 141 次 `12 KB` 8 卡 `hcclAllReduce` / `hcclAllGather` 的纯通信跨度；<br/>② 141 次穿插 `Compute Recipe -> hcclAllReduce -> Compute Recipe`（含 `libhcl.so` 内部 `synStreamSyncHCLStreamHandle` / `EventNetwork`）的执行跨度；<br/>③ 不同通信粒度/次数下的缩放斜率（注：充分考虑穿插与连续模式的流水重叠差异，不把差额简单等同于纯同步税）。 | • 量化每减少 1 次集合通信可节省的真实设备时间，以及 Compute $\leftrightarrow$ HCL 流交接的优化空间，指导修改算子通信次数或 Bridge 流编排。 |
-| **`G0-6`** | **144 个 Recipe 的耗时、内部气泡 (`2.06 ms`) 与字节 Roofline 审计** | 导出 70 层 TP8 模型单步 `144` 个计算 Recipe 的逐个设备耗时、内部无 TPC/MME 气泡时长、读写字节数与算子类型（特别是占权重读取 34% 的 BF16 `o_proj`、FP8 `qkv_proj`、以及 `mxfp4` MoE 的 `tpc_folded_scale_tail` / `tpc_vector` / `all_gather_fp32_local_sum`），计算每个 Recipe 的 `实际耗时 / 带宽 Roofline 下限` 比值。 | • 找出设备关键路径上**最贵的算子族**与**内部气泡最大的 Recipe**，作为修改 `gaudi-kernels-public` 的头号目标。 |
-| **`G0-7`** | **真实模型 `1 -> 2 -> 3` 步逐级预排队容量与设备状态反馈验证** | 鉴于小图 `571~573` 上限不能替真模型打包票，在真实模型命令规模与资源占用下，从 **1 步 $\rightarrow$ 2 步 $\rightarrow$ 3 步** 逐级验证完整预排队容量（检查是否触发 `waitForCompletionCopy` 或其它池背压），并单独验证每步 `token`、`position`、`KV 更新` 与 `EOS` 的设备反馈闭环正确性。 | • 摸清真实 70 层模型在不触发主机长阻塞前提下的安全预排队步数上限，并实测多步反馈闭环相对单步同步的端到端净收益。 |
-
----
-
-## 四、Gate 0 之后的阶段化实施准则（单项独立 ABBA 验收）
-
-只有通过上述 Gate 0 二元门禁的改造项，才准许进入后续阶段，并遵循以下两条铁律：
-1. **第一性原理与负结果敬畏**：
-   * 针对 **阶段一（算子与 Recipe 内部气泡优化，对应 `G0-6`）**：充分尊重 Gaudi2 MME 不支持原生 FP4、MXFP4 必须在 24 个 TPC 上解码的硬件事实，以及 `gaudi-kernels-public` 此前在小 $M$ 下 `mxfp4_compact` v2/v3 被速度门拒绝的历史证据。任何算子改动（无论是针对 BF16 `o_proj`、MoE 归约融合、还是 RMW SRAM 子图切分）都必须以 `G0-6` 的实测瓶颈为依据，并在单算子与整模两级通过速度门。
-2. **单项独立 ABBA 归因（拒绝打包验收）**：
-   * 在 **阶段一（Kernels/Recipes）** 与 **阶段二（Bridge 通信/跨步调度，对应 `G0-3 / G0-4 / G0-5 / G0-7`）** 中，**每一项具体改动必须单独执行 8 卡 70 层 TP8 无插桩 ABBA 对照**（锁定 `uclamp = 1024`，验证 768 个输出 Token 逐位一致），确认单项净收益达标后才准保留并叠加下一项，绝不将多项改动打包在同一个 `11.11 ms` 门槛下混同验收。
-
----
-
-## 五、`GaudiRT` 仓库结构（仅存证据与独立探针）
+## 四、`GaudiRT` 仓库结构
 
 ```text
 GaudiRT/
-├── AGENTS.md                            # 项目工程准则与方法学约束（零实现细节）
-├── CMakeLists.txt                       # 极简 C++20 探针构建配置（链接系统 /usr/lib/habanalabs 1.24.2-481）
+├── AGENTS.md                                         # 项目工程准则与方法学约束（零实现细节）
+├── CMakeLists.txt                                    # C++20 运行时核心、单元测试与硬件探针构建配置
 ├── docs/
-│   ├── software-autopsy.md              # 硬件参数、11.31ms 基线、573/571 阻塞栈、5.2GB 权重下限与现有栈审计
-│   └── DESIGN.md                        # 本设计规范：资产映射、L1_B 砍线裁决、Gate 0 门禁矩阵与方法学三原则
-├── include/gaudirt/common/
-│   ├── host_policy.hpp                  # Linux sched_setattr (uclamp_min=1024)、CPU 亲和性与无插桩环境校验
-│   ├── synapse_raii.hpp                 # Synapse 设备/流/带时间戳事件对 (EVENT_COLLECT_TIME) RAII 封装
-│   └── abba_harness.hpp                 # 同起止边界 ABBA 交错采样与分位数统计工具
-├── evidence/
-│   ├── README.md                        # 各证据子目录来源、实验条件与关键文件索引
-│   ├── review-20261023/                 # 第一轮真机复核（单算子 Launch ABBA、2KB SRAM->MME、70L 命令计数）
-│   ├── runtime-audit-20261023/          # 第二轮历史预排队记录与库哈希核对
-│   ├── design-review-20261023/          # libSynapse.so (1.24.2-481) 静态反汇编 (.asm) 与导出符号表
-│   ├── review2-20261023/                # 第三轮 Module 7 纯 C++ 在途上限实测 (plain.log / gdb.log) 与两轮评审报告
-│   └── gate0-20261023/                  # Gate 0 (G0-1 ~ G0-7) 门禁实验完整 JSON 证据与 SUMMARY.md 裁决报告
-├── probes/                              # 独立、零框架依赖的 Gate 0 C++20 硬件探针
-│   ├── prequeue_capacity_probe.cpp      # 定位 573/571 次 MappedMemMgr/waitForCompletionCopy 阻塞上限
-│   ├── g0_2_launch_and_sram_probe.cpp   # G0-2: 正交解耦绑定/节点 Launch 成本 & SRAM RMW 16 MiB 容量边界
-│   ├── g0_5_collective_handoff_probe.cpp# G0-5/G0-1: 8 卡 FP32 AllGather vs AllReduce & 同边界普通/预排队对比
-│   └── g0_7_distinct144_prequeue_probe.cpp # G0-7/G0-1: 144 独立 Recipe (3,068 绑定) 1->4 步预排队与 MappedMemMgr 守恒定律
-└── scripts/
-    ├── g0_3_4_host_and_path_audit.py    # G0-3/G0-4: async_scheduling 三处门禁与 uclamp=1024 主机阶段审计
-    └── g0_6_recipe_roofline_audit.py    # G0-6: 70L 144 Recipe 算子级 Roofline 与 2.056ms 子图内切换空泡拆解
+│   ├── software-autopsy.md                           # 硬件参数、11.31ms 基线、573/571 阻塞栈、5.2GB 权重下限与现有栈审计
+│   └── DESIGN.md                                     # 本设计规范：三层职责边界、RT-1/RT-2/RT-3 核心机制与真机验证收益
+├── include/gaudirt/
+│   ├── common/
+│   │   ├── host_policy.hpp                           # Linux sched_setattr (uclamp_min=1024)、CPU 亲和性与无插桩环境校验
+│   │   ├── synapse_raii.hpp                          # Synapse 设备/流/带时间戳事件对 (EVENT_COLLECT_TIME) RAII 封装
+│   │   └── abba_harness.hpp                          # 同起止边界 ABBA 交错采样与分位数统计工具
+│   └── runtime/
+│       ├── unified_region_lowerer.hpp                # RT-1: 混合计算+通信命令原子降维与单流 Region 合并器
+│       ├── generation_epoch_tracker.hpp              # RT-2: O(1) 代数守卫绑定预检与 Region Epoch 围栏追踪器
+│       ├── inflight_credit_manager.hpp               # RT-3: MappedMemMgr (575 - 2*N_distinct) 在途信用与步边界背压管理器
+│       └── compiled_region_executor.hpp              # 集成 RT-1/RT-2/RT-3 的通用编译产物重放执行器
+├── tests/
+│   └── runtime_unit_tests.cpp                        # GaudiRT 运行时核心机制确定性单元测试 (gaudirt_runtime_unit_tests)
+├── probes/
+│   ├── prequeue_capacity_probe.cpp                   # 定位 573/571 次 MappedMemMgr/waitForCompletionCopy 阻塞上限
+│   ├── g0_2_launch_and_sram_probe.cpp                # G0-2: 正交解耦绑定/节点 Launch 成本 & SRAM RMW 16 MiB 容量边界
+│   ├── g0_5_collective_handoff_probe.cpp             # G0-5/G0-1: 8 卡 FP32 AllGather vs AllReduce & 同边界普通/预排队对比
+│   ├── g0_7_distinct144_prequeue_probe.cpp           # G0-7/G0-1: 144 独立 Recipe 预排队与 MappedMemMgr 守恒定律发现
+│   └── rt_1_2_3_runtime_gaps_probe.cpp               # RT-1/RT-2/RT-3: 8 卡真机运行时缺口闭环验证探针
+├── scripts/
+│   ├── g0_3_4_host_and_path_audit.py                 # G0-3/G0-4: async_scheduling 三处门禁与 uclamp=1024 主机阶段审计
+│   └── g0_6_recipe_roofline_audit.py                 # G0-6: 70L 144 Recipe 算子级 Roofline 审计（移交 gaudi-kernels 的证据）
+└── evidence/
+    ├── README.md                                     # 各证据子目录来源、实验条件与关键文件索引
+    ├── review-20261023/                              # 第一轮真机复核
+    ├── runtime-audit-20261023/                       # 第二轮历史预排队记录与库哈希核对
+    ├── design-review-20261023/                       # libSynapse.so (1.24.2-481) 静态反汇编 (.asm) 与导出符号表
+    ├── review2-20261023/                             # 第三轮 Module 7 纯 C++ 在途上限实测与两轮评审报告
+    └── gate0-20261023/                               # Gate 0 (G0-1 ~ G0-7) 及 RT-1/RT-2/RT-3 完整 JSON 证据与 SUMMARY.md
 ```
