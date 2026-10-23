@@ -17,21 +17,28 @@ include_directories(
 link_directories(${HABANA_LIB_DIR})
 add_link_options(-Wl,-rpath,${HABANA_LIB_DIR})
 
+add_library(gaudirt STATIC
+    src/device_runtime.cpp
+    src/hbm_arena.cpp
+    src/recipe_registry.cpp
+    src/execution_engine.cpp
+)
+target_link_libraries(gaudirt PUBLIC Synapse hcl pthread dl)
+
 add_executable(prequeue_capacity_probe probes/prequeue_capacity_probe.cpp)
-target_link_libraries(prequeue_capacity_probe PRIVATE Synapse pthread dl)
+target_link_libraries(prequeue_capacity_probe PRIVATE gaudirt)
 
 add_executable(g0_2_launch_and_sram_probe probes/g0_2_launch_and_sram_probe.cpp)
-target_link_libraries(g0_2_launch_and_sram_probe PRIVATE Synapse pthread dl)
+target_link_libraries(g0_2_launch_and_sram_probe PRIVATE gaudirt)
 
 add_executable(g0_5_collective_handoff_probe probes/g0_5_collective_handoff_probe.cpp)
-target_link_libraries(g0_5_collective_handoff_probe PRIVATE Synapse hcl pthread dl)
+target_link_libraries(g0_5_collective_handoff_probe PRIVATE gaudirt)
 
 add_executable(g0_7_distinct144_prequeue_probe probes/g0_7_distinct144_prequeue_probe.cpp)
-target_link_libraries(g0_7_distinct144_prequeue_probe PRIVATE Synapse hcl pthread dl)
+target_link_libraries(g0_7_distinct144_prequeue_probe PRIVATE gaudirt)
 
 add_executable(rt_1_2_3_runtime_gaps_probe probes/rt_1_2_3_runtime_gaps_probe.cpp)
-target_link_libraries(rt_1_2_3_runtime_gaps_probe PRIVATE Synapse hcl pthread dl)
+target_link_libraries(rt_1_2_3_runtime_gaps_probe PRIVATE gaudirt)
 
 add_executable(gaudirt_runtime_unit_tests tests/runtime_unit_tests.cpp)
-target_link_libraries(gaudirt_runtime_unit_tests PRIVATE Synapse hcl pthread dl)
-
+target_link_libraries(gaudirt_runtime_unit_tests PRIVATE gaudirt)
