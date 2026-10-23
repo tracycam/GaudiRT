@@ -1,0 +1,205 @@
+{
+  "scope": "Review of updated documents only; no document edits, no new HPU workload or performance measurement",
+  "document_sha256": {
+    "docs/software-autopsy.md": "f3169f5b9be0346e04730d937b1522baafea2770a8f6d603b6ae959ac7dc22ff",
+    "docs/DESIGN.md": "7c472d98bfd19330e241595f2331fc9bb94ebd71f939966538e742c52b8722f8"
+  },
+  "decision": {
+    "scope": "agree with reuse existing stacks and evidence-first minimal patches",
+    "freeze_current_documents": false,
+    "gate0_evidence_collection": "go with corrected measurement methods; do not apply current causal Kill/Continue rules unchanged"
+  },
+  "findings": [
+    {
+      "id": "R1",
+      "severity": "blocking",
+      "locations": [
+        "docs/software-autopsy.md:33-40",
+        "docs/DESIGN.md:5",
+        "docs/DESIGN.md:29"
+      ],
+      "problem": "production70 数值抄录错误；P50 与连续 TPS 混用，且历史 sdk1241 被当成当前基线。",
+      "replacement": "该归档使用 sdk1241。runs[0,3] 的 resident_p50_ms 为 13.193967/13.370595，runs[1,2] 为 11.305955/11.323461；对应 resident_continuous_tps 分别为 75.679448/74.460273 和 88.128095/88.099304。按各臂 resident_step_count 与 resident_continuous_ms 合并，A/B 为 75.064911/88.113697 TPS，即 13.321804/11.348973 ms/token，节省 1.972830 ms/token。另一独立实验的 73.19→86.91 TPS 单独列示。当前 1.24.2-481 基线须重新建立，并归档实际加载库路径与 SHA256。",
+      "evidence": [
+        "evidence/review-20261023/production70-first-principles-a.original.json",
+        "../gaudi-kernels-public/docs/CPU-DEPENDENCY-AND-OVERLAP-20261011.md:7"
+      ]
+    },
+    {
+      "id": "R2",
+      "severity": "blocking",
+      "locations": [
+        "docs/DESIGN.md:56"
+      ],
+      "problem": "墙钟 Token 步长减 gate 后设备跨度，不能唯一量化单步主机供给饥饿，也不能否决所有主机优化。",
+      "replacement": "将实验称为受控预排队参考跨度。在相同输入、计算/通信序列与相同设备起止事件边界下比较普通执行和完整预排队；单独报告外层墙钟步长及事件区间外开销。所有 rank 必须在 gate 完成前提交完整一步，结束事件覆盖全部相关流。报告跨 rank 偏斜、门控扰动与重复样本；差值只作为候选优化空间，成因须由额外对照确认。"
+    },
+    {
+      "id": "R3",
+      "severity": "blocking",
+      "locations": [
+        "docs/software-autopsy.md:104-105",
+        "docs/DESIGN.md:56",
+        "docs/DESIGN.md:62"
+      ],
+      "problem": "把一两个小 Recipe 的 571/573 转换为真实模型 K<=3 的安全保证，超出新 GDB 证据范围。",
+      "replacement": "本次 Module 7 小图实验在已测配置下观察到 first_block_index=571/573；GDB 样本定位到 getMappedMemoryInfo→waitForCompletionCopy。它不构成任意模型的固定容量。K=2~3 仅是首轮验证范围，必须使用真实 Recipe、描述符规模、HCL 与实际流状态逐 K 验证；不以 K×144<571 证明非阻塞。历史四步表中的 568 是 collective 数，不是已审定的计算 Launch 总数。",
+      "evidence": [
+        "evidence/review2-20261023/prequeue_capacity_probe.cpp:155",
+        "evidence/review2-20261023/remote-run/gdb.log:81",
+        "../gaudi-kernels-public/docs/BOUNDED-CAPACITY-20261011.md:10"
+      ]
+    },
+    {
+      "id": "R4",
+      "severity": "blocking",
+      "locations": [
+        "docs/DESIGN.md:58",
+        "docs/DESIGN.md:62"
+      ],
+      "problem": "async_scheduling 会改变现有优化路径，不能视为只开启输入准备重叠的零差异对照。",
+      "replacement": "先做当前模型配置的 async 兼容性与执行路径准入检查。可运行时按完整策略进行配对 ABBA，记录 step graph、native/fallback 覆盖及输入缓存状态；路径改变时不将差值全部归因于输入准备重叠。未适用配置不用于否决设备状态反馈。",
+      "evidence": [
+        "../gaudi-kernels-public/python/gaudi_kernels/serving/decode_graph.py:69",
+        "../gaudi-kernels-public/python/gaudi_kernels/serving/runner.py:170",
+        "../gaudi-kernels-public/python/gaudi_kernels/serving/prefill_partition.py:55",
+        "../gaudi-kernels-public/python/gaudi_kernels/serving/kv_capacity.py:55"
+      ]
+    },
+    {
+      "id": "R5",
+      "severity": "blocking",
+      "locations": [
+        "docs/DESIGN.md:59"
+      ],
+      "problem": "五个 rdtsc 时间戳既不能覆盖所列散布工作，也不能作为无插桩或纯 CPU 计时。",
+      "replacement": "在独立诊断构建中，对真实函数与调用边界使用成对、经排序和标定的时间戳，按实际调用次数累计并处理异线程及嵌套区间；报告诊断扰动和计时类型。预检、frame 实例化与区域进出位于 PreparedRegionProgram::replay 外部。诊断值用于筛选候选，收益仅由无诊断代码的配对 ABBA 确认。",
+      "evidence": [
+        "../gaudi-pytorch-bridge/backend/habana_device/NativeExecutionPlan.cpp:169",
+        "../gaudi-pytorch-bridge/backend/habana_device/NativeExecutionPlan.cpp:194",
+        "../gaudi-pytorch-bridge/backend/habana_device/NativeExecutionPlan.cpp:709",
+        "../gaudi-pytorch-bridge/backend/habana_device/NativeExecutionPlan.cpp:743"
+      ]
+    },
+    {
+      "id": "R6",
+      "severity": "blocking",
+      "locations": [
+        "docs/DESIGN.md:60"
+      ],
+      "problem": "混合耗时减纯计算和纯通信不等于纯同步交接税；12 KB BF16 未证明匹配每次生产 collective。",
+      "replacement": "从实际模型记录各次 collective 的类型、dtype、count、算法与依赖；以这些记录构造探针。混合执行与独立执行的差值先记为交互开销，包含流水、批处理、排队和缓存变化；结合时间线与保持等价工作量/依赖的合法对照定位同步成本。减少 collective 次数先证明数学及依赖等价。",
+      "evidence": [
+        "../gaudi-kernels-public/python/gaudi_kernels/serving/executor/precision_runtime.py:96",
+        "../gaudi-kernels-public/docs/CPU-DEPENDENCY-AND-OVERLAP-20261011.md:32"
+      ]
+    },
+    {
+      "id": "R7",
+      "severity": "blocking",
+      "locations": [
+        "docs/DESIGN.md:61",
+        "docs/software-autopsy.md:134-148"
+      ],
+      "problem": "Roofline 差额可能已含内部气泡，再相加会重复计数；理想下限差额不是已证明可省的时间。",
+      "replacement": "约 5.2 GB 是在所列 checkpoint、runtime dtype、TP 布局与 KV 假设下的一次逻辑读取模型，实际 HBM 事务尚未测量。85% 有效带宽是情景假设。使用不重复计数的关键路径区间和乐观收益上界筛选候选；不再把已含在 Recipe 耗时中的内部气泡加一次，实际净收益由实现后的独立 ABBA 确认。",
+      "evidence": [
+        "../instance-assets/performance-recheck-20261016/model-config.json"
+      ]
+    },
+    {
+      "id": "R8",
+      "severity": "blocking",
+      "locations": [
+        "docs/software-autopsy.md:149",
+        "docs/DESIGN.md:70"
+      ],
+      "problem": "把 compact_reuse v2/v3 纯 TPC 复用的负结果写成 mxfp4_compact 的 SRAM→MME 负结果，并未经测量归因于解码/引擎交接。",
+      "replacement": "既有 compact_reuse v2/v3 的纯 TPC 复用候选未通过整链速度门；该负结果没有组件时间线，不能确定主因，也不能直接评价 TPC→SRAM→MME 候选。后者仍须按真实形状及数值合同独立对照。",
+      "evidence": [
+        "../gaudi-kernels-public/docs/COMPACT-REUSE-DIAGNOSTIC-20261017.md:3",
+        "../gaudi-kernels-public/docs/COMPACT-REUSE-DIAGNOSTIC-20261017.md:175"
+      ]
+    },
+    {
+      "id": "R9",
+      "severity": "blocking",
+      "locations": [
+        "docs/software-autopsy.md:109-117",
+        "docs/DESIGN.md:7",
+        "docs/DESIGN.md:18"
+      ],
+      "problem": "静态反汇编揭示耦合风险，不等于证明所有外部驻留机制不可能；setLongSo 参数签名也写错。",
+      "replacement": "审计揭示完成计数、槽位所有权和 Long-SO 回收耦合，当前尚无已验证且受支持的外部驻留方案及收益证据。基于维护成本和本项目边界，决定不研发依赖私有 ABI 的外部提交后端。这是范围取舍，不是对所有驻留实现的不可能性证明。scalEnqueue 尾部已确认的是两处 vtable+0x10 间接调用；导出候选签名为 NBuffQueueAllocator::setLongSo(unsigned long) 与 NBuffDeviceAllocator::setLongSo(unsigned long)，不得写成已确认传入三个参数。",
+      "evidence": [
+        "evidence/design-review-20261023/recipe-stages.asm:344",
+        "evidence/design-review-20261023/queue-launch.asm:37"
+      ]
+    },
+    {
+      "id": "R10",
+      "severity": "required_factual_correction",
+      "locations": [
+        "docs/software-autopsy.md:23",
+        "docs/software-autopsy.md:25",
+        "docs/software-autopsy.md:65"
+      ],
+      "problem": "TPC ~11/~44 TFLOPS 缺出处；自身 16 MiB 守卫被写成装机编译器默认硬限。",
+      "replacement": "TPC 保留已核验的 24 核、VLIW4、2048-bit SIMD，未经独立核实的峰值数字删除。SRAM 写为厂商标称 48 MB、驱动报告 50,331,648 B=48 MiB；现有构图器限制单 tile/scratch 为 16 MiB，SDK 各 GCFG 默认值、单 section 与总 SRAM 约束尚需读取和边界验证。",
+      "evidence": [
+        "../gaudi-kernels-public/csrc/ops/mxfp4_compact.cpp:41",
+        "../gaudi-kernels-public/csrc/ops/mxfp4_compact.cpp:55",
+        "../gaudi-kernels-public/csrc/ops/bf16_linear.cpp:13",
+        "https://docs.habana.ai/en/latest/TPC/TPC_User_Guide/index.html"
+      ]
+    },
+    {
+      "id": "R11",
+      "severity": "required_factual_correction",
+      "locations": [
+        "docs/software-autopsy.md:27",
+        "docs/software-autopsy.md:49-53",
+        "docs/software-autopsy.md:115",
+        "docs/DESIGN.md:29-32"
+      ],
+      "problem": "NIC 无 duration 的 trace 不能给出网络/交接根因分解；独立 profiler 中位数又被放到 11.31 ms 无插桩时间线中。",
+      "replacement": "分别列示历史无插桩基线与独立 profiler 运行。1.900 ms 只表示所有 rank 的对应通信 API 已返回时观察到的间隙；网络、EventNetwork 与后继计算就绪的占比未定。0.507 ms 是最慢 rank 尚未开始对应调用时的窗口，不是全部主机可优化成本的上限。首尾区间、Recipe 内无 TPC/MME 区间均保留为观测分类，未经对照不作排他根因。",
+      "evidence": [
+        "../gaudi-kernels-public/docs/CPU-DEPENDENCY-AND-OVERLAP-20261011.md:30"
+      ]
+    },
+    {
+      "id": "R12",
+      "severity": "required_gate_contract",
+      "locations": [
+        "docs/DESIGN.md:50",
+        "docs/DESIGN.md:62",
+        "docs/DESIGN.md:68-72"
+      ],
+      "problem": "阈值缺不确定性处理；未实现设备反馈前无法要求实测净收益；768 token 一致不足以覆盖状态与服务语义。",
+      "replacement": "阈值作为工程预算保留。重复 ABBA 的不确定区间跨过阈值时继续取样或记为未决。Gate 0 只筛选值得验证的方案；新路径尚未实现时报告收益上界而非实测净收益，原型完成后再验收净收益。算子保持既有数值合同；状态改动补验 EOS、取消、KV/页边界、存储别名、多次在途及部分提交失败语义，并检查输出可见延迟。未通过的候选保持禁用且继续使用现有正确路径。"
+    },
+    {
+      "id": "R13",
+      "severity": "required_gate_contract",
+      "locations": [
+        "docs/DESIGN.md:57"
+      ],
+      "problem": "既定单节点不能任意增加有效绑定；逻辑节点可能被融合，不能承诺无混杂通用成本公式。",
+      "replacement": "使用 SDK 允许的活跃绑定和算子组合，核对编译后节点、实际 launch 绑定及描述符大小；仅对可实现控制组报告条件化成本。未使用或被消除的绑定不得充作自变量，无法独立控制的因素明确标为混杂。"
+    },
+    {
+      "id": "R14",
+      "severity": "evidence_index_correction",
+      "locations": [
+        "docs/software-autopsy.md:10",
+        "docs/software-autopsy.md:34",
+        "docs/software-autopsy.md:114",
+        "evidence/README.md:8",
+        "evidence/README.md:9"
+      ],
+      "problem": "原始结果链接缺失；BFM 摘要被误标为 Synapse 摘要；反汇编及符号索引夸大已存内容。",
+      "replacement": "production70 链接改为 evidence/review-20261023/production70-first-principles-a.original.json。bfm-audit.json 标为 x86-64 BFM opcode/yield 审计，并记录 bit 4=yield，不能直接控制 config_and_arm_monitor、也不等于恢复完整 ARC 协议。当前 recipe-stages.asm 共 369 行，scalEnqueue 两处虚调用在 344/351 行；现有 synapse-symbols.txt 未包含 NBuff 导出项，prepareForDownload 仅有调用点而非完整函数体。索引按实际内容修正。"
+    }
+  ]
+}

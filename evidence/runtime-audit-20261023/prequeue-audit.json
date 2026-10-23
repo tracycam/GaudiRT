@@ -1,0 +1,157 @@
+{
+  "scope": "Historical prequeue experiment audit; no hardware rerun",
+  "modules": [
+    0,
+    1
+  ],
+  "world_size": 2,
+  "workload": {
+    "synthetic": true,
+    "model_tps": false,
+    "activation_shape": [
+      1,
+      64
+    ],
+    "weight_shape": [
+      64,
+      64
+    ],
+    "weight_description": "Rolled BF16 identity, complementary columns by rank",
+    "allgather_input_elements": 64,
+    "allgather_output_shape": [
+      2,
+      64
+    ],
+    "collectives_per_step": 142,
+    "repeat_plan": true,
+    "steps": 16,
+    "gate_loops": 50000000,
+    "capacity_only": true
+  },
+  "evidence": {
+    "result_modules": "prequeue/result.json:3",
+    "workload": "prequeue/source-probe.py:1,38,48-55,88-98",
+    "replay_many": "prequeue/source-probe.py:153-156",
+    "delay_gate_and_marker": "prequeue/source-probe.py:330-343",
+    "status_definition": "prequeue/source-probe.py:444-457",
+    "source_identity": "prequeue/source-identity.json:5,13",
+    "ungated_counts_rank0": "prequeue/rank0.json:2842-2871",
+    "no_uninstrumented_timing_samples": "prequeue/rank0.json:2691"
+  },
+  "observer": {
+    "path_from_record": "/home/ai/gaudi-experiments/bounded-capacity-20261011/libfeedback_observer_v2.so",
+    "recorded_sha256": "109247498c7b78233493b39d545aca5b068f5e9456901fbc4953d3242ed9d83a",
+    "archived_binary_sha256": "109247498c7b78233493b39d545aca5b068f5e9456901fbc4953d3242ed9d83a",
+    "archived_source": "instance-assets/bounded-capacity-20261011/bounded-capacity-20261011/submission_timing_v2.cpp",
+    "source_sha256": "b2c838c7bdda8bb393064cdea3035d182c8173c327a410ec9143f6ea7e689d92",
+    "source_and_binary_manifest": "instance-assets/bounded-capacity-20261011/bounded-capacity-20261011/source-artifacts.sha256",
+    "timing": "std::chrono::steady_clock elapsed wall time, opt-in wrappers around Synapse/HCCL APIs, atomic counters; not thread CPU time",
+    "timing_source_lines": "submission_timing_v2.cpp:16-20,32-42",
+    "peak_index_semantics": "++metrics[id].count occurs in Scope destructor; reset by api_timing_begin. It is a per-API completion ordinal within this timing window, not ring capacity or global launch ordinal. With concurrency, completion order need not equal entry order.",
+    "exclusive_timing_limitation": "Recorder exports outer_count/outer_ns, but this probe saves only count/inclusive_ns and peaks; inclusive sums can overlap or include waits."
+  },
+  "ranks": [
+    {
+      "rank": 0,
+      "gate_before": 22,
+      "gate_after": 0,
+      "submit_ms": 373.599732,
+      "gated_launch": {
+        "count": 2304,
+        "inclusive_ns": 317220749,
+        "peak_ns": 256538387,
+        "peak_call_index": 568
+      },
+      "gated_allgather": {
+        "count": 2272,
+        "inclusive_ns": 52894521,
+        "peak_ns": 110737,
+        "peak_call_index": 562
+      },
+      "gated_event_sync": {
+        "count": 32,
+        "inclusive_ns": 299305605,
+        "peak_ns": 276402170,
+        "peak_call_index": 1
+      },
+      "gated_peak_subtracted_launch_mean_us": 26.34926704298741,
+      "gated_allgather_mean_us": 23.281039172535213,
+      "gated_peak_subtracted_estimate_ms_per_step": 7.100202016690187,
+      "ungated_16_step_launch_count": 2304,
+      "ungated_16_step_launch_inclusive_ns": 38544136,
+      "ungated_launch_mean_us": 16.729225694444445,
+      "ungated_16_step_allgather_count": 2272,
+      "ungated_16_step_allgather_inclusive_ns": 35975802,
+      "ungated_allgather_mean_us": 15.834419894366198,
+      "ungated_launch_and_allgather_inclusive_ms_per_step": 4.657496125,
+      "uninstumented_timing_samples": 0,
+      "all_output_words_match_expected": true
+    },
+    {
+      "rank": 1,
+      "gate_before": 22,
+      "gate_after": 0,
+      "submit_ms": 374.054401,
+      "gated_launch": {
+        "count": 2304,
+        "inclusive_ns": 316175583,
+        "peak_ns": 255766011,
+        "peak_call_index": 568
+      },
+      "gated_allgather": {
+        "count": 2272,
+        "inclusive_ns": 53897477,
+        "peak_ns": 112926,
+        "peak_call_index": 562
+      },
+      "gated_event_sync": {
+        "count": 34,
+        "inclusive_ns": 293515521,
+        "peak_ns": 276056070,
+        "peak_call_index": 1
+      },
+      "gated_peak_subtracted_launch_mean_us": 26.23081719496309,
+      "gated_allgather_mean_us": 23.722481073943662,
+      "gated_peak_subtracted_estimate_ms_per_step": 7.145829988574685,
+      "ungated_16_step_launch_count": 2304,
+      "ungated_16_step_launch_inclusive_ns": 38081982,
+      "ungated_launch_mean_us": 16.52863802083333,
+      "ungated_16_step_allgather_count": 2272,
+      "ungated_16_step_allgather_inclusive_ns": 36168176,
+      "ungated_allgather_mean_us": 15.919091549295773,
+      "ungated_launch_and_allgather_inclusive_ms_per_step": 4.640634875,
+      "uninstumented_timing_samples": 0,
+      "all_output_words_match_expected": true
+    }
+  ],
+  "observations": [
+    "Both ranks report gate_before=22 and gate_after=0; all 16 output words already match expected when queued JSON is saved.",
+    "Both ranks report a launch_ext peak at completion index 568, lasting approximately 256ms, under a deliberate pending device gate.",
+    "This is strong evidence of producer-side blocking/backpressure in the deliberately gated workload, consistent with a bounded in-flight resource being exhausted while the consumer cannot advance.",
+    "This evidence does not localize the limiting resource to ArcHbmMemMgr/HbmGlblMemMgr, establish a universal 568-slot limit, or establish a 3.9-step limit for ordinary ungated execution.",
+    "FUNCTIONAL_PASS_PREQUEUE_LIMITED is selected when the gate has completed by submission return; it records a failed prequeue autonomy witness, not a driver-reported memory-pool-full diagnosis.",
+    "Subtracting one maximum duration does not remove other waits, cross-thread interactions, instrumentation, or gated-state effects.",
+    "The ungated isolated count windows are materially cheaper than the peak-subtracted gated window; neither is a measurement of 70-layer TP8 model critical-path CPU cost."
+  ],
+  "unknowns": [
+    "Blocking call stack at the 256ms peak",
+    "Specific limiting resource and capacity in bytes or slots",
+    "Effect of reserving descriptors on the observed backpressure",
+    "Uninstrumented CPU submission time for the identical workload",
+    "Critical-path SDK overhead on production70 model"
+  ],
+  "input_sha256": {
+    "partial-rank0.json": "1343a4414dea63ae5d883d93af012190e2393af54e2bba60c84cb0c1bf33175e",
+    "partial-rank1.json": "bf3cb4fd9607a60b9b3c9b713ea97a5632246501b63e17ec51698ccee9f23845",
+    "queued-rank0.json": "cb6a10eb6ea74797f399e26814c0c95bc267f96f9177206b2df2aecc4568f269",
+    "queued-rank1.json": "7fd82aecae82c46f6e8d63331ef18d3a408849e9777f52e2b55693b348ddacb6",
+    "rank0.json": "cee761db65d2783f44f1e44f88da641ac7341d0f24a983268f76176745f7d43a",
+    "rank1.json": "32633416afe0b6cf3a9b386aff04ebbd69cdc6213f017dba56fd210d96a0719e",
+    "result.json": "c5e80a49843c457ffef2a2b092dacd0c0d397c9874ca0e0c804a2929b40e06ad",
+    "resume.json": "7747182c1346c09771c57dda6ae1c8b7b2747cfe53822654cc4ee4ff23cd70d2",
+    "source-identity.json": "fafb554166bbdcd77ccd07b92e11b96256052134d285bf3fd513b0ba398848a2",
+    "source-probe.py": "979848ce48de58cc62291bb363bf0072ef5acad37481f69b72c5b0288f8b13ea",
+    "worker-rank0.log": "ff6d75ba874e574f329073885d537d7503ed1cebe34a1544044f587346e79385",
+    "worker-rank1.log": "fb15ef389c4ec7b8dc872483fcfadf3874f794cad03f3027c9f3ba17bb35ea0a"
+  }
+}

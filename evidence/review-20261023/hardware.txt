@@ -1,0 +1,8 @@
+module=0 rc=0 sram_base=0x1000fffffd000000 sram_bytes=50331648 dram_bytes=102273908736 tpc_mask=0xffffff mme_mask=0xf sched_mask=0x3f nic_mask=0x3ffeff external_nic_mask=0x0
+module=1 rc=0 sram_base=0x1000fffffd000000 sram_bytes=50331648 dram_bytes=102273908736 tpc_mask=0xffffff mme_mask=0xf sched_mask=0x3f nic_mask=0x3ffeff external_nic_mask=0x0
+module=2 rc=0 sram_base=0x1000fffffd000000 sram_bytes=50331648 dram_bytes=102273908736 tpc_mask=0xffffff mme_mask=0xf sched_mask=0x3f nic_mask=0x3ffeff external_nic_mask=0x0
+module=3 rc=0 sram_base=0x1000fffffd000000 sram_bytes=50331648 dram_bytes=102273908736 tpc_mask=0xffffff mme_mask=0xf sched_mask=0x3f nic_mask=0x3ffeff external_nic_mask=0x0
+module=4 rc=0 sram_base=0x1000fffffd000000 sram_bytes=50331648 dram_bytes=102273908736 tpc_mask=0xffffff mme_mask=0xf sched_mask=0x3f nic_mask=0x3ffeff external_nic_mask=0x0
+module=5 rc=0 sram_base=0x1000fffffd000000 sram_bytes=50331648 dram_bytes=102273908736 tpc_mask=0xffffff mme_mask=0xf sched_mask=0x3f nic_mask=0x3ffeff external_nic_mask=0x0
+module=6 rc=0 sram_base=0x1000fffffd000000 sram_bytes=50331648 dram_bytes=102273908736 tpc_mask=0xffffff mme_mask=0xf sched_mask=0x3f nic_mask=0x3ffeff external_nic_mask=0x0
+module=7 rc=0 sram_base=0x1000fffffd000000 sram_bytes=50331648 dram_bytes=102273908736 tpc_mask=0xffffff mme_mask=0xf sched_mask=0x3f nic_mask=0x3ffeff external_nic_mask=0x0

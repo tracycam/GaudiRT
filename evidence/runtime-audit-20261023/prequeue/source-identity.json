@@ -1,0 +1,16 @@
+{
+  "probe_sha256": "979848ce48de58cc62291bb363bf0072ef5acad37481f69b72c5b0288f8b13ea",
+  "artifacts": {
+    "/home/ai/gaudi-experiments/bounded-capacity-20261011/torch-build/bounded_feedback_gate.so": "8e28d08f63f6e0c94791d598752f7d388bce53b53e4716373b79216aae571624",
+    "/home/ai/gaudi-experiments/bounded-capacity-20261011/libfeedback_observer_v2.so": "109247498c7b78233493b39d545aca5b068f5e9456901fbc4953d3242ed9d83a"
+  },
+  "environment": {
+    "PT_HPU_LAZY_MODE": "1",
+    "PT_HPU_ENABLE_SFG": "0",
+    "PT_HPU_ENABLE_LAZY_COLLECTIVES": "true",
+    "PT_HPU_LAZY_COLLECTIVES_HOLD_TENSORS": "1",
+    "PT_HPU_LAZY_ACC_PAR_MODE": "0",
+    "LD_LIBRARY_PATH": "/home/ai/gaudi-experiments/framework-validation-20261010/tools/cpython-3.12.13-linux-x86_64-gnu/lib:/home/ai/gaudi-experiments/framework-validation-20261010/toolchain/usr/lib/x86_64-linux-gnu:/home/ai/gaudi-experiments/framework-validation-20261010/sdk1241/usr/lib/habanalabs",
+    "GC_KERNEL_PATH": "/home/ai/gaudi-experiments/bounded-capacity-20261011/libbounded_gate_tpc.so:/home/ai/gaudi-experiments/framework-validation-20261010/sdk1241/usr/lib/habanalabs/libtpc_kernels.so"
+  }
+}

@@ -1,0 +1,107 @@
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+[Detaching after vfork from child process 1764922]
+[New Thread 0x7fffbc6f56c0 (LWP 1764924)]
+[Detaching after vfork from child process 1764925]
+[Detaching after vfork from child process 1764927]
+[New Thread 0x7fffb3cf36c0 (LWP 1764929)]
+[New Thread 0x7fffb33dc6c0 (LWP 1764930)]
+[New Thread 0x7fffb2bdb6c0 (LWP 1764931)]
+[New Thread 0x7fffb22836c0 (LWP 1764932)]
+gate workspace=134408576
+gate_only_us=122129.9
+TRAP raising SIGUSR1 during blocked launch
+
+Thread 1 "prequeue_capaci" received signal SIGUSR1, User defined signal 1.
+__GI___ioctl (fd=20, request=3224921155) at ../sysdeps/unix/sysv/linux/ioctl.c:36
+warning: 36	../sysdeps/unix/sysv/linux/ioctl.c: No such file or directory
+
+Thread 6 (Thread 0x7fffb22836c0 (LWP 1764932) "prequeue_capaci"):
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+#1  0x00007ffff38a030c in __internal_syscall_cancel (a1=a1@entry=140736528732100, a2=<optimized out>, a3=a3@entry=0, a4=a4@entry=0, a5=a5@entry=0, a6=a6@entry=4294967295, nr=202) at ./nptl/cancellation.c:49
+#2  0x00007ffff38a06e7 in __futex_abstimed_wait_common64 (private=0, futex_word=0x7fffc6cd4fc4, expected=0, op=393, abstime=0x0, cancel=true) at ./nptl/futex-internal.c:57
+#3  __futex_abstimed_wait_common (futex_word=0x7fffc6cd4fc4, expected=0, clockid=0, abstime=0x0, private=0, cancel=true) at ./nptl/futex-internal.c:87
+#4  __GI___futex_abstimed_wait_cancelable64 (futex_word=futex_word@entry=0x7fffc6cd4fc4, expected=expected@entry=0, clockid=clockid@entry=0, abstime=abstime@entry=0x0, private=private@entry=0) at ./nptl/futex-internal.c:139
+#5  0x00007ffff38a30c7 in __pthread_cond_wait_common (cond=<optimized out>, mutex=0x7fffc6cd4f78, clockid=0, abstime=0x0) at ./nptl/pthread_cond_wait.c:421
+#6  ___pthread_cond_wait (cond=<optimized out>, mutex=0x7fffc6cd4f78) at ./nptl/pthread_cond_wait.c:453
+#7  0x00007fffc354d8b5 in ?? () from /usr/lib/habanalabs/libComplexGuid.so
+#8  0x00007fffc354d696 in ?? () from /usr/lib/habanalabs/libComplexGuid.so
+#9  0x00007ffff3cf5ef9 in ?? () from /usr/lib/x86_64-linux-gnu/libstdc++.so.6
+#10 0x00007ffff38a3dfa in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#11 0x00007ffff39375cc in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 5 (Thread 0x7fffb2bdb6c0 (LWP 1764931) "prequeue_capaci"):
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+#1  0x00007ffff38a030c in __internal_syscall_cancel (a1=a1@entry=0, a2=a2@entry=0, a3=<optimized out>, a4=<optimized out>, a5=a5@entry=0, a6=a6@entry=0, nr=230) at ./nptl/cancellation.c:49
+#2  0x00007ffff38f5af2 in __GI___clock_nanosleep (clock_id=<optimized out>, clock_id@entry=0, flags=flags@entry=0, req=<optimized out>, rem=<optimized out>) at ../sysdeps/unix/sysv/linux/clock_nanosleep.c:48
+#3  0x00007ffff3903707 in __GI___nanosleep (req=<optimized out>, rem=<optimized out>) at ../sysdeps/unix/sysv/linux/nanosleep.c:25
+#4  0x0000555555559067 in std::thread::_State_impl<std::thread::_Invoker<std::tuple<main::{lambda()#1}> > >::_M_run() ()
+#5  0x00007ffff3cf5ef9 in ?? () from /usr/lib/x86_64-linux-gnu/libstdc++.so.6
+#6  0x00007ffff38a3dfa in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#7  0x00007ffff39375cc in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 4 (Thread 0x7fffb33dc6c0 (LWP 1764930) "prequeue_capaci"):
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+#1  0x00007ffff38a039c in __internal_syscall_cancel (a1=<optimized out>, a2=<optimized out>, a3=<optimized out>, a4=0, a5=0, a6=0, nr=7) at ./nptl/cancellation.c:49
+#2  __syscall_cancel (a1=<optimized out>, a2=<optimized out>, a3=<optimized out>, a4=a4@entry=0, a5=a5@entry=0, a6=a6@entry=0, nr=7) at ./nptl/cancellation.c:75
+#3  0x00007ffff3927c0e in __GI___poll (fds=<optimized out>, nfds=<optimized out>, timeout=<optimized out>) at ../sysdeps/unix/sysv/linux/poll.c:29
+#4  0x00007ffff2ba3d72 in ?? () from /usr/lib/habanalabs/libhcl.so
+#5  0x00007ffff31d1c88 in ?? () from /usr/lib/habanalabs/libhcl.so
+#6  0x00007ffff31d3adb in std::thread::_State_impl<std::thread::_Invoker<std::tuple<void (HclThread::*)(std::function<void ()>), HclThread*, std::function<void ()> > > >::_M_run() () from /usr/lib/habanalabs/libhcl.so
+#7  0x00007ffff3cf5ef9 in ?? () from /usr/lib/x86_64-linux-gnu/libstdc++.so.6
+#8  0x00007ffff38a3dfa in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#9  0x00007ffff39375cc in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 3 (Thread 0x7fffb3cf36c0 (LWP 1764929) "Habana-efd"):
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+#1  0x00007ffff38a039c in __internal_syscall_cancel (a1=<optimized out>, a2=<optimized out>, a3=<optimized out>, a4=0, a5=0, a6=0, nr=7) at ./nptl/cancellation.c:49
+#2  __syscall_cancel (a1=<optimized out>, a2=<optimized out>, a3=<optimized out>, a4=a4@entry=0, a5=a5@entry=0, a6=a6@entry=0, nr=7) at ./nptl/cancellation.c:75
+#3  0x00007ffff3927c0e in __GI___poll (fds=<optimized out>, nfds=<optimized out>, timeout=<optimized out>) at ../sysdeps/unix/sysv/linux/poll.c:29
+#4  0x00007ffff7f74079 in hlthunk_notifier_recv () from /usr/lib/habanalabs/libhl-thunk.so
+#5  0x00007ffff4cae28e in EventFdController::_queryEvent(int) () from /usr/lib/habanalabs/libSynapse.so
+#6  0x00007ffff4caf0b7 in EventFdController::_mainLoop() () from /usr/lib/habanalabs/libSynapse.so
+#7  0x00007ffff3cf5ef9 in ?? () from /usr/lib/x86_64-linux-gnu/libstdc++.so.6
+#8  0x00007ffff38a3dfa in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#9  0x00007ffff39375cc in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 2 (Thread 0x7fffbc6f56c0 (LWP 1764924) "prequeue_capaci"):
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+#1  0x00007ffff38a030c in __internal_syscall_cancel (a1=a1@entry=140737353515008, a2=<optimized out>, a3=a3@entry=2, a4=a4@entry=140736354795440, a5=a5@entry=0, a6=a6@entry=4294967295, nr=202) at ./nptl/cancellation.c:49
+#2  0x00007ffff38a06e7 in __futex_abstimed_wait_common64 (private=0, futex_word=0x7ffff7f68000, expected=2, op=137, abstime=0x7fffbc6f3fb0, cancel=true) at ./nptl/futex-internal.c:57
+#3  __futex_abstimed_wait_common (futex_word=0x7ffff7f68000, expected=2, clockid=1, abstime=0x7fffbc6f3fb0, private=0, cancel=true) at ./nptl/futex-internal.c:87
+#4  __GI___futex_abstimed_wait_cancelable64 (futex_word=futex_word@entry=0x7ffff7f68000, expected=expected@entry=0, clockid=clockid@entry=1, abstime=abstime@entry=0x7fffbc6f3fb0, private=private@entry=0) at ./nptl/futex-internal.c:139
+#5  0x00007ffff38a3689 in __pthread_cond_wait_common (cond=<optimized out>, mutex=0x7ffff7f68020, clockid=1, abstime=<optimized out>) at ./nptl/pthread_cond_wait.c:421
+#6  ___pthread_cond_clockwait64 (cond=<optimized out>, mutex=0x7ffff7f68020, clockid=1, abstime=<optimized out>) at ./nptl/pthread_cond_wait.c:517
+#7  ___pthread_cond_clockwait64 (cond=<optimized out>, mutex=0x7ffff7f68020, clockid=1, abstime=<optimized out>) at ./nptl/pthread_cond_wait.c:505
+#8  0x00007ffff7e903cf in ?? () from /usr/lib/habanalabs/libhl_logger.so
+#9  0x00007ffff3cf5ef9 in ?? () from /usr/lib/x86_64-linux-gnu/libstdc++.so.6
+#10 0x00007ffff38a3dfa in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#11 0x00007ffff39375cc in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 1 (Thread 0x7ffff7e0c5c0 (LWP 1764919) "prequeue_capaci"):
+#0  __GI___ioctl (fd=20, request=3224921155) at ../sysdeps/unix/sysv/linux/ioctl.c:36
+#1  0x00007ffff7f728e7 in hlthunk_wait_for_interrupt_by_handle_with_timestamp () from /usr/lib/habanalabs/libhl-thunk.so
+#2  0x00007ffff7f72983 in hlthunk_wait_for_interrupt_by_handle () from /usr/lib/habanalabs/libhl-thunk.so
+#3  0x00007ffff1fae5da in Scal::completionGroupWait(Scal::CompletionGroupInterface const*, unsigned long, unsigned long, bool) () from /usr/lib/habanalabs/libscal.so
+#4  0x00007ffff556162c in ScalCompletionGroupBase::longSoWait(ScalLongSyncObject const&, unsigned long, bool) const () from /usr/lib/habanalabs/libSynapse.so
+#5  0x00007ffff55bf721 in ScalStreamBase::longSoWait(ScalLongSyncObject const&, unsigned long, char const*) const () from /usr/lib/habanalabs/libSynapse.so
+#6  0x00007ffff571dab1 in RecipeLauncher::checkCompletionCopy(unsigned long) () from /usr/lib/habanalabs/libSynapse.so
+#7  0x00007ffff56d8ecf in LaunchTracker::waitForCompletionCopy() () from /usr/lib/habanalabs/libSynapse.so
+#8  0x00007ffff571f1d8 in RecipeLauncher::getMappedMemoryInfo() () from /usr/lib/habanalabs/libSynapse.so
+#9  0x00007ffff5723264 in RecipeLauncher::prepareForDownload(LaunchInfo const&) () from /usr/lib/habanalabs/libSynapse.so
+#10 0x00007ffff5724cbb in RecipeLauncher::launch(LaunchInfo const&) () from /usr/lib/habanalabs/libSynapse.so
+#11 0x00007ffff577031d in QueueComputeScal::launch(LaunchInfo const&) () from /usr/lib/habanalabs/libSynapse.so
+#12 0x00007ffff5772c5f in QueueComputeScal::launch(synLaunchTensorInfoExt const*, unsigned int, unsigned long, InternalRecipeHandle*, unsigned long, unsigned int, std::vector<SlotMapItemSptr<EventWithMappedTensor>, std::allocator<SlotMapItemSptr<EventWithMappedTensor> > >&, unsigned char) () from /usr/lib/habanalabs/libSynapse.so
+#13 0x00007ffff4f63b74 in ComputeJob::run(QueueInterface*) () from /usr/lib/habanalabs/libSynapse.so
+#14 0x00007ffff4f4b24a in Stream::_addJobExecutePhase(std::unique_ptr<StreamJob, std::default_delete<StreamJob> >&, QueueInterface*) () from /usr/lib/habanalabs/libSynapse.so
+#15 0x00007ffff4f5196f in Stream::_addJobMultiThreads(std::unique_ptr<StreamJob, std::default_delete<StreamJob> >&, QueueType) () from /usr/lib/habanalabs/libSynapse.so
+#16 0x00007ffff4f52e29 in Stream::addJob(std::unique_ptr<StreamJob, std::default_delete<StreamJob> >&) () from /usr/lib/habanalabs/libSynapse.so
+#17 0x00007ffff4f70cfa in StreamsContainer::addJob(Stream*, std::unique_ptr<StreamJob, std::default_delete<StreamJob> >&) () from /usr/lib/habanalabs/libSynapse.so
+#18 0x00007ffff5528551 in common::DeviceScal::launch(Stream*, synLaunchTensorInfoExt const*, unsigned int, unsigned long, InternalRecipeHandle*, std::vector<SlotMapItemSptr<EventWithMappedTensor>, std::allocator<SlotMapItemSptr<EventWithMappedTensor> > >&, unsigned int) () from /usr/lib/habanalabs/libSynapse.so
+#19 0x00007ffff4be5b17 in DeviceCommon::launchWithExternalEvents(InternalStreamHandle*, synLaunchTensorInfoExt const*, unsigned int, unsigned long, InternalRecipeHandle*, EventInterfaceExternal**, unsigned int, unsigned int) () from /usr/lib/habanalabs/libSynapse.so
+#20 0x00007ffff4fbb137 in synSingleton::enqueueWithExternalEventsExt(InternalStreamHandle*, synLaunchTensorInfoExt const*, unsigned int, unsigned long, InternalRecipeHandle*, EventInterfaceExternal**, unsigned int, unsigned int) () from /usr/lib/habanalabs/libSynapse.so
+#21 0x00007ffff5141550 in synLaunchWithExternalEventsExt () from /usr/lib/habanalabs/libSynapse.so
+#22 0x0000555555558d7f in launch(InternalStreamHandle*, Recipe&) ()
+#23 0x0000555555557ebe in main ()
+Kill the program being debugged? (y or n) [answered Y; input not from terminal]
+[Inferior 1 (process 1764919) killed]

@@ -1,0 +1,89 @@
+{
+  "pid": 1730924,
+  "initial_dma": [
+    16,
+    30,
+    44,
+    58,
+    8,
+    22,
+    36,
+    50,
+    0,
+    14,
+    28,
+    42,
+    56,
+    6,
+    20,
+    34
+  ],
+  "completion_address": 129517157400576,
+  "expected": [
+    16,
+    30,
+    44,
+    58,
+    8,
+    22,
+    36,
+    50,
+    0,
+    14,
+    28,
+    42,
+    56,
+    6,
+    20,
+    34
+  ],
+  "gate_before": 22,
+  "gate_after": 0,
+  "submit_ms": 374.054401,
+  "steps": 16,
+  "collectives_per_step": 142,
+  "apis": {
+    "launch": {
+      "count": 0,
+      "inclusive_ns": 0,
+      "peak_ns": 0,
+      "peak_call_index": 0
+    },
+    "launch_ext": {
+      "count": 2304,
+      "inclusive_ns": 316175583,
+      "peak_ns": 255766011,
+      "peak_call_index": 568
+    },
+    "all_gather": {
+      "count": 2272,
+      "inclusive_ns": 53897477,
+      "peak_ns": 112926,
+      "peak_call_index": 562
+    },
+    "all_reduce": {
+      "count": 1,
+      "inclusive_ns": 339880,
+      "peak_ns": 339880,
+      "peak_call_index": 1
+    },
+    "event_record": {
+      "count": 34,
+      "inclusive_ns": 279445,
+      "peak_ns": 23026,
+      "peak_call_index": 10
+    },
+    "stream_wait": {
+      "count": 33,
+      "inclusive_ns": 100429,
+      "peak_ns": 12999,
+      "peak_call_index": 1
+    },
+    "event_sync": {
+      "count": 34,
+      "inclusive_ns": 293515521,
+      "peak_ns": 276056070,
+      "peak_call_index": 1
+    }
+  }
+}

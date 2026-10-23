@@ -1,0 +1,18 @@
+gate workspace=134408576
+gate_only_us=122192.3
+cfg=small_1node_3bind rep=0 bindings=3 ws=256 gate_launch_us=12.4 first_block_index=573 max_us=118311.3 at=573 launches_over_1ms=1 pre_block_p50_us=6.62 submit_us=146801.4 complete_us=146826.8
+  long_launch_indices: 573(118311us)
+cfg=small_1node_3bind rep=1 bindings=3 ws=256 gate_launch_us=287.1 first_block_index=573 max_us=118165.2 at=573 launches_over_1ms=1 pre_block_p50_us=7.02 submit_us=147216.8 complete_us=147246.3
+  long_launch_indices: 573(118165us)
+cfg=small_1node_3bind_alt2recipes rep=0 bindings=3 ws=256 gate_launch_us=189.9 first_block_index=571 max_us=118246.7 at=571 launches_over_1ms=1 pre_block_p50_us=6.99 submit_us=147004.1 complete_us=147036.7
+  long_launch_indices: 571(118247us)
+cfg=small_1node_3bind_alt2recipes rep=1 bindings=3 ws=256 gate_launch_us=219.5 first_block_index=571 max_us=118357.1 at=571 launches_over_1ms=1 pre_block_p50_us=6.74 submit_us=147001.9 complete_us=147032.7
+  long_launch_indices: 571(118357us)
+cfg=small_8node_24bind rep=0 bindings=24 ws=256 gate_launch_us=183.6 first_block_index=573 max_us=115591.0 at=573 launches_over_1ms=2 pre_block_p50_us=11.26 submit_us=162686.7 complete_us=162717.9
+  long_launch_indices: 573(115591us) 2370(2379us)
+cfg=small_8node_24bind rep=1 bindings=24 ws=256 gate_launch_us=281.3 first_block_index=573 max_us=115966.4 at=573 launches_over_1ms=1 pre_block_p50_us=10.82 submit_us=160265.7 complete_us=160296.4
+  long_launch_indices: 573(115966us)
+cfg=small_32node_96bind rep=0 bindings=96 ws=256 gate_launch_us=178.9 first_block_index=573 max_us=107596.6 at=573 launches_over_1ms=1 pre_block_p50_us=25.36 submit_us=209086.9 complete_us=210939.8
+  long_launch_indices: 573(107597us)
+cfg=small_32node_96bind rep=1 bindings=96 ws=256 gate_launch_us=183.0 first_block_index=573 max_us=108240.3 at=573 launches_over_1ms=1 pre_block_p50_us=24.10 submit_us=207964.8 complete_us=210940.7
+  long_launch_indices: 573(108240us)

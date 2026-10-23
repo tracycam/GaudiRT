@@ -1,0 +1,3 @@
+synGraphCompile(&recipe, graph, rmw ? "review_add_relu_rmw" : "review_add_relu", nullptr) failed: 26 at line 53
+device_sram_base=0x1000fffffd000000 device_sram_bytes=50331648 rmw=0
+terminate called without an active exception
