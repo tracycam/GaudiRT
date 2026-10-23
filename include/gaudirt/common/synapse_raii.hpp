@@ -22,6 +22,7 @@ namespace gaudirt::common {
 class SynapseContext {
 public:
   explicit SynapseContext(uint32_t module_id = 0) {
+    setenv("GC_KERNEL_PATH", "/usr/lib/habanalabs/libtpc_kernels.so", 0);
     GAUDIRT_SYN_CHECK(synInitialize());
     synModuleId mod = static_cast<synModuleId>(module_id);
     if (synDeviceAcquireByModuleId(&dev_, mod) != synSuccess) {

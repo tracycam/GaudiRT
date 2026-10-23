@@ -206,21 +206,6 @@ struct SramProbeResult {
   double device_p50_us = 0.0;
 };
 
-std::string parse_sram_sum_allocation(const std::string& json_path) {
-  std::ifstream ifs(json_path);
-  if (!ifs.is_open()) return "NO_JSON";
-  std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
-  size_t pos = content.find("\"sram_sum\"");
-  if (pos == std::string::npos) return "NOT_FOUND";
-  size_t alloc_pos = content.find("\"allocation\"", pos);
-  if (alloc_pos == std::string::npos || alloc_pos - pos > 600) return "NO_ALLOC_FIELD";
-  size_t colon = content.find(':', alloc_pos);
-  size_t q1 = content.find('"', colon + 1);
-  size_t q2 = content.find('"', q1 + 1);
-  if (q1 == std::string::npos || q2 == std::string::npos) return "PARSE_ERR";
-  return content.substr(q1 + 1, q2 - q1 - 1);
-}
-
 SramProbeResult run_sram_case(synDeviceId dev, synStreamHandle stream, unsigned k, unsigned m, unsigned n, bool rmw) {
   SramProbeResult res{};
   res.mid_bytes = 2ull * k * m;
@@ -231,8 +216,6 @@ SramProbeResult run_sram_case(synDeviceId dev, synStreamHandle stream, unsigned 
   std::string rm_cmd = "rm -f .graph_dumps/*" + tag + "*.json 2>/dev/null";
   int rc = std::system(rm_cmd.c_str());
   (void)rc;
-
-  synConfigurationSet("GCFG_GRAPH_VISUALIZATION", "true");
 
   const unsigned sizes[5][2] = {{k, m}, {k, m}, {n, k}, {n, m}, {k, m}};
   const char* names[5] = {"x", "b", "weight", "y", "sram_sum"};
@@ -251,16 +234,27 @@ SramProbeResult run_sram_case(synDeviceId dev, synStreamHandle stream, unsigned 
     d.m_dataType = syn_type_bf16;
     d.m_dims = 2;
     for (unsigned j = 0; j < 2; ++j) d.m_sizes[j] = d.m_minSizes[j] = sizes[i][j];
-    GAUDIRT_SYN_CHECK(synTensorCreate(&tensors[i], &d, sections[i], 0));
+    synStatus tst = synTensorCreate(&tensors[i], &d, sections[i], 0);
+    if (tst != synSuccess) {
+      res.allocation = "REJECTED_TENSOR_CREATE_" + std::to_string(int(tst));
+      synGraphDestroy(graph);
+      for (unsigned k_idx = 0; k_idx <= i; ++k_idx) synSectionDestroy(sections[k_idx]);
+      return res;
+    }
   }
-  GAUDIRT_SYN_CHECK(synNodeCreate(graph, tensors, &tensors[4], 2, 1, nullptr, 0, "add_fwd_bf16", "producer_add", nullptr, nullptr));
+  synStatus n1_st = synNodeCreate(graph, tensors, &tensors[4], 2, 1, nullptr, 0, "add_fwd_bf16", "producer_add", nullptr, nullptr);
+  if (n1_st != synSuccess) {
+    res.allocation = "REJECTED_OVER_RMW_LIMIT_STATUS_" + std::to_string(int(n1_st));
+    synGraphDestroy(graph);
+    for (auto s : sections) synSectionDestroy(s);
+    return res;
+  }
   synTensor gemm_in[2] = {tensors[4], tensors[2]};
   synGEMMParams params{false, false};
   GAUDIRT_SYN_CHECK(synNodeCreate(graph, gemm_in, &tensors[3], 2, 1, &params, sizeof(params), "gemm", "consumer_mme", nullptr, nullptr));
 
   synRecipeHandle recipe = nullptr;
   synStatus compile_st = synGraphCompile(&recipe, graph, tag.c_str(), nullptr);
-  synConfigurationSet("GCFG_GRAPH_VISUALIZATION", "false");
 
   if (compile_st != synSuccess) {
     res.allocation = "COMPILE_FAILED_" + std::to_string(int(compile_st));
@@ -268,9 +262,6 @@ SramProbeResult run_sram_case(synDeviceId dev, synStreamHandle stream, unsigned 
     for (auto s : sections) synSectionDestroy(s);
     return res;
   }
-
-  std::string post_json = ".graph_dumps/" + tag + "-PostGraph.json";
-  res.allocation = parse_sram_sum_allocation(post_json);
 
   uint64_t ids[4]{};
   GAUDIRT_SYN_CHECK(synTensorRetrieveIds(recipe, names, ids, 4));
@@ -288,6 +279,7 @@ SramProbeResult run_sram_case(synDeviceId dev, synStreamHandle stream, unsigned 
   if (res.workspace_bytes) {
     GAUDIRT_SYN_CHECK(synDeviceMalloc(dev, res.workspace_bytes, 0, 0, &workspace));
   }
+  res.allocation = (res.workspace_bytes < res.mid_bytes) ? "SRAM" : "DRAM_WORKSPACE";
 
   for (int i = 0; i < 10; ++i) {
     GAUDIRT_SYN_CHECK(synLaunchWithExternalEventsExt(stream, bindings, 4, workspace, recipe, nullptr, 0, 0));

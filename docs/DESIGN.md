@@ -81,17 +81,28 @@ flowchart TD
 
 ```text
 GaudiRT/
+├── AGENTS.md                            # 项目工程准则与方法学约束（零实现细节）
 ├── CMakeLists.txt                       # 极简 C++20 探针构建配置（链接系统 /usr/lib/habanalabs 1.24.2-481）
 ├── docs/
 │   ├── software-autopsy.md              # 硬件参数、11.31ms 基线、573/571 阻塞栈、5.2GB 权重下限与现有栈审计
-│   └── DESIGN.md                        # 本设计规范：资产映射、L1_B 砍线裁决、Gate 0 二元门禁矩阵
+│   └── DESIGN.md                        # 本设计规范：资产映射、L1_B 砍线裁决、Gate 0 门禁矩阵与方法学三原则
+├── include/gaudirt/common/
+│   ├── host_policy.hpp                  # Linux sched_setattr (uclamp_min=1024)、CPU 亲和性与无插桩环境校验
+│   ├── synapse_raii.hpp                 # Synapse 设备/流/带时间戳事件对 (EVENT_COLLECT_TIME) RAII 封装
+│   └── abba_harness.hpp                 # 同起止边界 ABBA 交错采样与分位数统计工具
 ├── evidence/
 │   ├── README.md                        # 各证据子目录来源、实验条件与关键文件索引
 │   ├── review-20261023/                 # 第一轮真机复核（单算子 Launch ABBA、2KB SRAM->MME、70L 命令计数）
 │   ├── runtime-audit-20261023/          # 第二轮历史预排队记录与库哈希核对
 │   ├── design-review-20261023/          # libSynapse.so (1.24.2-481) 静态反汇编 (.asm) 与导出符号表
 │   ├── review2-20261023/                # 第三轮 Module 7 纯 C++ 在途上限实测 (plain.log / gdb.log) 与两轮评审报告
-│   └── gate0-20261023/                  # [下一步生成] Gate 0 (G0-1 ~ G0-7) 门禁实验原始日志与裁决 JSON
-└── probes/                              # 独立、零框架依赖的 Gate 0 硬件探针
-    └── prequeue_capacity_probe.cpp      # 已完成：定位 573/571 次 MappedMemMgr/waitForCompletionCopy 阻塞上限
+│   └── gate0-20261023/                  # Gate 0 (G0-1 ~ G0-7) 门禁实验完整 JSON 证据与 SUMMARY.md 裁决报告
+├── probes/                              # 独立、零框架依赖的 Gate 0 C++20 硬件探针
+│   ├── prequeue_capacity_probe.cpp      # 定位 573/571 次 MappedMemMgr/waitForCompletionCopy 阻塞上限
+│   ├── g0_2_launch_and_sram_probe.cpp   # G0-2: 正交解耦绑定/节点 Launch 成本 & SRAM RMW 16 MiB 容量边界
+│   ├── g0_5_collective_handoff_probe.cpp# G0-5/G0-1: 8 卡 FP32 AllGather vs AllReduce & 同边界普通/预排队对比
+│   └── g0_7_distinct144_prequeue_probe.cpp # G0-7/G0-1: 144 独立 Recipe (3,068 绑定) 1->4 步预排队与 MappedMemMgr 守恒定律
+└── scripts/
+    ├── g0_3_4_host_and_path_audit.py    # G0-3/G0-4: async_scheduling 三处门禁与 uclamp=1024 主机阶段审计
+    └── g0_6_recipe_roofline_audit.py    # G0-6: 70L 144 Recipe 算子级 Roofline 与 2.056ms 子图内切换空泡拆解
 ```

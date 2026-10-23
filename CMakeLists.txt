@@ -15,6 +15,7 @@ include_directories(
     ${HABANA_INC_DIR}
 )
 link_directories(${HABANA_LIB_DIR})
+add_link_options(-Wl,-rpath,${HABANA_LIB_DIR})
 
 add_executable(prequeue_capacity_probe probes/prequeue_capacity_probe.cpp)
 target_link_libraries(prequeue_capacity_probe PRIVATE Synapse pthread dl)
@@ -24,3 +25,6 @@ target_link_libraries(g0_2_launch_and_sram_probe PRIVATE Synapse pthread dl)
 
 add_executable(g0_5_collective_handoff_probe probes/g0_5_collective_handoff_probe.cpp)
 target_link_libraries(g0_5_collective_handoff_probe PRIVATE Synapse hcl pthread dl)
+
+add_executable(g0_7_distinct144_prequeue_probe probes/g0_7_distinct144_prequeue_probe.cpp)
+target_link_libraries(g0_7_distinct144_prequeue_probe PRIVATE Synapse hcl pthread dl)

@@ -76,8 +76,9 @@ SimpleRecipe make_gemm_recipe(synDeviceId dev, unsigned m, unsigned k, unsigned 
   r.dev = dev;
   synGraphHandle graph = nullptr;
   GAUDIRT_SYN_CHECK(synGraphCreate(&graph, synDeviceGaudi2));
-  r.names = {"in", "w", "out"};
+  r.names = {std::string(tag) + "_in", std::string(tag) + "_w", std::string(tag) + "_out"};
   std::vector<synSectionHandle> sections;
+  std::vector<synTensor> tensors;
 
   auto mk = [&](const char* name, unsigned d0, unsigned d1, bool persistent) {
     synSectionHandle s = nullptr;
@@ -94,15 +95,16 @@ SimpleRecipe make_gemm_recipe(synDeviceId dev, unsigned m, unsigned k, unsigned 
     d.m_sizes[1] = d.m_minSizes[1] = d1;
     synTensor t = nullptr;
     GAUDIRT_SYN_CHECK(synTensorCreate(&t, &d, s, 0));
+    tensors.push_back(t);
     return t;
   };
 
-  synTensor x = mk("in", k, m, true);
-  synTensor w = mk("w", n, k, true);
-  synTensor out = mk("out", n, m, true);
+  synTensor x = mk(r.names[0].c_str(), k, m, true);
+  synTensor w = mk(r.names[1].c_str(), n, k, true);
+  synTensor out = mk(r.names[2].c_str(), n, m, true);
   synTensor cur = x;
   std::vector<std::string> mid_names;
-  for (unsigned i = 0; i < chain_len; ++i) mid_names.push_back("mid_" + std::to_string(i));
+  for (unsigned i = 0; i < chain_len; ++i) mid_names.push_back(std::string(tag) + "_mid_" + std::to_string(i));
   for (unsigned i = 0; i < chain_len; ++i) {
     synTensor next = (i + 1 == chain_len) ? out : mk(mid_names[i].c_str(), n, m, false);
     synTensor in[2] = {cur, w};
@@ -113,7 +115,7 @@ SimpleRecipe make_gemm_recipe(synDeviceId dev, unsigned m, unsigned k, unsigned 
   }
 
   GAUDIRT_SYN_CHECK(synGraphCompile(&r.handle, graph, tag, nullptr));
-  const char* cn[3] = {"in", "w", "out"};
+  const char* cn[3] = {r.names[0].c_str(), r.names[1].c_str(), r.names[2].c_str()};
   uint64_t ids[3]{};
   GAUDIRT_SYN_CHECK(synTensorRetrieveIds(r.handle, cn, ids, 3));
   const unsigned dims[3][2] = {{k, m}, {n, k}, {n, m}};
@@ -131,6 +133,7 @@ SimpleRecipe make_gemm_recipe(synDeviceId dev, unsigned m, unsigned k, unsigned 
     GAUDIRT_SYN_CHECK(synDeviceMalloc(dev, r.workspace_bytes, 0, 0, &r.workspace));
   }
   GAUDIRT_SYN_CHECK(synGraphDestroy(graph));
+  for (auto t : tensors) GAUDIRT_SYN_CHECK(synTensorDestroy(t));
   for (auto s : sections) GAUDIRT_SYN_CHECK(synSectionDestroy(s));
   return r;
 }
@@ -162,29 +165,37 @@ void run_rank(int rank, int nranks, SharedCoord* shm) {
   host_barrier(shm, nranks, sense);
 
   // Build:
-  // 1) A step compute recipe [M=16, K=2048, N=2048] representing a single decode compute block
-  // 2) A 120ms gate recipe [48 x 8192x8192] for pre-queued same-boundary comparison
-  SimpleRecipe step_comp = make_gemm_recipe(ctx.device(), 16, 2048, 2048, 1, "g0_5_step_comp");
-  SimpleRecipe gate = make_gemm_recipe(ctx.device(), 8192, 8192, 8192, 48, "g0_5_gate");
+  // 1) A fast compute recipe (~8 us)
+  // 2) A production-duration compute recipe (~50-60 us, so 144 recipes ~= 7.5-8.5 ms matching 70L model)
+  // 3) A 120ms gate recipe [48 x 8192x8192] for pre-queued same-boundary comparison
+  SimpleRecipe step_comp = make_gemm_recipe(ctx.device(), 16, 2048, 2048, 1, ("g0_5_step_r" + mod_str).c_str());
+  SimpleRecipe prod_comp = make_gemm_recipe(ctx.device(), 1536, 1536, 1536, 4, ("g0_5_prod_r" + mod_str).c_str());
+  SimpleRecipe gate = make_gemm_recipe(ctx.device(), 8192, 8192, 8192, 48, ("g0_5_gate_r" + mod_str).c_str());
 
-  // Allocate collective buffers: 6144 BF16 elements = 12 KB (matching production hidden_size=6144 decode token)
-  const size_t count_bf16 = 6144;
-  DeviceBuffer comm_send(ctx.device(), count_bf16 * 2 * nranks);
-  DeviceBuffer comm_recv(ctx.device(), count_bf16 * 2 * nranks);
+  // Allocate collective buffers: 6144 elements (matching production hidden_size=6144 decode token)
+  // For FP32 AllGather: send = 6144 * 4B = 24 KB, recv = 6144 * 4B * 8 = 192 KB
+  const size_t count_elems = 6144;
+  DeviceBuffer comm_send(ctx.device(), count_elems * 4 * nranks);
+  DeviceBuffer comm_recv(ctx.device(), count_elems * 4 * nranks);
 
   // Warmup
   for (int i = 0; i < 16; ++i) {
     step_comp.launch(stream);
+    prod_comp.launch(stream);
     GAUDIRT_HCCL_CHECK(hcclAllReduce(reinterpret_cast<const void*>(comm_send.addr()),
                                      reinterpret_cast<void*>(comm_recv.addr()),
-                                     count_bf16, hcclBfloat16, hcclSum, comm, stream));
+                                     count_elems, hcclBfloat16, hcclSum, comm, stream));
+    GAUDIRT_HCCL_CHECK(hcclAllGather(reinterpret_cast<const void*>(comm_send.addr()),
+                                     reinterpret_cast<void*>(comm_recv.addr()),
+                                     count_elems, hcclFloat32, comm, stream));
   }
   GAUDIRT_SYN_CHECK(synStreamSynchronize(stream));
   host_barrier(shm, nranks, sense);
 
   TimedEventPair ev_span(ctx.device());
 
-  auto run_interleaved = [&](unsigned n_compute, unsigned n_comm, bool use_gate,
+  auto run_interleaved = [&](const SimpleRecipe& comp_recipe, unsigned n_compute, unsigned n_comm,
+                             bool use_fp32_allgather, bool use_gate,
                              std::vector<double>& span_us_out,
                              std::vector<double>& submit_us_out,
                              std::vector<double>& wall_us_out) {
@@ -198,11 +209,17 @@ void run_rank(int rank, int nranks, SharedCoord* shm) {
       // Same start/end boundary around the [first_op_start, last_op_end] of the step
       ev_span.record_start(stream);
       for (unsigned i = 0; i < n_compute; ++i) {
-        step_comp.launch(stream);
+        comp_recipe.launch(stream);
         if (n_comm > 0 && (i * n_comm) / n_compute != ((i + 1) * n_comm) / n_compute) {
-          GAUDIRT_HCCL_CHECK(hcclAllReduce(reinterpret_cast<const void*>(comm_send.addr()),
-                                           reinterpret_cast<void*>(comm_recv.addr()),
-                                           count_bf16, hcclBfloat16, hcclSum, comm, stream));
+          if (use_fp32_allgather) {
+            GAUDIRT_HCCL_CHECK(hcclAllGather(reinterpret_cast<const void*>(comm_send.addr()),
+                                             reinterpret_cast<void*>(comm_recv.addr()),
+                                             count_elems, hcclFloat32, comm, stream));
+          } else {
+            GAUDIRT_HCCL_CHECK(hcclAllReduce(reinterpret_cast<const void*>(comm_send.addr()),
+                                             reinterpret_cast<void*>(comm_recv.addr()),
+                                             count_elems, hcclBfloat16, hcclSum, comm, stream));
+          }
         }
       }
       ev_span.record_end(stream);
@@ -217,45 +234,72 @@ void run_rank(int rank, int nranks, SharedCoord* shm) {
     }
   };
 
-  // Experiment 1: Same-boundary comparison of Normal Submit vs Gate-Prequeued on (144 compute + 141 collective)
-  // Run in ABBA order
+  // Experiment 1A: Fast compute (~1.15ms total) + 141 x BF16 AllReduce — Normal vs Gate-Prequeued (ABBA)
   std::vector<double> norm_span, norm_sub, norm_wall;
   std::vector<double> preq_span, preq_sub, preq_wall;
-  run_interleaved(144, 141, false, norm_span, norm_sub, norm_wall);
-  run_interleaved(144, 141, true, preq_span, preq_sub, preq_wall);
-  run_interleaved(144, 141, true, preq_span, preq_sub, preq_wall);
-  run_interleaved(144, 141, false, norm_span, norm_sub, norm_wall);
+  run_interleaved(step_comp, 144, 141, false, false, norm_span, norm_sub, norm_wall);
+  run_interleaved(step_comp, 144, 141, false, true, preq_span, preq_sub, preq_wall);
+  run_interleaved(step_comp, 144, 141, false, true, preq_span, preq_sub, preq_wall);
+  run_interleaved(step_comp, 144, 141, false, false, norm_span, norm_sub, norm_wall);
 
-  // Experiment 2: Marginal collective scaling on fixed 144 compute recipes with N_comm = 0, 35, 70, 141
+  // Experiment 1B: Production-matched compute (~7.5ms total) + 141 x FP32 AllGather — Normal vs Gate-Prequeued (ABBA)
+  std::vector<double> prod_norm_span, prod_norm_sub, prod_norm_wall;
+  std::vector<double> prod_preq_span, prod_preq_sub, prod_preq_wall;
+  std::vector<double> prod_0comm_span, prod_0comm_sub, prod_0comm_wall;
+  run_interleaved(prod_comp, 144, 0, true, false, prod_0comm_span, prod_0comm_sub, prod_0comm_wall);
+  run_interleaved(prod_comp, 144, 141, true, false, prod_norm_span, prod_norm_sub, prod_norm_wall);
+  run_interleaved(prod_comp, 144, 141, true, true, prod_preq_span, prod_preq_sub, prod_preq_wall);
+  run_interleaved(prod_comp, 144, 141, true, true, prod_preq_span, prod_preq_sub, prod_preq_wall);
+  run_interleaved(prod_comp, 144, 141, true, false, prod_norm_span, prod_norm_sub, prod_norm_wall);
+
+  // Experiment 2: Marginal collective scaling on fixed 144 compute recipes with N_comm = 0, 35, 70, 141 (FP32 AllGather)
   const unsigned comm_counts[] = {0, 35, 70, 141};
   SummaryStats scaling_span[4]{};
   SummaryStats scaling_sub[4]{};
   for (int idx = 0; idx < 4; ++idx) {
     std::vector<double> sp, sb, wl;
-    run_interleaved(144, comm_counts[idx], false, sp, sb, wl);
+    run_interleaved(prod_comp, 144, comm_counts[idx], true, false, sp, sb, wl);
     scaling_span[idx] = summarize(sp);
     scaling_sub[idx] = summarize(sb);
   }
 
-  // Experiment 3: Pure back-to-back 141 x 12KB hcclAllReduce (no interleaved compute)
-  std::vector<double> pure_comm_span, pure_comm_sub;
-  for (int r = 0; r < 20; ++r) {
-    host_barrier(shm, nranks, sense);
-    double t0 = now_us();
-    ev_span.record_start(stream);
-    for (unsigned c = 0; c < 141; ++c) {
-      GAUDIRT_HCCL_CHECK(hcclAllReduce(reinterpret_cast<const void*>(comm_send.addr()),
-                                       reinterpret_cast<void*>(comm_recv.addr()),
-                                       count_bf16, hcclBfloat16, hcclSum, comm, stream));
+  // Experiment 3: Pure back-to-back 141 collectives:
+  // (a) BF16 AllReduce (12 KB), (b) BF16 AllGather (12 KB -> 96 KB), (c) FP32 AllGather (24 KB -> 192 KB)
+  auto measure_pure_comm = [&](int mode, std::vector<double>& sp_out, std::vector<double>& sub_out) {
+    for (int r = 0; r < 16; ++r) {
+      host_barrier(shm, nranks, sense);
+      double t0 = now_us();
+      ev_span.record_start(stream);
+      for (unsigned c = 0; c < 141; ++c) {
+        if (mode == 0) {
+          GAUDIRT_HCCL_CHECK(hcclAllReduce(reinterpret_cast<const void*>(comm_send.addr()),
+                                           reinterpret_cast<void*>(comm_recv.addr()),
+                                           count_elems, hcclBfloat16, hcclSum, comm, stream));
+        } else if (mode == 1) {
+          GAUDIRT_HCCL_CHECK(hcclAllGather(reinterpret_cast<const void*>(comm_send.addr()),
+                                           reinterpret_cast<void*>(comm_recv.addr()),
+                                           count_elems, hcclBfloat16, comm, stream));
+        } else {
+          GAUDIRT_HCCL_CHECK(hcclAllGather(reinterpret_cast<const void*>(comm_send.addr()),
+                                           reinterpret_cast<void*>(comm_recv.addr()),
+                                           count_elems, hcclFloat32, comm, stream));
+        }
+      }
+      ev_span.record_end(stream);
+      double sub = now_us() - t0;
+      double sp = ev_span.elapsed_us();
+      if (r >= 4) {
+        sp_out.push_back(sp);
+        sub_out.push_back(sub);
+      }
     }
-    ev_span.record_end(stream);
-    double sub = now_us() - t0;
-    double sp = ev_span.elapsed_us();
-    if (r >= 4) {
-      pure_comm_span.push_back(sp);
-      pure_comm_sub.push_back(sub);
-    }
-  }
+  };
+  std::vector<double> pure_ar_bf16_sp, pure_ar_bf16_sub;
+  std::vector<double> pure_ag_bf16_sp, pure_ag_bf16_sub;
+  std::vector<double> pure_ag_fp32_sp, pure_ag_fp32_sub;
+  measure_pure_comm(0, pure_ar_bf16_sp, pure_ar_bf16_sub);
+  measure_pure_comm(1, pure_ag_bf16_sp, pure_ag_bf16_sub);
+  measure_pure_comm(2, pure_ag_fp32_sp, pure_ag_fp32_sub);
 
   if (rank == 0) {
     auto ns = summarize(norm_span);
@@ -263,15 +307,25 @@ void run_rank(int rank, int nranks, SharedCoord* shm) {
     auto nw = summarize(norm_wall);
     auto ps = summarize(preq_span);
     auto psub = summarize(preq_sub);
-    auto pcs = summarize(pure_comm_span);
-    auto pcsub = summarize(pure_comm_sub);
+
+    auto p0s = summarize(prod_0comm_span);
+    auto pns = summarize(prod_norm_span);
+    auto pnsub = summarize(prod_norm_sub);
+    auto pnw = summarize(prod_norm_wall);
+    auto pps = summarize(prod_preq_span);
+    auto ppsub = summarize(prod_preq_sub);
+
+    auto ar_bf16 = summarize(pure_ar_bf16_sp);
+    auto ag_bf16 = summarize(pure_ag_bf16_sp);
+    auto ag_fp32 = summarize(pure_ag_fp32_sp);
+    auto ag_fp32_sub = summarize(pure_ag_fp32_sub);
 
     std::printf("{\n");
     std::printf("  \"probe\": \"G0-5_collective_and_same_boundary_prequeue\",\n");
     std::printf("  \"nranks\": %d,\n", nranks);
     std::printf("  \"uclamp_applied\": %s,\n", host_st.uclamp_applied ? "true" : "false");
-    std::printf("  \"payload_bytes_bf16\": %zu,\n", count_bf16 * 2);
-    std::printf("  \"same_boundary_144comp_141comm\": {\n");
+    std::printf("  \"count_elems\": %zu,\n", count_elems);
+    std::printf("  \"fast_compute_144comp_141comm_same_boundary\": {\n");
     std::printf("    \"normal_device_span_p50_us\": %.2f,\n", ns.p50);
     std::printf("    \"prequeued_device_span_p50_us\": %.2f,\n", ps.p50);
     std::printf("    \"same_boundary_span_diff_us\": %.2f,\n", ns.p50 - ps.p50);
@@ -279,7 +333,16 @@ void run_rank(int rank, int nranks, SharedCoord* shm) {
     std::printf("    \"normal_wall_p50_us\": %.2f,\n", nw.p50);
     std::printf("    \"prequeued_host_submit_with_gate_p50_us\": %.2f\n", psub.p50);
     std::printf("  },\n");
-    std::printf("  \"interleaved_144comp_comm_scaling\": [\n");
+    std::printf("  \"prod_matched_compute_144comp_141comm_same_boundary\": {\n");
+    std::printf("    \"compute_only_144_device_span_p50_us\": %.2f,\n", p0s.p50);
+    std::printf("    \"normal_device_span_p50_us\": %.2f,\n", pns.p50);
+    std::printf("    \"prequeued_device_span_p50_us\": %.2f,\n", pps.p50);
+    std::printf("    \"same_boundary_span_diff_us\": %.2f,\n", pns.p50 - pps.p50);
+    std::printf("    \"normal_host_submit_p50_us\": %.2f,\n", pnsub.p50);
+    std::printf("    \"normal_wall_p50_us\": %.2f,\n", pnw.p50);
+    std::printf("    \"prequeued_host_submit_with_gate_p50_us\": %.2f\n", ppsub.p50);
+    std::printf("  },\n");
+    std::printf("  \"interleaved_prod_144comp_fp32_allgather_scaling\": [\n");
     for (int i = 0; i < 4; ++i) {
       double delta_vs_0 = scaling_span[i].p50 - scaling_span[0].p50;
       double per_comm = (comm_counts[i] > 0) ? (delta_vs_0 / comm_counts[i]) : 0.0;
@@ -288,11 +351,14 @@ void run_rank(int rank, int nranks, SharedCoord* shm) {
                   (i < 3) ? "," : "");
     }
     std::printf("  ],\n");
-    std::printf("  \"pure_141_allreduce_12kb\": {\n");
-    std::printf("    \"device_span_p50_us\": %.2f,\n", pcs.p50);
-    std::printf("    \"per_allreduce_device_p50_us\": %.2f,\n", pcs.p50 / 141.0);
-    std::printf("    \"host_submit_p50_us\": %.2f,\n", pcsub.p50);
-    std::printf("    \"per_allreduce_host_submit_p50_us\": %.2f\n", pcsub.p50 / 141.0);
+    std::printf("  \"pure_141_collectives_comparison\": {\n");
+    std::printf("    \"bf16_allreduce_12kb_span_p50_us\": %.2f,\n", ar_bf16.p50);
+    std::printf("    \"bf16_allreduce_per_call_us\": %.2f,\n", ar_bf16.p50 / 141.0);
+    std::printf("    \"bf16_allgather_12kb_to_96kb_span_p50_us\": %.2f,\n", ag_bf16.p50);
+    std::printf("    \"bf16_allgather_per_call_us\": %.2f,\n", ag_bf16.p50 / 141.0);
+    std::printf("    \"fp32_allgather_24kb_to_192kb_span_p50_us\": %.2f,\n", ag_fp32.p50);
+    std::printf("    \"fp32_allgather_per_call_us\": %.2f,\n", ag_fp32.p50 / 141.0);
+    std::printf("    \"fp32_allgather_host_submit_p50_us\": %.2f\n", ag_fp32_sub.p50);
     std::printf("  }\n");
     std::printf("}\n");
     std::fflush(stdout);
@@ -301,6 +367,7 @@ void run_rank(int rank, int nranks, SharedCoord* shm) {
   host_barrier(shm, nranks, sense);
   GAUDIRT_HCCL_CHECK(hcclCommDestroy(comm));
   step_comp.destroy();
+  prod_comp.destroy();
   gate.destroy();
   synStreamDestroy(stream);
 }

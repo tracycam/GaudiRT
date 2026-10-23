@@ -97,6 +97,7 @@ def audit_trace(jsonl_path: Path):
     )
 
     step_recipe_records = []
+    step_transition_records = []
     fine_op_totals = defaultdict(lambda: defaultdict(list))
 
     for step_idx, w in enumerate(windows):
@@ -154,6 +155,7 @@ def audit_trace(jsonl_path: Path):
 
         # Analyze each of the 144 recipe runs in this step
         per_step_runs = []
+        step_intra_gap_transitions = defaultdict(lambda: {"count": 0, "total_us": 0.0, "edma_us": 0.0, "pdma_us": 0.0})
         for ordinal_idx, r in enumerate(runs):
             r_begin, r_end = r["begin"], r["end"]
             r_span = r_end - r_begin
@@ -165,6 +167,24 @@ def audit_trace(jsonl_path: Path):
             mme_u = duration(mme_iv)
             comp_u = duration(comp_iv)
             intra_gap = max(0.0, r_span - comp_u)
+
+            # Decompose intra-recipe gap into exact node-to-node transitions inside this recipe run
+            sorted_ev = sorted(r["events"], key=lambda item: item[0])
+            cur_end = sorted_ev[0][1]
+            cur_op = classify_op_name(sorted_ev[0][2]["name"]) + "(" + sorted_ev[0][2]["family"] + ")"
+            for ev_b, ev_e, ev_x in sorted_ev[1:]:
+                nxt_op = classify_op_name(ev_x["name"]) + "(" + ev_x["family"] + ")"
+                if ev_b > cur_end:
+                    g_dur = ev_b - cur_end
+                    t_key = f"{cur_op} -> {nxt_op}"
+                    tr = step_intra_gap_transitions[t_key]
+                    tr["count"] += 1
+                    tr["total_us"] += g_dur
+                    tr["edma_us"] += overlap(by_engine["EDMA"], cur_end, ev_b)
+                    tr["pdma_us"] += overlap(by_engine["PDMA"], cur_end, ev_b)
+                if ev_e > cur_end:
+                    cur_end = ev_e
+                    cur_op = nxt_op
 
             # Check how much of the intra-recipe no-TPC/MME gap overlaps with EDMA or PDMA
             edma_in_span = overlap(by_engine["EDMA"], r_begin, r_end)
@@ -194,6 +214,31 @@ def audit_trace(jsonl_path: Path):
                 }
             )
         step_recipe_records.append(per_step_runs)
+        step_transition_records.append(step_intra_gap_transitions)
+
+    all_t_keys = set().union(*(d.keys() for d in step_transition_records))
+    intra_gap_transition_summary = []
+    for tk in all_t_keys:
+        intra_gap_transition_summary.append(
+            {
+                "transition": tk,
+                "count_per_step_median": statistics.median(
+                    d[tk]["count"] for d in step_transition_records
+                ),
+                "step_gap_median_us": statistics.median(
+                    d[tk]["total_us"] for d in step_transition_records
+                ),
+                "step_edma_overlap_median_us": statistics.median(
+                    d[tk]["edma_us"] for d in step_transition_records
+                ),
+                "step_pdma_overlap_median_us": statistics.median(
+                    d[tk]["pdma_us"] for d in step_transition_records
+                ),
+            }
+        )
+    intra_gap_transition_summary.sort(
+        key=lambda x: x["step_gap_median_us"], reverse=True
+    )
 
     # Aggregate across steps by recipe_id and by recipe signature
     by_recipe_id = defaultdict(list)
@@ -324,6 +369,7 @@ def audit_trace(jsonl_path: Path):
         "trace_file": str(jsonl_path),
         "steps_analyzed": len(step_recipe_records),
         "recipe_signature_breakdown": signature_summary,
+        "intra_recipe_gap_transitions": intra_gap_transition_summary,
         "fine_operator_breakdown": fine_op_summary,
     }
 
