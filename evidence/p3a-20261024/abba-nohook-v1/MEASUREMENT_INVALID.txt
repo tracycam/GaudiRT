@@ -1,0 +1,1 @@
+This run has no accepted ABBA summary. All four arms completed, but the direct perf JSON used mode=perf while the summary contract requires mode=direct. The source was corrected and the experiment rerun; do not treat this directory as a completed performance comparison.

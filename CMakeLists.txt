@@ -59,5 +59,10 @@ target_include_directories(p3a_compute_allgather_compute_probe PRIVATE /usr/incl
 target_link_options(p3a_compute_allgather_compute_probe PRIVATE "LINKER:--no-as-needed")
 target_link_libraries(p3a_compute_allgather_compute_probe PRIVATE scal_hook gaudirt scal hl-thunk)
 
+add_executable(p3a_nohook_compute_allgather_compute_probe probes/p3a_compute_allgather_compute_probe.cpp)
+target_compile_definitions(p3a_nohook_compute_allgather_compute_probe PRIVATE GAUDIRT_P3A_NO_HOOK)
+target_include_directories(p3a_nohook_compute_allgather_compute_probe PRIVATE /usr/include/drm)
+target_link_libraries(p3a_nohook_compute_allgather_compute_probe PRIVATE gaudirt scal hl-thunk)
+
 add_executable(gaudirt_runtime_unit_tests tests/runtime_unit_tests.cpp)
 target_link_libraries(gaudirt_runtime_unit_tests PRIVATE gaudirt)

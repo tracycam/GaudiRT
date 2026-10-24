@@ -152,8 +152,12 @@ GaudiRT/
 - 证据：`stable-v1/direct-{1000,6000}/`、`hook-unmap-v1/`、`smoke-1-v5/direct/`、`smoke-2-v1/direct/`、`long-1000-v1/direct-{64,65,129,1000}/` 及各目录 `summary.json/text`。完整 reference 二进制留远端，manifest 与日志本地归档；复现入口为 `scripts/p3a_compute_allgather_compute_driver.sh`，独立门禁汇总为 `scripts/p3a_gate_summary.py`。这些结果仅是正确性证据，尚不构成性能或生产可用结论。
 - 官方同步抓取证据：[`p3a-20261024/sync-capture/native-sync-v2/summary.json`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/evidence/p3a-20261024/sync-capture/native-sync-v2/summary.json) 与同目录原始 trace、8 Rank 校验、环境哈希。复现入口为 `scripts/p3a_sync_capture_driver.sh`，自动判定脚本为 `scripts/p3a_sync_capture_summary.py`。
 
-### 5. 下一阶段范围：先做无拦截器单层性能，不直接跳到 70 层
+### 5. P3a 无拦截器正确性与正式单层性能
 
-- 当前 P3a 通过的是链接 hook 的正确性实验，不能作为正式性能测量。下一步先拆分 capture/replay，使 direct 在无 `LD_PRELOAD`、无拦截器进程中运行，再按 P2a 的同一边界做独立进程 ABBA，分别报告 submit、wall、完成到完成节拍和真实提交次数。
-- 在单层闭环收益实测前，不进入 70 层 P3b，也不把 P2a 的 AllGather 微基准收益外推为整步或 TPOT 收益。
-- 若进入 P3b，目标仍是按流发布的一次逻辑整步，不是全系统一次 `scal_stream_submit`；必须另外验证复杂 Recipe、60 位 long-SO target 进位、CCB 容量/回收和动态形状回退。
+- `p3a_nohook_compute_allgather_compute_probe` 不链接 `libscal_hook`，`LD_PRELOAD` 为空。 hooked 进程只生成 recipe artifact；无 hook replay 在当前进程重做 130 步原生 P3 capture，继承网络模板/HCL 状态，并直接从 CCB 差异逐包重建 compute PI。artifact 不含设备指针或运行时句柄。
+- 无 hook direct 的 1、2、64、65、129、1000、6000 步均通过完整输出、guard、CG/target、PI、提交数和 hash 门禁；6000 步仍有 308,560 次 compute 提交、480,000 次网络提交、8 次 compute 与 1 次 network CCB 回绕。证据为 `nohook-v{1,2}/`、`nohook-long-1000/`、`nohook-wrap-6000/`。
+- 正式 ABBA 使用独立进程、无拦截器、同一份内存 reference cache、无睡眠/成功日志等待及共同验证后的 timestamp。最终两轮结果：
+  - `abba-nohook-v4`：submit 39.030 → 6.415 µs（-83.56%），wall 66.827 → 32.291 µs（-51.68%），完成到完成节拍 160.493 → 120.564 µs（-24.88%）。
+  - `abba-nohook-v5`：submit 40.119 → 6.725 µs（-83.24%），wall 70.821 → 36.443 µs（-48.54%），完成到完成节拍 168.102 → 125.195 µs（-25.52%）。
+- 早期包含 FNV hash 的测量出现 +16.17%/+30.07% 节拍回退；区域诊断把它定位到 hash 段（direct 约 300 µs、native 约 133 µs），而不是设备通信。正式性能已同时移除该诊断开销，correctness 仍保留 hash 链，性能 verdict 明确为 `NOT_MEASURED`。原始回归、区域 CSV、无效标签及最终证据全部保留，不以最终收益覆盖测量错误。
+- 上述结果只覆盖当前单层 FP32 微基准，完成到完成仍含初始化、D2H 和完整校验，不是纯 NIC 时间，也不证明 AllReduce、其它消息大小、70 层或 TPOT 收益。下一阶段仍须先验证复杂 Recipe、60 位 long-SO target 进位、CCB 回收和动态形状回退，再决定 P3b 范围。

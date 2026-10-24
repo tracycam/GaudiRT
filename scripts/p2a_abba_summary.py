@@ -26,9 +26,11 @@ def stats(values):
     }
 
 
-def reject_timed_diagnostics(path):
-    markers = ("[P2A_WAIT]", "[P2A_WAIT_PROGRESS]", "[P2A_SYNC_STATE]",
-               "[P2A_DYNAMIC]")
+def reject_timed_diagnostics(path, protocol):
+    markers = ["[P2A_WAIT]", "[P2A_WAIT_PROGRESS]", "[P2A_SYNC_STATE]",
+               "[P2A_DYNAMIC]"]
+    if protocol == "p3a":
+        markers.extend(["[P3A_STEP]", "[P0_SUBMIT]", "[P0_PHASE]"])
     for line in path.read_text().splitlines():
         if not any(marker in line for marker in markers):
             continue
@@ -37,10 +39,10 @@ def reject_timed_diagnostics(path):
             raise ValueError(f"timed diagnostic found in {path}: {line}")
 
 
-def read_arm(root, label, expected_mode):
+def read_arm(root, label, expected_mode, protocol):
     per_rank = {}
     for rank in range(8):
-        reject_timed_diagnostics(root / label / f"rank{rank}.log")
+        reject_timed_diagnostics(root / label / f"rank{rank}.log", protocol)
         path = root / label / f"rank{rank}_perf.json"
         with path.open() as handle:
             data = json.load(handle)
@@ -89,10 +91,14 @@ def rank_metrics(samples, metric):
 
 
 def main():
-    if len(sys.argv) != 2:
-        raise SystemExit("usage: p2a_abba_summary.py ABBA_DIR")
+    if len(sys.argv) not in (2, 3):
+        raise SystemExit("usage: p2a_abba_summary.py ABBA_DIR [p2a|p3a]")
     root = Path(sys.argv[1])
-    per_arm = {label: read_arm(root, label, mode) for label, mode in ARMS.items()}
+    protocol = sys.argv[2] if len(sys.argv) == 3 else "p2a"
+    if protocol not in ("p2a", "p3a"):
+        raise ValueError(f"unsupported protocol: {protocol}")
+    per_arm = {label: read_arm(root, label, mode, protocol)
+               for label, mode in ARMS.items()}
     metrics = {label: arm_metrics(per_arm[label]) for label in ARMS}
 
     metrics["A"] = {
@@ -132,6 +138,7 @@ def main():
 
     result = {
         "protocol": {
+            "experiment": protocol,
             "schedule": ["A1=native", "B1=direct", "B2=direct", "A2=native"],
             "process_isolation": True,
             "ld_preload": False,
@@ -141,7 +148,7 @@ def main():
             "dtype": "FP32",
             "wait_policy": "nonblocking poll without sleep or success-path logging",
             "timed_loop_diagnostics": "none; template, address, SM/CI and decode checks are excluded",
-            "wall_semantics": "host submit and busy-poll wait to common network CG; not isolated device time",
+            "wall_semantics": "host submit and wait to required CG/compute completion; not isolated device time",
             "span_semantics": "loop cadence including inter-call H2D/D2H and full output verification; not pure device latency",
         },
         "metrics": metrics,

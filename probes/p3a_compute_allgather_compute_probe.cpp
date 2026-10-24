@@ -6,6 +6,10 @@
 #include <sstream>
 
 extern "C" {
+#ifdef GAUDIRT_P3A_NO_HOOK
+void p0_hook_set_enabled(int) {}
+void p0_hook_set_phase(const char*) {}
+#else
 void p0_hook_set_enabled(int en);
 void p0_hook_set_phase(const char* phase_name);
 int p1_extract_recipe_blobs(const char* capture_phase, uint8_t* out_exec_blob,
@@ -19,6 +23,7 @@ int p3a_extract_compute_phase(const char* capture_phase, uint8_t* out_bytes,
                               uint32_t* out_submission_ends,
                               uint32_t* inout_submission_count);
 int p3a_compute_current_pi(uint32_t* out_pi);
+#endif
 }
 
 #define P3A_CHECK_SYN(call)                                                    \
@@ -350,7 +355,8 @@ class ReferenceWriter {
 
 class ReferenceReader {
  public:
-  ReferenceReader(const std::string& directory, uint32_t rank, uint32_t steps) {
+  ReferenceReader(const std::string& directory, uint32_t rank, uint32_t steps,
+                  bool preload = false) {
     const std::string base = directory + "/rank" + std::to_string(rank);
     data_.open(base + "_reference.bin", std::ios::binary);
     std::ifstream manifest(base + "_manifest.tsv");
@@ -369,10 +375,15 @@ class ReferenceReader {
     for (uint32_t i = 0; i < steps; ++i) {
       p3a_check(entries_[i].step == i, "reference manifest step mismatch");
     }
+    if (preload) {
+      records_.reserve(steps);
+      for (uint32_t i = 0; i < steps; ++i) records_.push_back(read(i));
+    }
   }
 
   Record read(uint32_t step) {
     p3a_check(step < entries_.size(), "reference read past manifest");
+    if (step < records_.size()) return records_[step];
     Record record{};
     data_.clear();
     data_.seekg(static_cast<std::streamoff>(step) * kRecordBytes);
@@ -386,6 +397,7 @@ class ReferenceReader {
 
  private:
   std::ifstream data_;
+  std::vector<Record> records_;
   std::vector<ManifestEntry> entries_;
 };
 
@@ -408,6 +420,7 @@ struct RecipeBlobs {
   uint64_t base7 = 0;
 };
 
+#ifndef GAUDIRT_P3A_NO_HOOK
 RecipeBlobs extract_blobs(const char* phase) {
   RecipeBlobs blobs;
   blobs.exec.resize(4096);
@@ -426,6 +439,7 @@ RecipeBlobs extract_blobs(const char* phase) {
   blobs.dynamic.resize(dynamic_size);
   return blobs;
 }
+#endif
 
 uint32_t read32(const std::vector<uint8_t>& bytes, size_t offset) {
   uint32_t value = 0;
@@ -459,6 +473,7 @@ struct NativeComputeCapture {
   uint64_t original_dynamic = 0;
 };
 
+#ifndef GAUDIRT_P3A_NO_HOOK
 NativeComputeCapture extract_compute(const char* phase, bool need_external_wait) {
   std::vector<uint8_t> bytes(16384);
   std::vector<uint32_t> ends(64);
@@ -535,6 +550,7 @@ NativeComputeCapture extract_compute(const char* phase, bool need_external_wait)
             "missing post network external wait");
   return result;
 }
+#endif
 
 struct RelocatedRecipe {
   NativeComputeCapture capture;
@@ -551,12 +567,156 @@ struct RelocatedRecipe {
   void* staging = nullptr;
 };
 
+void artifact_write_u64(std::ofstream& out, uint64_t value) {
+  out.write(reinterpret_cast<const char*>(&value), sizeof(value));
+}
+
+void artifact_write_bytes(std::ofstream& out,
+                          const std::vector<uint8_t>& bytes) {
+  artifact_write_u64(out, bytes.size());
+  out.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+}
+
+uint64_t artifact_read_u64(std::ifstream& in) {
+  uint64_t value = 0;
+  in.read(reinterpret_cast<char*>(&value), sizeof(value));
+  p3a_check(in.good(), "truncated recipe artifact integer");
+  return value;
+}
+
+std::vector<uint8_t> artifact_read_bytes(std::ifstream& in, size_t max_bytes) {
+  const uint64_t size = artifact_read_u64(in);
+  p3a_check(size <= max_bytes, "recipe artifact byte vector is too large");
+  std::vector<uint8_t> bytes(size);
+  in.read(reinterpret_cast<char*>(bytes.data()), size);
+  p3a_check(in.good(), "truncated recipe artifact bytes");
+  return bytes;
+}
+
+void artifact_write_recipe(std::ofstream& out, const RelocatedRecipe& recipe) {
+  artifact_write_u64(out, recipe.capture.original_dynamic);
+  artifact_write_u64(out, recipe.capture.submissions.size());
+  for (const auto& submission : recipe.capture.submissions) {
+    artifact_write_bytes(out, submission);
+  }
+  artifact_write_bytes(out, recipe.capture.external_wait);
+  for (const uint64_t base : {recipe.blobs.base0, recipe.blobs.base1,
+                              recipe.blobs.base2, recipe.blobs.base7}) {
+    artifact_write_u64(out, base);
+  }
+  artifact_write_bytes(out, recipe.blobs.exec);
+  artifact_write_bytes(out, recipe.blobs.patch);
+  artifact_write_bytes(out, recipe.blobs.dynamic);
+  for (const int offset : recipe.tensor_offsets) {
+    p3a_check(offset >= 0, "negative recipe artifact tensor offset");
+    artifact_write_u64(out, static_cast<uint32_t>(offset));
+  }
+  artifact_write_u64(out, recipe.kernel_offsets.size());
+  for (const uint32_t offset : recipe.kernel_offsets) {
+    artifact_write_u64(out, offset);
+  }
+}
+
+RelocatedRecipe artifact_read_recipe(std::ifstream& in, bool post) {
+  RelocatedRecipe recipe;
+  recipe.capture.original_dynamic = artifact_read_u64(in);
+  const uint64_t submission_count = artifact_read_u64(in);
+  p3a_check(submission_count > 0 && submission_count <= 64,
+            "invalid recipe artifact publication count");
+  for (uint64_t i = 0; i < submission_count; ++i) {
+    recipe.capture.submissions.push_back(artifact_read_bytes(in, 16384));
+  }
+  recipe.capture.external_wait = artifact_read_bytes(in, 16);
+  for (uint64_t* base : {&recipe.blobs.base0, &recipe.blobs.base1,
+                         &recipe.blobs.base2, &recipe.blobs.base7}) {
+    *base = artifact_read_u64(in);
+  }
+  recipe.blobs.exec = artifact_read_bytes(in, 4096);
+  recipe.blobs.patch = artifact_read_bytes(in, 4096);
+  recipe.blobs.dynamic = artifact_read_bytes(in, 65536);
+  for (int& offset : recipe.tensor_offsets) {
+    offset = static_cast<int>(artifact_read_u64(in));
+  }
+  const uint64_t kernel_count = artifact_read_u64(in);
+  p3a_check(kernel_count == 2, "invalid recipe artifact kernel offset count");
+  for (uint64_t i = 0; i < kernel_count; ++i) {
+    recipe.kernel_offsets.push_back(
+        static_cast<uint32_t>(artifact_read_u64(in)));
+  }
+
+  p3a_check(recipe.blobs.exec.size() <= 0x200 &&
+                recipe.blobs.patch.size() <= 0x200 &&
+                recipe.blobs.dynamic.size() <= 0x9000 &&
+                recipe.blobs.base7 >= recipe.blobs.base2 &&
+                recipe.capture.external_wait.size() == (post ? 16U : 0U),
+            "invalid recipe artifact metadata");
+  size_t packet_count = 0;
+  size_t payload_bytes = 0;
+  for (const auto& submission : recipe.capture.submissions) {
+    size_t offset = 0;
+    while (offset < submission.size()) {
+      const size_t size = gaudirt::scal::compute_packet_size(
+          submission.data() + offset, submission.size() - offset);
+      p3a_check(size != 0, "invalid recipe artifact compute packet");
+      ++packet_count;
+      payload_bytes += size;
+      offset += size;
+    }
+  }
+  p3a_check(packet_count == 6 && payload_bytes == 80,
+            "invalid recipe artifact command payload");
+  return recipe;
+}
+
+std::array<RelocatedRecipe, 2> g_recipe_artifacts;
+bool g_recipe_artifacts_loaded = false;
+
+void write_recipe_artifacts(const std::string& directory, uint32_t rank,
+                            const RelocatedRecipe& pre,
+                            const RelocatedRecipe& post) {
+  const std::string path =
+      directory + "/rank" + std::to_string(rank) + "_recipe_artifact.bin";
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  p3a_check(out.is_open(), "recipe artifact output open failed");
+  const char magic[8] = {'P', '3', 'A', 'A', 'R', 'T', '0', '1'};
+  out.write(magic, sizeof(magic));
+  artifact_write_u64(out, rank);
+  artifact_write_u64(out, 2);
+  artifact_write_recipe(out, pre);
+  artifact_write_recipe(out, post);
+  out.close();
+  p3a_check(out.good(), "recipe artifact write failed");
+}
+
+void load_recipe_artifacts(const std::string& directory, uint32_t rank) {
+  const std::string path =
+      directory + "/rank" + std::to_string(rank) + "_recipe_artifact.bin";
+  std::ifstream in(path, std::ios::binary);
+  p3a_check(in.is_open(), "recipe artifact input open failed");
+  char magic[8]{};
+  in.read(magic, sizeof(magic));
+  p3a_check(in.good() && std::memcmp(magic, "P3AART01", 8) == 0,
+            "invalid recipe artifact magic");
+  p3a_check(artifact_read_u64(in) == rank && artifact_read_u64(in) == 2,
+            "recipe artifact rank or recipe count mismatch");
+  g_recipe_artifacts[0] = artifact_read_recipe(in, false);
+  g_recipe_artifacts[1] = artifact_read_recipe(in, true);
+  p3a_check(in.peek() == std::ifstream::traits_type::eof(),
+            "recipe artifact has trailing data");
+  g_recipe_artifacts_loaded = true;
+}
+
 RelocatedRecipe prepare_recipe(const char* phase,
                                const NativeComputeCapture& capture,
                                RankRuntime& rt,
                                const std::array<P3aBufferSet*, 2>& sets,
                                bool pre, std::ofstream& log) {
   RelocatedRecipe result;
+#ifdef GAUDIRT_P3A_NO_HOOK
+  (void)capture;
+  p3a_check(g_recipe_artifacts_loaded, "recipe artifacts were not loaded");
+  result = g_recipe_artifacts[pre ? 0 : 1];
+#else
   result.capture = capture;
   result.blobs = extract_blobs(phase);
   const RecipeBlobs cold =
@@ -600,6 +760,7 @@ RelocatedRecipe prepare_recipe(const char* phase,
   }
   p3a_check(result.kernel_offsets.size() == 2,
             "unexpected recipe kernel patch offset count");
+#endif
 
   P3A_CHECK_SYN(synDeviceMalloc(rt.device(), 65536, 0, 0, &result.raw_hbm));
   result.exec_hbm = (result.raw_hbm + 0x1FFFULL) & ~0x1FFFULL;
@@ -691,13 +852,44 @@ class ComputeReplay {
     P3A_CHECK_SCAL(scal_get_completion_group_handle_by_name(
         rt.scal(), "compute_completion_queue0", &cg_));
     read_expected();
+#ifdef GAUDIRT_P3A_NO_HOOK
+    next_pi_ = info_.current_pi;
+    p3a_check(next_pi_ < kComputeCcbBytes, "invalid initial compute PI");
+    const auto* ccb = static_cast<const uint8_t*>(buffer_.host_address);
+    initial_ccb_.assign(ccb, ccb + kComputeCcbBytes);
+#endif
   }
 
   void set_pre_recipe(RelocatedRecipe* recipe) { pre_ = recipe; }
   void set_post_recipe(RelocatedRecipe* recipe) { post_ = recipe; }
 
   void finish_native_capture() {
+#ifdef GAUDIRT_P3A_NO_HOOK
+    const uint8_t* ccb = static_cast<const uint8_t*>(buffer_.host_address);
+    p3a_check(initial_ccb_.size() == kComputeCcbBytes &&
+                  std::memcmp(initial_ccb_.data(), ccb, next_pi_) == 0,
+              "compute CCB prefix changed during native capture");
+    uint32_t last_diff = next_pi_;
+    bool found_diff = false;
+    for (uint32_t offset = next_pi_; offset < kComputeCcbBytes; ++offset) {
+      if (initial_ccb_[offset] != ccb[offset]) {
+        last_diff = offset;
+        found_diff = true;
+      }
+    }
+    if (found_diff) {
+      uint32_t offset = next_pi_;
+      while (offset <= last_diff) {
+        const size_t size = gaudirt::scal::compute_packet_size(
+            ccb + offset, kComputeCcbBytes - offset);
+        p3a_check(size != 0, "invalid compute packet during PI reconstruction");
+        offset += static_cast<uint32_t>(size);
+      }
+      next_pi_ = offset;
+    }
+#else
     P3A_CHECK_SCAL(p3a_compute_current_pi(&next_pi_));
+#endif
     read_expected();
     log_ << "[P3A_COMPUTE_INIT] next_pi=0x" << std::hex << next_pi_
          << " expected=" << std::dec << expected_ << std::endl;
@@ -787,6 +979,18 @@ class ComputeReplay {
     }
   }
 
+  void wait_for_perf(uint64_t target) {
+    const auto start = std::chrono::steady_clock::now();
+    for (;;) {
+      const int rc = scal_completion_group_wait(cg_, target, 0);
+      if (rc == SCAL_SUCCESS) return;
+      p3a_check(rc == SCAL_TIMED_OUT, "compute completion wait failed");
+      const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - start);
+      p3a_check(elapsed.count() < 65000, "compute completion wait timed out");
+    }
+  }
+
   uint64_t current() {
     scal_completion_group_infoV2_t info{};
     P3A_CHECK_SCAL(scal_completion_group_get_infoV2(cg_, &info));
@@ -860,6 +1064,7 @@ class ComputeReplay {
   RelocatedRecipe* pre_ = nullptr;
   RelocatedRecipe* post_ = nullptr;
   uint32_t next_pi_ = 0;
+  std::vector<uint8_t> initial_ccb_;
   uint64_t expected_ = 0;
   uint64_t submit_calls_ = 0;
   uint64_t boundary_calls_ = 0;
@@ -915,9 +1120,92 @@ int run_reference_rank(uint32_t rank, SharedCoord* shm,
   return 0;
 }
 
+void write_p3a_perf_samples(const std::string& log_dir, uint32_t rank,
+                            const std::string& mode,
+                            const std::vector<PerfSample>& samples) {
+  p3a_check(samples.size() == 130, "P3a performance sample count mismatch");
+  std::vector<double> submit_us;
+  std::vector<double> wall_us;
+  std::vector<double> span_us;
+  for (size_t i = 0; i < samples.size(); ++i) {
+    p3a_check(samples[i].submit_us > 0 && samples[i].wall_us > 0 &&
+                  samples[i].completion_ns > 0,
+              "invalid P3a performance sample");
+    submit_us.push_back(samples[i].submit_us);
+    wall_us.push_back(samples[i].wall_us);
+    if (i) {
+      p3a_check(samples[i].completion_ns >= samples[i - 1].completion_ns,
+                "P3a completion timestamps are not monotonic");
+      span_us.push_back(
+          (samples[i].completion_ns - samples[i - 1].completion_ns) / 1000.0);
+    }
+  }
+  const auto submit_stats = gaudirt::common::summarize(submit_us);
+  const auto wall_stats = gaudirt::common::summarize(wall_us);
+  const auto span_stats = gaudirt::common::summarize(span_us);
+  std::ofstream json(log_dir + "/rank" + std::to_string(rank) + "_perf.json",
+                     std::ios::out | std::ios::trunc);
+  json << std::fixed << std::setprecision(6);
+  json << "{\"rank\":" << rank << ",\"mode\":\"" << mode
+       << "\",\"samples\":[";
+  for (size_t i = 0; i < samples.size(); ++i) {
+    if (i) json << ',';
+    json << "{\"index\":" << 130 + i << ",\"submit_us\":"
+         << samples[i].submit_us << ",\"wall_us\":" << samples[i].wall_us
+         << ",\"completion_ns\":" << samples[i].completion_ns << '}';
+  }
+  json << "],\"summary\":{\"submit_p50_us\":" << submit_stats.p50
+       << ",\"wall_p50_us\":" << wall_stats.p50
+       << ",\"completion_to_completion_p50_us\":" << span_stats.p50
+       << ",\"submit_mean_us\":" << submit_stats.mean
+       << ",\"wall_mean_us\":" << wall_stats.mean
+       << ",\"completion_to_completion_mean_us\":" << span_stats.mean
+       << ",\"submit_max_us\":" << submit_stats.max
+       << ",\"wall_max_us\":" << wall_stats.max
+       << ",\"completion_to_completion_max_us\":" << span_stats.max << "}}\n";
+  if (rank == 0) {
+    std::fprintf(stderr,
+                 "[P3A_PERF_SUMMARY] mode=%s count=130 submit_p50_us=%.3f "
+                 "wall_p50_us=%.3f completion_to_completion_p50_us=%.3f\n",
+                 mode.c_str(), submit_stats.p50, wall_stats.p50, span_stats.p50);
+  }
+}
+
+struct P3aRegionSample {
+  double initialize_us = 0;
+  double submit_us = 0;
+  double wait_us = 0;
+  double readback_us = 0;
+  double verify_us = 0;
+  double tail_us = 0;
+  double reference_read_us = 0;
+  double memcmp_us = 0;
+  double hash_us = 0;
+  double manifest_us = 0;
+};
+
+void write_p3a_region_samples(const std::string& log_dir, uint32_t rank,
+                              const std::string& mode,
+                              const std::vector<P3aRegionSample>& samples) {
+  if (rank != 0) return;
+  std::ofstream out(log_dir + "/rank0_regions.csv", std::ios::out | std::ios::trunc);
+  out << "step,initialize_us,submit_us,wait_us,readback_us,verify_us,tail_us,"
+         "reference_read_us,memcmp_us,hash_us,manifest_us\n";
+  out << std::fixed << std::setprecision(6);
+  for (size_t i = 0; i < samples.size(); ++i) {
+    const auto& sample = samples[i];
+    out << i << ',' << sample.initialize_us << ',' << sample.submit_us << ','
+        << sample.wait_us << ',' << sample.readback_us << ','
+        << sample.verify_us << ',' << sample.tail_us << ','
+        << sample.reference_read_us << ',' << sample.memcmp_us << ','
+        << sample.hash_us << ',' << sample.manifest_us << '\n';
+  }
+}
+
 int run_direct_rank(uint32_t rank, SharedCoord* shm,
-                    const std::string& data_dir, const std::string& log_dir,
-                    uint32_t steps) {
+                    const std::string& mode, const std::string& data_dir,
+                    const std::string& log_dir, uint32_t steps) {
+  const bool region_timings = std::getenv("P3A_REGION_TIMINGS") != nullptr;
   int sense = 0;
   if (rank == 7) {
     const std::string path = log_dir + "/rank7_scal_trace.log";
@@ -1006,25 +1294,104 @@ int run_direct_rank(uint32_t rank, SharedCoord* shm,
     }
   }
 
+  if (mode == "native") {
+    ReferenceReader reader(data_dir, rank, steps, true);
+    std::vector<PerfSample> samples;
+    samples.reserve(steps);
+    std::vector<P3aRegionSample> regions;
+    if (region_timings) regions.reserve(steps);
+    for (uint32_t step = 0; step < steps; ++step) {
+      const double initialize_start =
+          region_timings ? gaudirt::common::now_us() : 0;
+      a.initialize(rt.verification_stream(), rank, step);
+      b.initialize(rt.verification_stream(), rank, step);
+      P3A_CHECK_SYN(synStreamSynchronize(rt.verification_stream()));
+      P3aBufferSet& set = (step & 1) ? b : a;
+      PerfSample sample;
+      sample.slot = rt.register_timestamp(130 + step + 1);
+      const double t0 = gaudirt::common::now_us();
+      pre.launch(rt.stream(), set.a(), set.b(), set.send());
+      P2A_CHECK_HCCL(hcclAllGather(
+          reinterpret_cast<const void*>(set.send()),
+          reinterpret_cast<void*>(set.recv()), kCount, hcclFloat32,
+          rt.comm(), rt.stream()));
+      post.launch(rt.stream(), set.recv(), set.b_large(), set.out());
+      const double t1 = gaudirt::common::now_us();
+      P3A_CHECK_SYN(synStreamSynchronize(rt.stream()));
+      const double t2 = gaudirt::common::now_us();
+      sample.submit_us = t1 - t0;
+      sample.wall_us = t2 - t0;
+
+      const Record actual = set.readback(rt.verification_stream());
+      const double readback_end =
+          region_timings ? gaudirt::common::now_us() : 0;
+      const Record expected = reader.read(step);
+      const double reference_end =
+          region_timings ? gaudirt::common::now_us() : 0;
+      compare_reference(expected, actual, step, rank);
+      const double memcmp_end = region_timings ? gaudirt::common::now_us() : 0;
+      const double hash_end = memcmp_end;
+      const double verify_end = region_timings ? gaudirt::common::now_us() : 0;
+      sample.completion_ns = rt.timestamp_at_when_ready(sample.slot);
+      samples.push_back(sample);
+      p3a_check(host_barrier(shm, sense), "native performance barrier failed");
+      if (region_timings) {
+        const double tail_end = gaudirt::common::now_us();
+        regions.push_back({t0 - initialize_start, t1 - t0, t2 - t1,
+                           readback_end - t2, verify_end - readback_end,
+                           tail_end - verify_end,
+                           reference_end - readback_end,
+                           memcmp_end - reference_end, hash_end - memcmp_end,
+                           verify_end - hash_end});
+      }
+    }
+    write_p3a_perf_samples(log_dir, rank, mode, samples);
+    if (region_timings) write_p3a_region_samples(log_dir, rank, mode, regions);
+    log << "[P3A_NATIVE_VERDICT] rank=" << rank
+        << " native_steps=" << steps << " syn_launch_calls=" << 2 * steps
+        << " hccl_allgather_calls=" << steps
+        << " output_memcmp=PASS guard_memcmp=PASS hash_chain=NOT_MEASURED"
+        << std::endl;
+    std::_Exit(0);
+  }
+
+#ifndef GAUDIRT_P3A_NO_HOOK
   NativeComputeCapture pre_capture =
       extract_compute("P3A_WARM_PRE", false);
   NativeComputeCapture post_capture =
       extract_compute("P3A_WARM_POST", true);
+#else
+  NativeComputeCapture pre_capture{};
+  NativeComputeCapture post_capture{};
+  load_recipe_artifacts(data_dir, rank);
+#endif
   RelocatedRecipe pre_recipe =
       prepare_recipe("P3A_WARM_PRE", pre_capture, rt, sets, true, log);
   RelocatedRecipe post_recipe =
       prepare_recipe("P3A_WARM_POST", post_capture, rt, sets, false, log);
+  if (mode == "artifact") {
+    write_recipe_artifacts(data_dir, rank, pre_recipe, post_recipe);
+    log << "[P3A_ARTIFACT] rank=" << rank << " status=PASS" << std::endl;
+    std::_Exit(0);
+  }
   compute.set_pre_recipe(&pre_recipe);
   compute.set_post_recipe(&post_recipe);
   compute.finish_native_capture();
   p0_hook_set_enabled(0);
   p0_hook_set_phase("BENCH");
 
-  ReferenceReader reader(data_dir, rank, steps);
+  const bool perf = mode == "perf";
+  ReferenceReader reader(data_dir, rank, steps, perf);
+  std::vector<PerfSample> samples;
+  if (perf) samples.reserve(steps);
+  std::vector<P3aRegionSample> regions;
+  if (region_timings) regions.reserve(steps);
   uint64_t chain = kFnvOffset;
   uint64_t compute_wraps = 0;
   uint64_t network_wraps = 0;
   for (uint32_t step = 0; step < steps; ++step) {
+    const double initialize_start =
+        region_timings ? gaudirt::common::now_us() : 0;
     a.initialize(rt.verification_stream(), rank, step);
     b.initialize(rt.verification_stream(), rank, step);
     P3A_CHECK_SYN(synStreamSynchronize(rt.verification_stream()));
@@ -1038,6 +1405,9 @@ int run_direct_rank(uint32_t rank, SharedCoord* shm,
     p3a_check(post_target <= 0x7FFF && external_wait_target <= 0x7FFF,
               "direct long-SO target exceeds 15 bits");
 
+    PerfSample sample;
+    if (perf) sample.slot = rt.register_timestamp(global_index + 1);
+    const double t0 = perf ? gaudirt::common::now_us() : 0;
     auto writer = compute.writer();
     const uint32_t step_start_pi = writer.pi();
     compute.set_expected(post_target);
@@ -1057,28 +1427,51 @@ int run_direct_rank(uint32_t rank, SharedCoord* shm,
 
     const auto& replay_template = calls[66 + (step % 64)];
     CallCapture actual = rt.replay(replay_template, global_index, set.send(),
-                                   set.recv(), nullptr,
+                                   set.recv(), perf ? &sample : nullptr,
                                    static_cast<uint32_t>(pre_target), false,
                                    false);
     p3a_check(actual.external_target == external_wait_target,
               "network external target changed before post wait");
-    validate_addresses(actual, rank);
+    if (!perf) validate_addresses(actual, rank);
 
     const auto step_stats = writer.stats();
     compute.finish_step(writer);
+    const double t1 = perf ? gaudirt::common::now_us() : 0;
 
-    rt.wait_network(actual, global_index, false);
-    compute.wait(post_target, global_index);
+    if (perf) {
+      rt.wait_network_targets(actual, global_index, false);
+      compute.wait_for_perf(post_target);
+    } else {
+      rt.wait_network(actual, global_index, false);
+      compute.wait(post_target, global_index);
+    }
+    const double t2 = perf ? gaudirt::common::now_us() : 0;
+    sample.submit_us = t1 - t0;
+    sample.wall_us = t2 - t0;
     p3a_check(compute.current() == post_target,
               "compute completion current value mismatch");
     const Record actual_record = set.readback(rt.verification_stream());
+    const double readback_end =
+        region_timings ? gaudirt::common::now_us() : 0;
     const Record expected_record = reader.read(step);
+    const double reference_end =
+        region_timings ? gaudirt::common::now_us() : 0;
     compare_reference(expected_record, actual_record, step, rank);
-    const uint64_t hash = record_hash(actual_record);
-    chain = chain_hash(chain, step, actual_record);
-    p3a_check(hash == reader.entry(step).record &&
-                  chain == reader.entry(step).chain,
-              "direct hash chain mismatch");
+    const double memcmp_end = region_timings ? gaudirt::common::now_us() : 0;
+    uint64_t hash = 0;
+    if (!perf) {
+      hash = record_hash(actual_record);
+      chain = chain_hash(chain, step, actual_record);
+      p3a_check(hash == reader.entry(step).record &&
+                    chain == reader.entry(step).chain,
+                "direct hash chain mismatch");
+    }
+    const double hash_end = region_timings ? gaudirt::common::now_us() : 0;
+    const double verify_end = region_timings ? gaudirt::common::now_us() : 0;
+    if (perf) {
+      sample.completion_ns = rt.timestamp_at_when_ready(sample.slot);
+      samples.push_back(sample);
+    }
 
     if (step_start_pi / kComputeCcbBytes != post_end_pi / kComputeCcbBytes) {
       ++compute_wraps;
@@ -1089,25 +1482,37 @@ int run_direct_rank(uint32_t rank, SharedCoord* shm,
         ++network_wraps;
       }
     }
-    log << "[P3A_STEP] rank=" << rank << " step=" << step
-        << " set=" << set_index << " pre_target=" << pre_target
-        << " post_target=" << post_target
-        << " post_wait_target=" << external_wait_target
-        << " external_target=" << actual.external_target
-        << " internal_target=" << actual.internal_target
-        << " pre_pi=0x" << std::hex << pre_start_pi << ":0x" << pre_end_pi
-        << " wait_pi=0x" << wait_start_pi << ":0x" << wait_end_pi
-        << " post_pi=0x" << post_start_pi << ":0x" << post_end_pi << std::dec
-        << " compute_submissions=" << step_stats.submit_calls
-        << " compute_boundary_submissions=" << step_stats.boundary_submit_calls
-        << " network_submissions=" << actual.streams.size()
-        << " compute_nop_bytes=" << step_stats.nop_bytes
-        << " record_fnv1a64=" << hex64(hash)
-        << " chain_fnv1a64=" << hex64(chain)
-        << " memcmp=PASS guard=PASS" << std::endl;
+    if (!perf) {
+      log << "[P3A_STEP] rank=" << rank << " step=" << step
+          << " set=" << set_index << " pre_target=" << pre_target
+          << " post_target=" << post_target
+          << " post_wait_target=" << external_wait_target
+          << " external_target=" << actual.external_target
+          << " internal_target=" << actual.internal_target
+          << " pre_pi=0x" << std::hex << pre_start_pi << ":0x" << pre_end_pi
+          << " wait_pi=0x" << wait_start_pi << ":0x" << wait_end_pi
+          << " post_pi=0x" << post_start_pi << ":0x" << post_end_pi << std::dec
+          << " compute_submissions=" << step_stats.submit_calls
+          << " compute_boundary_submissions=" << step_stats.boundary_submit_calls
+          << " network_submissions=" << actual.streams.size()
+          << " compute_nop_bytes=" << step_stats.nop_bytes
+          << " record_fnv1a64=" << hex64(hash)
+          << " chain_fnv1a64=" << hex64(chain)
+          << " memcmp=PASS guard=PASS" << std::endl;
+    }
     p3a_check(host_barrier(shm, sense), "direct step barrier failed");
-    if (rank == 0 && (step == 0 || step == 1 || step == 63 || step == 64 ||
-                      step == 128 || step + 1 == steps)) {
+    if (region_timings) {
+      const double tail_end = gaudirt::common::now_us();
+      regions.push_back({t0 - initialize_start, t1 - t0, t2 - t1,
+                         readback_end - t2, verify_end - readback_end,
+                         tail_end - verify_end,
+                         reference_end - readback_end,
+                         memcmp_end - reference_end, hash_end - memcmp_end,
+                         verify_end - hash_end});
+    }
+    if (!perf && rank == 0 &&
+        (step == 0 || step == 1 || step == 63 || step == 64 ||
+         step == 128 || step + 1 == steps)) {
       std::fprintf(stderr,
                    "[P3A_PROGRESS] mode=direct step=%u pre_target=%llu "
                    "post_target=%llu chain=%s\n",
@@ -1117,6 +1522,8 @@ int run_direct_rank(uint32_t rank, SharedCoord* shm,
     }
   }
 
+  if (perf) write_p3a_perf_samples(log_dir, rank, "direct", samples);
+  if (region_timings) write_p3a_region_samples(log_dir, rank, mode, regions);
   p3a_check(rt.direct_submit_calls() == 10ULL * steps,
             "direct network submit count mismatch");
   p3a_check(compute.submit_calls() >= 5ULL * steps,
@@ -1128,14 +1535,15 @@ int run_direct_rank(uint32_t rank, SharedCoord* shm,
       << rt.direct_submit_calls() << " compute_wraps=" << compute_wraps
       << " network_wraps=" << network_wraps << " compute_nop_bytes="
       << compute.nop_bytes() << " network_nop_bytes=" << rt.direct_nop_bytes()
-      << " output_memcmp=PASS guard_memcmp=PASS hash_chain=PASS" << std::endl;
+      << " output_memcmp=PASS guard_memcmp=PASS hash_chain=" << (perf ? "NOT_MEASURED" : "PASS") << std::endl;
   if (rank == 0) {
     std::fprintf(stderr,
                  "[P3A_DIRECT_VERDICT] ranks=8 direct_steps=%u "
                  "compute_submissions=%llu network_submissions=%llu "
-                 "output_memcmp=PASS guard_memcmp=PASS hash_chain=PASS\n",
+                 "output_memcmp=PASS guard_memcmp=PASS hash_chain=%s\n",
                  steps, static_cast<unsigned long long>(compute.submit_calls()),
-                 static_cast<unsigned long long>(rt.direct_submit_calls()));
+                 static_cast<unsigned long long>(rt.direct_submit_calls()),
+                 perf ? "NOT_MEASURED" : "PASS");
   }
   log.flush();
   std::_Exit(0);
@@ -1155,7 +1563,8 @@ int run_all(const std::string& mode, const std::string& data_dir,
     if (pid == 0) {
       const int rc = mode == "reference"
                          ? run_reference_rank(rank, shm, data_dir, steps)
-                         : run_direct_rank(rank, shm, data_dir, log_dir, steps);
+                         : run_direct_rank(rank, shm, mode, data_dir, log_dir,
+                                           steps);
       std::_Exit(rc);
     }
     p3a_check(pid > 0, "rank fork failed");
@@ -1192,7 +1601,7 @@ int run_all(const std::string& mode, const std::string& data_dir,
     std::ofstream verdict(log_dir + "/verdict.json", std::ios::out | std::ios::trunc);
     verdict << "{\"verdict\":\"PASS\",\"mode\":\"" << mode
             << "\",\"ranks\":8,\"steps\":" << steps
-            << ",\"native_capture_steps\":" << (mode == "direct" ? 130 : 0)
+            << ",\"native_capture_steps\":" << (mode == "reference" ? 0 : 130)
             << ",\"output_bytes_per_rank_step\":32768"
             << ",\"guard_bytes_per_rank_step\":512}\n";
   }
@@ -1217,13 +1626,16 @@ int main(int argc, char** argv) {
       steps = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 0));
     } else {
       std::fprintf(stderr,
-                   "usage: %s --mode reference|direct --steps N --data-dir PATH "
-                   "--log-dir PATH\n",
+                   "usage: %s --mode reference|direct|artifact|native|perf "
+                   "--steps N --data-dir PATH --log-dir PATH\n",
                    argv[0]);
       return 2;
     }
   }
-  if ((mode != "reference" && mode != "direct") || steps == 0 || steps > 6000 ||
+  const bool performance = mode == "native" || mode == "perf";
+  if ((mode != "reference" && mode != "direct" && mode != "artifact" &&
+       !performance) ||
+      steps == 0 || steps > 6000 || (performance && steps > 130) ||
       data_dir.empty() || log_dir.empty()) {
     std::fprintf(stderr, "invalid P3a arguments\n");
     return 2;

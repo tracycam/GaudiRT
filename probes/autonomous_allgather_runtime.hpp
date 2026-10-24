@@ -285,6 +285,7 @@ class RankRuntime {
   synDeviceId device() const { return device_; }
   synStreamHandle stream() const { return stream_; }
   synStreamHandle verification_stream() const { return runtime_->h2d_stream(); }
+  hcclComm_t comm() const { return runtime_->comm(); }
   scal_handle_t scal() const { return scal_; }
   uint64_t global_hbm_base() const { return global_hbm_base_; }
   uint64_t next_external_target() const { return external_.expected + 1; }
