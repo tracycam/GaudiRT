@@ -1,0 +1,4 @@
+verdict=PASS scope=autonomous_correctness ranks=8 direct_steps=65
+compute_submissions=3336 network_submissions=5200
+rank0_compute_wraps=0 rank0_network_wraps=0 rank0_final_chain=8ee615d9ec6995ae
+rank0_external_wait_chunk1_writes=0 rank0_monitor_chunk1_writes=0 rank0_monitor_high_chunk_writes=0

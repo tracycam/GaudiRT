@@ -1,0 +1,20 @@
+[ 55%] Built target gaudirt
+[ 77%] Built target scal_hook
+[ 88%] Building CXX object CMakeFiles/p3a_compute_allgather_compute_probe.dir/probes/p3a_compute_allgather_compute_probe.cpp.o
+/home/ai/GaudiRT-longso-exp/probes/p3a_compute_allgather_compute_probe.cpp: In function ‘void {anonymous}::write_p3a_region_samples(const std::string&, uint32_t, const std::string&, const std::vector<P3aRegionSample>&)’:
+/home/ai/GaudiRT-longso-exp/probes/p3a_compute_allgather_compute_probe.cpp:1188:50: warning: unused parameter ‘mode’ [-Wunused-parameter]
+ 1188 |                               const std::string& mode,
+      |                               ~~~~~~~~~~~~~~~~~~~^~~~
+/home/ai/GaudiRT-longso-exp/probes/p3a_compute_allgather_compute_probe.cpp: At global scope:
+/home/ai/GaudiRT-longso-exp/probes/p3a_compute_allgather_compute_probe.cpp:691:6: warning: ‘void {anonymous}::load_recipe_artifacts(const std::string&, uint32_t)’ defined but not used [-Wunused-function]
+  691 | void load_recipe_artifacts(const std::string& directory, uint32_t rank) {
+      |      ^~~~~~~~~~~~~~~~~~~~~
+In file included from /home/ai/GaudiRT-longso-exp/probes/p3a_compute_allgather_compute_probe.cpp:2:
+/home/ai/GaudiRT-longso-exp/probes/autonomous_allgather_runtime.hpp:1117:6: warning: ‘bool {anonymous}::compare_cycles(const CallCapture&, const CallCapture&, std::string&)’ defined but not used [-Wunused-function]
+ 1117 | bool compare_cycles(const CallCapture& a, const CallCapture& b,
+      |      ^~~~~~~~~~~~~~
+/home/ai/GaudiRT-longso-exp/probes/autonomous_allgather_runtime.hpp:967:6: warning: ‘void {anonymous}::validate_monitor_progress(const std::vector<CallCapture>&)’ defined but not used [-Wunused-function]
+  967 | void validate_monitor_progress(const std::vector<CallCapture>& calls) {
+      |      ^~~~~~~~~~~~~~~~~~~~~~~~~
+[100%] Linking CXX executable p3a_compute_allgather_compute_probe
+[100%] Built target p3a_compute_allgather_compute_probe

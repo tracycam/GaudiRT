@@ -12,6 +12,8 @@ DATA_DIR="$3"
 OUT="$4"
 ROOT="${GAUDIRT_ROOT:-$HOME/GaudiRT}"
 NO_HOOK="${P3A_NO_HOOK:-0}"
+BUILD_DIR="${P3A_BUILD_DIR:-$ROOT/build}"
+TIMEOUT_S="${P3A_TIMEOUT_S:-900}"
 
 if [[ "$MODE" != reference && "$MODE" != direct && "$MODE" != artifact &&
       "$MODE" != native && "$MODE" != perf ]]; then
@@ -27,19 +29,19 @@ if [[ "$NO_HOOK" != 1 && ( "$MODE" == native || "$MODE" == perf ) ]]; then
     exit 2
 fi
 if [[ "$NO_HOOK" == 1 ]]; then
-    BIN="$ROOT/build/p3a_nohook_compute_allgather_compute_probe"
+    BIN="$BUILD_DIR/p3a_nohook_compute_allgather_compute_probe"
     TARGET="p3a_nohook_compute_allgather_compute_probe"
 else
-    BIN="$ROOT/build/p3a_compute_allgather_compute_probe"
+    BIN="$BUILD_DIR/p3a_compute_allgather_compute_probe"
     TARGET="p3a_compute_allgather_compute_probe"
 fi
 mkdir -p "$DATA_DIR" "$OUT"
-cmake -S "$ROOT" -B "$ROOT/build"
-cmake --build "$ROOT/build" --target "$TARGET" -j8
+cmake -S "$ROOT" -B "$BUILD_DIR"
+cmake --build "$BUILD_DIR" --target "$TARGET" -j8
 hl-smi > "$OUT/hl-smi.txt"
 
 set +e
-timeout -k 10s 900s env \
+timeout -k 10s "${TIMEOUT_S}s" env \
     GC_KERNEL_PATH=/usr/lib/habanalabs/libtpc_kernels.so \
     HABANA_LOGS="$OUT/habana-logs" \
     "$BIN" --mode "$MODE" --steps "$STEPS" \
@@ -54,7 +56,7 @@ set -e
     uname -a
     printf 'probe_exit_code=%d\n' "$rc"
     printf 'mode=%s steps=%s no_hook=%s\n' "$MODE" "$STEPS" "$NO_HOOK"
-    printf 'binary=%s\n' "$BIN"
+    printf 'binary=%s\nbuild_dir=%s\ntimeout_s=%s\n' "$BIN" "$BUILD_DIR" "$TIMEOUT_S"
     printf 'LD_PRELOAD=%s\n' "${LD_PRELOAD-}"
     printf 'P3A_REGION_TIMINGS=%s\n' "${P3A_REGION_TIMINGS-}"
     ldd "$BIN"
@@ -66,6 +68,7 @@ set -e
         "$ROOT/probes/p3a_compute_allgather_compute_probe.cpp" \
         "$ROOT/probes/autonomous_allgather_runtime.hpp" \
         "$ROOT/probes/p0_scal_hook.cpp" \
-        "$ROOT/include/gaudirt/scal/ccb_writer.hpp"
+        "$ROOT/include/gaudirt/scal/ccb_writer.hpp" \
+        "$ROOT/include/gaudirt/scal/long_so.hpp"
 } > "$OUT/environment.txt"
 exit "$rc"

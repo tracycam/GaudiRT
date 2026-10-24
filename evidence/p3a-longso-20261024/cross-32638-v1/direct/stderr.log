@@ -1,0 +1,12 @@
+[P3A_PROGRESS] mode=native_capture step=0
+[P3A_PROGRESS] mode=native_capture step=1
+[P3A_PROGRESS] mode=native_capture step=63
+[P3A_PROGRESS] mode=native_capture step=64
+[P3A_PROGRESS] mode=native_capture step=129
+[P3A_PROGRESS] mode=direct step=0 pre_target=261 post_target=262 chain=77c0195250ddf9ea
+[P3A_PROGRESS] mode=direct step=1 pre_target=263 post_target=264 chain=96ad61cd529cc111
+[P3A_PROGRESS] mode=direct step=63 pre_target=387 post_target=388 chain=fd58e3b35ac3c891
+[P3A_PROGRESS] mode=direct step=64 pre_target=389 post_target=390 chain=8ee615d9ec6995ae
+[P3A_PROGRESS] mode=direct step=128 pre_target=517 post_target=518 chain=616811bbcc4d892f
+[P3A_PROGRESS] mode=direct step=32637 pre_target=65535 post_target=65536 chain=6721b0adec5f794b
+[P3A_DIRECT_VERDICT] ranks=8 direct_steps=32638 compute_submissions=209815 network_submissions=326380 output_memcmp=PASS guard_memcmp=PASS hash_chain=PASS

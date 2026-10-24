@@ -259,9 +259,13 @@ class HardwareStateTracker {
           uint32_t sod = (data >> 17) & 0x7FFFu;
           uint32_t msb_sid = (m.config >> 16) & 0xFu;
           uint32_t base_sob = ((msb_sid << 8) | sid) * 8u;
-          oss << "DCORE" << dcore << "_MON_ARM[" << mon_id << "]: watch SOB_group("
-              << base_sob << ".." << (base_sob + 7) << ", mask=0x" << std::hex
-              << mask << std::dec << ") " << (sop ? "==" : ">=") << " " << sod;
+          oss << "DCORE" << dcore << "_MON_ARM[" << mon_id << "]: raw=0x"
+              << std::hex << std::setw(8) << std::setfill('0') << data
+              << " sid=0x" << sid << " mask=0x" << mask << std::dec
+              << " sop=" << sop << " target=0x" << std::hex << sod << std::dec
+              << "(" << sod << ") watch SOB_group(" << base_sob << ".."
+              << (base_sob + 7) << ", mask=0x" << std::hex << mask << std::dec
+              << ") " << (sop ? "==" : ">=") << " " << sod;
           if (m.pay_addrl != 0) {
             oss << " => fire [addr=0x" << std::hex << m.pay_addrl
                 << ", data=0x" << m.pay_data << std::dec << "]";
@@ -715,9 +719,23 @@ inline std::string decode_ccb_commands(const std::string& phase,
         case SCHED_COMPUTE_ARC_CMD_WAIT_FOR_EXT_SIGNAL: {
           const auto* c =
               reinterpret_cast<const sched_arc_cmd_wait_for_ext_signal_t*>(ptr);
+          const uint64_t target =
+              static_cast<uint64_t>(c->target_value0) |
+              (static_cast<uint64_t>(c->target_value1) << 15) |
+              (static_cast<uint64_t>(c->target_value2) << 30) |
+              (static_cast<uint64_t>(c->target_value3) << 45);
           oss << "WAIT_FOR_EXT_SIGNAL: sm_id=" << c->sm_id
-              << " sob_id=" << c->sob_id << " target0=" << c->target_value0
-              << "\n";
+              << " sob_id=" << c->sob_id << " raw=[";
+          for (uint32_t i = 0; i < sizeof(*c) / sizeof(uint32_t); ++i) {
+            if (i) oss << " ";
+            oss << "0x" << std::hex << std::setw(8) << std::setfill('0')
+                << reinterpret_cast<const uint32_t*>(ptr)[i];
+          }
+          oss << std::dec << "] target_chunks=[0x" << std::hex
+              << c->target_value0 << ",0x" << c->target_value1 << ",0x"
+              << c->target_value2 << ",0x" << c->target_value3 << std::dec
+              << "] target=0x" << std::hex << target << std::dec << "(" << target
+              << ")\n";
           cmd_size = sizeof(sched_arc_cmd_wait_for_ext_signal_t);
           break;
         }

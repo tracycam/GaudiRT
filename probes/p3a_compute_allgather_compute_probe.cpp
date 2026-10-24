@@ -901,7 +901,8 @@ class ComputeReplay {
   }
 
   void set_expected(uint64_t target) {
-    p3a_check(target <= 0x7FFF, "compute target exceeds 15 bits");
+    p3a_check(gaudirt::scal::long_so_target_valid(target),
+              "compute target exceeds 60 bits");
     P3A_CHECK_SCAL(scal_completion_group_set_expected_ctr(cg_, target));
     expected_ = target;
   }
@@ -919,7 +920,8 @@ class ComputeReplay {
 
   void publish_external_wait(gaudirt::scal::CcbWriter& writer,
                              const RelocatedRecipe& post, uint64_t target) {
-    p3a_check(post.capture.external_wait.size() == 16 && target <= 0x7FFF,
+    p3a_check(post.capture.external_wait.size() == 16 &&
+                  gaudirt::scal::long_so_target_valid(target),
               "invalid post external wait target");
     std::vector<uint8_t> packet = post.capture.external_wait;
     const auto* original =
@@ -927,23 +929,28 @@ class ComputeReplay {
             post.capture.external_wait.data());
     auto* wait = reinterpret_cast<sched_arc_cmd_wait_for_ext_signal_t*>(
         packet.data());
-    const uint64_t original_target_value = original->target_value;
+    const uint8_t original_reserved = original->reserved0;
     const uint8_t original_num_engines = original->num_engine_group_type;
     std::array<uint8_t, 4> original_engines{};
     std::memcpy(original_engines.data(), original->engine_group_type, 4);
-    wait->target_value0 = static_cast<uint64_t>(target);
-    p3a_check((wait->target_value & ~0x7FFFULL) ==
-                      (original_target_value & ~0x7FFFULL) &&
+    p3a_check(gaudirt::scal::set_wait_for_ext_signal_target(*wait, target) &&
+                  wait->reserved0 == original_reserved &&
                   wait->num_engine_group_type == original_num_engines &&
                   std::memcmp(wait->engine_group_type, original_engines.data(),
                               4) == 0 &&
                   wait->sm_id == 3 && wait->sob_id == 1440,
-              "post external wait fields changed beyond target0");
+              "post external wait fields changed beyond 60-bit target");
+    last_external_wait_chunks_ = gaudirt::scal::long_so_chunks(target);
     auto submit = [&](unsigned pi) {
       return scal_stream_submit(stream_, pi, info_.submission_alignment);
     };
     P3A_CHECK_SCAL(writer.append(packet.data(), packet.size(), true, submit));
     P3A_CHECK_SCAL(writer.submit_now(submit));
+  }
+
+  const std::array<uint16_t, gaudirt::scal::kLongSoChunks>&
+  last_external_wait_chunks() const {
+    return last_external_wait_chunks_;
   }
 
   void publish_post(gaudirt::scal::CcbWriter& writer, uint32_t set) {
@@ -1066,6 +1073,7 @@ class ComputeReplay {
   uint32_t next_pi_ = 0;
   std::vector<uint8_t> initial_ccb_;
   uint64_t expected_ = 0;
+  std::array<uint16_t, gaudirt::scal::kLongSoChunks> last_external_wait_chunks_{};
   uint64_t submit_calls_ = 0;
   uint64_t boundary_calls_ = 0;
   uint64_t nop_bytes_ = 0;
@@ -1389,6 +1397,7 @@ int run_direct_rank(uint32_t rank, SharedCoord* shm,
   uint64_t chain = kFnvOffset;
   uint64_t compute_wraps = 0;
   uint64_t network_wraps = 0;
+  uint64_t external_wait_chunk1_writes = 0;
   for (uint32_t step = 0; step < steps; ++step) {
     const double initialize_start =
         region_timings ? gaudirt::common::now_us() : 0;
@@ -1402,8 +1411,9 @@ int run_direct_rank(uint32_t rank, SharedCoord* shm,
     const uint64_t pre_target = base_target + 1;
     const uint64_t post_target = base_target + 2;
     const uint64_t external_wait_target = rt.next_external_target();
-    p3a_check(post_target <= 0x7FFF && external_wait_target <= 0x7FFF,
-              "direct long-SO target exceeds 15 bits");
+    p3a_check(gaudirt::scal::long_so_target_valid(post_target) &&
+                  gaudirt::scal::long_so_target_valid(external_wait_target),
+              "direct long-SO target exceeds 60 bits");
 
     PerfSample sample;
     if (perf) sample.slot = rt.register_timestamp(global_index + 1);
@@ -1417,6 +1427,7 @@ int run_direct_rank(uint32_t rank, SharedCoord* shm,
 
     const uint32_t wait_start_pi = writer.pi();
     compute.publish_external_wait(writer, post_recipe, external_wait_target);
+    external_wait_chunk1_writes += compute.last_external_wait_chunks()[1] != 0;
     const uint32_t wait_end_pi = writer.pi();
     p3a_check(wait_end_pi - wait_start_pi >= 16,
               "post external wait was not published");
@@ -1426,12 +1437,14 @@ int run_direct_rank(uint32_t rank, SharedCoord* shm,
     const uint32_t post_end_pi = writer.pi();
 
     const auto& replay_template = calls[66 + (step % 64)];
+    const uint64_t previous_chunk1_writes = rt.direct_monitor_chunk1_writes();
+    const uint64_t previous_high_chunk_writes = rt.direct_monitor_high_chunk_writes();
     CallCapture actual = rt.replay(replay_template, global_index, set.send(),
                                    set.recv(), perf ? &sample : nullptr,
-                                   static_cast<uint32_t>(pre_target), false,
-                                   false);
-    p3a_check(actual.external_target == external_wait_target,
-              "network external target changed before post wait");
+                                   pre_target, false, false);
+    p3a_check(actual.external_target == external_wait_target &&
+                  rt.replay_monitor_target(actual) == pre_target,
+              "network targets changed before post wait");
     if (!perf) validate_addresses(actual, rank);
 
     const auto step_stats = writer.stats();
@@ -1489,6 +1502,17 @@ int run_direct_rank(uint32_t rank, SharedCoord* shm,
           << " post_wait_target=" << external_wait_target
           << " external_target=" << actual.external_target
           << " internal_target=" << actual.internal_target
+          << " wait_chunks=" << compute.last_external_wait_chunks()[0] << ":"
+          << compute.last_external_wait_chunks()[1] << ":"
+          << compute.last_external_wait_chunks()[2] << ":"
+          << compute.last_external_wait_chunks()[3]
+          << " external_wait_chunk1_writes="
+          << (compute.last_external_wait_chunks()[1] != 0)
+          << " monitor_target=" << rt.replay_monitor_target(actual)
+          << " monitor_chunk1_writes="
+          << rt.direct_monitor_chunk1_writes() - previous_chunk1_writes
+          << " monitor_high_chunk_writes="
+          << rt.direct_monitor_high_chunk_writes() - previous_high_chunk_writes
           << " pre_pi=0x" << std::hex << pre_start_pi << ":0x" << pre_end_pi
           << " wait_pi=0x" << wait_start_pi << ":0x" << wait_end_pi
           << " post_pi=0x" << post_start_pi << ":0x" << post_end_pi << std::dec
@@ -1535,6 +1559,9 @@ int run_direct_rank(uint32_t rank, SharedCoord* shm,
       << rt.direct_submit_calls() << " compute_wraps=" << compute_wraps
       << " network_wraps=" << network_wraps << " compute_nop_bytes="
       << compute.nop_bytes() << " network_nop_bytes=" << rt.direct_nop_bytes()
+      << " external_wait_chunk1_writes=" << external_wait_chunk1_writes
+      << " monitor_chunk1_writes=" << rt.direct_monitor_chunk1_writes()
+      << " monitor_high_chunk_writes=" << rt.direct_monitor_high_chunk_writes()
       << " output_memcmp=PASS guard_memcmp=PASS hash_chain=" << (perf ? "NOT_MEASURED" : "PASS") << std::endl;
   if (rank == 0) {
     std::fprintf(stderr,
@@ -1635,7 +1662,7 @@ int main(int argc, char** argv) {
   const bool performance = mode == "native" || mode == "perf";
   if ((mode != "reference" && mode != "direct" && mode != "artifact" &&
        !performance) ||
-      steps == 0 || steps > 6000 || (performance && steps > 130) ||
+      steps == 0 || steps > 32638 || (performance && steps > 130) ||
       data_dir.empty() || log_dir.empty()) {
     std::fprintf(stderr, "invalid P3a arguments\n");
     return 2;

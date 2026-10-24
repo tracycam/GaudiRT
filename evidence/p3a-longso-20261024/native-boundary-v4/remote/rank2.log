@@ -1,0 +1,11 @@
+[P2A_TIMESTAMP_PRECHECK] target=0 first_ns=831894575052748 second_ns=831894575053283 offset_unit=uint64_element
+[P2A_INIT] rank=2 streams=10 ccb_bytes=0x40000 global_hbm_base=0x1001600150000000
+[P3A_NATIVE_STEP] rank=2 step=0 pre_target=1 post_target=2
+[P3A_NATIVE_STEP] rank=2 step=1 pre_target=3 post_target=4
+[P3A_NATIVE_STEP] rank=2 step=16382 pre_target=32765 post_target=32766
+[P3A_NATIVE_STEP] rank=2 step=16383 pre_target=32767 post_target=32768
+[P3A_NATIVE_STEP] rank=2 step=16384 pre_target=32769 post_target=32770
+[P3A_NATIVE_STEP] rank=2 step=32766 pre_target=65533 post_target=65534
+[P3A_NATIVE_STEP] rank=2 step=32767 pre_target=65535 post_target=65536
+[P3A_NATIVE_STEP] rank=2 step=32768 pre_target=65537 post_target=65538
+[P3A_LONGSO_VERDICT] rank=2 native_capture_steps=32769 output_checks=PASS guard_checks=PASS

@@ -25,6 +25,7 @@
 #include "gaudirt/common/abba_harness.hpp"
 #include "gaudirt/runtime/device_runtime.hpp"
 #include "gaudirt/scal/ccb_writer.hpp"
+#include "gaudirt/scal/long_so.hpp"
 
 #define P2A_CHECK_SYN(call)                                                   \
   do {                                                                        \
@@ -238,8 +239,11 @@ void check(bool condition, const char* message);
 bool is_monitor_arm_addr(uint32_t addr);
 bool is_dcore1_sob_addr(uint32_t addr);
 uint32_t replay_lbw_addr(uint32_t addr, uint32_t slot);
-uint32_t replay_lbw_data(uint32_t addr, uint32_t data, uint32_t target);
-uint32_t monitor_target(const CallCapture& call);
+uint64_t monitor_target(
+    const CallCapture& call,
+    const gaudirt::scal::LongMonitorState* state = nullptr);
+void observe_monitor_state(const CallCapture& call,
+                           gaudirt::scal::LongMonitorState& state);
 void validate_monitor_progress(const std::vector<CallCapture>& calls);
 bool same_packets(const StreamCapture& a, const StreamCapture& b,
                   bool ignore_addresses);
@@ -367,6 +371,7 @@ class RankRuntime {
       fail("unexpected active stream count: " +
            std::to_string(call.streams.size()));
     }
+    observe_monitor_state(call, monitor_state_);
     return call;
   }
 
@@ -401,7 +406,7 @@ class RankRuntime {
   CallCapture replay(const CallCapture& replay_template, uint64_t index,
                      uint64_t send_addr, uint64_t recv_addr,
                      PerfSample* sample = nullptr,
-                     std::optional<uint32_t> compute_monitor_target = std::nullopt,
+                     std::optional<uint64_t> compute_monitor_target = std::nullopt,
                      bool wait_for_completion = true, bool log_state = true) {
     const double t0 = sample ? gaudirt::common::now_us() : 0;
     check(replay_template.streams.size() == kActiveCount &&
@@ -410,15 +415,17 @@ class RankRuntime {
               (recv_addr >> 32) == (replay_template.recv_addr >> 32),
           "unsupported replay template or address range");
     const uint32_t slot = index % 64;
-    uint32_t actual_monitor = 0;
+    uint64_t actual_monitor = 0;
     if (compute_monitor_target) {
       actual_monitor = *compute_monitor_target;
-      check(actual_monitor <= 0x7FFF, "compute monitor target exceeds 15 bits");
+      check(gaudirt::scal::long_so_target_valid(actual_monitor),
+            "compute monitor target exceeds 60 bits");
     } else {
-      const uint32_t expected_monitor =
+      const uint64_t expected_monitor =
           monitor_target(replay_template) + 4 * (index - replay_template.index);
       actual_monitor = read_current(pdma_tx_);
-      check(actual_monitor == expected_monitor && actual_monitor <= 0x7FFF,
+      check(actual_monitor == expected_monitor &&
+                gaudirt::scal::long_so_target_valid(actual_monitor),
             "PDMA monitor target mismatch");
     }
 
@@ -451,17 +458,15 @@ class RankRuntime {
           off += size;
           continue;
         }
-        std::vector<uint8_t> packet(ptr, ptr + size);
+        std::vector<uint8_t> packet =
+            rewrite_monitors(ptr, size, captured.kind, actual_monitor);
         if (opcode == 1) {
           auto* c = reinterpret_cast<sched_arc_cmd_lbw_write_t*>(packet.data());
-          c->src_data = replay_lbw_data(c->dst_addr, c->src_data, actual_monitor);
           c->dst_addr = replay_lbw_addr(c->dst_addr, slot);
         } else if (opcode == 2) {
           auto* c =
               reinterpret_cast<sched_arc_cmd_lbw_burst_write_t*>(packet.data());
           for (uint32_t j = 0; j < c->num_lbw_write; ++j) {
-            c->addr_data[j].data = replay_lbw_data(
-                c->addr_data[j].addr, c->addr_data[j].data, actual_monitor);
             c->addr_data[j].addr = replay_lbw_addr(c->addr_data[j].addr, slot);
           }
         }
@@ -480,7 +485,6 @@ class RankRuntime {
           auto* lbw = reinterpret_cast<sched_arc_lbw_write_t*>(
               packet.data() + 4 + fence_dwords * 4);
           for (uint32_t j = 0; j < c->num_lbw_write; ++j) {
-            lbw[j].data = replay_lbw_data(lbw[j].addr, lbw[j].data, actual_monitor);
             lbw[j].addr = replay_lbw_addr(lbw[j].addr, slot);
           }
         } else if (scaleup && opcode == 10) {
@@ -512,9 +516,12 @@ class RankRuntime {
       actual.bytes = encoded[i];
       result.streams.push_back(std::move(actual));
     }
+    check(monitor_target(result, &monitor_state_) == actual_monitor,
+          "encoded monitor target mismatch");
 
     for (size_t i = 0; i < kActiveCount; ++i) {
       if (sample == nullptr &&
+          result.streams[i].bytes.size() == replay_template.streams[i].bytes.size() &&
           !same_packets(result.streams[i], replay_template.streams[i], true)) {
         log_call(replay_template);
         log_call(result);
@@ -626,6 +633,15 @@ class RankRuntime {
   uint64_t direct_submit_calls() const { return direct_submit_calls_; }
   uint64_t direct_boundary_calls() const { return direct_boundary_calls_; }
   uint64_t direct_nop_bytes() const { return direct_nop_bytes_; }
+  uint64_t direct_monitor_chunk1_writes() const {
+    return monitor_state_.chunk1_writes();
+  }
+  uint64_t direct_monitor_high_chunk_writes() const {
+    return monitor_state_.high_chunk_writes();
+  }
+  uint64_t replay_monitor_target(const CallCapture& call) const {
+    return monitor_target(call, &monitor_state_);
+  }
 
   uint32_t register_timestamp(uint64_t target) {
     return timestamps_->register_target(target);
@@ -717,6 +733,83 @@ class RankRuntime {
     std::exit(1);
   }
 
+  std::vector<uint8_t> rewrite_monitors(
+      const uint8_t* ptr, size_t size, gaudirt::scal::SchedulerKind kind,
+      uint64_t target) {
+    std::vector<uint8_t> packet(ptr, ptr + size);
+    uint32_t dw0 = 0;
+    std::memcpy(&dw0, ptr, sizeof(dw0));
+    const uint32_t opcode = dw0 & 0x1F;
+    const bool scaleup = kind == gaudirt::scal::SchedulerKind::kScaleUpSend ||
+                         kind == gaudirt::scal::SchedulerKind::kScaleUpRecv;
+    const bool gc_or_scaleout =
+        kind == gaudirt::scal::SchedulerKind::kGcReduction ||
+        kind == gaudirt::scal::SchedulerKind::kScaleOutSend ||
+        kind == gaudirt::scal::SchedulerKind::kScaleOutRecv;
+    const bool alloc = (scaleup && opcode == 8) || (gc_or_scaleout && opcode == 5);
+    if (opcode != 1 && opcode != 2 && !alloc) return packet;
+
+    size_t prefix = 0;
+    uint32_t count = 0;
+    if (opcode == 1) {
+      const auto* command =
+          reinterpret_cast<const sched_arc_cmd_lbw_write_t*>(packet.data());
+      check(command->fence == 0, "cannot expand fenced LBW monitor write");
+      prefix = 4;
+      count = 1;
+    } else if (opcode == 2) {
+      const auto* command =
+          reinterpret_cast<const sched_arc_cmd_lbw_burst_write_t*>(packet.data());
+      prefix = 4;
+      count = command->num_lbw_write;
+    } else {
+      const auto* command =
+          reinterpret_cast<const sched_arc_cmd_alloc_nic_barrier_t*>(packet.data());
+      prefix = 4 + 4 * ((command->fence_count > 0) + (command->fence_count > 4));
+      count = command->num_lbw_write;
+    }
+    std::vector<sched_arc_lbw_write_t> writes(count);
+    for (uint32_t i = 0; i < count; ++i) {
+      if (opcode == 1) {
+        const auto* command =
+            reinterpret_cast<const sched_arc_cmd_lbw_write_t*>(packet.data());
+        writes[i] = {command->dst_addr, command->src_data};
+      } else {
+        std::memcpy(&writes[i], packet.data() + prefix + 8 * i, sizeof(writes[i]));
+      }
+    }
+    check(monitor_state_.rewrite(writes, target), "invalid monitor replay group");
+    check(writes.size() <= 31 && prefix + 8 * writes.size() <= 256 &&
+              (!alloc || prefix + 8 * writes.size() <= 63 * 4),
+          "expanded monitor packet exceeds command capacity");
+
+    std::vector<uint8_t> expanded(packet.begin(), packet.begin() + prefix);
+    expanded.resize(prefix + 8 * writes.size());
+    for (size_t i = 0; i < writes.size(); ++i) {
+      std::memcpy(expanded.data() + prefix + 8 * i, &writes[i], sizeof(writes[i]));
+    }
+    if (opcode == 1 && writes.size() != 1) {
+      const uint32_t burst_header = 2;
+      std::memcpy(expanded.data(), &burst_header, sizeof(burst_header));
+      auto* command =
+          reinterpret_cast<sched_arc_cmd_lbw_burst_write_t*>(expanded.data());
+      command->num_lbw_write = writes.size();
+    } else if (opcode == 2) {
+      auto* command =
+          reinterpret_cast<sched_arc_cmd_lbw_burst_write_t*>(expanded.data());
+      command->num_lbw_write = writes.size();
+    } else if (alloc) {
+      auto* command =
+          reinterpret_cast<sched_arc_cmd_alloc_nic_barrier_t*>(expanded.data());
+      command->num_lbw_write = writes.size();
+      command->cmd_size_dwords = expanded.size() / 4;
+    }
+    check(gaudirt::scal::network_packet_size(expanded.data(), expanded.size(), kind) ==
+              expanded.size(),
+          "invalid expanded monitor packet");
+    return expanded;
+  }
+
   void init_stream(StreamCapture& stream) {
     P2A_CHECK_SCAL(
         scal_get_stream_handle_by_name(scal_, stream.name.c_str(), &stream.handle));
@@ -785,6 +878,7 @@ class RankRuntime {
   CgCapture internal_;
   CgCapture pdma_tx_;
   gaudirt::scal::HardwareStateTracker tracker_;
+  gaudirt::scal::LongMonitorState monitor_state_;
   uint64_t direct_submit_calls_ = 0;
   uint64_t direct_boundary_calls_ = 0;
   uint64_t direct_nop_bytes_ = 0;
@@ -901,26 +995,8 @@ uint32_t replay_lbw_addr(uint32_t addr, uint32_t slot) {
   return offset >= 0x100 ? 0xFC300100 + 4 * slot : 0xFC300000 + 4 * slot;
 }
 
-uint32_t replay_lbw_data(uint32_t addr, uint32_t data, uint32_t target) {
-  return is_monitor_arm_addr(addr) ? (data & 0x1FFFFU) | (target << 17) : data;
-}
-
-void collect_monitor_target(uint32_t addr, uint32_t data, uint32_t& target,
-                            bool& found) {
-  if (!is_monitor_arm_addr(addr)) return;
-  const uint32_t current = (data >> 17) & 0x7FFF;
-  if (found && target != current) {
-    std::fprintf(stderr, "[P2A_FATAL] inconsistent monitor targets %u/%u\n",
-                 target, current);
-    std::exit(1);
-  }
-  target = current;
-  found = true;
-}
-
-uint32_t monitor_target(const CallCapture& call) {
-  uint32_t target = 0;
-  bool found = false;
+template <typename Visitor>
+void visit_monitor_writes(const CallCapture& call, Visitor&& visitor) {
   for (const auto& stream : call.streams) {
     size_t off = 0;
     while (off < stream.bytes.size()) {
@@ -933,13 +1009,12 @@ uint32_t monitor_target(const CallCapture& call) {
       const uint32_t opcode = dw0 & 0x1F;
       if (opcode == 1) {
         const auto* c = reinterpret_cast<const sched_arc_cmd_lbw_write_t*>(ptr);
-        collect_monitor_target(c->dst_addr, c->src_data, target, found);
+        visitor(c->dst_addr, c->src_data);
       } else if (opcode == 2) {
         const auto* c =
             reinterpret_cast<const sched_arc_cmd_lbw_burst_write_t*>(ptr);
         for (uint32_t i = 0; i < c->num_lbw_write; ++i) {
-          collect_monitor_target(c->addr_data[i].addr, c->addr_data[i].data,
-                                 target, found);
+          visitor(c->addr_data[i].addr, c->addr_data[i].data);
         }
       }
       const bool scaleup = stream.kind == gaudirt::scal::SchedulerKind::kScaleUpSend ||
@@ -954,21 +1029,58 @@ uint32_t monitor_target(const CallCapture& call) {
         const auto* lbw = reinterpret_cast<const sched_arc_lbw_write_t*>(
             ptr + 4 + fence_dwords * 4);
         for (uint32_t i = 0; i < c->num_lbw_write; ++i) {
-          collect_monitor_target(lbw[i].addr, lbw[i].data, target, found);
+          visitor(lbw[i].addr, lbw[i].data);
         }
       }
       off += size;
     }
   }
-  check(found, "missing monitor target");
+}
+
+void observe_monitor_state(const CallCapture& call,
+                           gaudirt::scal::LongMonitorState& state) {
+  visit_monitor_writes(call, [&](uint32_t addr, uint32_t data) {
+    state.observe(addr, data);
+  });
+}
+
+uint64_t monitor_target(const CallCapture& call,
+                        const gaudirt::scal::LongMonitorState* state) {
+  using Chunks =
+      std::array<std::optional<uint16_t>, gaudirt::scal::kLongSoChunks>;
+  std::map<uint32_t, Chunks> groups;
+  visit_monitor_writes(call, [&](uint32_t addr, uint32_t data) {
+    const auto chunk = gaudirt::scal::monitor_arm_chunk(addr);
+    if (chunk) {
+      auto& target_chunk =
+          groups[gaudirt::scal::monitor_arm_base(addr)][*chunk];
+      check(!target_chunk, "duplicate monitor chunk in capture");
+      target_chunk = (data >> 17) & gaudirt::scal::kLongSoChunkMask;
+    }
+  });
+  check(!groups.empty(), "missing monitor target");
+  uint64_t target = 0;
+  bool found = false;
+  for (const auto& [base, chunks] : groups) {
+    std::array<uint16_t, gaudirt::scal::kLongSoChunks> resolved{};
+    check(chunks[0].has_value(), "monitor capture omitted ARM0");
+    for (unsigned chunk = 0; chunk < gaudirt::scal::kLongSoChunks; ++chunk) {
+      const auto cached = state ? state->target_chunk(base, chunk) : std::nullopt;
+      resolved[chunk] = chunks[chunk].value_or(cached.value_or(0));
+    }
+    const uint64_t current = gaudirt::scal::long_so_target(resolved);
+    check(!found || target == current, "inconsistent monitor targets");
+    target = current;
+    found = true;
+  }
   return target;
 }
 
 void validate_monitor_progress(const std::vector<CallCapture>& calls) {
   check(calls.size() >= 130, "monitor validation requires 130 calls");
-  uint32_t previous = monitor_target(calls[7]);
+  uint64_t previous = monitor_target(calls[7]);
   for (size_t k = 8; k < 130; ++k) {
-    const uint32_t current = monitor_target(calls[k]);
+    const uint64_t current = monitor_target(calls[k]);
     check(current == previous + 4, "monitor target progression mismatch");
     previous = current;
   }

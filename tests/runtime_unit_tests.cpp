@@ -7,6 +7,7 @@
 #include "gaudirt/runtime/inflight_credit_manager.hpp"
 #include "gaudirt/runtime/recipe_registry.hpp"
 #include "gaudirt/runtime/unified_region_lowerer.hpp"
+#include "gaudirt/scal/long_so.hpp"
 
 #include <atomic>
 #include <cassert>
@@ -22,6 +23,85 @@
 using namespace gaudirt::runtime;
 
 namespace {
+
+void test_long_so_encoding_and_monitor_expansion() {
+  using namespace gaudirt::scal;
+  const uint64_t targets[] = {0,
+                              1,
+                              0x7FFF,
+                              0x8000,
+                              0x8001,
+                              (1ULL << 30) - 1,
+                              1ULL << 30,
+                              1ULL << 45,
+                              (1ULL << 60) - 1};
+  for (const uint64_t target : targets) {
+    assert(long_so_target_valid(target));
+    assert(long_so_target(long_so_chunks(target)) == target);
+  }
+  assert(!long_so_target_valid(1ULL << 60));
+
+  const std::array<uint8_t, 16> native_wait = {
+      0x0a, 0xb4, 0x4c, 0x00, 0x02, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03};
+  sched_arc_cmd_wait_for_ext_signal_t wait{};
+  std::memcpy(&wait, native_wait.data(), sizeof(wait));
+  uint32_t first_dword = 0;
+  std::memcpy(&first_dword, &wait, sizeof(first_dword));
+  for (const uint64_t target : targets) {
+    const uint8_t reserved = wait.reserved0;
+    assert(set_wait_for_ext_signal_target(wait, target));
+    assert(wait_for_ext_signal_target(wait) == target);
+    uint32_t current_dword = 0;
+    std::memcpy(&current_dword, &wait, sizeof(current_dword));
+    assert(current_dword == first_dword);
+    assert(wait.reserved0 == reserved);
+    assert(std::memcmp(wait.engine_group_type, native_wait.data() + 12, 4) == 0);
+  }
+  const uint64_t old_target = wait_for_ext_signal_target(wait);
+  assert(!set_wait_for_ext_signal_target(wait, 1ULL << 60));
+  assert(wait_for_ext_signal_target(wait) == old_target);
+
+  constexpr uint32_t base = 0xFC70F080;
+  LongMonitorState state;
+  for (unsigned chunk = kLongSoChunks; chunk-- > 0;) {
+    const uint32_t data = monitor_arm_data(0x200B8, chunk, 1);
+    state.observe(base + 4 * chunk, data);
+  }
+  std::vector<sched_arc_lbw_write_t> writes = {{base, 0x200B8}};
+  assert(state.rewrite(writes, 0x7FFF) && writes.size() == 1);
+  assert(((writes[0].data >> 17) & 0x7FFF) == 0x7FFF);
+
+  const bool crossed = state.rewrite(writes, 0x8000);
+  if (!crossed || writes.size() != 2) {
+    std::fprintf(stderr, "long-SO cross failed: ok=%d writes=%zu\n", crossed,
+                 writes.size());
+    for (const auto& write : writes) {
+      std::fprintf(stderr, "  addr=0x%x data=0x%x\n", write.addr, write.data);
+    }
+  }
+  assert(crossed && writes.size() == 2);
+  assert(writes[0].addr == base + 4 && writes[1].addr == base);
+  assert(((writes[0].data >> 17) & 0x7FFF) == 1);
+  assert((writes[0].data & 0xFF00) == 0 && (writes[0].data & 0xFF) == 0);
+  assert(state.chunk1_writes() == 1 && state.high_chunk_writes() == 1);
+  writes.erase(writes.begin());
+  assert(state.rewrite(writes, 0x8001) && writes.size() == 1);
+  assert(state.chunk1_writes() == 1);
+  assert(state.target_chunk(base, 0) == 1 && state.target_chunk(base, 1) == 1);
+  assert(state.target_chunk(base, 2) == 0 && state.target_chunk(base, 3) == 0);
+  assert(state.rewrite(writes, 0x8003) && writes.size() == 1);
+  assert(state.target_chunk(base, 0) == 3 && state.target_chunk(base, 1) == 1);
+
+  assert(state.rewrite(writes, 1ULL << 30) && writes.size() == 3);
+  assert(writes[0].addr == base + 8 && writes[1].addr == base + 4 &&
+         writes[2].addr == base);
+  assert(state.chunk1_writes() == 2 && state.high_chunk_writes() == 3);
+  writes = {{0xFC300100, 0x12345678}};
+  assert(state.rewrite(writes, 0x8001));
+  assert(writes.size() == 1 && writes[0].data == 0x12345678);
+  assert(!state.rewrite(writes, 1ULL << 60));
+}
 
 void test_unified_region_lowerer_production70() {
   std::vector<CapturedCommandDesc> cmds(286);
@@ -385,11 +465,16 @@ void test_libgaudirt_8card_compute_and_collective() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  test_long_so_encoding_and_monitor_expansion();
   test_unified_region_lowerer_production70();
   test_mixed_command_without_internal_raw_stays_barrier();
   test_generation_epoch_tracker();
   test_credit_formula();
+  if (argc == 2 && std::strcmp(argv[1], "--host-only") == 0) {
+    std::printf("[GaudiRT] Host-only runtime_unit_tests PASSED.\n");
+    return 0;
+  }
   test_libgaudirt_8card_compute_and_collective();
   test_libgaudirt_foundation_on_hardware();
   std::printf("[GaudiRT] All runtime_unit_tests (including 1-card & 8-card hardware foundation) PASSED.\n");
