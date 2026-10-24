@@ -116,6 +116,8 @@
 
 **裁决**：**在设计阶段直接砍掉“外部 Hack `libSynapse.so` 绕过 `RecipeLauncher` 的驻留实例（`L1_B`）”**，不在 Gate 0 中浪费时间编写注定触犯暗礁三的私有协议 Hack。
 
+**后续实验边界更新**：上述否决针对生产接入仍然成立；它不再被解释为禁止一切受控协议探针。后续 P1 已在销毁原 Recipe、原槽位投毒后证明单 Recipe 自管 HBM 重放与真实单次提交可行（[`p1-complete-20261024/run_stdout.log`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/evidence/p1-complete-20261024/run_stdout.log)），P2a 也已完成 8 卡 AllGather 的 130 次 direct 重放（[`direct_nop_fix_stderr.log`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/evidence/p2a-20261024/direct_nop_fix_stderr.log)）。这些实验只证明机制可行；生产路径仍须先完成复杂 Recipe、整步/多步正确性、严格版本熔断及端到端净收益验收，不能把该探针结果当成撤销 `L1_B` 风险裁决的依据。
+
 ---
 
 ### 4. `EventNetwork` 的真实归属层（纠正跨层归因错误）

@@ -1,0 +1,13 @@
+[P3A_PROGRESS] mode=native_capture step=0
+[P3A_PROGRESS] mode=native_capture step=1
+[P3A_PROGRESS] mode=native_capture step=63
+[P3A_PROGRESS] mode=native_capture step=64
+[P3A_PROGRESS] mode=native_capture step=129
+Synapse detected a device critical error that requires a restart. Killing process in 5 seconds (hl: 3, rankID: 7) 13:08:08 [please check log files for dfa cause]
+Synapse detected a device critical error that requires a restart. Killing process in 5 seconds (hl: 1, rankID: 6) 13:08:08 [please check log files for dfa cause]
+Synapse detected a device critical error that requires a restart. Killing process in 5 seconds (hl: 2, rankID: 2) 13:08:08 [please check log files for dfa cause]
+Synapse detected a device critical error that requires a restart. Killing process in 5 seconds (hl: 5, rankID: 4) 13:08:08 [please check log files for dfa cause]
+Synapse detected a device critical error that requires a restart. Killing process in 5 seconds (hl: 6, rankID: 1) 13:08:08 [please check log files for dfa cause]
+Synapse detected a device critical error that requires a restart. Killing process in 5 seconds (hl: 0, rankID: 3) 13:08:08 [please check log files for dfa cause]
+Synapse detected a device critical error that requires a restart. Killing process in 5 seconds (hl: 4, rankID: 0) 13:08:08 [please check log files for dfa cause]
+Synapse detected a device critical error that requires a restart. Killing process in 5 seconds (hl: 7, rankID: 5) 13:08:08 [please check log files for dfa cause]

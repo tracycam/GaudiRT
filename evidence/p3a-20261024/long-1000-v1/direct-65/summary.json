@@ -1,0 +1,107 @@
+{
+  "direct_steps": 65,
+  "guard_bytes_per_rank_step": 512,
+  "native_capture_steps": 130,
+  "output_bytes_per_rank_step": 32768,
+  "rank_results": [
+    {
+      "compute_boundary_submissions": 27,
+      "compute_nop_bytes": 428,
+      "compute_submissions": 417,
+      "compute_wraps": 0,
+      "final_chain_fnv1a64": "8ee615d9ec6995ae",
+      "final_record_fnv1a64": "51bf54250eedf004",
+      "network_nop_bytes": 296,
+      "network_submissions": 650,
+      "network_wraps": 0,
+      "rank": 0
+    },
+    {
+      "compute_boundary_submissions": 27,
+      "compute_nop_bytes": 428,
+      "compute_submissions": 417,
+      "compute_wraps": 0,
+      "final_chain_fnv1a64": "8ee615d9ec6995ae",
+      "final_record_fnv1a64": "51bf54250eedf004",
+      "network_nop_bytes": 296,
+      "network_submissions": 650,
+      "network_wraps": 0,
+      "rank": 1
+    },
+    {
+      "compute_boundary_submissions": 27,
+      "compute_nop_bytes": 428,
+      "compute_submissions": 417,
+      "compute_wraps": 0,
+      "final_chain_fnv1a64": "8ee615d9ec6995ae",
+      "final_record_fnv1a64": "51bf54250eedf004",
+      "network_nop_bytes": 296,
+      "network_submissions": 650,
+      "network_wraps": 0,
+      "rank": 2
+    },
+    {
+      "compute_boundary_submissions": 27,
+      "compute_nop_bytes": 428,
+      "compute_submissions": 417,
+      "compute_wraps": 0,
+      "final_chain_fnv1a64": "8ee615d9ec6995ae",
+      "final_record_fnv1a64": "51bf54250eedf004",
+      "network_nop_bytes": 296,
+      "network_submissions": 650,
+      "network_wraps": 0,
+      "rank": 3
+    },
+    {
+      "compute_boundary_submissions": 27,
+      "compute_nop_bytes": 428,
+      "compute_submissions": 417,
+      "compute_wraps": 0,
+      "final_chain_fnv1a64": "8ee615d9ec6995ae",
+      "final_record_fnv1a64": "51bf54250eedf004",
+      "network_nop_bytes": 296,
+      "network_submissions": 650,
+      "network_wraps": 0,
+      "rank": 4
+    },
+    {
+      "compute_boundary_submissions": 27,
+      "compute_nop_bytes": 428,
+      "compute_submissions": 417,
+      "compute_wraps": 0,
+      "final_chain_fnv1a64": "8ee615d9ec6995ae",
+      "final_record_fnv1a64": "51bf54250eedf004",
+      "network_nop_bytes": 296,
+      "network_submissions": 650,
+      "network_wraps": 0,
+      "rank": 5
+    },
+    {
+      "compute_boundary_submissions": 27,
+      "compute_nop_bytes": 428,
+      "compute_submissions": 417,
+      "compute_wraps": 0,
+      "final_chain_fnv1a64": "8ee615d9ec6995ae",
+      "final_record_fnv1a64": "51bf54250eedf004",
+      "network_nop_bytes": 296,
+      "network_submissions": 650,
+      "network_wraps": 0,
+      "rank": 6
+    },
+    {
+      "compute_boundary_submissions": 27,
+      "compute_nop_bytes": 428,
+      "compute_submissions": 417,
+      "compute_wraps": 0,
+      "final_chain_fnv1a64": "8ee615d9ec6995ae",
+      "final_record_fnv1a64": "51bf54250eedf004",
+      "network_nop_bytes": 296,
+      "network_submissions": 650,
+      "network_wraps": 0,
+      "rank": 7
+    }
+  ],
+  "ranks": 8,
+  "scope": "autonomous add-AllGather-add correctness only",
+  "verdict": "PASS"
+}

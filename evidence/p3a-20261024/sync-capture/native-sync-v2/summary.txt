@@ -1,0 +1,5 @@
+verdict=PASS (native synchronization capture only)
+ranks=8 native_steps_per_rank=3 output_bytes=32768 guard_bytes=512
+COLD: network_streams=10 compute_DCORE3_SOB1472_target=2 network_monitors=[2, 2, 2, 2, 2] post_wait_DCORE3_SOB1440=[1]
+WARM: network_streams=10 compute_DCORE3_SOB1472_target=4 network_monitors=[4, 4, 4, 4, 4] post_wait_DCORE3_SOB1440=[2]
+MUTATED: network_streams=10 compute_DCORE3_SOB1472_target=6 network_monitors=[6, 6, 6, 6, 6] post_wait_DCORE3_SOB1440=[3]

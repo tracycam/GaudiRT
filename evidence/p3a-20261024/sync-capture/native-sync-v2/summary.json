@@ -1,0 +1,72 @@
+{
+  "guard_bytes_per_rank_step": 512,
+  "iterations": [
+    {
+      "label": "COLD",
+      "network_external_long_sob": "DCORE3_SOB[1440]",
+      "network_external_target": 1,
+      "network_internal_target": 1,
+      "network_monitor_targets": [
+        2,
+        2,
+        2,
+        2,
+        2
+      ],
+      "network_stream_submissions": 10,
+      "post_compute_target": 3,
+      "post_compute_wait_targets": [
+        1
+      ],
+      "pre_compute_long_sob": "DCORE3_SOB[1472]",
+      "pre_compute_target": 2
+    },
+    {
+      "label": "WARM",
+      "network_external_long_sob": "DCORE3_SOB[1440]",
+      "network_external_target": 2,
+      "network_internal_target": 2,
+      "network_monitor_targets": [
+        4,
+        4,
+        4,
+        4,
+        4
+      ],
+      "network_stream_submissions": 10,
+      "post_compute_target": 5,
+      "post_compute_wait_targets": [
+        2
+      ],
+      "pre_compute_long_sob": "DCORE3_SOB[1472]",
+      "pre_compute_target": 4
+    },
+    {
+      "label": "MUTATED",
+      "network_external_long_sob": "DCORE3_SOB[1440]",
+      "network_external_target": 3,
+      "network_internal_target": 3,
+      "network_monitor_targets": [
+        6,
+        6,
+        6,
+        6,
+        6
+      ],
+      "network_stream_submissions": 10,
+      "post_compute_target": 7,
+      "post_compute_wait_targets": [
+        3
+      ],
+      "pre_compute_long_sob": "DCORE3_SOB[1472]",
+      "pre_compute_target": 6
+    }
+  ],
+  "native_steps_per_rank": 3,
+  "output_bytes_per_rank_step": 32768,
+  "ranks": 8,
+  "scope": "official native add-AllGather-add synchronization capture; not autonomous replay",
+  "stderr_sha256": "133dabc55a2a15804e28ee35b54412f7243618303ca13fb38e31cf97b06169dc",
+  "trace_sha256": "78510e3bf79b15c2cd44bb93a020eb1e43bbde08f4ee1bb73daabdd4b62efa65",
+  "verdict": "PASS"
+}

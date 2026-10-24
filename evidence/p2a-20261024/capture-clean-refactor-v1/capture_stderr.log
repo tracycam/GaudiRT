@@ -1,0 +1,9 @@
+[P2A_PROGRESS] native_capture=0
+[P2A_PROGRESS] native_capture=64
+[P2A_PROGRESS] native_capture=129
+[P2A_CAPTURE_VERDICT] mode=FULL ranks=8 native_calls=130 streams=10 address_checks=PASS cycle_checks=PASS output_checks=PASS
+[P2A_PROGRESS] direct_replay=0 global=130
+[P2A_PROGRESS] direct_replay=63 global=193
+[P2A_PROGRESS] direct_replay=64 global=194
+[P2A_PROGRESS] direct_replay=129 global=259
+[P2A_DIRECT_VERDICT] ranks=8 direct_calls=130 streams=10 submit_calls=1300 boundary_calls=0 output_checks=PASS guard_checks=PASS

@@ -1,0 +1,7 @@
+The original wall_us and completion_to_completion_us values in summary.txt are NOT valid communication-performance results.
+
+All 1040 external waits per arm record elapsed_ms=1, proving 1 ms sleep quantization. Completion spans also include copies, verification and asymmetric direct-only diagnostics. The +2.56% value is not evidence of a device regression.
+
+submit_us is only a descriptive host-path microbenchmark; 142 times its delta is not measured end-to-end savings.
+
+See measurement-review-20261024.json for the code/trace audit and required retest. Original raw artifacts are preserved unchanged.

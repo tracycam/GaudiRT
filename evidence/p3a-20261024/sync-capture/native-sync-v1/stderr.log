@@ -1,0 +1,8 @@
+[P3A_SYNC] rank=6 iteration=0 source=0 element=64 actual=1005.000000 expected=5.000000
+[P3A_SYNC] rank=3 iteration=0 source=0 element=64 actual=1005.000000 expected=5.000000
+[P3A_SYNC] rank=5 iteration=0 source=0 element=64 actual=1005.000000 expected=5.000000
+[P3A_SYNC] rank=1 iteration=0 source=0 element=64 actual=1005.000000 expected=5.000000
+[P3A_SYNC] rank=4 iteration=0 source=0 element=64 actual=1005.000000 expected=5.000000
+[P3A_SYNC] rank=2 iteration=0 source=0 element=64 actual=1005.000000 expected=5.000000
+[P3A_SYNC] rank=0 iteration=0 source=0 element=64 actual=1005.000000 expected=5.000000
+[P3A_SYNC] rank=7 iteration=0 source=0 element=64 actual=1005.000000 expected=5.000000

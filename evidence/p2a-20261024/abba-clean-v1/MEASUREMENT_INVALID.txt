@@ -1,0 +1,5 @@
+This run is not a valid clean ABBA result.
+
+The remote executable was built from the stale 1434-line P2a implementation, not the 3-line shared-runtime entry point. Performance-index logs still contain P2A_WAIT, P2A_SYNC_STATE and P2A_DYNAMIC, and wall remains dominated by the old 1 ms sleep path.
+
+The newer summary validator rejects these logs. Do not use the +4.20% span or -0.81% wall values as performance evidence.

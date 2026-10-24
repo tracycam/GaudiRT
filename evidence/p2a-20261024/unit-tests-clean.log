@@ -1,0 +1,14 @@
+-- Configuring done (0.1s)
+-- Generating done (0.0s)
+-- Build files have been written to: /home/ai/GaudiRT/build
+[ 71%] Built target gaudirt
+[100%] Built target p2a_autonomous_allgather_replay_probe
+[P2A_ABBA] arm=A1 mode=native
+[P2A_ABBA] arm=B1 mode=direct
+[P2A_ABBA] arm=B2 mode=direct
+[P2A_ABBA] arm=A2 mode=native
+submit_us: native=12.122 us direct=4.339 us delta=-7.784 us (-64.21%)
+wall_us: native=30.181 us direct=21.003 us delta=-9.178 us (-30.41%)
+completion_to_completion_us: native=96.662 us direct=85.846 us delta=-10.816 us (-11.19%)
+evidence=/home/ai/GaudiRT/evidence/p2a-20261024/abba-clean-v4/abba_summary.json
+[GaudiRT] All runtime_unit_tests (including 1-card & 8-card hardware foundation) PASSED.

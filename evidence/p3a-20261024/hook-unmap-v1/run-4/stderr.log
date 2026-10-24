@@ -1,0 +1,8 @@
+[P3A_SYNC_VERDICT] rank=5 native_steps=3 closed_loop=PASS output_bytes=32768 guard_bytes=512
+[P3A_SYNC_VERDICT] rank=0 native_steps=3 closed_loop=PASS output_bytes=32768 guard_bytes=512
+[P3A_SYNC_VERDICT] rank=6 native_steps=3 closed_loop=PASS output_bytes=32768 guard_bytes=512
+[P3A_SYNC_VERDICT] rank=4 native_steps=3 closed_loop=PASS output_bytes=32768 guard_bytes=512
+[P3A_SYNC_VERDICT] rank=2 native_steps=3 closed_loop=PASS output_bytes=32768 guard_bytes=512
+[P3A_SYNC_VERDICT] rank=3 native_steps=3 closed_loop=PASS output_bytes=32768 guard_bytes=512
+[P3A_SYNC_VERDICT] rank=1 native_steps=3 closed_loop=PASS output_bytes=32768 guard_bytes=512
+[P3A_SYNC_VERDICT] rank=7 native_steps=3 closed_loop=PASS output_bytes=32768 guard_bytes=512

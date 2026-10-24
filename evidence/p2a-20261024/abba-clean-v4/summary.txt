@@ -1,0 +1,4 @@
+submit_us: native=12.122 us direct=4.339 us delta=-7.784 us (-64.21%)
+wall_us: native=30.181 us direct=21.003 us delta=-9.178 us (-30.41%)
+completion_to_completion_us: native=96.662 us direct=85.846 us delta=-10.816 us (-11.19%)
+evidence=/home/ai/GaudiRT/evidence/p2a-20261024/abba-clean-v4/abba_summary.json

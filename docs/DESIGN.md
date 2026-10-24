@@ -105,3 +105,55 @@ GaudiRT/
     ├── review2-20261023/                             # 第三轮 Module 7 纯 C++ 在途上限实测与两轮评审报告
     └── gate0-20261023/                               # Gate 0 (G0-1 ~ G0-7) 及 RT-1/RT-2/RT-3 完整 JSON 证据与 SUMMARY.md
 ```
+
+---
+
+## 五、受控自主 SCAL 重放实验线（P0 / P1 / P2a）
+
+原有 `L1_B` 生产否决仍然有效：本实验线只用于验证协议与候选收益，**不视为生产接入，也不改变 `RT-1/RT-2/RT-3` 已验证的主线路径**。实验必须保持版本锁定、完整数值门禁和明确的完成回收语义；没有这些门禁时，不把私有 ARC/ECB 指令用于生产。
+
+### 1. P1：单 Recipe 自主重放已完成
+
+- `add_fwd_f32` 的 base[0]/base[1]/base[2] 全部迁入自管 HBM，base[2] 使用独立 `hbm_shared` 分配；base[2]/base[7]、动态 ECB 和两个 **32 位**内核地址字段完成重定位。
+- 原 `synRecipeHandle` 已销毁，原三块槽位写零并读回验证；之后单次、1000 次同步及 1000 次整批重放的完整 4096B 输出均与 Synapse `memcmp=0`。
+- Gate 3 真实达到 `scal_stream_submit calls=1`、`boundary_calls=0`；PI 为 85,328B（含 5,328B NOP），诊断口径整批摊销约 4.52 µs/replay。
+- 证据：[`p1-complete-20261024/run_stdout.log`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/evidence/p1-complete-20261024/run_stdout.log)；复现入口：[`scripts/p1_complete_driver.sh`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/scripts/p1_complete_driver.sh)。该结果只覆盖当前 Recipe，不外推到复杂 Recipe 或整个 Synapse 生命周期。
+
+### 2. P2a：8 卡 AllGather 自主重放正确性已完成
+
+- 无 `LD_PRELOAD` 的 8 Rank、130 次 native 抓取完成：10 条网络流、双 CG、四种 send/recv 地址组合、完整 32KB 输出及 512B 保护区、两个 64-SOB 周期模板校验。
+- 随后 130 次 direct 重放完成：每步 10 次提交流（共 1300 次）、`boundary_calls=0`、完整输出及保护区通过，覆盖第 64/65/129 次及 rendezvous/context 边界。关键修复是区分 **compute NOP=5 与网络 NOP=4**，见 `include/gaudirt/scal/ccb_writer.hpp`。
+- 证据：[`direct_nop_fix_stderr.log`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/evidence/p2a-20261024/direct_nop_fix_stderr.log) 与 `direct-nop-fix/rank*.log`；复现入口：[`scripts/p2a_capture_driver.sh`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/scripts/p2a_capture_driver.sh)。
+
+### 3. P2a 性能：旧结论作废，干净 ABBA 已取得微基准收益
+
+原 `abba-20261024T092927Z` 因 1 ms 睡眠、步间拷贝/校验和 direct 额外诊断而不能用于性能裁决，原 +2.56% 已撤回。后续 `abba-clean-v1` 又发现远端误用旧源文件，`abba-clean-v2` 则暴露 timestamp 可见性竞争，均保留为无效实验，不混入结果。
+
+最终 `abba-clean-v3` 使用正确共享入口、无睡眠/成功日志等待、两臂相同诊断边界及延后到共同验证后的 timestamp 读取；独立进程 A-B-B-A、无 `LD_PRELOAD`，性能区间 `P2A_WAIT/P2A_SYNC_STATE/P2A_DYNAMIC` 均为 0：
+
+| 指标（中位数） | native | direct | 差值 |
+| :--- | ---: | ---: | ---: |
+| 主机 submit | 12.049 µs | 4.465 µs | -62.94% |
+| submit + 忙轮询到共同 CG | 32.409 µs | 22.370 µs | -30.98% |
+| 完成到完成循环节拍 | 100.127 µs | 88.179 µs | -11.93% |
+
+第二项不是纯 NIC 时间，第三项仍含 H2D/D2H 和全量校验；它们只证明当前 4KB FP32 AllGather 微基准的 direct 收益，不能外推为 AllReduce、其它消息大小或完整模型 TPOT。独立 `abba-clean-v4` 复现同向：submit -64.21%、submit+共同 CG wall -30.41%、完成到完成节拍 -11.19%；`gaudirt_runtime_unit_tests`（含 1 卡与 8 卡硬件）同时通过。原始证据为 `abba-clean-v{3,4}/summary.txt`、逐 Rank JSON 和环境哈希；汇总器会拒绝性能区间的污染日志。
+
+**尚未完成**：AllReduce、其它消息大小、P3 整步合成、P4 多步 Decode 和 P5 生产护栏。当前结果证明机制可行，但不证明完整模型上的端到端净收益。
+
+### 4. P3a：单层自主闭环及双 CCB 回绕正确性已通过
+
+- `p0_scal_capture_decode_probe --mode p3a-sync` 已在 8 Rank 上完成冷、热、改地址三轮官方 `add -> AllGather -> add`：每轮只在三段全部入队后做一次主机同步；完整 32KB 输出及 512B 保护区均通过。失败的首轮 `native-sync-v1` 是探针输入缓冲区重叠，保留作负证据；修正后的通过证据为 `native-sync-v2`。
+- 计算到通信：AllGather 阶段没有 compute0 提交。GC2、scale-up send2/receive2、scale-out send2/receive2 的五处 Monitor 监视 compute completion `DCORE3_SOB[1472]`；三轮 target 为 2/4/6，与前置 Recipe 完成目标一致。
+- 通信到计算：后置 compute0 首先执行 16B `WAIT_FOR_EXT_SIGNAL`，等待 network external CG 的 `DCORE3_SOB[1440]`；三轮 target 为 1/2/3。自主重放保留完整 16B 和独立 publication，并将 pre/wait/post 全部发布后再提交网络，避免后置命令晚于网络完成才发布。
+- `p3a_compute_allgather_compute_probe` 的 direct 1、2、64、65、129、1000 步均已在 8 Rank 通过：每步与独立官方 reference 完整 32KB `memcmp`、512B guard 和逐步 hash 链一致。1000 步共 51,424 次 compute 提交、80,000 次网络提交，compute CCB 回绕 1 次；每步 6 个 compute publication 加边界提交和 10 个网络提交，不是一次全局 submit。
+- 6000 步扩展门禁全部通过：308,560 次 compute 提交、480,000 次网络提交，compute CCB 回绕 8 次、network CCB 回绕 1 次，最终 hash `aaa05b2aeaf1256b`。1000 步的 `network_wraps=0` 仍如实保留，由扩展实验补足覆盖。
+- hook 曾因缺少 `hlthunk_memory_unmap` 生命周期跟踪而在 native PDMA 解码时段错误；修复后 4 次官方原生抓取和 4 次 direct 首轮均通过。早期模板、staging/DFA、发布竞争及仪器失败目录全部保留，不以最终成功覆盖失败过程。
+- 证据：`stable-v1/direct-{1000,6000}/`、`hook-unmap-v1/`、`smoke-1-v5/direct/`、`smoke-2-v1/direct/`、`long-1000-v1/direct-{64,65,129,1000}/` 及各目录 `summary.json/text`。完整 reference 二进制留远端，manifest 与日志本地归档；复现入口为 `scripts/p3a_compute_allgather_compute_driver.sh`，独立门禁汇总为 `scripts/p3a_gate_summary.py`。这些结果仅是正确性证据，尚不构成性能或生产可用结论。
+- 官方同步抓取证据：[`p3a-20261024/sync-capture/native-sync-v2/summary.json`](file:///home/rate/llm/Gaudi-LLM/GaudiRT/evidence/p3a-20261024/sync-capture/native-sync-v2/summary.json) 与同目录原始 trace、8 Rank 校验、环境哈希。复现入口为 `scripts/p3a_sync_capture_driver.sh`，自动判定脚本为 `scripts/p3a_sync_capture_summary.py`。
+
+### 5. 下一阶段范围：先做无拦截器单层性能，不直接跳到 70 层
+
+- 当前 P3a 通过的是链接 hook 的正确性实验，不能作为正式性能测量。下一步先拆分 capture/replay，使 direct 在无 `LD_PRELOAD`、无拦截器进程中运行，再按 P2a 的同一边界做独立进程 ABBA，分别报告 submit、wall、完成到完成节拍和真实提交次数。
+- 在单层闭环收益实测前，不进入 70 层 P3b，也不把 P2a 的 AllGather 微基准收益外推为整步或 TPOT 收益。
+- 若进入 P3b，目标仍是按流发布的一次逻辑整步，不是全系统一次 `scal_stream_submit`；必须另外验证复杂 Recipe、60 位 long-SO target 进位、CCB 容量/回收和动态形状回退。
