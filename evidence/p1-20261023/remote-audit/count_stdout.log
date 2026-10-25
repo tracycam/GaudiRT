@@ -1,7 +1,0 @@
-[P1_EXTRACT] exec_blob=352B patch_blob=168B orig_base=[0:0x100160015a300200, 1:0x100160015a300000, 2:0x10016001521f8000, 7:0x1001600152200a00]
-[P1_PATCH_OFFSETS] tensor_a=+0x90 tensor_b=+0x98 tensor_c=+0xa0
-[P1_GATE1_SINGLE] memcmp=0 ref[0]=2.0000 auton[0]=2.0000 ref[1023]=258.1250 auton[1023]=258.1250 => PASS
-[P1_GATE2_1000_SYNC] memcmp=0 syn_ref[0]=501.5000 auton[0]=501.5000 syn_ref[1023]=1132.2500 auton[1023]=1132.2500 | syn_us=37.58 us/launch vs auton_sync_us=21.86 us/launch => PASS
-[P1_GATE3_1000_SINGLE_SUBMIT] memcmp=0 syn_ref[0]=501.5000 auton[0]=501.5000 syn_ref[1023]=1132.2500 auton[1023]=1132.2500 | auton_single_submit_us=4.67 us/launch => PASS
-
-[P1_VERDICT] ALL 3 GATES PASSED (1000/1000 bitwise identical to Synapse, zero synLaunch, zero PDMA descriptor re-upload)!

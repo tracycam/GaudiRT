@@ -83,15 +83,6 @@ size_t BindingTable::find_slot(const std::string& name) const {
   return it->second;
 }
 
-std::vector<BindingSnapshot> BindingTable::snapshots() const {
-  std::vector<BindingSnapshot> out(launch_infos_.size());
-  for (size_t i = 0; i < launch_infos_.size(); ++i) {
-    out[i].device_address = launch_infos_[i].pTensorAddress;
-    out[i].shape_stride_hash = launch_infos_[i].tensorId;
-  }
-  return out;
-}
-
 RecipeRegistry::~RecipeRegistry() {
   for (auto& entry : entries_) {
     if (entry.handle != nullptr) {

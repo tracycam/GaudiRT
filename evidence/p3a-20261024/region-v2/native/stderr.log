@@ -1,6 +1,0 @@
-[P3A_PROGRESS] mode=native_capture step=0
-[P3A_PROGRESS] mode=native_capture step=1
-[P3A_PROGRESS] mode=native_capture step=63
-[P3A_PROGRESS] mode=native_capture step=64
-[P3A_PROGRESS] mode=native_capture step=129
-[P3A_PERF_SUMMARY] mode=native count=130 submit_p50_us=52.370 wall_p50_us=76.935 completion_to_completion_p50_us=304.870

@@ -1,7 +1,0 @@
-[P3A_PROGRESS] mode=native_capture step=0
-[P3A_PROGRESS] mode=native_capture step=1
-[P3A_PROGRESS] mode=native_capture step=63
-[P3A_PROGRESS] mode=native_capture step=64
-[P3A_PROGRESS] mode=native_capture step=129
-[P3A_PROGRESS] mode=direct step=0 pre_target=261 post_target=262 chain=77c0195250ddf9ea
-[P3A_DIRECT_VERDICT] ranks=8 direct_steps=1 compute_submissions=6 network_submissions=10 output_memcmp=PASS guard_memcmp=PASS hash_chain=PASS

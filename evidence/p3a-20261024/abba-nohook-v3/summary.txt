@@ -1,4 +1,0 @@
-submit_us: native=38.556 us direct=5.757 us delta=-32.799 us (-85.07%)
-wall_us: native=63.873 us direct=29.648 us delta=-34.226 us (-53.58%)
-completion_to_completion_us: native=249.978 us direct=325.147 us delta=+75.169 us (+30.07%)
-evidence=/home/ai/GaudiRT/evidence/p3a-20261024/abba-nohook-v3/abba_summary.json

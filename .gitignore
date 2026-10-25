@@ -1,4 +1,6 @@
 build/
+evidence/
+*.log
 *.recipe
 *.o
 *.so

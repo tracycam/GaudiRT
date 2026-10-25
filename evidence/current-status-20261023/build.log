@@ -1,9 +1,0 @@
-[ 14%] Building CXX object CMakeFiles/gaudirt.dir/src/hbm_arena.cpp.o
-[ 28%] Building CXX object CMakeFiles/gaudirt.dir/src/device_runtime.cpp.o
-[ 42%] Building CXX object CMakeFiles/gaudirt.dir/src/recipe_registry.cpp.o
-[ 57%] Building CXX object CMakeFiles/gaudirt.dir/src/execution_engine.cpp.o
-[ 71%] Linking CXX static library libgaudirt.a
-[ 71%] Built target gaudirt
-[ 85%] Building CXX object CMakeFiles/gaudirt_runtime_unit_tests.dir/tests/runtime_unit_tests.cpp.o
-[100%] Linking CXX executable gaudirt_runtime_unit_tests
-[100%] Built target gaudirt_runtime_unit_tests

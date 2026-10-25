@@ -1,7 +1,0 @@
-[P3A_PROGRESS] mode=native_capture step=0
-[P3A_PROGRESS] mode=native_capture step=1
-[P3A_PROGRESS] mode=native_capture step=63
-[P3A_PROGRESS] mode=native_capture step=64
-[P3A_PROGRESS] mode=native_capture step=129
-[P3A_PERF_SUMMARY] mode=direct count=130 submit_p50_us=7.217 wall_p50_us=26.925 completion_to_completion_p50_us=422.927
-[P3A_DIRECT_VERDICT] ranks=8 direct_steps=130 compute_submissions=835 network_submissions=1300 output_memcmp=PASS guard_memcmp=PASS hash_chain=PASS

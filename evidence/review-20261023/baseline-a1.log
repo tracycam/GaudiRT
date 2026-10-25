@@ -1,8 +1,0 @@
-device_sram_base=0x1000fffffd000000 device_sram_bytes=50331648 rmw=0
-graph_nodes=2 recipes=1 workspace_bytes=256
-bitwise_mismatches=0 words=4096
-batch=1 trials=32 enqueue_mean_us=12.178625 enqueue_p50_us=11.466000 enqueue_p95_us=15.037000 completion_mean_us=33.010625 completion_p50_us=32.345000
-batch=16 trials=32 enqueue_mean_us=11.683467 enqueue_p50_us=11.830375 enqueue_p95_us=12.276250 completion_mean_us=13.056170 completion_p50_us=13.192500
-batch=256 trials=32 enqueue_mean_us=11.085264 enqueue_p50_us=11.047129 enqueue_p95_us=11.548547 completion_mean_us=11.178452 completion_p50_us=11.141207
-bitwise_mismatches=0 words=4096
-bitwise_mismatches=0 words=4096

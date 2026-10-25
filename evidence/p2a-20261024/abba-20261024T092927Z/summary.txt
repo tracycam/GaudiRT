@@ -1,4 +1,0 @@
-submit_us: native=14.831 us direct=6.621 us delta=-8.210 us (-55.36%)
-wall_us: native=1091.750 us direct=1068.279 us delta=-23.471 us (-2.15%)
-completion_to_completion_us: native=1177.637 us direct=1207.842 us delta=+30.205 us (+2.56%)
-evidence=evidence/p2a-20261024/abba-20261024T092927Z/abba_summary.json

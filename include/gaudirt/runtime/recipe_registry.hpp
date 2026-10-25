@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include "gaudirt/runtime/generation_epoch_tracker.hpp"
-
 #include <synapse_api.h>
 
 #include <cstddef>
@@ -48,9 +46,6 @@ class BindingTable {
   const std::vector<synLaunchTensorInfoExt>& launch_infos() const noexcept {
     return launch_infos_;
   }
-
-  // Export compact snapshots for GenerationEpochTracker.
-  std::vector<BindingSnapshot> snapshots() const;
 
  private:
   std::vector<std::string> names_;

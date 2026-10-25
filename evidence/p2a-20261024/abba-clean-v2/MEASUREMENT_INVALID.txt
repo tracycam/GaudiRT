@@ -1,5 +1,0 @@
-No valid ABBA summary was produced.
-
-The correct shared-runtime build passed the full native/direct correctness capture, but the first native performance arm failed with completion_ns=0. The old immediate timestamp read raced timestamp visibility once the 1 ms sleep was removed.
-
-The timestamp read was moved after the common D2H and synchronization boundary, with a nonzero wait. A later run must provide the performance result.
