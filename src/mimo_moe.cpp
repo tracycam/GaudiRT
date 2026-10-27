@@ -1,0 +1,339 @@
+// SPDX-License-Identifier: Apache-2.0
+#include "gaudirt/runtime/mimo_moe.hpp"
+
+#include <perf_lib_layer_params.h>
+
+#include <initializer_list>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace gaudirt::runtime {
+namespace {
+
+using Sizes = std::initializer_list<uint64_t>;
+
+void check(synStatus status, const char* where) {
+  if (status != synSuccess) {
+    throw std::runtime_error(std::string("MimoMoeLayer1: ") + where +
+                             " failed with Synapse status " +
+                             std::to_string(static_cast<int>(status)));
+  }
+}
+
+template <size_t N>
+void validate_addresses(const std::array<uint64_t, N>& addresses,
+                        const char* where) {
+  for (size_t i = 0; i < addresses.size(); ++i) {
+    if (addresses[i] == 0) {
+      throw std::invalid_argument(std::string("MimoMoeLayer1: ") + where +
+                                  " contains a null HBM address");
+    }
+    for (size_t j = i + 1; j < addresses.size(); ++j) {
+      if (addresses[i] == addresses[j]) {
+        throw std::invalid_argument(std::string("MimoMoeLayer1: ") + where +
+                                    " contains aliased HBM addresses");
+      }
+    }
+  }
+}
+
+struct RouterPostParams {
+  float factor;
+  int32_t renormalize;
+  int32_t apply_scale;
+};
+static_assert(sizeof(RouterPostParams) == 12);
+
+}  // namespace
+
+MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights)
+    : tp_rank_(tp_rank) {
+  if (tp_rank_ >= kTpSize) {
+    throw std::invalid_argument("MimoMoeLayer1: TP rank must be in [0,8)");
+  }
+  validate_addresses(
+      std::array<uint64_t, 9>{weights.post_attention_gamma_bf16,
+                              weights.router_weight_bf16,
+                              weights.router_correction_bias_fp32,
+                              weights.gate_up_packed_u8,
+                              weights.gate_up_scales_u8,
+                              weights.down_packed_u8,
+                              weights.down_scales_u8,
+                              weights.mxfp4_lut_bf16,
+                              weights.down_combine_directions_u8},
+      "weights");
+
+  synGraphHandle graph = nullptr;
+  std::vector<synSectionHandle> sections;
+  sections.reserve(kSlotCount);
+  try {
+    check(synGraphCreate(&graph, synDeviceGaudi2), "synGraphCreate");
+
+    auto external = [&](Slot slot, const char* name, synDataType dtype,
+                        Sizes sizes, uint64_t address) -> synTensor {
+      synSectionHandle section = nullptr;
+      check(synSectionCreate(&section, 0, graph), name);
+      sections.push_back(section);
+      check(synSectionSetPersistent(section, true), name);
+      synTensorDescriptor descriptor{};
+      descriptor.m_name = name;
+      descriptor.m_dataType = dtype;
+      descriptor.m_dims = static_cast<unsigned>(sizes.size());
+      unsigned dim = 0;
+      for (uint64_t size : sizes) {
+        descriptor.m_sizes[dim] = descriptor.m_minSizes[dim] = size;
+        ++dim;
+      }
+      synTensor tensor = nullptr;
+      check(synTensorCreate(&tensor, &descriptor, section, 0), name);
+
+      synLaunchTensorInfo info{};
+      info.tensorName = name;
+      info.pTensorAddress = address;
+      info.tensorType = DATA_TENSOR;
+      dim = 0;
+      for (uint64_t size : sizes) {
+        info.tensorSize[dim++] = static_cast<uint32_t>(size);
+      }
+      launch_tensors_[slot] = info;
+      return tensor;
+    };
+
+    auto temporary = [&](const char* name, synDataType dtype,
+                         Sizes sizes) -> synTensor {
+      synTensorDescriptor descriptor{};
+      descriptor.m_name = name;
+      descriptor.m_dataType = dtype;
+      descriptor.m_dims = static_cast<unsigned>(sizes.size());
+      unsigned dim = 0;
+      for (uint64_t size : sizes) {
+        descriptor.m_sizes[dim] = descriptor.m_minSizes[dim] = size;
+        ++dim;
+      }
+      synTensor tensor = nullptr;
+      check(synTensorCreate(&tensor, &descriptor, nullptr, 0), name);
+      return tensor;
+    };
+
+    synTensor attention = external(kAttention, "mimo1_attention", syn_type_bf16,
+                                   {kHiddenSize, 1}, 0);
+    synTensor residual_in =
+        external(kResidualIn, "mimo1_residual_in", syn_type_bf16,
+                 {kHiddenSize, 1}, 0);
+    synTensor gamma = external(kGamma, "mimo1_post_attention_gamma",
+                               syn_type_bf16, {kHiddenSize},
+                               weights.post_attention_gamma_bf16);
+    synTensor router_weight =
+        external(kRouterWeight, "mimo1_router_weight", syn_type_bf16,
+                 {kHiddenSize, kExpertCount}, weights.router_weight_bf16);
+    synTensor router_bias =
+        external(kRouterBias, "mimo1_router_correction_bias", syn_type_single,
+                 {kExpertCount, 1}, weights.router_correction_bias_fp32);
+    synTensor gate_up_weight = external(
+        kGateUpWeight, "mimo1_gate_up_packed", syn_type_uint8,
+        {256, static_cast<uint64_t>(kExpertCount) * kHiddenSize},
+        weights.gate_up_packed_u8);
+    synTensor gate_up_scale = external(
+        kGateUpScale, "mimo1_gate_up_scales", syn_type_uint8,
+        {512, static_cast<uint64_t>(kExpertCount) * kHiddenSize / 32},
+        weights.gate_up_scales_u8);
+    synTensor down_weight = external(
+        kDownWeight, "mimo1_down_packed", syn_type_uint8,
+        {256, static_cast<uint64_t>(kExpertCount) * 12 * kLocalDownK},
+        weights.down_packed_u8);
+    synTensor down_scale = external(
+        kDownScale, "mimo1_down_scales", syn_type_uint8,
+        {512, static_cast<uint64_t>(kExpertCount) * 12 * kLocalDownK / 32},
+        weights.down_scales_u8);
+    synTensor lut = external(kLut, "mimo1_mxfp4_lut", syn_type_bf16, {512, 1},
+                             weights.mxfp4_lut_bf16);
+    synTensor directions =
+        external(kDirections, "mimo1_down_combine_directions", syn_type_uint8,
+                 {256, 2}, weights.down_combine_directions_u8);
+    synTensor residual_out =
+        external(kResidualOut, "mimo1_residual_out", syn_type_bf16,
+                 {kHiddenSize, 1}, 0);
+    synTensor normalized = external(kNormalized, "mimo1_normalized",
+                                    syn_type_bf16, {kHiddenSize, 1}, 0);
+    synTensor route_ids = external(kTopkIds, "mimo1_topk_ids", syn_type_int32,
+                                   {kTopK, 1}, 0);
+    synTensor route_weights =
+        external(kTopkWeights, "mimo1_topk_weights", syn_type_single,
+                 {kTopK, 1}, 0);
+    synTensor moe_out = external(kMoeOut, "mimo1_moe_local_fp32",
+                                 syn_type_single, {kHiddenSize, 1}, 0);
+
+    synTensor router_logits =
+        temporary("mimo1_router_logits", syn_type_single, {kExpertCount, 1});
+    synTensor scores =
+        temporary("mimo1_router_scores", syn_type_single, {kExpertCount, 1});
+    synTensor biased_scores = temporary("mimo1_router_biased_scores",
+                                        syn_type_single, {kExpertCount, 1});
+    synTensor topk_values =
+        temporary("mimo1_topk_values", syn_type_single, {kTopK, 1});
+    synTensor selected_ids =
+        temporary("mimo1_selected_ids", syn_type_int32, {kTopK, 1});
+    synTensor route_weight_sum =
+        temporary("mimo1_route_weight_sum", syn_type_single, {1, 1});
+    synTensor gate_up_partial = temporary(
+        "mimo1_gate_up_partial", syn_type_single, {kTopK * 1536, 1});
+    synTensor gate_activation = temporary("mimo1_gate_activation",
+                                          syn_type_bf16, {kLocalDownK, kTopK});
+    synTensor down_partial = temporary(
+        "mimo1_down_partial", syn_type_single, {kTopK * kHiddenSize, 1});
+
+    auto node = [&](const char* guid, const char* name,
+                    std::initializer_list<synTensor> inputs,
+                    std::initializer_list<synTensor> outputs,
+                    const void* params, unsigned params_size) {
+      check(synNodeCreate(graph, inputs.begin(), outputs.begin(),
+                          static_cast<uint32_t>(inputs.size()),
+                          static_cast<uint32_t>(outputs.size()), params,
+                          params_size, guid, name, nullptr, nullptr),
+            name);
+    };
+
+    const float epsilon = 1e-5F;
+    node("gk_residual_rmsnorm_bf16_v1", "mimo1_post_rmsnorm",
+         {attention, residual_in, gamma}, {residual_out, normalized}, &epsilon,
+         sizeof(epsilon));
+
+    const synGEMMParams gemm_params{false, true};
+    node("gemm", "mimo1_router_gemm", {normalized, router_weight},
+         {router_logits}, &gemm_params, sizeof(gemm_params));
+
+    const ns_SigmoidKernel::Params sigmoid_params{NO_SATURATION_SIGMOID};
+    node("sigmoid_fwd_f32", "mimo1_router_sigmoid", {router_logits}, {scores},
+         &sigmoid_params, sizeof(sigmoid_params));
+    node("add_fwd_f32", "mimo1_router_correction", {scores, router_bias},
+         {biased_scores}, nullptr, 0);
+
+    ns_TopkNodeV2::ParamsV4 topk_params{};
+    topk_params.bsw = kTopK;
+    topk_params.axis = 0;
+    topk_params.bottomK = false;
+    topk_params.isVcData = false;
+    node("topk", "mimo1_router_top8", {biased_scores},
+         {topk_values, selected_ids}, &topk_params, sizeof(topk_params));
+
+    const RouterPostParams router_post_params{1.0F, 1, 0};
+    node("gk_router_post8_vector_experiment", "mimo1_router_post8",
+         {scores, selected_ids}, {route_weights, route_ids, route_weight_sum},
+         &router_post_params, sizeof(router_post_params));
+
+    node("gk_moe_gp_scale_tail_v1", "mimo1_gate_up_mxfp4",
+         {gate_up_weight, gate_up_scale, normalized, lut, route_ids},
+         {gate_up_partial}, nullptr, 0);
+
+    const int32_t gate_splits = 3;
+    node("ub_compact_gate", "mimo1_gate_silu", {gate_up_partial, route_ids},
+         {gate_activation}, &gate_splits, sizeof(gate_splits));
+
+    node("downact_direct_down_broadcast", "mimo1_down_mxfp4",
+         {down_weight, down_scale, gate_activation, lut, route_ids},
+         {down_partial}, nullptr, 0);
+
+    const int32_t combine_topk = kTopK;
+    node("pf_combine_f32", "mimo1_fp32_combine",
+         {down_partial, route_weights, directions}, {moe_out}, &combine_topk,
+         sizeof(combine_topk));
+
+    const std::string recipe_name =
+        "mimo_layer1_moe_b1_m1_tp8_rank" + std::to_string(tp_rank_);
+    check(synGraphCompile(&recipe_, graph, recipe_name.c_str(), nullptr),
+          "synGraphCompile");
+    check(synWorkspaceGetSize(&workspace_bytes_, recipe_),
+          "synWorkspaceGetSize");
+
+    synGraphDestroy(graph);
+    graph = nullptr;
+    for (synSectionHandle& section : sections) {
+      synSectionDestroy(section);
+      section = nullptr;
+    }
+  } catch (...) {
+    if (recipe_ != nullptr) {
+      synRecipeDestroy(recipe_);
+      recipe_ = nullptr;
+    }
+    if (graph != nullptr) {
+      synGraphDestroy(graph);
+    }
+    for (synSectionHandle& section : sections) {
+      if (section != nullptr) {
+        synSectionDestroy(section);
+      }
+    }
+    throw;
+  }
+}
+
+MimoMoeLayer1::~MimoMoeLayer1() {
+  if (recipe_ != nullptr) {
+    synRecipeDestroy(recipe_);
+  }
+}
+
+void MimoMoeLayer1::launch(synStreamHandle stream, const Inputs& inputs,
+                           const Outputs& outputs, uint64_t workspace_addr) {
+  if (stream == nullptr) {
+    throw std::invalid_argument("MimoMoeLayer1: null launch stream");
+  }
+  if ((workspace_bytes_ == 0) != (workspace_addr == 0)) {
+    throw std::invalid_argument(
+        "MimoMoeLayer1: workspace address does not match compiled workspace");
+  }
+
+  launch_tensors_[kAttention].pTensorAddress = inputs.attention_bf16;
+  launch_tensors_[kResidualIn].pTensorAddress = inputs.residual_in_bf16;
+  launch_tensors_[kResidualOut].pTensorAddress = outputs.residual_out_bf16;
+  launch_tensors_[kNormalized].pTensorAddress = outputs.normalized_bf16;
+  launch_tensors_[kTopkIds].pTensorAddress = outputs.topk_ids_i32;
+  launch_tensors_[kTopkWeights].pTensorAddress = outputs.topk_weights_fp32;
+  launch_tensors_[kMoeOut].pTensorAddress = outputs.moe_local_fp32;
+
+  std::array<uint64_t, kSlotCount> addresses{};
+  for (size_t i = 0; i < addresses.size(); ++i) {
+    addresses[i] = launch_tensors_[i].pTensorAddress;
+  }
+  validate_addresses(addresses, "launch bindings");
+  for (uint64_t address : addresses) {
+    if (address == workspace_addr && workspace_addr != 0) {
+      throw std::invalid_argument(
+          "MimoMoeLayer1: workspace aliases a tensor binding");
+    }
+  }
+
+  check(synLaunch(stream, launch_tensors_.data(),
+                  static_cast<uint32_t>(launch_tensors_.size()), workspace_addr,
+                  recipe_, SYN_FLAGS_TENSOR_NAME),
+        "synLaunch");
+}
+
+std::array<uint16_t, 512> MimoMoeLayer1::make_mxfp4_lut_bf16() {
+  constexpr std::array<uint16_t, 16> values = {
+      0x0000, 0x3f00, 0x3f80, 0x3fc0, 0x4000, 0x4040, 0x4080, 0x40c0,
+      0x8000, 0xbf00, 0xbf80, 0xbfc0, 0xc000, 0xc040, 0xc080, 0xc0c0};
+  std::array<uint16_t, 512> table{};
+  for (size_t byte = 0; byte < 256; ++byte) {
+    table[2 * byte] = values[byte % 16];
+    table[2 * byte + 1] = values[byte / 16];
+  }
+  return table;
+}
+
+std::array<uint8_t, 512> MimoMoeLayer1::make_down_combine_directions() {
+  std::array<uint8_t, 512> directions{};
+  for (size_t parity = 0; parity < 2; ++parity) {
+    for (size_t byte = 0; byte < 256; ++byte) {
+      const size_t lane = byte / 4;
+      directions[parity * 256 + byte] = static_cast<uint8_t>(
+          lane % 16 / 2 + lane / 16 % 2 * 32 +
+          (lane % 2 == parity ? 128 : 0));
+    }
+  }
+  return directions;
+}
+
+}  // namespace gaudirt::runtime

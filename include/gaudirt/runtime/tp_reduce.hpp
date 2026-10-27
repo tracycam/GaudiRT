@@ -3,6 +3,7 @@
 
 #include "gaudirt/runtime/hbm_arena.hpp"
 
+#include <array>
 #include <cstdint>
 
 namespace gaudirt::runtime {
@@ -21,9 +22,10 @@ class TpReduce {
  private:
   HbmArena& arena_;
   uint32_t elements_ = 0;
+  uint64_t rank_bytes_ = 0;
   synGraphHandle graph_ = nullptr;
   synRecipeHandle recipe_ = nullptr;
-  synSectionHandle gathered_section_ = nullptr;
+  std::array<synSectionHandle, 8> rank_sections_{};
   synSectionHandle output_section_ = nullptr;
   uint64_t workspace_bytes_ = 0;
 };

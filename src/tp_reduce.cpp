@@ -49,28 +49,25 @@ TpReduce::TpReduce(HbmArena& arena, uint32_t elements,
       (gathered_type != syn_type_bf16 && gathered_type != syn_type_float)) {
     throw std::invalid_argument("TpReduce: invalid elements or gathered dtype");
   }
+  rank_bytes_ = static_cast<uint64_t>(elements_) *
+                (gathered_type == syn_type_bf16 ? 2 : 4);
   try {
     check(synGraphCreate(&graph_, synDeviceGaudi2), "create graph");
-    check(synSectionCreate(&gathered_section_, 0, graph_),
-          "create gathered section");
-    check(synSectionSetPersistent(gathered_section_, true),
-          "persist gathered section");
     check(synSectionCreate(&output_section_, 0, graph_), "create output section");
     check(synSectionSetPersistent(output_section_, true),
           "persist output section");
-    synTensor gathered = tensor("gathered", gathered_type, elements, 8,
-                                gathered_section_);
     synTensor output = tensor("output", syn_type_bf16, elements, 1,
                               output_section_);
 
     std::vector<synTensor> ranks(8);
     for (unsigned rank = 0; rank < 8; ++rank) {
+      check(synSectionCreate(&rank_sections_[rank], 0, graph_),
+            "create rank section");
+      check(synSectionSetPersistent(rank_sections_[rank], true),
+            "persist rank section");
       ranks[rank] = tensor(("rank" + std::to_string(rank)).c_str(),
-                           gathered_type, elements, 1);
+                           gathered_type, elements, 1, rank_sections_[rank]);
     }
-    synSplitParams split{1};
-    node(graph_, {gathered}, ranks, &split, sizeof(split), "split",
-         "split_gathered_ranks");
 
     ns_CastKernel::ParamsV3 cast_params = {};
     cast_params.round_mode = CAST_ROUND_HALF_NE;
@@ -102,11 +99,13 @@ TpReduce::TpReduce(HbmArena& arena, uint32_t elements,
   } catch (...) {
     if (recipe_) synRecipeDestroy(recipe_);
     if (graph_) synGraphDestroy(graph_);
-    if (gathered_section_) synSectionDestroy(gathered_section_);
+    for (auto& section : rank_sections_) {
+      if (section) synSectionDestroy(section);
+      section = nullptr;
+    }
     if (output_section_) synSectionDestroy(output_section_);
     recipe_ = nullptr;
     graph_ = nullptr;
-    gathered_section_ = nullptr;
     output_section_ = nullptr;
     throw;
   }
@@ -115,7 +114,9 @@ TpReduce::TpReduce(HbmArena& arena, uint32_t elements,
 TpReduce::~TpReduce() {
   if (recipe_) synRecipeDestroy(recipe_);
   if (graph_) synGraphDestroy(graph_);
-  if (gathered_section_) synSectionDestroy(gathered_section_);
+  for (auto& section : rank_sections_) {
+    if (section) synSectionDestroy(section);
+  }
   if (output_section_) synSectionDestroy(output_section_);
 }
 
@@ -124,19 +125,24 @@ void TpReduce::execute(uint64_t gathered, uint64_t output,
   if (!gathered || !output || !stream || !recipe_) {
     throw std::runtime_error("TpReduce: invalid launch argument");
   }
-  synLaunchTensorInfo tensors[2] = {};
-  tensors[0].tensorName = "gathered";
-  tensors[0].tensorType = DATA_TENSOR;
-  tensors[0].pTensorAddress = gathered;
-  tensors[0].tensorSize[0] = elements_;
-  tensors[0].tensorSize[1] = 8;
-  tensors[1].tensorName = "output";
-  tensors[1].tensorType = DATA_TENSOR;
-  tensors[1].pTensorAddress = output;
-  tensors[1].tensorSize[0] = elements_;
-  tensors[1].tensorSize[1] = 1;
+  std::vector<synLaunchTensorInfo> tensors(9);
+  const char* names[] = {"rank0", "rank1", "rank2", "rank3",
+                         "rank4", "rank5", "rank6", "rank7"};
+  for (unsigned rank = 0; rank < 8; ++rank) {
+    tensors[rank].tensorName = names[rank];
+    tensors[rank].tensorType = DATA_TENSOR;
+    tensors[rank].pTensorAddress = gathered + rank * rank_bytes_;
+    tensors[rank].tensorSize[0] = elements_;
+    tensors[rank].tensorSize[1] = 1;
+  }
+  tensors[8].tensorName = "output";
+  tensors[8].tensorType = DATA_TENSOR;
+  tensors[8].pTensorAddress = output;
+  tensors[8].tensorSize[0] = elements_;
+  tensors[8].tensorSize[1] = 1;
   const uint64_t workspace = arena_.ensure_workspace(workspace_bytes_);
-  check(synLaunch(stream, tensors, 2, workspace, recipe_, SYN_FLAGS_TENSOR_NAME),
+  check(synLaunch(stream, tensors.data(), tensors.size(), workspace, recipe_,
+                  SYN_FLAGS_TENSOR_NAME),
         "launch");
 }
 

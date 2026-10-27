@@ -30,3 +30,10 @@ target_link_libraries(gaudirt PUBLIC Synapse hcl pthread)
 add_executable(gaudirt_runtime_unit_tests tests/runtime_unit_tests.cpp)
 target_compile_options(gaudirt_runtime_unit_tests PRIVATE -UNDEBUG)
 target_link_libraries(gaudirt_runtime_unit_tests PRIVATE gaudirt)
+
+add_executable(mimo_layer1
+    src/mimo_layer_main.cpp
+    src/mimo_attention.cpp
+    src/mimo_moe.cpp
+)
+target_link_libraries(mimo_layer1 PRIVATE gaudirt)
