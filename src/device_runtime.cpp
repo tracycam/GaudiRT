@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "gaudirt/runtime/device_runtime.hpp"
+#include "gaudirt/common/synapse_raii.hpp"
 
 #include <cstdlib>
 #include <stdexcept>
@@ -21,6 +22,11 @@ DeviceRuntime::DeviceRuntime(const Config& cfg)
   if (synInitialize() != synSuccess) {
     throw std::runtime_error("DeviceRuntime: synInitialize failed");
   }
+  if (!common::device_module_exists(cfg_.module_id)) {
+    synDestroy();
+    throw std::runtime_error("DeviceRuntime: unknown module " +
+                             std::to_string(cfg_.module_id));
+  }
 
   const synModuleId mod = static_cast<synModuleId>(cfg_.module_id);
   synStatus acq = synFail;
@@ -32,11 +38,10 @@ DeviceRuntime::DeviceRuntime(const Config& cfg)
     usleep(25000);  // 25 ms backoff for kernel fd release
   }
   if (acq != synSuccess) {
-    if (synDeviceAcquireByDeviceType(&device_id_, synDeviceGaudi2) !=
-        synSuccess) {
-      synDestroy();
-      throw std::runtime_error("DeviceRuntime: failed to acquire Gaudi2 device");
-    }
+    synDestroy();
+    throw std::runtime_error("DeviceRuntime: failed to acquire module " +
+                             std::to_string(cfg_.module_id) + ", status " +
+                             std::to_string(static_cast<int>(acq)));
   }
 
   if (synStreamCreateGeneric(&compute_stream_, device_id_, 0) != synSuccess ||

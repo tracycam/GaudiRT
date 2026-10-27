@@ -25,11 +25,17 @@ struct TensorSlotMeta {
   uint64_t byte_size = 0;
 };
 
+uint64_t tensor_byte_size(synDataType dtype, uint64_t elements);
+
 // Pre-built contiguous binding array for a registered recipe.
 // Supports O(1) slot rebinding and tracks a monotonic binding generation.
 class BindingTable {
  public:
   explicit BindingTable(const std::vector<TensorSlotMeta>& slots);
+  BindingTable(const BindingTable& other);
+  BindingTable& operator=(const BindingTable& other);
+  BindingTable(BindingTable&& other) noexcept;
+  BindingTable& operator=(BindingTable&& other) noexcept;
 
   // Bind HBM address by slot index (O(1)) or by tensor name.
   void bind_slot(size_t slot_index, uint64_t hbm_addr);
@@ -48,6 +54,8 @@ class BindingTable {
   }
 
  private:
+  void relink_tensor_names();
+
   std::vector<std::string> names_;
   std::unordered_map<std::string, size_t> name_to_slot_;
   std::vector<synLaunchTensorInfoExt> launch_infos_;

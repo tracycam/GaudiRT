@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -96,6 +97,69 @@ void test_credit_formula() {
   assert(InFlightCreditManager::max_launches_for_distinct(72, 575) == 431);
   assert(InFlightCreditManager::max_launches_for_distinct(140, 575) == 295);
   assert(InFlightCreditManager::max_launches_for_distinct(144, 575) == 287);
+}
+
+void test_binding_table_value_semantics_and_dtype() {
+  assert(tensor_byte_size(syn_type_int4, 3) == 2);
+  assert(tensor_byte_size(syn_type_uint4, 1) == 1);
+  assert(tensor_byte_size(syn_type_uint4, 9) == 5);
+  assert(tensor_byte_size(syn_type_float, 1024) == 4096);
+  bool rejected = false;
+  try {
+    tensor_byte_size(syn_type_na, 1);
+  } catch (const std::invalid_argument&) {
+    rejected = true;
+  }
+  assert(rejected);
+  assert(tensor_byte_size(syn_type_int4, UINT64_MAX) == UINT64_MAX / 2 + 1);
+  bool overflow = false;
+  try {
+    tensor_byte_size(syn_type_float, UINT64_MAX);
+  } catch (const std::overflow_error&) {
+    overflow = true;
+  }
+  assert(overflow);
+
+  std::vector<TensorSlotMeta> slots(2);
+  slots[0].name = "x";
+  slots[0].tensor_id = 1;
+  slots[1].name = "out";
+  slots[1].tensor_id = 2;
+  BindingTable original(slots);
+  original.bind_name("x", 0x1000);
+  original.bind_name("out", 0x2000);
+
+  auto verify = [](const BindingTable& table) {
+    const auto& infos = table.launch_infos();
+    assert(infos.size() == 2);
+    assert(std::strcmp(infos[0].tensorName, "x") == 0);
+    assert(std::strcmp(infos[1].tensorName, "out") == 0);
+    assert(infos[0].pTensorAddress == 0x1000);
+    assert(infos[1].pTensorAddress == 0x2000);
+  };
+
+  std::vector<BindingTable> tables;
+  for (size_t i = 0; i < 8; ++i) tables.push_back(original);
+  BindingTable copied = tables.front();
+  copied = tables.back();
+  BindingTable moved = std::move(copied);
+  tables.push_back(std::move(moved));
+  for (const auto& table : tables) verify(table);
+
+  std::vector<TensorSlotMeta> one_slot(1);
+  one_slot[0].name = "a_much_longer_tensor_name_for_heap_storage";
+  BindingTable assigned(original);
+  assigned = BindingTable(one_slot);
+  assert(assigned.size() == 1);
+  assert(std::strcmp(assigned.launch_infos()[0].tensorName,
+                     one_slot[0].name.c_str()) == 0);
+  assigned = std::move(original);
+  verify(assigned);
+  auto move_assign = [](BindingTable& to, BindingTable&& from) {
+    to = std::move(from);
+  };
+  move_assign(assigned, std::move(assigned));
+  verify(assigned);
 }
 
 synRecipeHandle compile_test_add_recipe(const std::string& recipe_name,
@@ -194,16 +258,30 @@ void test_foundation_on_hardware() {
   assert(bindings.generation() == generation + 1);
 }
 
+void test_invalid_module_fails() {
+  DeviceRuntime::Config cfg{};
+  cfg.module_id = UINT32_MAX;
+  bool rejected = false;
+  try {
+    DeviceRuntime invalid(cfg);
+  } catch (const std::runtime_error&) {
+    rejected = true;
+  }
+  assert(rejected);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   test_long_so_encoding_and_monitor_expansion();
   test_credit_formula();
+  test_binding_table_value_semantics_and_dtype();
   if (argc == 2 && std::strcmp(argv[1], "--host-only") == 0) {
     std::printf("[GaudiRT] Host-only runtime_unit_tests PASSED.\n");
     return 0;
   }
   test_foundation_on_hardware();
+  test_invalid_module_fails();
   std::printf("[GaudiRT] Host tests and 1-card foundation PASSED.\n");
   return 0;
 }

@@ -1,10 +1,12 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <vector>
 #include <synapse_api.h>
 
 #define GAUDIRT_SYN_CHECK(expr)                                                \
@@ -19,15 +21,25 @@
 
 namespace gaudirt::common {
 
+inline bool device_module_exists(uint32_t module_id) {
+  uint32_t count = 0;
+  GAUDIRT_SYN_CHECK(synDeviceGetCount(&count));
+  std::vector<uint32_t> module_ids(count);
+  uint32_t size = count;
+  GAUDIRT_SYN_CHECK(synDeviceGetModuleIDs(module_ids.data(), &size));
+  module_ids.resize(size);
+  return std::find(module_ids.begin(), module_ids.end(), module_id) !=
+         module_ids.end();
+}
+
 class SynapseContext {
 public:
   explicit SynapseContext(uint32_t module_id = 0) {
     setenv("GC_KERNEL_PATH", "/usr/lib/habanalabs/libtpc_kernels.so", 0);
     GAUDIRT_SYN_CHECK(synInitialize());
+    if (!device_module_exists(module_id)) GAUDIRT_SYN_CHECK(synFail);
     synModuleId mod = static_cast<synModuleId>(module_id);
-    if (synDeviceAcquireByModuleId(&dev_, mod) != synSuccess) {
-      GAUDIRT_SYN_CHECK(synDeviceAcquireByDeviceType(&dev_, synDeviceGaudi2));
-    }
+    GAUDIRT_SYN_CHECK(synDeviceAcquireByModuleId(&dev_, mod));
   }
   ~SynapseContext() {
     if (dev_ != SYN_INVALID_DEVICE_ID) {

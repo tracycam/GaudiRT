@@ -3,36 +3,74 @@
 
 #include <cstring>
 #include <stdexcept>
+#include <utility>
 
 namespace gaudirt::runtime {
 
 namespace {
 
-uint64_t dtype_bytes(synDataType dt) noexcept {
-  switch (dt) {
+class RecipeHandleGuard {
+ public:
+  explicit RecipeHandleGuard(synRecipeHandle handle) : handle_(handle) {}
+  ~RecipeHandleGuard() {
+    if (handle_) synRecipeDestroy(handle_);
+  }
+  RecipeHandleGuard(const RecipeHandleGuard&) = delete;
+  RecipeHandleGuard& operator=(const RecipeHandleGuard&) = delete;
+
+  synRecipeHandle get() const { return handle_; }
+  synRecipeHandle release() {
+    synRecipeHandle handle = handle_;
+    handle_ = nullptr;
+    return handle;
+  }
+
+ private:
+  synRecipeHandle handle_;
+};
+
+uint64_t dtype_bits(synDataType dtype) {
+  switch (dtype) {
+    case syn_type_int4:
+    case syn_type_uint4:
+      return 4;
     case syn_type_int8:
     case syn_type_uint8:
     case syn_type_fp8_152:
     case syn_type_fp8_143:
-      return 1;
+      return 8;
     case syn_type_bf16:
     case syn_type_fp16:
     case syn_type_int16:
     case syn_type_uint16:
-      return 2;
+    case syn_type_ufp16:
+      return 16;
     case syn_type_float:
     case syn_type_int32:
     case syn_type_uint32:
-      return 4;
+    case syn_type_tf32:
+    case syn_type_hb_float:
+      return 32;
     case syn_type_int64:
     case syn_type_uint64:
-      return 8;
+      return 64;
     default:
-      return 4;
+      throw std::invalid_argument("RecipeRegistry: unsupported synDataType " +
+                                  std::to_string(static_cast<int>(dtype)));
   }
 }
 
 }  // namespace
+
+uint64_t tensor_byte_size(synDataType dtype, uint64_t elements) {
+  const uint64_t bits = dtype_bits(dtype);
+  if (bits == 4) return elements / 2 + elements % 2;
+  const uint64_t bytes = bits / 8;
+  if (elements > UINT64_MAX / bytes) {
+    throw std::overflow_error("RecipeRegistry: tensor byte size overflow");
+  }
+  return elements * bytes;
+}
 
 BindingTable::BindingTable(const std::vector<TensorSlotMeta>& slots) {
   names_.reserve(slots.size());
@@ -50,6 +88,47 @@ BindingTable::BindingTable(const std::vector<TensorSlotMeta>& slots) {
     }
     info.tensorId = slots[i].tensor_id;
     launch_infos_[i] = info;
+  }
+}
+
+BindingTable::BindingTable(const BindingTable& other)
+    : names_(other.names_),
+      name_to_slot_(other.name_to_slot_),
+      launch_infos_(other.launch_infos_),
+      generation_(other.generation_) {
+  relink_tensor_names();
+}
+
+BindingTable& BindingTable::operator=(const BindingTable& other) {
+  if (this != &other) {
+    BindingTable copy(other);
+    *this = std::move(copy);
+  }
+  return *this;
+}
+
+BindingTable::BindingTable(BindingTable&& other) noexcept
+    : names_(std::move(other.names_)),
+      name_to_slot_(std::move(other.name_to_slot_)),
+      launch_infos_(std::move(other.launch_infos_)),
+      generation_(other.generation_) {
+  relink_tensor_names();
+}
+
+BindingTable& BindingTable::operator=(BindingTable&& other) noexcept {
+  if (this != &other) {
+    names_ = std::move(other.names_);
+    name_to_slot_ = std::move(other.name_to_slot_);
+    launch_infos_ = std::move(other.launch_infos_);
+    generation_ = other.generation_;
+    relink_tensor_names();
+  }
+  return *this;
+}
+
+void BindingTable::relink_tensor_names() {
+  for (size_t i = 0; i < launch_infos_.size(); ++i) {
+    launch_infos_[i].tensorName = names_[i].c_str();
   }
 }
 
@@ -136,10 +215,14 @@ std::vector<TensorSlotMeta> RecipeRegistry::introspect_recipe(
     for (int d = 0; d < HABANA_DIM_MAX; ++d) {
       meta.max_size[d] = infos[i].tensorMaxSize[d];
       if (static_cast<uint32_t>(d) < meta.dims) {
-        elems *= static_cast<uint64_t>(infos[i].tensorMaxSize[d]);
+        const uint64_t size = infos[i].tensorMaxSize[d];
+        if (size != 0 && elems > UINT64_MAX / size) {
+          throw std::overflow_error("RecipeRegistry: tensor element count overflow");
+        }
+        elems *= size;
       }
     }
-    meta.byte_size = elems * dtype_bytes(meta.data_type);
+    meta.byte_size = tensor_byte_size(meta.data_type, elems);
     slots[i] = std::move(meta);
   }
   return slots;
@@ -151,6 +234,7 @@ RecipeRegistry::RecipeId RecipeRegistry::register_compiled(
     throw std::invalid_argument(
         "RecipeRegistry::register_compiled: null recipe handle");
   }
+  RecipeHandleGuard owner(handle);
   uint64_t ws_bytes = 0;
   if (synWorkspaceGetSize(&ws_bytes, handle) != synSuccess) {
     throw std::runtime_error("RecipeRegistry: synWorkspaceGetSize failed");
@@ -163,18 +247,20 @@ RecipeRegistry::RecipeId RecipeRegistry::register_compiled(
   entry.workspace_bytes = ws_bytes;
   entry.slots = introspect_recipe(handle);
   entries_.push_back(std::move(entry));
+  owner.release();
   return entries_.back().id;
 }
 
 RecipeRegistry::RecipeId RecipeRegistry::load_from_file(
     const std::string& name, const std::string& path) {
   synRecipeHandle handle = nullptr;
-  if (synRecipeDeSerialize(&handle, path.c_str()) != synSuccess ||
-      handle == nullptr) {
+  const synStatus status = synRecipeDeSerialize(&handle, path.c_str());
+  RecipeHandleGuard owner(handle);
+  if (status != synSuccess || handle == nullptr) {
     throw std::runtime_error("RecipeRegistry: synRecipeDeSerialize failed for " +
                              path);
   }
-  return register_compiled(name, handle);
+  return register_compiled(name, owner.release());
 }
 
 void RecipeRegistry::save_to_file(RecipeId id, const std::string& path) const {
