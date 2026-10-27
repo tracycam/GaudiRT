@@ -23,6 +23,7 @@ add_library(gaudirt STATIC
     src/recipe_registry.cpp
     src/sha256.cpp
     src/weight_manifest.cpp
+    src/tp_reduce.cpp
 )
 target_link_libraries(gaudirt PUBLIC Synapse hcl pthread)
 

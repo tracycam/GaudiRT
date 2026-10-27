@@ -5,6 +5,7 @@
 #include "gaudirt/runtime/inflight_credit_manager.hpp"
 #include "gaudirt/runtime/weight_manifest.hpp"
 #include "gaudirt/runtime/recipe_registry.hpp"
+#include "gaudirt/runtime/tp_reduce.hpp"
 #include "gaudirt/scal/long_so.hpp"
 
 #include <cassert>
@@ -334,6 +335,23 @@ void test_foundation_on_hardware() {
                       roundtrip.data(), roundtrip.size());
   assert(std::string(roundtrip.begin(), roundtrip.end()) == "abc");
   std::filesystem::remove_all(weight_dir);
+
+  std::vector<float> gathered(8 * kElems);
+  for (size_t rank = 0; rank < 8; ++rank) {
+    std::fill_n(gathered.begin() + rank * kElems, kElems,
+                static_cast<float>(rank + 1));
+  }
+  const uint64_t gathered_addr = arena.allocate(gathered.size() * sizeof(float));
+  arena.copy_h2d_sync(rt.h2d_stream(), gathered.data(), gathered_addr,
+                      gathered.size() * sizeof(float));
+  const uint64_t reduced_addr = arena.allocate(kElems * sizeof(uint16_t));
+  TpReduce reduce(arena, kElems, syn_type_float);
+  reduce.execute(gathered_addr, reduced_addr, rt.compute_stream());
+  assert(synStreamSynchronize(rt.compute_stream()) == synSuccess);
+  std::vector<uint16_t> reduced(kElems);
+  arena.copy_d2h_sync(rt.d2h_stream(), reduced_addr, reduced.data(),
+                      reduced.size() * sizeof(uint16_t));
+  for (const uint16_t value : reduced) assert(value == 0x4210);
 }
 
 void test_invalid_module_fails() {
