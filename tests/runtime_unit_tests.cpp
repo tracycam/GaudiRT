@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "gaudirt/common/sha256.hpp"
 #include "gaudirt/runtime/device_runtime.hpp"
 #include "gaudirt/runtime/hbm_arena.hpp"
 #include "gaudirt/runtime/inflight_credit_manager.hpp"
+#include "gaudirt/runtime/weight_manifest.hpp"
 #include "gaudirt/runtime/recipe_registry.hpp"
 #include "gaudirt/scal/long_so.hpp"
 
@@ -9,6 +11,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <unistd.h>
@@ -162,6 +165,60 @@ void test_binding_table_value_semantics_and_dtype() {
   verify(assigned);
 }
 
+void test_weight_manifest() {
+  const std::vector<uint8_t> million_a(1000000, 'a');
+  assert(gaudirt::common::sha256_bytes(million_a.data(), million_a.size()) ==
+         "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+  const std::filesystem::path directory =
+      std::filesystem::temp_directory_path() /
+      ("gaudirt_weight_manifest_" + std::to_string(getpid()));
+  std::filesystem::create_directories(directory);
+  const std::string digest =
+      "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+  {
+    std::ofstream raw(directory / "x.bin", std::ios::binary);
+    raw << "abc";
+  }
+  {
+    std::ofstream manifest(directory / "weights.manifest");
+    manifest << "GAUDIRT_WEIGHTS_V1\n"
+             << "T x uint8 3 1 3 x.bin " << digest << '\n'
+             << "T e4m3 fp8_e4m3 3 1 3 x.bin " << digest << '\n'
+             << "T e5m2 fp8_e5m2 3 1 3 x.bin " << digest << '\n';
+  }
+  const auto tensors = WeightManifest::read_manifest(directory);
+  assert(tensors.size() == 3);
+  assert(tensors[0].name == "x" && tensors[0].dtype == syn_type_uint8);
+  assert(tensors[0].elements == 3 && tensors[0].bytes == 3);
+  assert(tensors[1].dtype == syn_type_fp8_143);
+  assert(tensors[2].dtype == syn_type_fp8_152);
+  {
+    std::ofstream raw(directory / "x.bin", std::ios::binary);
+    raw << "abd";
+  }
+  bool rejected = false;
+  try {
+    WeightManifest::read_manifest(directory);
+  } catch (const std::runtime_error&) {
+    rejected = true;
+  }
+  assert(rejected);
+  {
+    std::ofstream manifest(directory / "weights.manifest");
+    manifest << "GAUDIRT_WEIGHTS_V1\n"
+             << "T x fp32 1 1 1 ../x.bin "
+             << std::string(64, '0') << '\n';
+  }
+  rejected = false;
+  try {
+    WeightManifest::read_manifest(directory);
+  } catch (const std::runtime_error&) {
+    rejected = true;
+  }
+  assert(rejected);
+  std::filesystem::remove_all(directory);
+}
+
 synRecipeHandle compile_test_add_recipe(const std::string& recipe_name,
                                         TSize elements) {
   synGraphHandle graph = nullptr;
@@ -256,6 +313,27 @@ void test_foundation_on_hardware() {
   bindings.bind_slot(bindings.find_slot("in_b"), addr_a);
   assert(bindings.address_at(bindings.find_slot("in_b")) == addr_a);
   assert(bindings.generation() == generation + 1);
+
+  const std::filesystem::path weight_dir =
+      std::filesystem::temp_directory_path() /
+      ("gaudirt_weight_upload_" + std::to_string(getpid()));
+  std::filesystem::create_directories(weight_dir);
+  {
+    std::ofstream raw(weight_dir / "x.bin", std::ios::binary);
+    raw << "abc";
+  }
+  {
+    std::ofstream manifest(weight_dir / "weights.manifest");
+    manifest << "GAUDIRT_WEIGHTS_V1\n"
+             << "T x uint8 3 1 3 x.bin "
+             << "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\n";
+  }
+  WeightManifest uploaded(weight_dir, rt, arena);
+  std::vector<uint8_t> roundtrip(3);
+  arena.copy_d2h_sync(rt.d2h_stream(), uploaded.get("x").device_address,
+                      roundtrip.data(), roundtrip.size());
+  assert(std::string(roundtrip.begin(), roundtrip.end()) == "abc");
+  std::filesystem::remove_all(weight_dir);
 }
 
 void test_invalid_module_fails() {
@@ -276,6 +354,7 @@ int main(int argc, char** argv) {
   test_long_so_encoding_and_monitor_expansion();
   test_credit_formula();
   test_binding_table_value_semantics_and_dtype();
+  test_weight_manifest();
   if (argc == 2 && std::strcmp(argv[1], "--host-only") == 0) {
     std::printf("[GaudiRT] Host-only runtime_unit_tests PASSED.\n");
     return 0;

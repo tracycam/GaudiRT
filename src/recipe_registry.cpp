@@ -33,6 +33,8 @@ uint64_t dtype_bits(synDataType dtype) {
   switch (dtype) {
     case syn_type_int4:
     case syn_type_uint4:
+    case syn_type_packed_nf4:
+    case syn_type_packed_mxfp4:
       return 4;
     case syn_type_int8:
     case syn_type_uint8:

@@ -21,6 +21,8 @@ add_library(gaudirt STATIC
     src/device_runtime.cpp
     src/hbm_arena.cpp
     src/recipe_registry.cpp
+    src/sha256.cpp
+    src/weight_manifest.cpp
 )
 target_link_libraries(gaudirt PUBLIC Synapse hcl pthread)
 
