@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "gaudirt/common/synapse_raii.hpp"
 #include "gaudirt/runtime/device_runtime.hpp"
 #include "gaudirt/runtime/hbm_arena.hpp"
 #include "gaudirt/runtime/mimo_attention.hpp"
@@ -8,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -151,22 +153,12 @@ int run(int argc, char** argv) {
   attention_io.output_local = arena.allocate(12288);
 
   gaudirt::runtime::MimoAttention attention(arena, weights, kCacheSlots);
-  attention.execute(attention_io, runtime.compute_stream());
-
+  auto attention_reduce =
+      std::make_unique<gaudirt::runtime::TpReduce>(arena, 6144, syn_type_bf16);
+  auto moe_reduce =
+      std::make_unique<gaudirt::runtime::TpReduce>(arena, 6144, syn_type_float);
   const uint64_t attention_output = arena.allocate(12288);
-  gaudirt::runtime::TpReduce attention_reduce(arena, 6144, syn_type_bf16);
   const uint64_t attention_gathered = arena.allocate(world * 12288);
-  if (hcclAllGather(attention_io.output_local == 0
-                        ? nullptr
-                        : reinterpret_cast<const void*>(attention_io.output_local),
-                    reinterpret_cast<void*>(attention_gathered), 6144,
-                    hcclBfloat16, runtime.comm(), runtime.compute_stream()) !=
-      hcclSuccess) {
-    throw std::runtime_error("attention AllGather failed");
-  }
-  attention_reduce.execute(attention_gathered, attention_output,
-                           runtime.compute_stream());
-  runtime.synchronize_compute();
 
   gaudirt::runtime::MimoMoeLayer1::Weights moe_weights{};
   moe_weights.post_attention_gamma_bf16 =
@@ -198,18 +190,52 @@ int run(int argc, char** argv) {
   moe_outputs.topk_ids_i32 = arena.allocate(32);
   moe_outputs.topk_weights_fp32 = arena.allocate(32);
   moe_outputs.moe_local_fp32 = arena.allocate(24576);
-  moe.launch(runtime.compute_stream(), moe_inputs, moe_outputs, moe_workspace);
-
   const uint64_t layer_output = arena.allocate(12288);
-  gaudirt::runtime::TpReduce moe_reduce(arena, 6144, syn_type_float);
   const uint64_t moe_gathered = arena.allocate(world * 24576);
-  if (hcclAllGather(reinterpret_cast<const void*>(moe_outputs.moe_local_fp32),
-                    reinterpret_cast<void*>(moe_gathered), 6144, hcclFloat32,
-                    runtime.comm(), runtime.compute_stream()) != hcclSuccess) {
-    throw std::runtime_error("MoE AllGather failed");
+  auto execute_layer = [&]() {
+    attention.execute(attention_io, runtime.compute_stream());
+    if (hcclAllGather(attention_io.output_local == 0
+                          ? nullptr
+                          : reinterpret_cast<const void*>(attention_io.output_local),
+                      reinterpret_cast<void*>(attention_gathered), 6144,
+                      hcclBfloat16, runtime.comm(), runtime.compute_stream()) !=
+        hcclSuccess) {
+      throw std::runtime_error("attention AllGather failed");
+    }
+    attention_reduce->execute(attention_gathered, attention_output,
+                              runtime.compute_stream());
+    moe.launch(runtime.compute_stream(), moe_inputs, moe_outputs, moe_workspace);
+    if (hcclAllGather(reinterpret_cast<const void*>(moe_outputs.moe_local_fp32),
+                      reinterpret_cast<void*>(moe_gathered), 6144, hcclFloat32,
+                      runtime.comm(), runtime.compute_stream()) != hcclSuccess) {
+      throw std::runtime_error("MoE AllGather failed");
+    }
+    moe_reduce->execute(moe_gathered, layer_output, runtime.compute_stream());
+  };
+
+  const char* perf_text = std::getenv("MIMO_LAYER_PERF_ITERS");
+  const uint32_t measured = perf_text ? static_cast<uint32_t>(std::stoul(perf_text)) : 0;
+  const uint32_t warmup = measured ? 2 : 0;
+  std::vector<double> timings;
+  for (uint32_t step = 0; step < warmup + std::max(1U, measured); ++step) {
+    std::unique_ptr<gaudirt::common::TimedEventPair> timer;
+    if (measured && step >= warmup) {
+      timer = std::make_unique<gaudirt::common::TimedEventPair>(runtime.device_id());
+      timer->record_start(runtime.compute_stream());
+    }
+    execute_layer();
+    if (timer) timer->record_end(runtime.compute_stream());
+    runtime.synchronize_compute();
+    if (timer) timings.push_back(timer->elapsed_us());
   }
-  moe_reduce.execute(moe_gathered, layer_output, runtime.compute_stream());
-  runtime.synchronize_compute();
+  if (measured) {
+    std::sort(timings.begin(), timings.end());
+    std::cout << "MIMO_LAYER_PERF_SUMMARY rank=" << rank
+              << " warmup=" << warmup << " iters=" << measured
+              << " p50_us=" << timings[timings.size() / 2]
+              << " min_us=" << timings.front()
+              << " max_us=" << timings.back() << '\n';
+  }
 
   bool pass = true;
   pass &= compare(download(arena, runtime, attention_io.residual_out, 12288),
