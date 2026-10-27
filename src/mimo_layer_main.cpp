@@ -112,6 +112,21 @@ int run(int argc, char** argv) {
   const uint32_t world = static_cast<uint32_t>(std::stoul(argv[6]));
   const std::filesystem::path output = argv[7];
   const std::filesystem::path unique_id = argv[8];
+  const char* oproj_mode_text = std::getenv("MIMO_LAYER_OPROJ_MODE");
+  const std::string oproj_mode = oproj_mode_text ? oproj_mode_text : "bf16";
+  if (oproj_mode != "bf16") {
+    throw std::runtime_error("unsupported MIMO_LAYER_OPROJ_MODE: " + oproj_mode);
+  }
+  const char* perf_text = std::getenv("MIMO_LAYER_PERF_ITERS");
+  const char* warmup_text = std::getenv("MIMO_LAYER_PERF_WARMUP");
+  const uint32_t measured =
+      perf_text ? static_cast<uint32_t>(std::stoul(perf_text)) : 0;
+  const uint32_t warmup =
+      measured ? (warmup_text ? static_cast<uint32_t>(std::stoul(warmup_text)) : 2) : 0;
+  if (measured > 256 || (measured && (warmup == 0 || warmup > 64)) ||
+      (!measured && warmup_text)) {
+    throw std::runtime_error("performance requires 1..256 samples and 1..64 warmups");
+  }
   if (world != 8 || rank >= world) {
     throw std::runtime_error("mimo_layer1 requires TP8");
   }
@@ -213,9 +228,6 @@ int run(int argc, char** argv) {
     moe_reduce->execute(moe_gathered, layer_output, runtime.compute_stream());
   };
 
-  const char* perf_text = std::getenv("MIMO_LAYER_PERF_ITERS");
-  const uint32_t measured = perf_text ? static_cast<uint32_t>(std::stoul(perf_text)) : 0;
-  const uint32_t warmup = measured ? 2 : 0;
   std::vector<double> timings;
   for (uint32_t step = 0; step < warmup + std::max(1U, measured); ++step) {
     std::unique_ptr<gaudirt::common::TimedEventPair> timer;
@@ -229,12 +241,20 @@ int run(int argc, char** argv) {
     if (timer) timings.push_back(timer->elapsed_us());
   }
   if (measured) {
+    const auto previous_precision = std::cout.precision(9);
+    for (uint32_t sample = 0; sample < timings.size(); ++sample) {
+      std::cout << "MIMO_LAYER_PERF_SAMPLE rank=" << rank
+                << " oproj=" << oproj_mode << " sample=" << sample
+                << " elapsed_us=" << timings[sample] << '\n';
+    }
     std::sort(timings.begin(), timings.end());
     std::cout << "MIMO_LAYER_PERF_SUMMARY rank=" << rank
+              << " oproj=" << oproj_mode
               << " warmup=" << warmup << " iters=" << measured
               << " p50_us=" << timings[timings.size() / 2]
               << " min_us=" << timings.front()
               << " max_us=" << timings.back() << '\n';
+    std::cout.precision(previous_precision);
   }
 
   bool pass = true;
@@ -246,6 +266,38 @@ int run(int argc, char** argv) {
                   "attention_normalized", rank);
   pass &= compare(download(arena, runtime, attention_io.qkv, 3392 * 2),
                   read_file(attention_dir / "qkv_reference.bin"), "qkv", rank);
+  pass &= compare(download(arena, runtime, attention_io.query, 16 * 192 * 2),
+                  read_file(attention_dir / "query_reference.bin"), "query", rank);
+  pass &= compare(download(arena, runtime, attention_io.new_key, 192 * 2),
+                  read_file(attention_dir / "new_key_reference.bin"), "new_key", rank);
+  pass &= compare(download(arena, runtime, attention_io.new_value, 128 * 2),
+                  read_file(attention_dir / "new_value_reference.bin"), "new_value", rank);
+  auto expected_key_cache = read_file(attention_dir / "key_cache.bin");
+  auto expected_value_cache = read_file(attention_dir / "value_cache.bin");
+  const auto expected_new_key = read_file(attention_dir / "new_key_reference.bin");
+  const auto expected_new_value = read_file(attention_dir / "new_value_reference.bin");
+  const auto slot_mapping = read_file(attention_dir / "slot_mapping.bin");
+  uint32_t current_slot = 0;
+  if (slot_mapping.size() != sizeof(current_slot) ||
+      expected_key_cache.size() != kCacheSlots * 192 * 2 ||
+      expected_value_cache.size() != kCacheSlots * 128 * 2 ||
+      expected_new_key.size() != 192 * 2 || expected_new_value.size() != 128 * 2) {
+    throw std::runtime_error("invalid KV fixture geometry");
+  }
+  std::memcpy(&current_slot, slot_mapping.data(), sizeof(current_slot));
+  if (current_slot >= kCacheSlots) {
+    throw std::runtime_error("KV fixture slot is out of range");
+  }
+  std::memcpy(expected_key_cache.data() + current_slot * 192 * 2,
+              expected_new_key.data(), expected_new_key.size());
+  std::memcpy(expected_value_cache.data() + current_slot * 128 * 2,
+              expected_new_value.data(), expected_new_value.size());
+  pass &= compare(download(arena, runtime, attention_io.key_cache,
+                           expected_key_cache.size()),
+                  expected_key_cache, "key_cache", rank);
+  pass &= compare(download(arena, runtime, attention_io.value_cache,
+                           expected_value_cache.size()),
+                  expected_value_cache, "value_cache", rank);
   pass &= compare(download(arena, runtime, attention_io.context, 16 * 128 * 2),
                   read_file(attention_dir / "context_reference.bin"), "context", rank);
   pass &= compare(download(arena, runtime, attention_io.output_local, 12288),
@@ -268,6 +320,8 @@ int run(int argc, char** argv) {
   pass &= compare(download(arena, runtime, layer_output, 12288),
                   read_file(moe_dir / "layer_output.bin"), "layer_output", rank);
 
+  write_file(output / "oproj_local.bin",
+             download(arena, runtime, attention_io.output_local, 12288));
   write_file(output / "attention.bin",
              download(arena, runtime, attention_output, 12288));
   write_file(output / "moe_normalized.bin",
@@ -277,6 +331,7 @@ int run(int argc, char** argv) {
   write_file(output / "layer_output.bin",
              download(arena, runtime, layer_output, 12288));
   std::cout << "rank=" << rank << " layer_status=" << (pass ? "PASS" : "FAIL")
+            << " oproj=" << oproj_mode
             << " attention_workspace=" << attention.workspace_bytes()
             << " moe_workspace=" << moe.workspace_bytes() << '\n';
   return pass ? 0 : 6;
