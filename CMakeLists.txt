@@ -33,6 +33,7 @@ target_link_libraries(gaudirt_runtime_unit_tests PRIVATE gaudirt)
 
 add_library(mimo_layer_vertical STATIC
     src/mimo_attention.cpp
+    src/mimo_full_attention.cpp
     src/mimo_moe.cpp
 )
 target_link_libraries(mimo_layer_vertical PUBLIC gaudirt)

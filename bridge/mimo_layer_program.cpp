@@ -2,6 +2,7 @@
 #include "gaudirt/runtime/device_runtime.hpp"
 #include "gaudirt/runtime/hbm_arena.hpp"
 #include "gaudirt/runtime/mimo_attention.hpp"
+#include "gaudirt/runtime/mimo_full_attention.hpp"
 #include "gaudirt/runtime/mimo_moe.hpp"
 #include "gaudirt/runtime/tp_reduce.hpp"
 #include "gaudirt/runtime/weight_manifest.hpp"
@@ -32,6 +33,7 @@ using runtime::DeviceRuntime;
 using runtime::HbmArena;
 using runtime::MimoAttention;
 using runtime::MimoAttentionIo;
+using runtime::MimoFullAttention;
 using runtime::MimoMoeLayer1;
 using runtime::TpReduce;
 using runtime::WeightManifest;
@@ -123,12 +125,13 @@ WeightTensor weight(const at::Tensor& tensor, const char* name,
 }
 
 std::unique_ptr<WeightManifest> make_attention_weights(
-    const std::vector<at::Tensor>& tensors, int64_t device) {
-  if (tensors.size() < 15) {
-    throw std::invalid_argument("BridgeLayer: expected at least fifteen layer weights");
+    const std::vector<at::Tensor>& tensors, int64_t device, bool has_sink = true) {
+  const size_t required = has_sink ? 15 : 14;
+  if (tensors.size() < required) {
+    throw std::invalid_argument("BridgeLayer: insufficient layer weights");
   }
   std::vector<WeightTensor> manifest;
-  manifest.reserve(6);
+  manifest.reserve(has_sink ? 6 : 5);
   manifest.push_back(weight(tensors[0], "input_layernorm", syn_type_bf16,
                             at::kBFloat16, {6144}, device));
   manifest.push_back(weight(tensors[1], "qkv_weight", syn_type_fp8_143,
@@ -137,35 +140,40 @@ std::unique_ptr<WeightManifest> make_attention_weights(
                             at::kFloat, {48, 27}, device));
   manifest.push_back(weight(tensors[3], "qkv_bias", syn_type_float,
                             at::kFloat, {3392}, device));
-  manifest.push_back(weight(tensors[4], "attention_sink", syn_type_bf16,
-                            at::kBFloat16, {16}, device));
-  manifest.push_back(weight(tensors[5], "oproj_weight", syn_type_bf16,
-                            at::kBFloat16, {2048, 6144}, device));
+  if (has_sink) {
+    manifest.push_back(weight(tensors[4], "attention_sink", syn_type_bf16,
+                              at::kBFloat16, {16}, device));
+  }
+  manifest.push_back(weight(tensors[has_sink ? 5 : 4], "oproj_weight",
+                            syn_type_bf16, at::kBFloat16, {2048, 6144}, device));
   return std::make_unique<WeightManifest>(std::move(manifest));
 }
 
 MimoMoeLayer1::Weights make_moe_weights(
-    const std::vector<at::Tensor>& tensors, int64_t device) {
-  if (tensors.size() < 15) {
-    throw std::invalid_argument("BridgeLayer: expected at least fifteen layer weights");
+    const std::vector<at::Tensor>& tensors, int64_t device, bool has_sink = true) {
+  const size_t required = has_sink ? 15 : 14;
+  if (tensors.size() < required) {
+    throw std::invalid_argument("BridgeLayer: insufficient layer weights");
   }
+  const size_t base = has_sink ? 6 : 5;
   MimoMoeLayer1::Weights result{};
   result.post_attention_gamma_bf16 =
-      address(tensors[6], at::kBFloat16, 6144, device);
+      address(tensors[base], at::kBFloat16, 6144, device);
   result.router_weight_bf16 =
-      address(tensors[7], at::kBFloat16, 384 * 6144, device);
+      address(tensors[base + 1], at::kBFloat16, 384 * 6144, device);
   result.router_correction_bias_fp32 =
-      address(tensors[8], at::kFloat, 384, device);
+      address(tensors[base + 2], at::kFloat, 384, device);
   result.gate_up_packed_u8 =
-      address(tensors[9], at::kByte, 603979776, device);
+      address(tensors[base + 3], at::kByte, 603979776, device);
   result.gate_up_scales_u8 =
-      address(tensors[10], at::kByte, 37748736, device);
+      address(tensors[base + 4], at::kByte, 37748736, device);
   result.down_packed_u8 =
-      address(tensors[11], at::kByte, 301989888, device);
+      address(tensors[base + 5], at::kByte, 301989888, device);
   result.down_scales_u8 =
-      address(tensors[12], at::kByte, 18874368, device);
-  result.mxfp4_lut_bf16 = address(tensors[13], at::kBFloat16, 512, device);
-  result.down_combine_directions_u8 = address(tensors[14], at::kByte, 512, device);
+      address(tensors[base + 6], at::kByte, 18874368, device);
+  result.mxfp4_lut_bf16 = address(tensors[base + 7], at::kBFloat16, 512, device);
+  result.down_combine_directions_u8 =
+      address(tensors[base + 8], at::kByte, 512, device);
   return result;
 }
 
@@ -176,10 +184,12 @@ class LayerProgram {
                const at::Tensor& value_cache,
                std::vector<at::Tensor> static_inputs,
                const at::Tensor& arena_slab,
-               const std::filesystem::path& unique_id_path)
+               const std::filesystem::path& unique_id_path, bool full_attention)
       : rank_(rank), device_(device), keep_alive_(std::move(weights)),
-        input_owners_(std::move(static_inputs)) {
-    if (rank_ >= 8 || keep_alive_.size() != 15 || input_owners_.size() != 6) {
+        input_owners_(std::move(static_inputs)), full_attention_(full_attention) {
+    const size_t expected_weights = full_attention_ ? 14 : 15;
+    if (rank_ >= 8 || keep_alive_.size() != expected_weights ||
+        input_owners_.size() != 6) {
       throw std::invalid_argument("BridgeLayer: invalid initialization contract");
     }
     const auto cache_shape = key_cache.sizes();
@@ -234,11 +244,17 @@ class LayerProgram {
     }
     arena_->set_borrowed_workspace(workspace, workspace_bytes);
 
-    weights_ = make_attention_weights(keep_alive_, device_);
-    attention_ = std::make_unique<MimoAttention>(*arena_, *weights_, cache_slots_);
+    weights_ = make_attention_weights(keep_alive_, device_, !full_attention_);
+    if (full_attention_) {
+      full_attention_graph_ =
+          std::make_unique<MimoFullAttention>(*arena_, *weights_, cache_slots_);
+    } else {
+      attention_ = std::make_unique<MimoAttention>(*arena_, *weights_, cache_slots_);
+    }
     attention_reduce_ = std::make_unique<TpReduce>(*arena_, 6144, syn_type_bf16);
     moe_reduce_ = std::make_unique<TpReduce>(*arena_, 6144, syn_type_float);
-    moe_ = std::make_unique<MimoMoeLayer1>(rank_, make_moe_weights(keep_alive_, device_));
+    moe_ = std::make_unique<MimoMoeLayer1>(
+        rank_, make_moe_weights(keep_alive_, device_, !full_attention_));
 
     auto& io = attention_io_;
     io.residual_out = arena_->allocate(12288);
@@ -263,6 +279,10 @@ class LayerProgram {
                                     .device(c10::DeviceType::HPU, device_);
     layer_output_owner_ = at::empty({1, 6144}, output_options);
     residual_output_owner_ = at::empty({1, 6144}, output_options);
+    if (full_attention_) {
+      query_owner_ = at::empty({1, 1, 3072}, output_options);
+      io.query = address(query_owner_, at::kBFloat16, 3072, device_);
+    }
     layer_output_ = address(layer_output_owner_, at::kBFloat16, 6144, device_);
     moe_outputs_.residual_out_bf16 =
         address(residual_output_owner_, at::kBFloat16, 6144, device_);
@@ -278,12 +298,85 @@ class LayerProgram {
     }
   }
 
+  at::Tensor prepare_full(
+      const at::Tensor& hidden, const at::Tensor& residual,
+      const at::Tensor& key_cache, const at::Tensor& value_cache,
+      const at::Tensor& position, const at::Tensor& slot_mapping,
+      const at::Tensor& window_pages, const at::Tensor& window_groups,
+      const at::Tensor& rope_cos, const at::Tensor& rope_sin) {
+    if (!full_attention_) {
+      throw std::invalid_argument("BridgeLayer: prepare_full requires a full layer");
+    }
+    if (hidden.dim() != 2 || hidden.size(0) != 1 || hidden.size(1) != 6144 ||
+        residual.dim() != 2 || residual.size(0) != 1 || residual.size(1) != 6144) {
+      throw std::invalid_argument("BridgeLayer: expected BF16 [1,6144] inputs");
+    }
+    auto& io = attention_io_;
+    io.hidden_states = address(hidden, at::kBFloat16, 6144, device_);
+    io.residual = address(residual, at::kBFloat16, 6144, device_);
+    io.key_cache = address(key_cache, at::kBFloat16, cache_slots_ * 192, device_);
+    io.value_cache = address(value_cache, at::kBFloat16, cache_slots_ * 128, device_);
+    io.position = address(position, at::kInt, 1, device_);
+    io.slot_mapping = address(slot_mapping, at::kInt, 1, device_);
+    io.window_pages = address(window_pages, at::kInt, 2, device_);
+    io.window_groups = address(window_groups, at::kInt, 2, device_);
+    io.rope_cos = address(rope_cos, at::kBFloat16, 64, device_);
+    io.rope_sin = address(rope_sin, at::kBFloat16, 64, device_);
+    if (io.key_cache != key_cache_address_ || io.value_cache != value_cache_address_) {
+      throw std::invalid_argument("BridgeLayer: KV storage changed");
+    }
+    const uint64_t expected[] = {io.position, io.slot_mapping, io.window_pages,
+                                 io.window_groups, io.rope_cos, io.rope_sin};
+    for (size_t i = 0; i < 6; ++i) {
+      if (expected[i] != metadata_addresses_[i]) {
+        throw std::invalid_argument("BridgeLayer: static metadata storage changed");
+      }
+    }
+    input_owners_.push_back(hidden);
+    input_owners_.push_back(residual);
+    full_attention_graph_->execute_prepare(io, runtime_->compute_stream());
+    return query_owner_;
+  }
+
+  std::tuple<at::Tensor, at::Tensor> finish_full(const at::Tensor& context) {
+    if (!full_attention_) {
+      throw std::invalid_argument("BridgeLayer: finish_full requires a full layer");
+    }
+    if (context.dim() != 3 || context.size(0) != 1 || context.size(1) != 1 ||
+        context.size(2) != 2048) {
+      throw std::invalid_argument("BridgeLayer: expected BF16 [1,1,2048] context");
+    }
+    auto& io = attention_io_;
+    io.context = address(context, at::kBFloat16, 2048, device_);
+    full_attention_graph_->execute_finish(io, runtime_->compute_stream());
+    if (hcclAllGather(reinterpret_cast<const void*>(io.output_local),
+                      reinterpret_cast<void*>(attention_gathered_), 6144,
+                      hcclBfloat16, runtime_->comm(), runtime_->compute_stream()) !=
+        hcclSuccess) {
+      throw std::runtime_error("BridgeLayer: attention AllGather failed");
+    }
+    attention_reduce_->execute(attention_gathered_, attention_output_,
+                               runtime_->compute_stream());
+    moe_->launch(runtime_->compute_stream(), moe_inputs_, moe_outputs_,
+                 moe_workspace_);
+    if (hcclAllGather(reinterpret_cast<const void*>(moe_outputs_.moe_local_fp32),
+                      reinterpret_cast<void*>(moe_gathered_), 6144, hcclFloat32,
+                      runtime_->comm(), runtime_->compute_stream()) != hcclSuccess) {
+      throw std::runtime_error("BridgeLayer: MoE AllGather failed");
+    }
+    moe_reduce_->execute(moe_gathered_, layer_output_, runtime_->compute_stream());
+    return {layer_output_owner_, residual_output_owner_};
+  }
+
   std::tuple<at::Tensor, at::Tensor> forward(
       const at::Tensor& hidden, const at::Tensor& residual,
       const at::Tensor& key_cache, const at::Tensor& value_cache,
       const at::Tensor& position, const at::Tensor& slot_mapping,
       const at::Tensor& window_pages, const at::Tensor& window_groups,
       const at::Tensor& rope_cos, const at::Tensor& rope_sin) {
+    if (full_attention_) {
+      throw std::invalid_argument("BridgeLayer: full layers require prepare/finish");
+    }
     if (hidden.dim() != 2 || hidden.size(0) != 1 || hidden.size(1) != 6144 ||
         residual.dim() != 2 || residual.size(0) != 1 || residual.size(1) != 6144) {
       throw std::invalid_argument("BridgeLayer: expected BF16 [1,6144] inputs");
@@ -338,25 +431,30 @@ class LayerProgram {
 
   void rebind(std::vector<at::Tensor> weights, const at::Tensor& key_cache,
               const at::Tensor& value_cache) {
-    if (weights.size() != 15 || keep_alive_.size() != 17 ||
-        key_cache.sizes() != keep_alive_[15].sizes() ||
-        value_cache.sizes() != keep_alive_[16].sizes()) {
+    const size_t expected = full_attention_ ? 14 : 15;
+    if (weights.size() != expected || keep_alive_.size() != expected + 2 ||
+        key_cache.sizes() != keep_alive_[expected].sizes() ||
+        value_cache.sizes() != keep_alive_[expected + 1].sizes()) {
       throw std::invalid_argument("BridgeLayer: incompatible layer rebind");
     }
     runtime_->synchronize_compute();
     for (size_t i = 0; i < weights.size(); ++i) {
       keep_alive_[i] = std::move(weights[i]);
     }
-    keep_alive_[15] = key_cache;
-    keep_alive_[16] = value_cache;
+    keep_alive_[expected] = key_cache;
+    keep_alive_[expected + 1] = value_cache;
     key_cache_address_ =
-        address(keep_alive_[15], at::kBFloat16, cache_slots_ * 192, device_);
+        address(keep_alive_[expected], at::kBFloat16, cache_slots_ * 192, device_);
     value_cache_address_ =
-        address(keep_alive_[16], at::kBFloat16, cache_slots_ * 128, device_);
-    auto rebound_weights = make_attention_weights(keep_alive_, device_);
-    attention_->rebind_weights(*rebound_weights);
+        address(keep_alive_[expected + 1], at::kBFloat16, cache_slots_ * 128, device_);
+    auto rebound_weights = make_attention_weights(keep_alive_, device_, !full_attention_);
+    if (full_attention_) {
+      full_attention_graph_->rebind_weights(*rebound_weights);
+    } else {
+      attention_->rebind_weights(*rebound_weights);
+    }
     weights_ = std::move(rebound_weights);
-    moe_->rebind_weights(make_moe_weights(keep_alive_, device_));
+    moe_->rebind_weights(make_moe_weights(keep_alive_, device_, !full_attention_));
   }
 
   void synchronize() { runtime_->synchronize_compute(); }
@@ -366,6 +464,9 @@ class LayerProgram {
   }
 
   std::pair<uint64_t, uint64_t> recipe_info() const {
+    if (full_attention_) {
+      return full_attention_graph_->recipe_identity();
+    }
     return {attention_->recipe_identity(), moe_->recipe_identity()};
   }
 
@@ -382,9 +483,12 @@ class LayerProgram {
   at::Tensor arena_owner_;
   at::Tensor layer_output_owner_;
   at::Tensor residual_output_owner_;
+  at::Tensor query_owner_;
   std::unique_ptr<HbmArena> arena_;
   std::unique_ptr<WeightManifest> weights_;
+  bool full_attention_ = false;
   std::unique_ptr<MimoAttention> attention_;
+  std::unique_ptr<MimoFullAttention> full_attention_graph_;
   std::unique_ptr<TpReduce> attention_reduce_;
   std::unique_ptr<TpReduce> moe_reduce_;
   std::unique_ptr<MimoMoeLayer1> moe_;
@@ -405,13 +509,14 @@ void initialize(uint32_t rank, synDeviceId device, uint64_t stream,
                 const at::Tensor& value_cache,
                 std::vector<at::Tensor> static_inputs,
                 const at::Tensor& arena_slab,
-                const std::string& unique_id_path) {
+                const std::string& unique_id_path, bool full_attention = false) {
   if (active) {
     throw std::runtime_error("BridgeLayer: already initialized");
   }
   active = std::make_unique<LayerProgram>(rank, device, stream, std::move(weights),
                                           key_cache, value_cache,
-                                          std::move(static_inputs), arena_slab, unique_id_path);
+                                          std::move(static_inputs), arena_slab,
+                                          unique_id_path, full_attention);
 }
 
 std::tuple<at::Tensor, at::Tensor> forward(
@@ -425,6 +530,27 @@ std::tuple<at::Tensor, at::Tensor> forward(
   }
   return active->forward(hidden, residual, key_cache, value_cache, position,
                          slot_mapping, window_pages, window_groups, rope_cos, rope_sin);
+}
+
+at::Tensor prepare_full(
+    const at::Tensor& hidden, const at::Tensor& residual,
+    const at::Tensor& key_cache, const at::Tensor& value_cache,
+    const at::Tensor& position, const at::Tensor& slot_mapping,
+    const at::Tensor& window_pages, const at::Tensor& window_groups,
+    const at::Tensor& rope_cos, const at::Tensor& rope_sin) {
+  if (!active) {
+    throw std::runtime_error("BridgeLayer: not initialized");
+  }
+  return active->prepare_full(hidden, residual, key_cache, value_cache, position,
+                              slot_mapping, window_pages, window_groups,
+                              rope_cos, rope_sin);
+}
+
+std::tuple<at::Tensor, at::Tensor> finish_full(const at::Tensor& context) {
+  if (!active) {
+    throw std::runtime_error("BridgeLayer: not initialized");
+  }
+  return active->finish_full(context);
 }
 
 std::tuple<at::Tensor, at::Tensor> meta(
@@ -485,6 +611,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("workspace_info", &gaudirt::bridge::workspace_info);
   m.def("recipe_info", &gaudirt::bridge::recipe_info);
   m.def("rebind", &gaudirt::bridge::rebind);
+  m.def("prepare_full", &gaudirt::bridge::prepare_full);
+  m.def("finish_full", &gaudirt::bridge::finish_full);
   m.def("initialize", &gaudirt::bridge::initialize);
   m.def("synchronize", &gaudirt::bridge::synchronize);
   m.def("finalize", &gaudirt::bridge::finalize);
