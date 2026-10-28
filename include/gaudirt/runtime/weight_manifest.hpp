@@ -27,6 +27,9 @@ class WeightManifest {
  public:
   WeightManifest(const std::filesystem::path& directory,
                    DeviceRuntime& runtime, HbmArena& arena);
+  // Register caller-owned device tensors without file I/O or upload. The caller
+  // must keep their storage alive for every graph launch using these addresses.
+  explicit WeightManifest(std::vector<WeightTensor> tensors);
 
   static std::vector<WeightTensor> read_manifest(
       const std::filesystem::path& directory);

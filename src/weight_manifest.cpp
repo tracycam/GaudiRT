@@ -147,6 +147,35 @@ std::vector<WeightTensor> WeightManifest::read_manifest(
   return tensors;
 }
 
+WeightManifest::WeightManifest(std::vector<WeightTensor> tensors)
+    : tensors_(std::move(tensors)) {
+  if (tensors_.empty()) {
+    throw std::invalid_argument("borrowed weight manifest must not be empty");
+  }
+  std::unordered_set<std::string> names;
+  for (const auto& tensor : tensors_) {
+    if (tensor.name.empty() || tensor.device_address == 0 ||
+        tensor.shape.empty() || tensor.shape.size() > HABANA_DIM_MAX ||
+        tensor.elements == 0) {
+      throw std::invalid_argument("invalid borrowed weight tensor " + tensor.name);
+    }
+    uint64_t elements = 1;
+    for (const uint64_t size : tensor.shape) {
+      if (size == 0 || elements > UINT64_MAX / size) {
+        throw std::invalid_argument("borrowed weight shape overflow " + tensor.name);
+      }
+      elements *= size;
+    }
+    if (elements != tensor.elements ||
+        tensor.bytes != tensor_byte_size(tensor.dtype, tensor.elements)) {
+      throw std::invalid_argument("borrowed weight geometry mismatch " + tensor.name);
+    }
+    if (!names.insert(tensor.name).second) {
+      throw std::invalid_argument("duplicate borrowed weight tensor " + tensor.name);
+    }
+  }
+}
+
 WeightManifest::WeightManifest(const std::filesystem::path& directory,
                                    DeviceRuntime& runtime, HbmArena& arena)
     : tensors_(read_manifest(directory)) {

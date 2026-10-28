@@ -16,6 +16,9 @@ class HbmArena {
   static constexpr uint64_t kDefaultAlignment = 256;
 
   explicit HbmArena(synDeviceId device_id, uint64_t slab_bytes);
+  struct BorrowedSlab {};
+  HbmArena(synDeviceId device_id, uint64_t base_address, uint64_t slab_bytes,
+           BorrowedSlab);
   ~HbmArena();
 
   HbmArena(const HbmArena&) = delete;
@@ -30,6 +33,10 @@ class HbmArena {
   // Ensure the shared recipe workspace buffer is at least `min_bytes`.
   // Increments generation if a new workspace buffer is allocated.
   uint64_t ensure_workspace(uint64_t min_bytes);
+
+  // Use caller-owned device memory as workspace before the first allocation.
+  // Requests beyond `bytes` fail instead of falling back to the slab.
+  void set_borrowed_workspace(uint64_t address, uint64_t bytes);
 
   // Map/unmap host memory for DMA and execute async H2D / D2H transfers.
   void copy_h2d_sync(synStreamHandle h2d_stream, const void* host_src,
@@ -52,6 +59,9 @@ class HbmArena {
   uint64_t workspace_addr_ = 0;
   uint64_t workspace_bytes_ = 0;
   uint64_t generation_ = 1;
+  bool owns_slab_ = true;
+  bool owns_workspace_ = true;
+  bool workspace_is_borrowed_ = false;
 };
 
 }  // namespace gaudirt::runtime

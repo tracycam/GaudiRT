@@ -2,25 +2,38 @@
 #include "gaudirt/runtime/hbm_arena.hpp"
 
 #include <stdexcept>
+#include <string>
 
 namespace gaudirt::runtime {
 
 HbmArena::HbmArena(synDeviceId device_id, uint64_t slab_bytes)
     : device_id_(device_id), slab_capacity_(slab_bytes) {
   if (slab_capacity_ > 0) {
-    if (synDeviceMalloc(device_id_, slab_capacity_, 0, 0, &slab_base_) !=
-        synSuccess) {
-      throw std::runtime_error("HbmArena: synDeviceMalloc failed for slab");
+    const synStatus status = synDeviceMalloc(device_id_, slab_capacity_, 0, 0, &slab_base_);
+    if (status != synSuccess) {
+      throw std::runtime_error("HbmArena: synDeviceMalloc failed for slab, status " +
+                               std::to_string(static_cast<int>(status)) +
+                               ", device " + std::to_string(device_id_));
     }
   }
 }
 
+HbmArena::HbmArena(synDeviceId device_id, uint64_t base_address,
+                   uint64_t slab_bytes, BorrowedSlab)
+    : device_id_(device_id), slab_base_(base_address),
+      slab_capacity_(slab_bytes), owns_slab_(false), owns_workspace_(false) {
+  if (slab_base_ == 0 || slab_capacity_ == 0 ||
+      slab_base_ % kDefaultAlignment != 0) {
+    throw std::invalid_argument("HbmArena: invalid borrowed slab");
+  }
+}
+
 HbmArena::~HbmArena() {
-  if (workspace_addr_ != 0) {
+  if (workspace_addr_ != 0 && owns_workspace_) {
     synDeviceFree(device_id_, workspace_addr_, 0);
     workspace_addr_ = 0;
   }
-  if (slab_base_ != 0) {
+  if (slab_base_ != 0 && owns_slab_) {
     synDeviceFree(device_id_, slab_base_, 0);
     slab_base_ = 0;
   }
@@ -53,7 +66,16 @@ uint64_t HbmArena::ensure_workspace(uint64_t min_bytes) {
   if (min_bytes <= workspace_bytes_) {
     return workspace_addr_;
   }
-  if (workspace_addr_ != 0) {
+  if (workspace_is_borrowed_) {
+    throw std::runtime_error("HbmArena: required workspace exceeds borrowed buffer");
+  }
+  if (!owns_slab_) {
+    workspace_addr_ = allocate(min_bytes);
+    workspace_bytes_ = min_bytes;
+    ++generation_;
+    return workspace_addr_;
+  }
+  if (workspace_addr_ != 0 && owns_workspace_) {
     synDeviceFree(device_id_, workspace_addr_, 0);
     workspace_addr_ = 0;
     workspace_bytes_ = 0;
@@ -65,6 +87,20 @@ uint64_t HbmArena::ensure_workspace(uint64_t min_bytes) {
   workspace_bytes_ = min_bytes;
   ++generation_;
   return workspace_addr_;
+}
+
+void HbmArena::set_borrowed_workspace(uint64_t address, uint64_t bytes) {
+  if (address == 0 || bytes == 0) {
+    throw std::invalid_argument("HbmArena: invalid borrowed workspace");
+  }
+  if (workspace_addr_ != 0 || workspace_is_borrowed_) {
+    throw std::runtime_error("HbmArena: workspace is already configured");
+  }
+  workspace_addr_ = address;
+  workspace_bytes_ = bytes;
+  owns_workspace_ = false;
+  workspace_is_borrowed_ = true;
+  ++generation_;
 }
 
 void HbmArena::copy_h2d_sync(synStreamHandle h2d_stream, const void* host_src,

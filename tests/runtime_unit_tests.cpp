@@ -217,7 +217,80 @@ void test_weight_manifest() {
     rejected = true;
   }
   assert(rejected);
+
+  WeightTensor borrowed;
+  borrowed.name = "borrowed";
+  borrowed.dtype = syn_type_bf16;
+  borrowed.shape = {2, 4};
+  borrowed.elements = 8;
+  borrowed.bytes = 16;
+  borrowed.device_address = 0x1000;
+  WeightManifest external(std::vector<WeightTensor>{borrowed});
+  assert(external.get("borrowed").device_address == 0x1000);
+  auto rejects = [](WeightTensor tensor) {
+    try {
+      WeightManifest invalid(std::vector<WeightTensor>{tensor});
+    } catch (const std::invalid_argument&) {
+      return true;
+    }
+    return false;
+  };
+  auto invalid = borrowed;
+  invalid.device_address = 0;
+  assert(rejects(invalid));
+  invalid = borrowed;
+  invalid.bytes = 1;
+  assert(rejects(invalid));
+  rejected = false;
+  try {
+    WeightManifest duplicate(std::vector<WeightTensor>{borrowed, borrowed});
+  } catch (const std::invalid_argument&) {
+    rejected = true;
+  }
+  assert(rejected);
   std::filesystem::remove_all(directory);
+}
+
+void test_borrowed_arena() {
+  gaudirt::runtime::HbmArena arena(0, 0x1000, 4096,
+                                   gaudirt::runtime::HbmArena::BorrowedSlab{});
+  assert(arena.base_addr() == 0x1000);
+  assert(arena.capacity_bytes() == 4096);
+  const uint64_t workspace = arena.ensure_workspace(128);
+  assert(workspace == 0x1000);
+  assert(arena.workspace_bytes() == 128);
+  assert(arena.allocate(128) == 0x1100);
+  assert(arena.ensure_workspace(128) == workspace);
+
+  gaudirt::runtime::HbmArena external(0, 0x1000, 4096,
+                                      gaudirt::runtime::HbmArena::BorrowedSlab{});
+  external.set_borrowed_workspace(0x8000, 512);
+  assert(external.ensure_workspace(128) == 0x8000);
+  assert(external.ensure_workspace(512) == 0x8000);
+  assert(external.allocate(128) == 0x1000);
+  bool rejected = false;
+  try {
+    external.ensure_workspace(513);
+  } catch (const std::runtime_error&) {
+    rejected = true;
+  }
+  assert(rejected);
+  assert(external.used_bytes() == 128);
+  rejected = false;
+  try {
+    external.set_borrowed_workspace(0x9000, 512);
+  } catch (const std::runtime_error&) {
+    rejected = true;
+  }
+  assert(rejected);
+  rejected = false;
+  try {
+    gaudirt::runtime::HbmArena invalid(0, 0x1001, 4096,
+                                       gaudirt::runtime::HbmArena::BorrowedSlab{});
+  } catch (const std::invalid_argument&) {
+    rejected = true;
+  }
+  assert(rejected);
 }
 
 synRecipeHandle compile_test_add_recipe(const std::string& recipe_name,
@@ -373,6 +446,7 @@ int main(int argc, char** argv) {
   test_credit_formula();
   test_binding_table_value_semantics_and_dtype();
   test_weight_manifest();
+  test_borrowed_arena();
   if (argc == 2 && std::strcmp(argv[1], "--host-only") == 0) {
     std::printf("[GaudiRT] Host-only runtime_unit_tests PASSED.\n");
     return 0;

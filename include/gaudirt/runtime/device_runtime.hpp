@@ -12,9 +12,9 @@
 
 namespace gaudirt::runtime {
 
-// Standalone device, stream, and collective runtime context for a single Gaudi2
-// module/rank. Owns Synapse initialization, device acquisition, compute/DMA
-// streams, CPU uclamp policy, and optional HCCL communicator lifecycle.
+// Device, stream, and collective runtime context for a single Gaudi2
+// module/rank. Owns Synapse initialization and device acquisition by default;
+// an existing device and compute stream can instead be borrowed from a caller.
 class DeviceRuntime {
  public:
   struct Config {
@@ -24,6 +24,7 @@ class DeviceRuntime {
     uint32_t uclamp_min = 1024;
     uint32_t uclamp_max = 1024;
     int pin_cpu = -1;
+    synDeviceId borrowed_device_id = SYN_INVALID_DEVICE_ID;
   };
 
   explicit DeviceRuntime(const Config& cfg);
@@ -34,6 +35,9 @@ class DeviceRuntime {
 
   // Initialize 8-card (or N-card) HCCL communicator using a shared unique ID.
   void init_comm(const hcclUniqueId& uid);
+  // Replace the owned compute stream with a non-null caller-owned stream. The
+  // borrowed stream is synchronized but never destroyed by this runtime.
+  void use_compute_stream(synStreamHandle stream);
 
   // Synchronize the primary compute stream or all streams on this device.
   void synchronize_compute() const;
@@ -58,6 +62,8 @@ class DeviceRuntime {
   synStreamHandle h2d_stream_ = nullptr;
   synStreamHandle d2h_stream_ = nullptr;
   hcclComm_t comm_ = nullptr;
+  bool owns_device_ = true;
+  bool owns_compute_stream_ = false;
 };
 
 }  // namespace gaudirt::runtime
