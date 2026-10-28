@@ -64,9 +64,11 @@ class MimoAttention {
   MimoAttention& operator=(const MimoAttention&) = delete;
 
   void execute(const MimoAttentionIo& io, synStreamHandle stream);
+  void rebind_weights(const WeightManifest& weights);
 
   uint32_t cache_slots() const noexcept;
   uint64_t workspace_bytes() const noexcept;
+  uint64_t recipe_identity() const noexcept;
 
  private:
   struct Impl;

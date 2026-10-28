@@ -80,7 +80,7 @@ const WeightTensor& expect_weight(const WeightManifest& weights,
 
 struct MimoAttention::Impl {
   HbmArena& arena;
-  const WeightManifest& weights;
+  const WeightManifest* weights;
   uint32_t cache_slots;
   synGraphHandle graph = nullptr;
   synRecipeHandle recipe = nullptr;
@@ -101,7 +101,7 @@ struct MimoAttention::Impl {
   synTensor output_local = nullptr;
 
   Impl(HbmArena& arena, const WeightManifest& weights, uint32_t cache_slots)
-      : arena(arena), weights(weights), cache_slots(cache_slots) {}
+      : arena(arena), weights(&weights), cache_slots(cache_slots) {}
 
   ~Impl() { close(); }
 
@@ -207,16 +207,16 @@ struct MimoAttention::Impl {
     }
 
     const auto& norm_weight =
-        expect_weight(weights, "input_layernorm", syn_type_bf16, {6144});
+        expect_weight(*weights, "input_layernorm", syn_type_bf16, {6144});
     const auto& qkv_weight = expect_weight(
-        weights, "qkv_weight", syn_type_fp8_143, {128, 3392, 48});
+        *weights, "qkv_weight", syn_type_fp8_143, {128, 3392, 48});
     const auto& qkv_scales =
-        expect_weight(weights, "qkv_scales", syn_type_float, {48, 27});
+        expect_weight(*weights, "qkv_scales", syn_type_float, {48, 27});
     const auto& qkv_bias =
-        expect_weight(weights, "qkv_bias", syn_type_float, {3392});
+        expect_weight(*weights, "qkv_bias", syn_type_float, {3392});
     const auto& sinks =
-        expect_weight(weights, "attention_sink", syn_type_bf16, {16});
-    const auto& oproj_weight = expect_weight(weights, "oproj_weight",
+        expect_weight(*weights, "attention_sink", syn_type_bf16, {16});
+    const auto& oproj_weight = expect_weight(*weights, "oproj_weight",
                                              syn_type_bf16, {2048, 6144});
     (void)norm_weight;
     (void)qkv_weight;
@@ -353,14 +353,14 @@ struct MimoAttention::Impl {
       case Binding::kContext: return io.context;
       case Binding::kOutputLocal: return io.output_local;
       case Binding::kInputLayernorm:
-        return weights.get("input_layernorm").device_address;
-      case Binding::kQkvWeight: return weights.get("qkv_weight").device_address;
-      case Binding::kQkvScales: return weights.get("qkv_scales").device_address;
-      case Binding::kQkvBias: return weights.get("qkv_bias").device_address;
+        return weights->get("input_layernorm").device_address;
+      case Binding::kQkvWeight: return weights->get("qkv_weight").device_address;
+      case Binding::kQkvScales: return weights->get("qkv_scales").device_address;
+      case Binding::kQkvBias: return weights->get("qkv_bias").device_address;
       case Binding::kAttentionSink:
-        return weights.get("attention_sink").device_address;
+        return weights->get("attention_sink").device_address;
       case Binding::kOprojWeight:
-        return weights.get("oproj_weight").device_address;
+        return weights->get("oproj_weight").device_address;
     }
     throw std::runtime_error("MimoAttention: invalid tensor binding");
   }
@@ -403,12 +403,20 @@ void MimoAttention::execute(const MimoAttentionIo& io, synStreamHandle stream) {
   impl_->execute(io, stream);
 }
 
+void MimoAttention::rebind_weights(const WeightManifest& weights) {
+  impl_->weights = &weights;
+}
+
 uint32_t MimoAttention::cache_slots() const noexcept {
   return impl_->cache_slots;
 }
 
 uint64_t MimoAttention::workspace_bytes() const noexcept {
   return impl_->workspace_size;
+}
+
+uint64_t MimoAttention::recipe_identity() const noexcept {
+  return reinterpret_cast<uint64_t>(impl_->recipe);
 }
 
 }  // namespace gaudirt::runtime

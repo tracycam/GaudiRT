@@ -80,9 +80,13 @@ class MimoMoeLayer1 final {
   // Concurrent launch calls on one instance are not supported.
   void launch(synStreamHandle stream, const Inputs& inputs,
               const Outputs& outputs, uint64_t workspace_addr);
+  void rebind_weights(const Weights& weights);
 
   uint32_t tp_rank() const noexcept { return tp_rank_; }
   uint64_t workspace_bytes() const noexcept { return workspace_bytes_; }
+  uint64_t recipe_identity() const noexcept {
+    return reinterpret_cast<uint64_t>(recipe_);
+  }
 
   // Host bytes for mxfp4_lut_bf16 [512,1] and
   // down_combine_directions_u8 [256,2], respectively.

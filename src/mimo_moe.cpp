@@ -275,6 +275,29 @@ MimoMoeLayer1::~MimoMoeLayer1() {
   }
 }
 
+void MimoMoeLayer1::rebind_weights(const Weights& weights) {
+  validate_addresses(
+      std::array<uint64_t, 9>{weights.post_attention_gamma_bf16,
+                              weights.router_weight_bf16,
+                              weights.router_correction_bias_fp32,
+                              weights.gate_up_packed_u8,
+                              weights.gate_up_scales_u8,
+                              weights.down_packed_u8,
+                              weights.down_scales_u8,
+                              weights.mxfp4_lut_bf16,
+                              weights.down_combine_directions_u8},
+      "weights");
+  launch_tensors_[kGamma].pTensorAddress = weights.post_attention_gamma_bf16;
+  launch_tensors_[kRouterWeight].pTensorAddress = weights.router_weight_bf16;
+  launch_tensors_[kRouterBias].pTensorAddress = weights.router_correction_bias_fp32;
+  launch_tensors_[kGateUpWeight].pTensorAddress = weights.gate_up_packed_u8;
+  launch_tensors_[kGateUpScale].pTensorAddress = weights.gate_up_scales_u8;
+  launch_tensors_[kDownWeight].pTensorAddress = weights.down_packed_u8;
+  launch_tensors_[kDownScale].pTensorAddress = weights.down_scales_u8;
+  launch_tensors_[kLut].pTensorAddress = weights.mxfp4_lut_bf16;
+  launch_tensors_[kDirections].pTensorAddress = weights.down_combine_directions_u8;
+}
+
 void MimoMoeLayer1::launch(synStreamHandle stream, const Inputs& inputs,
                            const Outputs& outputs, uint64_t workspace_addr) {
   if (stream == nullptr) {

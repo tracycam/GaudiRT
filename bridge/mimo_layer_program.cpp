@@ -122,6 +122,53 @@ WeightTensor weight(const at::Tensor& tensor, const char* name,
   return result;
 }
 
+std::unique_ptr<WeightManifest> make_attention_weights(
+    const std::vector<at::Tensor>& tensors, int64_t device) {
+  if (tensors.size() < 15) {
+    throw std::invalid_argument("BridgeLayer: expected at least fifteen layer weights");
+  }
+  std::vector<WeightTensor> manifest;
+  manifest.reserve(6);
+  manifest.push_back(weight(tensors[0], "input_layernorm", syn_type_bf16,
+                            at::kBFloat16, {6144}, device));
+  manifest.push_back(weight(tensors[1], "qkv_weight", syn_type_fp8_143,
+                            at::kFloat8_e4m3fn, {128, 3392, 48}, device));
+  manifest.push_back(weight(tensors[2], "qkv_scales", syn_type_float,
+                            at::kFloat, {48, 27}, device));
+  manifest.push_back(weight(tensors[3], "qkv_bias", syn_type_float,
+                            at::kFloat, {3392}, device));
+  manifest.push_back(weight(tensors[4], "attention_sink", syn_type_bf16,
+                            at::kBFloat16, {16}, device));
+  manifest.push_back(weight(tensors[5], "oproj_weight", syn_type_bf16,
+                            at::kBFloat16, {2048, 6144}, device));
+  return std::make_unique<WeightManifest>(std::move(manifest));
+}
+
+MimoMoeLayer1::Weights make_moe_weights(
+    const std::vector<at::Tensor>& tensors, int64_t device) {
+  if (tensors.size() < 15) {
+    throw std::invalid_argument("BridgeLayer: expected at least fifteen layer weights");
+  }
+  MimoMoeLayer1::Weights result{};
+  result.post_attention_gamma_bf16 =
+      address(tensors[6], at::kBFloat16, 6144, device);
+  result.router_weight_bf16 =
+      address(tensors[7], at::kBFloat16, 384 * 6144, device);
+  result.router_correction_bias_fp32 =
+      address(tensors[8], at::kFloat, 384, device);
+  result.gate_up_packed_u8 =
+      address(tensors[9], at::kByte, 603979776, device);
+  result.gate_up_scales_u8 =
+      address(tensors[10], at::kByte, 37748736, device);
+  result.down_packed_u8 =
+      address(tensors[11], at::kByte, 301989888, device);
+  result.down_scales_u8 =
+      address(tensors[12], at::kByte, 18874368, device);
+  result.mxfp4_lut_bf16 = address(tensors[13], at::kBFloat16, 512, device);
+  result.down_combine_directions_u8 = address(tensors[14], at::kByte, 512, device);
+  return result;
+}
+
 class LayerProgram {
  public:
   LayerProgram(uint32_t rank, synDeviceId device, uint64_t stream,
@@ -187,45 +234,11 @@ class LayerProgram {
     }
     arena_->set_borrowed_workspace(workspace, workspace_bytes);
 
-    std::vector<WeightTensor> manifest;
-    manifest.reserve(6);
-    manifest.push_back(weight(keep_alive_[0], "input_layernorm", syn_type_bf16,
-                              at::kBFloat16, {6144}, device_));
-    manifest.push_back(weight(keep_alive_[1], "qkv_weight", syn_type_fp8_143,
-                              at::kFloat8_e4m3fn, {128, 3392, 48}, device_));
-    manifest.push_back(weight(keep_alive_[2], "qkv_scales", syn_type_float,
-                              at::kFloat, {48, 27}, device_));
-    manifest.push_back(weight(keep_alive_[3], "qkv_bias", syn_type_float,
-                              at::kFloat, {3392}, device_));
-    manifest.push_back(weight(keep_alive_[4], "attention_sink", syn_type_bf16,
-                              at::kBFloat16, {16}, device_));
-    manifest.push_back(weight(keep_alive_[5], "oproj_weight", syn_type_bf16,
-                              at::kBFloat16, {2048, 6144}, device_));
-    weights_ = std::make_unique<WeightManifest>(std::move(manifest));
+    weights_ = make_attention_weights(keep_alive_, device_);
     attention_ = std::make_unique<MimoAttention>(*arena_, *weights_, cache_slots_);
     attention_reduce_ = std::make_unique<TpReduce>(*arena_, 6144, syn_type_bf16);
     moe_reduce_ = std::make_unique<TpReduce>(*arena_, 6144, syn_type_float);
-
-    MimoMoeLayer1::Weights moe_weights{};
-    moe_weights.post_attention_gamma_bf16 =
-        address(keep_alive_[6], at::kBFloat16, 6144, device_);
-    moe_weights.router_weight_bf16 =
-        address(keep_alive_[7], at::kBFloat16, 384 * 6144, device_);
-    moe_weights.router_correction_bias_fp32 =
-        address(keep_alive_[8], at::kFloat, 384, device_);
-    moe_weights.gate_up_packed_u8 =
-        address(keep_alive_[9], at::kByte, 603979776, device_);
-    moe_weights.gate_up_scales_u8 =
-        address(keep_alive_[10], at::kByte, 37748736, device_);
-    moe_weights.down_packed_u8 =
-        address(keep_alive_[11], at::kByte, 301989888, device_);
-    moe_weights.down_scales_u8 =
-        address(keep_alive_[12], at::kByte, 18874368, device_);
-    moe_weights.mxfp4_lut_bf16 =
-        address(keep_alive_[13], at::kBFloat16, 512, device_);
-    moe_weights.down_combine_directions_u8 =
-        address(keep_alive_[14], at::kByte, 512, device_);
-    moe_ = std::make_unique<MimoMoeLayer1>(rank_, moe_weights);
+    moe_ = std::make_unique<MimoMoeLayer1>(rank_, make_moe_weights(keep_alive_, device_));
 
     auto& io = attention_io_;
     io.residual_out = arena_->allocate(12288);
@@ -323,10 +336,37 @@ class LayerProgram {
     return {layer_output_owner_, residual_output_owner_};
   }
 
+  void rebind(std::vector<at::Tensor> weights, const at::Tensor& key_cache,
+              const at::Tensor& value_cache) {
+    if (weights.size() != 15 || keep_alive_.size() != 17 ||
+        key_cache.sizes() != keep_alive_[15].sizes() ||
+        value_cache.sizes() != keep_alive_[16].sizes()) {
+      throw std::invalid_argument("BridgeLayer: incompatible layer rebind");
+    }
+    runtime_->synchronize_compute();
+    for (size_t i = 0; i < weights.size(); ++i) {
+      keep_alive_[i] = std::move(weights[i]);
+    }
+    keep_alive_[15] = key_cache;
+    keep_alive_[16] = value_cache;
+    key_cache_address_ =
+        address(keep_alive_[15], at::kBFloat16, cache_slots_ * 192, device_);
+    value_cache_address_ =
+        address(keep_alive_[16], at::kBFloat16, cache_slots_ * 128, device_);
+    auto rebound_weights = make_attention_weights(keep_alive_, device_);
+    attention_->rebind_weights(*rebound_weights);
+    weights_ = std::move(rebound_weights);
+    moe_->rebind_weights(make_moe_weights(keep_alive_, device_));
+  }
+
   void synchronize() { runtime_->synchronize_compute(); }
 
   std::pair<uint64_t, uint64_t> workspace_info() const {
     return {arena_->workspace_addr(), arena_->workspace_bytes()};
+  }
+
+  std::pair<uint64_t, uint64_t> recipe_info() const {
+    return {attention_->recipe_identity(), moe_->recipe_identity()};
   }
 
  private:
@@ -409,6 +449,21 @@ std::pair<uint64_t, uint64_t> workspace_info() {
   return active->workspace_info();
 }
 
+void rebind(std::vector<at::Tensor> weights, const at::Tensor& key_cache,
+            const at::Tensor& value_cache) {
+  if (!active) {
+    throw std::runtime_error("BridgeLayer: not initialized");
+  }
+  active->rebind(std::move(weights), key_cache, value_cache);
+}
+
+std::pair<uint64_t, uint64_t> recipe_info() {
+  if (!active) {
+    throw std::runtime_error("BridgeLayer: not initialized");
+  }
+  return active->recipe_info();
+}
+
 void finalize() { active.reset(); }
 
 }  // namespace
@@ -428,6 +483,8 @@ TORCH_LIBRARY_IMPL(gaudirt, Meta, m) {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("workspace_info", &gaudirt::bridge::workspace_info);
+  m.def("recipe_info", &gaudirt::bridge::recipe_info);
+  m.def("rebind", &gaudirt::bridge::rebind);
   m.def("initialize", &gaudirt::bridge::initialize);
   m.def("synchronize", &gaudirt::bridge::synchronize);
   m.def("finalize", &gaudirt::bridge::finalize);
