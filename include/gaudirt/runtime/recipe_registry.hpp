@@ -62,6 +62,10 @@ class BindingTable {
   uint64_t generation_ = 1;
 };
 
+void initialize_launch_tensor_ids(synRecipeHandle recipe,
+                                  synLaunchTensorInfo* launch_infos,
+                                  size_t count);
+
 // Manages compiled Synapse recipes: registration, disk serialization
 // (.recipe), deserialization, workspace query, and persistent tensor metadata.
 class RecipeRegistry {

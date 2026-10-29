@@ -285,4 +285,48 @@ BindingTable RecipeRegistry::create_binding_table(RecipeId id) const {
   return BindingTable(e.slots);
 }
 
+void initialize_launch_tensor_ids(synRecipeHandle recipe,
+                                  synLaunchTensorInfo* launch_infos,
+                                  size_t count) {
+  if (recipe == nullptr || (count != 0 && launch_infos == nullptr)) {
+    throw std::invalid_argument("initialize_launch_tensor_ids: invalid arguments");
+  }
+  uint32_t recipe_count = 0;
+  if (synTensorRetrieveLaunchAmount(recipe, &recipe_count) != synSuccess ||
+      recipe_count != count) {
+    throw std::runtime_error("initialize_launch_tensor_ids: tensor count mismatch");
+  }
+  if (count == 0) return;
+  std::vector<uint64_t> ids(count, 0);
+  if (synTensorRetrieveLaunchIds(recipe, ids.data(), recipe_count) != synSuccess) {
+    throw std::runtime_error("initialize_launch_tensor_ids: id query failed");
+  }
+  std::vector<synRetrievedLaunchTensorInfoExt> retrieved(count);
+  for (size_t i = 0; i < count; ++i) {
+    std::memset(&retrieved[i], 0, sizeof(retrieved[i]));
+    retrieved[i].tensorId = ids[i];
+  }
+  if (synTensorRetrieveLaunchInfoByIdExt(recipe, recipe_count, retrieved.data()) !=
+      synSuccess) {
+    throw std::runtime_error("initialize_launch_tensor_ids: metadata query failed");
+  }
+  std::unordered_map<std::string, uint64_t> name_to_id;
+  for (const auto& info : retrieved) {
+    if (!name_to_id.emplace(info.tensorName, info.tensorId).second) {
+      throw std::runtime_error("initialize_launch_tensor_ids: duplicate tensor name");
+    }
+  }
+  for (size_t i = 0; i < count; ++i) {
+    if (launch_infos[i].tensorName == nullptr) {
+      throw std::invalid_argument("initialize_launch_tensor_ids: null tensor name");
+    }
+    const auto it = name_to_id.find(launch_infos[i].tensorName);
+    if (it == name_to_id.end()) {
+      throw std::runtime_error("initialize_launch_tensor_ids: unknown tensor " +
+                               std::string(launch_infos[i].tensorName));
+    }
+    launch_infos[i].tensorId = it->second;
+  }
+}
+
 }  // namespace gaudirt::runtime
