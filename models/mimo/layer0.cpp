@@ -20,9 +20,10 @@ void check(hcclResult_t status, const char* operation) {
 Layer0::Layer0(runtime::HbmArena& arena, runtime::DeviceRuntime& runtime,
                const runtime::WeightManifest& attention_weights,
                const runtime::WeightManifest& dense_weights, uint32_t cache_slots,
-               uint32_t page_count)
-    : attention_(arena, attention_weights, cache_slots, true, page_count),
-      attention_reduce_(arena, 6144, syn_type_float), dense_(arena, dense_weights),
+               uint32_t page_count, runtime::RecipeCache* cache)
+    : attention_(arena, attention_weights, cache_slots, true, page_count, cache),
+      attention_reduce_(arena, 6144, syn_type_float),
+      dense_(arena, dense_weights, cache),
       dense_reduce_(arena, 6144, syn_type_float), comm_(runtime.comm()),
       post_attention_gamma_(
           dense_weights.get("post_attention_gamma").device_address) {

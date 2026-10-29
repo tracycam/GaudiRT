@@ -23,7 +23,8 @@ class LayerC final {
   };
 
   LayerC(runtime::HbmArena& arena, runtime::DeviceRuntime& runtime,
-         const runtime::WeightManifest& weights, uint32_t cache_slots);
+         const runtime::WeightManifest& weights, uint32_t cache_slots,
+         runtime::RecipeCache* cache = nullptr);
 
   LayerC(const LayerC&) = delete;
   LayerC& operator=(const LayerC&) = delete;

@@ -24,7 +24,7 @@ class LayerB final {
 
   LayerB(runtime::HbmArena& arena, runtime::DeviceRuntime& runtime,
          const runtime::WeightManifest& weights, uint32_t cache_slots,
-         uint32_t page_count = 64);
+         uint32_t page_count = 64, runtime::RecipeCache* cache = nullptr);
 
   LayerB(const LayerB&) = delete;
   LayerB& operator=(const LayerB&) = delete;

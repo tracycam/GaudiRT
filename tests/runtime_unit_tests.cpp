@@ -441,9 +441,28 @@ void test_invalid_module_fails() {
 
 }  // namespace
 
+void test_recipe_cache_contract() {
+  RecipeCache disabled;
+  assert(!disabled.enabled());
+  assert(disabled.load("invalid/key") == nullptr);
+  disabled.save(nullptr, "invalid/key");
+  assert(disabled.stats().first == 0 && disabled.stats().second == 0);
+
+  RecipeCache enabled(std::filesystem::temp_directory_path() / "gaudirt_cache_test");
+  bool rejected = false;
+  try {
+    static_cast<void>(enabled.load("invalid/key"));
+  } catch (const std::invalid_argument&) {
+    rejected = true;
+  }
+  assert(rejected);
+  assert(enabled.stats().first == 0 && enabled.stats().second == 0);
+}
+
 int main(int argc, char** argv) {
   test_long_so_encoding_and_monitor_expansion();
   test_credit_formula();
+  test_recipe_cache_contract();
   test_binding_table_value_semantics_and_dtype();
   test_weight_manifest();
   test_borrowed_arena();

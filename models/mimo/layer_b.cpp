@@ -19,8 +19,8 @@ void check(hcclResult_t status, const char* operation) {
 
 LayerB::LayerB(runtime::HbmArena& arena, runtime::DeviceRuntime& runtime,
                const runtime::WeightManifest& weights, uint32_t cache_slots,
-               uint32_t page_count)
-    : attention_(arena, weights, cache_slots, false, page_count),
+               uint32_t page_count, runtime::RecipeCache* cache)
+    : attention_(arena, weights, cache_slots, false, page_count, cache),
       attention_reduce_(arena, 6144, syn_type_float),
       moe_(runtime.rank(), [&] {
         moe_weights_.post_attention_gamma_bf16 =
@@ -40,7 +40,7 @@ LayerB::LayerB(runtime::HbmArena& arena, runtime::DeviceRuntime& runtime,
         arena.copy_h2d_sync(runtime.h2d_stream(), directions.data(),
                             moe_weights_.down_combine_directions_u8, directions.size());
         return moe_weights_;
-      }(), "full_attention"),
+      }(), "full_attention", cache),
       moe_reduce_(arena, 6144, syn_type_float), comm_(runtime.comm()) {
   if (!comm_) throw std::invalid_argument("MiMo Type B: missing HCCL");
   moe_workspace_ = arena.ensure_workspace(std::max(

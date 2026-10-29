@@ -112,7 +112,9 @@ struct Instance {
 
 class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram> {
  public:
-  PrivateProgram(uint32_t rank, uint32_t world, const std::filesystem::path& unique_id)
+  PrivateProgram(uint32_t rank, uint32_t world,
+                 const std::filesystem::path& unique_id,
+                 const std::filesystem::path& recipe_cache)
       : rank_(rank), runtime_([&] {
           runtime::DeviceRuntime::Config config;
           config.module_id = rank;
@@ -121,7 +123,10 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
           config.pin_cpu = rank * 4;
           return config;
         }()),
-        arena_(runtime_.device_id(), 4 * 1024 * 1024 * 1024ULL) {
+        arena_(runtime_.device_id(), 4 * 1024 * 1024 * 1024ULL),
+        recipe_cache_(recipe_cache.empty()
+                          ? std::filesystem::path{}
+                          : recipe_cache / ("rank" + std::to_string(rank))) {
     if (world != 8 || rank >= world) {
       throw std::invalid_argument("PrivateUse1: only TP8 is supported");
     }
@@ -214,6 +219,11 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     return instances_.at(checked_kind(kind_value))->recipe_identity();
   }
 
+  std::vector<uint64_t> recipe_cache_stats() const {
+    const auto [loaded, saved] = recipe_cache_.stats();
+    return {loaded, saved};
+  }
+
   at::Tensor wrap(uint64_t address, const std::vector<int64_t>& shape,
                   at::ScalarType dtype) {
     if (!owns_address(address)) {
@@ -272,7 +282,8 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     instance->page_count = page_count;
     if (kind == Kind::A) {
       instance->a = std::make_unique<Layer0>(arena_, runtime_, attention_weights,
-                                             *dense_weights, cache_slots, page_count);
+                                             *dense_weights, cache_slots, page_count,
+                                             &recipe_cache_);
       auto& io = instance->a_io;
       io.attention.normalized = arena_.allocate(12288);
       io.attention.qkv = arena_.allocate(3392 * 2);
@@ -288,7 +299,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       io.down_gathered_fp32 = arena_.allocate(8 * 6144 * 4);
     } else if (kind == Kind::B) {
       instance->b = std::make_unique<LayerB>(arena_, runtime_, attention_weights,
-                                             cache_slots, page_count);
+                                             cache_slots, page_count, &recipe_cache_);
       auto& io = instance->b_io;
       io.attention.residual_out = arena_.allocate(12288);
       io.attention.normalized = arena_.allocate(12288);
@@ -307,7 +318,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       io.moe_gathered_fp32 = arena_.allocate(8 * 6144 * 4);
     } else {
       instance->c = std::make_unique<LayerC>(arena_, runtime_, attention_weights,
-                                             cache_slots);
+                                             cache_slots, &recipe_cache_);
       auto& io = instance->c_io;
       io.attention.residual_out = arena_.allocate(12288);
       io.attention.normalized = arena_.allocate(12288);
@@ -372,6 +383,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   uint32_t rank_;
   runtime::DeviceRuntime runtime_;
   runtime::HbmArena arena_;
+  runtime::RecipeCache recipe_cache_;
   std::unordered_map<Kind, std::unique_ptr<Instance>> instances_;
   std::unordered_map<uint32_t, LayerEntry> entries_;
 };
@@ -563,9 +575,11 @@ at::Tensor empty_strided(at::IntArrayRef size, at::IntArrayRef stride,
       c10::DispatchKeySet(c10::DispatchKey::PrivateUse1), dtype.value_or(at::kFloat));
 }
 
-void initialize(uint32_t rank, uint32_t world, const std::string& unique_id) {
+void initialize(uint32_t rank, uint32_t world, const std::string& unique_id,
+                const std::string& recipe_cache) {
   initialize_backend();
-  auto instance = std::make_shared<PrivateProgram>(rank, world, unique_id);
+  auto instance = std::make_shared<PrivateProgram>(rank, world, unique_id,
+                                                   recipe_cache);
   std::lock_guard<std::mutex> lock(registry_mutex);
   if (!registry.empty()) {
     throw std::runtime_error("PrivateUse1: only one rank may be initialized per process");
@@ -589,6 +603,10 @@ void register_layer(uint32_t rank, uint32_t layer_id, int64_t kind,
 
 std::vector<uint64_t> recipe_identity(uint32_t rank, int64_t kind) {
   return get(rank)->recipe_identity(kind);
+}
+
+std::vector<uint64_t> recipe_cache_stats(uint32_t rank) {
+  return get(rank)->recipe_cache_stats();
 }
 
 void shutdown(uint32_t rank) {
@@ -641,5 +659,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("initialize", &gaudirt::mimo::initialize);
   m.def("register_layer", &gaudirt::mimo::register_layer);
   m.def("recipe_identity", &gaudirt::mimo::recipe_identity);
+  m.def("recipe_cache_stats", &gaudirt::mimo::recipe_cache_stats);
   m.def("shutdown", &gaudirt::mimo::shutdown);
 }

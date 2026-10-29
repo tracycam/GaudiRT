@@ -10,6 +10,7 @@ namespace gaudirt::runtime {
 
 class HbmArena;
 class WeightManifest;
+class RecipeCache;
 
 // BF16 shapes are fastest-first: hidden_states/residual/residual_out/normalized
 // and output_local [6144,1]; qkv [3392,1]; query [192,16,1]; new_key
@@ -62,7 +63,7 @@ class MimoAttention {
   static constexpr uint32_t kKvBlockSize = 128;
 
   MimoAttention(HbmArena& arena, const WeightManifest& weights,
-                uint32_t cache_slots);
+                uint32_t cache_slots, RecipeCache* cache = nullptr);
   ~MimoAttention();
 
   MimoAttention(const MimoAttention&) = delete;

@@ -85,6 +85,7 @@ struct MimoAttention::Impl {
   uint32_t cache_slots;
   synGraphHandle graph = nullptr;
   synRecipeHandle recipe = nullptr;
+  RecipeCache* cache = nullptr;
   uint64_t workspace_size = 0;
   std::vector<ExternalTensor> externals;
   std::vector<synLaunchTensorInfo> launch;
@@ -328,9 +329,8 @@ struct MimoAttention::Impl {
     node({context_flat, oproj}, {output_local}, &oproj_gemm_params,
          sizeof(oproj_gemm_params), "gemm", "oproj_bf16_mme_local");
 
-    check(synGraphCompile(&recipe, graph, "mimo_layer1_attention_b1_m1_tp8",
-                          nullptr),
-          "compile graph");
+    recipe = compile_cached(graph, "mimo_layer1_attention_b1_m1_tp8",
+                            "swa_c" + std::to_string(cache_slots), cache);
     check(synWorkspaceGetSize(&workspace_size, recipe), "get workspace size");
     arena.ensure_workspace(workspace_size);
     if (graph) {
@@ -407,8 +407,9 @@ struct MimoAttention::Impl {
 };
 
 MimoAttention::MimoAttention(HbmArena& arena, const WeightManifest& weights,
-                             uint32_t cache_slots)
+                             uint32_t cache_slots, RecipeCache* cache)
     : impl_(std::make_unique<Impl>(arena, weights, cache_slots)) {
+  impl_->cache = cache;
   impl_->build();
 }
 

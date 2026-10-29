@@ -50,7 +50,7 @@ static_assert(sizeof(RouterPostParams) == 12);
 }  // namespace
 
 MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
-                             const char* graph_variant)
+                             const char* graph_variant, RecipeCache* cache)
     : tp_rank_(tp_rank) {
   if (tp_rank_ >= kTpSize) {
     throw std::invalid_argument("MimoMoeLayer1: TP rank must be in [0,8)");
@@ -250,8 +250,10 @@ MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
     const std::string recipe_name =
         std::string("mimo_") + graph_variant + "_moe_b1_m1_tp8_rank" +
         std::to_string(tp_rank_);
-    check(synGraphCompile(&recipe_, graph, recipe_name.c_str(), nullptr),
-          "synGraphCompile");
+    recipe_ = compile_cached(
+        graph, recipe_name,
+        std::string("moe_") + graph_variant + "_rank" + std::to_string(tp_rank_),
+        cache);
     check(synWorkspaceGetSize(&workspace_bytes_, recipe_),
           "synWorkspaceGetSize");
     initialize_launch_tensor_ids(recipe_, launch_tensors_.data(),

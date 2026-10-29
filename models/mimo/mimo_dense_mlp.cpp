@@ -82,6 +82,7 @@ struct MimoDenseMlp::Impl {
   synGraphHandle down_graph = nullptr;
   synRecipeHandle gate_up_recipe = nullptr;
   synRecipeHandle down_recipe = nullptr;
+  RecipeCache* cache = nullptr;
   uint64_t gate_up_workspace_size = 0;
   uint64_t down_workspace_size = 0;
   uint64_t gate_up_n = 0;
@@ -249,9 +250,10 @@ struct MimoDenseMlp::Impl {
                                          syn_type_float, {down_k, 1});
     node(gate_up_graph, {gate_up}, {activation_wide}, nullptr, 0,
          "gk_dense_swiglu_fp32_v1", "swiglu_fp32");
-    check(synGraphCompile(&gate_up_recipe, gate_up_graph,
-                          "mimo_dense_gate_up_b1_m1_tp8", nullptr),
-          "compile gate_up graph");
+    gate_up_recipe = compile_cached(
+        gate_up_graph, "mimo_dense_gate_up_b1_m1_tp8",
+        "dense_gate_up_n" + std::to_string(gate_up_n) + "_g" +
+            std::to_string(groups), cache);
     check(synWorkspaceGetSize(&gate_up_workspace_size, gate_up_recipe),
           "get gate_up workspace size");
     arena.ensure_workspace(gate_up_workspace_size);
@@ -286,9 +288,10 @@ struct MimoDenseMlp::Impl {
                                       {6144, 1});
     node(down_graph, {activation, weight, weight_scale, bias}, {output_local},
          nullptr, 0, "gk_dense_linear_fp32_v1", "down_fp32_linear");
-    check(synGraphCompile(&down_recipe, down_graph,
-                          "mimo_dense_down_b1_m1_tp8", nullptr),
-          "compile down graph");
+    down_recipe = compile_cached(
+        down_graph, "mimo_dense_down_b1_m1_tp8",
+        "dense_down_k" + std::to_string(down_k) + "_g" + std::to_string(groups),
+        cache);
     check(synWorkspaceGetSize(&down_workspace_size, down_recipe),
           "get down workspace size");
     arena.ensure_workspace(down_workspace_size);
@@ -356,8 +359,10 @@ struct MimoDenseMlp::Impl {
   }
 };
 
-MimoDenseMlp::MimoDenseMlp(HbmArena& arena, const WeightManifest& weights)
+MimoDenseMlp::MimoDenseMlp(HbmArena& arena, const WeightManifest& weights,
+                           RecipeCache* cache)
     : impl_(std::make_unique<Impl>(arena, weights)) {
+  impl_->cache = cache;
   impl_->build();
 }
 

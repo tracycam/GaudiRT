@@ -11,6 +11,7 @@ namespace gaudirt::runtime {
 
 class HbmArena;
 class WeightManifest;
+class RecipeCache;
 
 class MimoDenseMlp final {
  public:
@@ -26,7 +27,8 @@ class MimoDenseMlp final {
     uint64_t output_local_fp32 = 0;
   };
 
-  MimoDenseMlp(HbmArena& arena, const WeightManifest& weights);
+  MimoDenseMlp(HbmArena& arena, const WeightManifest& weights,
+               RecipeCache* cache = nullptr);
   ~MimoDenseMlp();
 
   MimoDenseMlp(const MimoDenseMlp&) = delete;

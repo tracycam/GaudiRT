@@ -90,6 +90,7 @@ struct MimoFullAttention::Impl {
   synGraphHandle finish_graph = nullptr;
   synRecipeHandle prepare_recipe = nullptr;
   synRecipeHandle finish_recipe = nullptr;
+  RecipeCache* cache = nullptr;
   uint64_t prepare_workspace_size = 0;
   uint64_t finish_workspace_size = 0;
   std::vector<ExternalTensor> prepare_externals;
@@ -348,8 +349,11 @@ struct MimoFullAttention::Impl {
     const std::string recipe_name = pure_rmsnorm
         ? "mimo_full_attention_prepare_b1_m1_tp8_pure"
         : "mimo_full_attention_prepare_b1_m1_tp8_residual";
-    check(synGraphCompile(&prepare_recipe, prepare_graph, recipe_name.c_str(), nullptr),
-          "compile prepare graph");
+    prepare_recipe = compile_cached(
+        prepare_graph, recipe_name,
+        std::string("full_prepare_") + (pure_rmsnorm ? "pure" : "residual") +
+            "_c" + std::to_string(cache_slots) + "_p" + std::to_string(page_count),
+        cache);
     check(synWorkspaceGetSize(&prepare_workspace_size, prepare_recipe),
           "get prepare workspace size");
     arena.ensure_workspace(prepare_workspace_size);
@@ -386,8 +390,11 @@ struct MimoFullAttention::Impl {
     const std::string recipe_name = pure_rmsnorm
         ? "mimo_full_attention_oproj_b1_m1_tp8_pure"
         : "mimo_full_attention_oproj_b1_m1_tp8_residual";
-    check(synGraphCompile(&finish_recipe, finish_graph, recipe_name.c_str(), nullptr),
-          "compile finish graph");
+    finish_recipe = compile_cached(
+        finish_graph, recipe_name,
+        std::string("full_oproj_") + (pure_rmsnorm ? "pure" : "residual") +
+            "_c" + std::to_string(cache_slots) + "_p" + std::to_string(page_count),
+        cache);
     check(synWorkspaceGetSize(&finish_workspace_size, finish_recipe),
           "get finish workspace size");
     arena.ensure_workspace(finish_workspace_size);
@@ -467,9 +474,10 @@ struct MimoFullAttention::Impl {
 MimoFullAttention::MimoFullAttention(HbmArena& arena,
                                      const WeightManifest& weights,
                                      uint32_t cache_slots, bool pure_rmsnorm,
-                                     uint32_t page_count)
+                                     uint32_t page_count, RecipeCache* cache)
     : impl_(std::make_unique<Impl>(arena, weights, cache_slots, pure_rmsnorm,
                                   page_count)) {
+  impl_->cache = cache;
   impl_->build();
 }
 

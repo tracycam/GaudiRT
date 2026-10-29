@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "gaudirt/runtime/recipe_registry.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <stdexcept>
 #include <utility>
@@ -72,6 +74,60 @@ uint64_t tensor_byte_size(synDataType dtype, uint64_t elements) {
     throw std::overflow_error("RecipeRegistry: tensor byte size overflow");
   }
   return elements * bytes;
+}
+
+std::filesystem::path RecipeCache::file_for(const std::string& key) const {
+  if (key.empty() ||
+      !std::all_of(key.begin(), key.end(), [](unsigned char c) {
+        return std::isalnum(c) != 0 || c == '_' || c == '-' || c == '.';
+      })) {
+    throw std::invalid_argument("RecipeCache: invalid key");
+  }
+  return directory_ / (key + ".recipe");
+}
+
+synRecipeHandle RecipeCache::load(const std::string& key) {
+  if (!enabled()) return nullptr;
+  const auto path = file_for(key);
+  if (!std::filesystem::exists(path)) return nullptr;
+  synRecipeHandle recipe = nullptr;
+  const synStatus status = synRecipeDeSerialize(&recipe, path.c_str());
+  if (status != synSuccess || recipe == nullptr) {
+    throw std::runtime_error("RecipeCache: deserialization failed for " +
+                             path.filename().string());
+  }
+  ++loaded_;
+  return recipe;
+}
+
+void RecipeCache::save(synRecipeHandle recipe, const std::string& key) {
+  if (!enabled()) return;
+  if (recipe == nullptr) {
+    throw std::invalid_argument("RecipeCache: cannot serialize a null recipe");
+  }
+  std::filesystem::create_directories(directory_);
+  const auto path = file_for(key);
+  auto temporary = path;
+  temporary += ".tmp";
+  std::filesystem::remove(temporary);
+  if (synRecipeSerialize(recipe, temporary.c_str()) != synSuccess) {
+    throw std::runtime_error("RecipeCache: serialization failed for " +
+                             path.filename().string());
+  }
+  std::filesystem::rename(temporary, path);
+  ++saved_;
+}
+
+synRecipeHandle compile_cached(synGraphHandle graph, const std::string& name,
+                               const std::string& key, RecipeCache* cache) {
+  synRecipeHandle recipe = cache != nullptr ? cache->load(key) : nullptr;
+  if (recipe != nullptr) return recipe;
+  if (synGraphCompile(&recipe, graph, name.c_str(), nullptr) != synSuccess ||
+      recipe == nullptr) {
+    throw std::runtime_error("RecipeCache: graph compilation failed for " + name);
+  }
+  if (cache != nullptr) cache->save(recipe, key);
+  return recipe;
 }
 
 BindingTable::BindingTable(const std::vector<TensorSlotMeta>& slots) {

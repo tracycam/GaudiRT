@@ -5,9 +5,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace gaudirt::runtime {
@@ -26,6 +28,32 @@ struct TensorSlotMeta {
 };
 
 uint64_t tensor_byte_size(synDataType dtype, uint64_t elements);
+
+// The caller scopes the directory to one graph/kernel fingerprint. A present
+// but invalid cache entry is an error; only a missing entry requests compilation.
+class RecipeCache {
+ public:
+  RecipeCache() = default;
+  explicit RecipeCache(std::filesystem::path directory)
+      : directory_(std::move(directory)) {}
+
+  bool enabled() const noexcept { return !directory_.empty(); }
+  synRecipeHandle load(const std::string& key);
+  void save(synRecipeHandle recipe, const std::string& key);
+  std::pair<uint64_t, uint64_t> stats() const noexcept {
+    return {loaded_, saved_};
+  }
+
+ private:
+  std::filesystem::path file_for(const std::string& key) const;
+
+  std::filesystem::path directory_;
+  uint64_t loaded_ = 0;
+  uint64_t saved_ = 0;
+};
+
+synRecipeHandle compile_cached(synGraphHandle graph, const std::string& name,
+                               const std::string& key, RecipeCache* cache);
 
 // Pre-built contiguous binding array for a registered recipe.
 // Supports O(1) slot rebinding and tracks a monotonic binding generation.

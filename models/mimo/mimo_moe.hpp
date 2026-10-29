@@ -9,6 +9,8 @@
 
 namespace gaudirt::runtime {
 
+class RecipeCache;
+
 // Fixed MiMo layer1 decode MoE: B1/M1, TP8/EP1, H6144, E384, top8.
 // All tensors use Synapse FCD-first geometry. HBM addresses refer to contiguous
 // payload bytes, not .npy headers. The caller owns every buffer and HCCL.
@@ -66,7 +68,7 @@ class MimoMoeLayer1 final {
   // driver. This constructor builds and compiles the graph but does not acquire
   // a device, initialize HCCL, upload weights, or launch work.
   MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
-                const char* graph_variant);
+                const char* graph_variant, RecipeCache* cache = nullptr);
   ~MimoMoeLayer1();
 
   MimoMoeLayer1(const MimoMoeLayer1&) = delete;
