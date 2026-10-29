@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "gaudirt/runtime/mimo_attention.hpp"
+#include "mimo_attention.hpp"
 
 #include "gaudirt/runtime/hbm_arena.hpp"
+#include "gaudirt/runtime/recipe_registry.hpp"
 #include "gaudirt/runtime/weight_manifest.hpp"
 
 #include <perf_lib_layer_params.h>
@@ -86,6 +87,7 @@ struct MimoAttention::Impl {
   synRecipeHandle recipe = nullptr;
   uint64_t workspace_size = 0;
   std::vector<ExternalTensor> externals;
+  std::vector<synLaunchTensorInfo> launch;
 
   synTensor hidden_states = nullptr;
   synTensor residual = nullptr;
@@ -330,6 +332,16 @@ struct MimoAttention::Impl {
           "compile graph");
     check(synWorkspaceGetSize(&workspace_size, recipe), "get workspace size");
     arena.ensure_workspace(workspace_size);
+    launch.resize(externals.size());
+    for (size_t i = 0; i < externals.size(); ++i) {
+      launch[i] = {};
+      launch[i].tensorName = externals[i].name;
+      launch[i].tensorType = DATA_TENSOR;
+      for (size_t dim = 0; dim < externals[i].shape.size(); ++dim) {
+        launch[i].tensorSize[dim] = externals[i].shape[dim];
+      }
+    }
+    initialize_launch_tensor_ids(recipe, launch.data(), launch.size());
   }
 
   uint64_t resolve(Binding binding, const MimoAttentionIo& io) const {
@@ -369,24 +381,16 @@ struct MimoAttention::Impl {
     if (!stream || !recipe) {
       throw std::runtime_error("MimoAttention: invalid stream or recipe");
     }
-    std::vector<synLaunchTensorInfo> launch(externals.size());
     for (size_t i = 0; i < externals.size(); ++i) {
       const uint64_t address = resolve(externals[i].binding, io);
       if (address == 0) {
         throw std::runtime_error(std::string("MimoAttention: null address for ") +
                                  externals[i].name);
       }
-      launch[i] = {};
-      launch[i].tensorName = externals[i].name;
-      launch[i].tensorType = DATA_TENSOR;
       launch[i].pTensorAddress = address;
-      for (size_t dim = 0; dim < externals[i].shape.size(); ++dim) {
-        launch[i].tensorSize[dim] = externals[i].shape[dim];
-      }
     }
     const uint64_t workspace = arena.ensure_workspace(workspace_size);
-    check(synLaunch(stream, launch.data(), launch.size(), workspace, recipe,
-                    SYN_FLAGS_TENSOR_NAME),
+    check(synLaunch(stream, launch.data(), launch.size(), workspace, recipe, 0),
           "launch graph");
   }
 };

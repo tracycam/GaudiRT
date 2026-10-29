@@ -32,11 +32,33 @@ target_compile_options(gaudirt_runtime_unit_tests PRIVATE -UNDEBUG)
 target_link_libraries(gaudirt_runtime_unit_tests PRIVATE gaudirt)
 
 add_library(mimo_layer_vertical STATIC
-    src/mimo_attention.cpp
-    src/mimo_full_attention.cpp
-    src/mimo_moe.cpp
+    models/mimo/mimo_attention.cpp
+    models/mimo/mimo_full_attention.cpp
+    models/mimo/mimo_dense_mlp.cpp
+    models/mimo/mimo_moe.cpp
 )
+target_include_directories(mimo_layer_vertical PUBLIC models/mimo)
 target_link_libraries(mimo_layer_vertical PUBLIC gaudirt)
 
-add_executable(mimo_layer1 src/mimo_layer_main.cpp)
+add_executable(mimo_layer1 models/mimo/layer1_main.cpp)
 target_link_libraries(mimo_layer1 PRIVATE mimo_layer_vertical)
+
+add_executable(mimo_dense models/mimo/dense_main.cpp)
+target_link_libraries(mimo_dense PRIVATE mimo_layer_vertical)
+
+add_executable(mimo_full_attention models/mimo/full_attention_main.cpp)
+target_link_libraries(mimo_full_attention PRIVATE mimo_layer_vertical)
+
+add_library(mimo_layer0_vertical STATIC models/mimo/layer0.cpp)
+target_include_directories(mimo_layer0_vertical PUBLIC models/mimo)
+target_link_libraries(mimo_layer0_vertical PUBLIC mimo_layer_vertical)
+
+add_executable(mimo_layer0 models/mimo/layer0_main.cpp)
+target_link_libraries(mimo_layer0 PRIVATE mimo_layer0_vertical)
+
+add_library(mimo_layer_b_vertical STATIC models/mimo/layer_b.cpp)
+target_include_directories(mimo_layer_b_vertical PUBLIC models/mimo)
+target_link_libraries(mimo_layer_b_vertical PUBLIC mimo_layer_vertical)
+
+add_executable(mimo_layer_b models/mimo/layer_b_main.cpp)
+target_link_libraries(mimo_layer_b PRIVATE mimo_layer_b_vertical)

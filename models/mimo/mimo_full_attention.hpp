@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include "gaudirt/runtime/mimo_attention.hpp"
+#include "mimo_attention.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -12,14 +12,14 @@ namespace gaudirt::runtime {
 class MimoFullAttention final {
  public:
   MimoFullAttention(HbmArena& arena, const WeightManifest& weights,
-                    uint32_t cache_slots);
+                    uint32_t cache_slots, bool pure_rmsnorm = false,
+                    uint32_t page_count = 64);
   ~MimoFullAttention();
 
   MimoFullAttention(const MimoFullAttention&) = delete;
   MimoFullAttention& operator=(const MimoFullAttention&) = delete;
 
-  void execute_prepare(const MimoAttentionIo& io, synStreamHandle stream);
-  void execute_finish(const MimoAttentionIo& io, synStreamHandle stream);
+  void execute(const MimoAttentionIo& io, synStreamHandle stream);
   void rebind_weights(const WeightManifest& weights);
 
   uint64_t workspace_bytes() const noexcept;

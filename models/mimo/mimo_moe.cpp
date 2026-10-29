@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "gaudirt/runtime/mimo_moe.hpp"
+#include "mimo_moe.hpp"
+
+#include "gaudirt/runtime/recipe_registry.hpp"
 
 #include <perf_lib_layer_params.h>
 
@@ -245,6 +247,8 @@ MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights)
           "synGraphCompile");
     check(synWorkspaceGetSize(&workspace_bytes_, recipe_),
           "synWorkspaceGetSize");
+    initialize_launch_tensor_ids(recipe_, launch_tensors_.data(),
+                                 launch_tensors_.size());
 
     synGraphDestroy(graph);
     graph = nullptr;
@@ -330,7 +334,7 @@ void MimoMoeLayer1::launch(synStreamHandle stream, const Inputs& inputs,
 
   check(synLaunch(stream, launch_tensors_.data(),
                   static_cast<uint32_t>(launch_tensors_.size()), workspace_addr,
-                  recipe_, SYN_FLAGS_TENSOR_NAME),
+                  recipe_, 0),
         "synLaunch");
 }
 

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "gaudirt/runtime/mimo_full_attention.hpp"
+#include "mimo_full_attention.hpp"
 
 #include "gaudirt/runtime/hbm_arena.hpp"
+#include "gaudirt/runtime/recipe_registry.hpp"
 #include "gaudirt/runtime/weight_manifest.hpp"
 
 #include <perf_lib_layer_params.h>
@@ -20,6 +21,7 @@ namespace {
 
 constexpr float kRmsNormEpsilon = 1e-5F;
 constexpr float kValueScale = 0.612F;
+constexpr float kAttentionScale = 0.07216878364870322F;
 
 void check(synStatus status, const std::string& operation) {
   if (status != synSuccess) {
@@ -39,6 +41,9 @@ enum class Binding {
   kKeyCache,
   kValueCache,
   kSlotMapping,
+  kFullBlockList,
+  kFullBlockUsage,
+  kFullBlockGroups,
   kPosition,
   kQkv,
   kQuery,
@@ -79,6 +84,8 @@ struct MimoFullAttention::Impl {
   HbmArena& arena;
   const WeightManifest* weights;
   uint32_t cache_slots;
+  bool pure_rmsnorm;
+  uint32_t page_count;
   synGraphHandle prepare_graph = nullptr;
   synGraphHandle finish_graph = nullptr;
   synRecipeHandle prepare_recipe = nullptr;
@@ -90,8 +97,10 @@ struct MimoFullAttention::Impl {
   std::vector<synLaunchTensorInfo> prepare_launch;
   std::vector<synLaunchTensorInfo> finish_launch;
 
-  Impl(HbmArena& arena, const WeightManifest& weights, uint32_t cache_slots)
-      : arena(arena), weights(&weights), cache_slots(cache_slots) {}
+  Impl(HbmArena& arena, const WeightManifest& weights, uint32_t cache_slots,
+       bool pure_rmsnorm, uint32_t page_count)
+      : arena(arena), weights(&weights), cache_slots(cache_slots),
+        pure_rmsnorm(pure_rmsnorm), page_count(page_count) {}
 
   ~Impl() { close(); }
 
@@ -188,6 +197,9 @@ struct MimoFullAttention::Impl {
                           MimoAttention::kHeadDim) {
       throw std::runtime_error("MimoFullAttention: invalid cache geometry");
     }
+    if (page_count == 0 || page_count > 64) {
+      throw std::runtime_error("MimoFullAttention: invalid page count");
+    }
     expect_weight(*weights, "input_layernorm", syn_type_bf16, {6144});
     expect_weight(*weights, "qkv_weight", syn_type_fp8_143, {128, 3392, 48});
     expect_weight(*weights, "qkv_scales", syn_type_float, {48, 27});
@@ -202,20 +214,26 @@ struct MimoFullAttention::Impl {
     synTensor hidden_states = external(
         prepare_graph, prepare_externals, "hidden_states",
         Binding::kHiddenStates, syn_type_bf16, {6144, 1});
-    synTensor residual = external(prepare_graph, prepare_externals, "residual",
-                                  Binding::kResidual, syn_type_bf16, {6144, 1});
-    synTensor residual_out = external(
-        prepare_graph, prepare_externals, "residual_out",
-        Binding::kResidualOut, syn_type_bf16, {6144, 1});
     synTensor normalized = external(
         prepare_graph, prepare_externals, "normalized", Binding::kNormalized,
         syn_type_bf16, {6144, 1});
     synTensor norm_gamma = external(
         prepare_graph, prepare_externals, "input_layernorm",
         Binding::kInputLayernorm, syn_type_bf16, {6144});
-    node(prepare_graph, {hidden_states, residual, norm_gamma},
-         {residual_out, normalized}, &kRmsNormEpsilon, sizeof(kRmsNormEpsilon),
-         "gk_residual_rmsnorm_bf16_v1", "input_residual_rmsnorm");
+    if (pure_rmsnorm) {
+      node(prepare_graph, {hidden_states, norm_gamma}, {normalized},
+           &kRmsNormEpsilon, sizeof(kRmsNormEpsilon),
+           "gk_pure_rmsnorm_bf16_v1", "input_pure_rmsnorm");
+    } else {
+      synTensor residual = external(prepare_graph, prepare_externals, "residual",
+                                    Binding::kResidual, syn_type_bf16, {6144, 1});
+      synTensor residual_out = external(
+          prepare_graph, prepare_externals, "residual_out",
+          Binding::kResidualOut, syn_type_bf16, {6144, 1});
+      node(prepare_graph, {hidden_states, residual, norm_gamma},
+           {residual_out, normalized}, &kRmsNormEpsilon, sizeof(kRmsNormEpsilon),
+           "gk_residual_rmsnorm_bf16_v1", "input_residual_rmsnorm");
+    }
 
     synTensor qkv_packed = external(
         prepare_graph, prepare_externals, "qkv_weight", Binding::kQkvWeight,
@@ -288,6 +306,31 @@ struct MimoFullAttention::Impl {
          {value_cache_after}, &index_copy_params, sizeof(index_copy_params),
          "index_copy_fwd_bf16", "write_new_value");
 
+    synTensor block_list = external(prepare_graph, prepare_externals, "block_list",
+                                    Binding::kFullBlockList, syn_type_int32,
+                                    {page_count});
+    synTensor block_usage = external(prepare_graph, prepare_externals, "block_usage",
+                                     Binding::kFullBlockUsage, syn_type_int32,
+                                     {page_count});
+    synTensor block_groups = external(prepare_graph, prepare_externals, "block_groups",
+                                      Binding::kFullBlockGroups, syn_type_int32,
+                                      {page_count});
+    synTensor block_max = intermediate(prepare_graph, "full_attention_block_max",
+                                       syn_type_float, {page_count * 16});
+    synTensor block_sums = intermediate(prepare_graph, "full_attention_block_sums",
+                                        syn_type_float, {page_count * 16});
+    synTensor block_values = intermediate(prepare_graph, "full_attention_block_values",
+                                          syn_type_float, {128, page_count, 16});
+    node(prepare_graph,
+         {query, key_cache_after, value_cache_after, block_list, block_usage,
+          block_groups},
+         {block_max, block_sums, block_values}, &kAttentionScale,
+         sizeof(kAttentionScale), "gk_full_diffkv_block_fp32_v0", "full_diffkv_pages");
+    synTensor context = external(prepare_graph, prepare_externals, "context",
+                                 Binding::kContext, syn_type_bf16, {128, 16, 1});
+    node(prepare_graph, {block_max, block_sums, block_values}, {context}, nullptr, 0,
+         "gk_full_diffkv_reduce_fp32_v0", "full_diffkv_normalize");
+
     check(synGraphCompile(&prepare_recipe, prepare_graph,
                           "mimo_full_attention_prepare_b1_m1_tp8", nullptr),
           "compile prepare graph");
@@ -303,6 +346,8 @@ struct MimoFullAttention::Impl {
         prepare_launch[i].tensorSize[dim] = prepare_externals[i].shape[dim];
       }
     }
+    initialize_launch_tensor_ids(prepare_recipe, prepare_launch.data(),
+                                 prepare_launch.size());
   }
 
   void build_finish() {
@@ -317,11 +362,11 @@ struct MimoFullAttention::Impl {
                                Binding::kOprojWeight, syn_type_bf16, {2048, 6144});
     synTensor output_local = external(finish_graph, finish_externals,
                                       "output_local", Binding::kOutputLocal,
-                                      syn_type_bf16, {6144, 1});
+                                      syn_type_float, {6144, 1});
     synGEMMParams oproj_gemm_params{false, true};
     node(finish_graph, {context_flat, oproj}, {output_local},
          &oproj_gemm_params, sizeof(oproj_gemm_params), "gemm",
-         "oproj_bf16_mme_local");
+         "oproj_bf16_fp32_mme_local");
     check(synGraphCompile(&finish_recipe, finish_graph,
                           "mimo_full_attention_oproj_b1_m1_tp8", nullptr),
           "compile finish graph");
@@ -337,6 +382,8 @@ struct MimoFullAttention::Impl {
         finish_launch[i].tensorSize[dim] = finish_externals[i].shape[dim];
       }
     }
+    initialize_launch_tensor_ids(finish_recipe, finish_launch.data(),
+                                 finish_launch.size());
   }
 
   uint64_t resolve(Binding binding, const MimoAttentionIo& io) const {
@@ -350,13 +397,16 @@ struct MimoFullAttention::Impl {
       case Binding::kKeyCache: return io.key_cache;
       case Binding::kValueCache: return io.value_cache;
       case Binding::kSlotMapping: return io.slot_mapping;
+      case Binding::kFullBlockList: return io.full_block_list;
+      case Binding::kFullBlockUsage: return io.full_block_usage;
+      case Binding::kFullBlockGroups: return io.full_block_groups;
       case Binding::kPosition: return io.position;
       case Binding::kQkv: return io.qkv;
       case Binding::kQuery: return io.query;
       case Binding::kNewKey: return io.new_key;
       case Binding::kNewValue: return io.new_value;
       case Binding::kContext: return io.context;
-      case Binding::kOutputLocal: return io.output_local;
+      case Binding::kOutputLocal: return io.output_local_fp32;
       case Binding::kInputLayernorm:
         return weights->get("input_layernorm").device_address;
       case Binding::kQkvWeight: return weights->get("qkv_weight").device_address;
@@ -384,17 +434,13 @@ struct MimoFullAttention::Impl {
       launch[i].pTensorAddress = address;
     }
     const uint64_t workspace = arena.ensure_workspace(workspace_size);
-    check(synLaunch(stream, launch.data(), launch.size(), workspace, recipe,
-                    SYN_FLAGS_TENSOR_NAME),
+    check(synLaunch(stream, launch.data(), launch.size(), workspace, recipe, 0),
           std::string("launch ") + label);
   }
 
-  void execute_prepare(const MimoAttentionIo& io, synStreamHandle stream) {
+  void execute(const MimoAttentionIo& io, synStreamHandle stream) {
     launch(prepare_recipe, prepare_externals, prepare_launch,
            prepare_workspace_size, io, stream, "prepare graph");
-  }
-
-  void execute_finish(const MimoAttentionIo& io, synStreamHandle stream) {
     launch(finish_recipe, finish_externals, finish_launch, finish_workspace_size,
            io, stream, "finish graph");
   }
@@ -402,21 +448,18 @@ struct MimoFullAttention::Impl {
 
 MimoFullAttention::MimoFullAttention(HbmArena& arena,
                                      const WeightManifest& weights,
-                                     uint32_t cache_slots)
-    : impl_(std::make_unique<Impl>(arena, weights, cache_slots)) {
+                                     uint32_t cache_slots, bool pure_rmsnorm,
+                                     uint32_t page_count)
+    : impl_(std::make_unique<Impl>(arena, weights, cache_slots, pure_rmsnorm,
+                                  page_count)) {
   impl_->build();
 }
 
 MimoFullAttention::~MimoFullAttention() = default;
 
-void MimoFullAttention::execute_prepare(const MimoAttentionIo& io,
-                                        synStreamHandle stream) {
-  impl_->execute_prepare(io, stream);
-}
-
-void MimoFullAttention::execute_finish(const MimoAttentionIo& io,
-                                       synStreamHandle stream) {
-  impl_->execute_finish(io, stream);
+void MimoFullAttention::execute(const MimoAttentionIo& io,
+                                synStreamHandle stream) {
+  impl_->execute(io, stream);
 }
 
 void MimoFullAttention::rebind_weights(const WeightManifest& weights) {

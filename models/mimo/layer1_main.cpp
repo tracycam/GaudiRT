@@ -2,8 +2,8 @@
 #include "gaudirt/common/synapse_raii.hpp"
 #include "gaudirt/runtime/device_runtime.hpp"
 #include "gaudirt/runtime/hbm_arena.hpp"
-#include "gaudirt/runtime/mimo_attention.hpp"
-#include "gaudirt/runtime/mimo_moe.hpp"
+#include "mimo_attention.hpp"
+#include "mimo_moe.hpp"
 #include "gaudirt/runtime/tp_reduce.hpp"
 #include "gaudirt/runtime/weight_manifest.hpp"
 

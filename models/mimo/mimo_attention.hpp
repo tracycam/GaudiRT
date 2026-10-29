@@ -17,6 +17,7 @@ class WeightManifest;
 // are [64,1,1], with each 32-value half of the loaded cache row repeated twice.
 // key_cache/value_cache are [192,1,cache_slots]/[128,1,cache_slots].
 // slot_mapping/position are I32[1]; window_pages/window_groups are I32[2].
+// Full-Attention block list/usage/groups are I32[page_count], page_count <= 64.
 struct MimoAttentionIo {
   uint64_t hidden_states = 0;
   uint64_t residual = 0;
@@ -30,6 +31,9 @@ struct MimoAttentionIo {
   uint64_t slot_mapping = 0;
   uint64_t window_pages = 0;
   uint64_t window_groups = 0;
+  uint64_t full_block_list = 0;
+  uint64_t full_block_usage = 0;
+  uint64_t full_block_groups = 0;
   uint64_t position = 0;
 
   uint64_t qkv = 0;
@@ -38,6 +42,7 @@ struct MimoAttentionIo {
   uint64_t new_value = 0;
   uint64_t context = 0;
   uint64_t output_local = 0;
+  uint64_t output_local_fp32 = 0;
 };
 
 // One decode row of MiMo layer1 on one TP8 rank. Every address is mandatory.
