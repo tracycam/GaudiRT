@@ -7,6 +7,7 @@
 #include "gaudirt/runtime/tp_reduce.hpp"
 
 #include <cstdint>
+#include <vector>
 
 namespace gaudirt::mimo {
 
@@ -29,10 +30,16 @@ class LayerB final {
   LayerB& operator=(const LayerB&) = delete;
 
   void execute(const Io& io, synStreamHandle stream);
+  void rebind_weights(const runtime::WeightManifest& weights);
+  std::vector<uint64_t> recipe_identity() const {
+    auto attention = attention_.recipe_identity();
+    return {attention.first, attention.second, moe_.recipe_identity()};
+  }
 
  private:
   runtime::MimoFullAttention attention_;
   runtime::TpReduce attention_reduce_;
+  runtime::MimoMoeLayer1::Weights moe_weights_{};
   runtime::MimoMoeLayer1 moe_;
   runtime::TpReduce moe_reduce_;
   hcclComm_t comm_;

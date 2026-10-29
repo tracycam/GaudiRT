@@ -58,4 +58,14 @@ void Layer0::execute(const Io& io, synStreamHandle stream) {
   dense_reduce_.execute(io.down_gathered_fp32, io.layer_output_bf16, stream);
 }
 
+void Layer0::rebind_weights(const runtime::WeightManifest& attention_weights,
+                            const runtime::WeightManifest& dense_weights) {
+  attention_.rebind_weights(attention_weights);
+  dense_.rebind_weights(dense_weights);
+  post_attention_gamma_ = dense_weights.get("post_attention_gamma").device_address;
+  if (!post_attention_gamma_) {
+    throw std::invalid_argument("MiMo layer0: null post-attention gamma");
+  }
+}
+
 }  // namespace gaudirt::mimo

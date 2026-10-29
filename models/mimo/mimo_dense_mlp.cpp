@@ -97,13 +97,24 @@ struct MimoDenseMlp::Impl {
   ~Impl() {
     if (gate_up_recipe) synRecipeDestroy(gate_up_recipe);
     if (down_recipe) synRecipeDestroy(down_recipe);
+    destroy_graphs();
+  }
+
+  void destroy_graphs() noexcept {
     if (gate_up_graph) synGraphDestroy(gate_up_graph);
     if (down_graph) synGraphDestroy(down_graph);
+    gate_up_graph = down_graph = nullptr;
     for (auto& external : gate_up_externals) {
-      if (external.section) synSectionDestroy(external.section);
+      if (external.section) {
+        synSectionDestroy(external.section);
+        external.section = nullptr;
+      }
     }
     for (auto& external : down_externals) {
-      if (external.section) synSectionDestroy(external.section);
+      if (external.section) {
+        synSectionDestroy(external.section);
+        external.section = nullptr;
+      }
     }
   }
 
@@ -197,6 +208,7 @@ struct MimoDenseMlp::Impl {
     expect_weight(*weights, "down_bias", syn_type_float, {6144});
     build_gate_up(groups);
     build_down(down_groups);
+    destroy_graphs();
   }
 
   void build_gate_up(uint64_t groups) {

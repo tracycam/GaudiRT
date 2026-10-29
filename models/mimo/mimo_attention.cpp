@@ -174,8 +174,9 @@ struct MimoAttention::Impl {
 
   synTensor intermediate(const char* name, synDataType dtype,
                          std::initializer_list<uint64_t> sizes) {
+    const std::string full_name = "swa_" + std::string(name);
     synTensorDescriptor descriptor = {};
-    descriptor.m_name = name;
+    descriptor.m_name = full_name.c_str();
     descriptor.m_dataType = dtype;
     descriptor.m_dims = sizes.size();
     unsigned dim = 0;
@@ -332,6 +333,16 @@ struct MimoAttention::Impl {
           "compile graph");
     check(synWorkspaceGetSize(&workspace_size, recipe), "get workspace size");
     arena.ensure_workspace(workspace_size);
+    if (graph) {
+      synGraphDestroy(graph);
+      graph = nullptr;
+    }
+    for (auto& external : externals) {
+      if (external.section) {
+        synSectionDestroy(external.section);
+        external.section = nullptr;
+      }
+    }
     launch.resize(externals.size());
     for (size_t i = 0; i < externals.size(); ++i) {
       launch[i] = {};
@@ -408,6 +419,12 @@ void MimoAttention::execute(const MimoAttentionIo& io, synStreamHandle stream) {
 }
 
 void MimoAttention::rebind_weights(const WeightManifest& weights) {
+  expect_weight(weights, "input_layernorm", syn_type_bf16, {6144});
+  expect_weight(weights, "qkv_weight", syn_type_fp8_143, {128, 3392, 48});
+  expect_weight(weights, "qkv_scales", syn_type_float, {48, 27});
+  expect_weight(weights, "qkv_bias", syn_type_float, {3392});
+  expect_weight(weights, "attention_sink", syn_type_bf16, {16});
+  expect_weight(weights, "oproj_weight", syn_type_bf16, {2048, 6144});
   impl_->weights = &weights;
 }
 

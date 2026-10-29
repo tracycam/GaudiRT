@@ -7,6 +7,7 @@
 #include "gaudirt/runtime/tp_reduce.hpp"
 
 #include <cstdint>
+#include <vector>
 
 namespace gaudirt::mimo {
 
@@ -30,6 +31,13 @@ class Layer0 final {
   Layer0& operator=(const Layer0&) = delete;
 
   void execute(const Io& io, synStreamHandle stream);
+  void rebind_weights(const runtime::WeightManifest& attention_weights,
+                      const runtime::WeightManifest& dense_weights);
+  std::vector<uint64_t> recipe_identity() const {
+    auto attention = attention_.recipe_identity();
+    auto dense = dense_.recipe_identity();
+    return {attention.first, attention.second, dense.first, dense.second};
+  }
 
  private:
   runtime::MimoFullAttention attention_;

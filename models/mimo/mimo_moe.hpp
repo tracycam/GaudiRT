@@ -65,7 +65,8 @@ class MimoMoeLayer1 final {
   // Synapse and the required TPC libraries must already be initialized by the
   // driver. This constructor builds and compiles the graph but does not acquire
   // a device, initialize HCCL, upload weights, or launch work.
-  MimoMoeLayer1(uint32_t tp_rank, const Weights& weights);
+  MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
+                const char* graph_variant);
   ~MimoMoeLayer1();
 
   MimoMoeLayer1(const MimoMoeLayer1&) = delete;

@@ -107,13 +107,24 @@ struct MimoFullAttention::Impl {
   void close() noexcept {
     if (prepare_recipe) synRecipeDestroy(prepare_recipe);
     if (finish_recipe) synRecipeDestroy(finish_recipe);
+    destroy_graphs();
+  }
+
+  void destroy_graphs() noexcept {
     if (prepare_graph) synGraphDestroy(prepare_graph);
     if (finish_graph) synGraphDestroy(finish_graph);
+    prepare_graph = finish_graph = nullptr;
     for (auto& external : prepare_externals) {
-      if (external.section) synSectionDestroy(external.section);
+      if (external.section) {
+        synSectionDestroy(external.section);
+        external.section = nullptr;
+      }
     }
     for (auto& external : finish_externals) {
-      if (external.section) synSectionDestroy(external.section);
+      if (external.section) {
+        synSectionDestroy(external.section);
+        external.section = nullptr;
+      }
     }
   }
 
@@ -166,8 +177,10 @@ struct MimoFullAttention::Impl {
   synTensor intermediate(synGraphHandle, const char* name,
                          synDataType dtype,
                          std::initializer_list<uint64_t> sizes) {
+    const std::string full_name = (pure_rmsnorm ? "pure_" : "residual_") +
+                                  std::string(name);
     synTensorDescriptor descriptor = {};
-    descriptor.m_name = name;
+    descriptor.m_name = full_name.c_str();
     descriptor.m_dataType = dtype;
     descriptor.m_dims = sizes.size();
     unsigned dim = 0;
@@ -207,6 +220,7 @@ struct MimoFullAttention::Impl {
     expect_weight(*weights, "oproj_weight", syn_type_bf16, {2048, 6144});
     build_prepare();
     build_finish();
+    destroy_graphs();
   }
 
   void build_prepare() {
@@ -331,8 +345,10 @@ struct MimoFullAttention::Impl {
     node(prepare_graph, {block_max, block_sums, block_values}, {context}, nullptr, 0,
          "gk_full_diffkv_reduce_fp32_v0", "full_diffkv_normalize");
 
-    check(synGraphCompile(&prepare_recipe, prepare_graph,
-                          "mimo_full_attention_prepare_b1_m1_tp8", nullptr),
+    const std::string recipe_name = pure_rmsnorm
+        ? "mimo_full_attention_prepare_b1_m1_tp8_pure"
+        : "mimo_full_attention_prepare_b1_m1_tp8_residual";
+    check(synGraphCompile(&prepare_recipe, prepare_graph, recipe_name.c_str(), nullptr),
           "compile prepare graph");
     check(synWorkspaceGetSize(&prepare_workspace_size, prepare_recipe),
           "get prepare workspace size");
@@ -367,8 +383,10 @@ struct MimoFullAttention::Impl {
     node(finish_graph, {context_flat, oproj}, {output_local},
          &oproj_gemm_params, sizeof(oproj_gemm_params), "gemm",
          "oproj_bf16_fp32_mme_local");
-    check(synGraphCompile(&finish_recipe, finish_graph,
-                          "mimo_full_attention_oproj_b1_m1_tp8", nullptr),
+    const std::string recipe_name = pure_rmsnorm
+        ? "mimo_full_attention_oproj_b1_m1_tp8_pure"
+        : "mimo_full_attention_oproj_b1_m1_tp8_residual";
+    check(synGraphCompile(&finish_recipe, finish_graph, recipe_name.c_str(), nullptr),
           "compile finish graph");
     check(synWorkspaceGetSize(&finish_workspace_size, finish_recipe),
           "get finish workspace size");

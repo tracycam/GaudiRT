@@ -62,3 +62,7 @@ target_link_libraries(mimo_layer_b_vertical PUBLIC mimo_layer_vertical)
 
 add_executable(mimo_layer_b models/mimo/layer_b_main.cpp)
 target_link_libraries(mimo_layer_b PRIVATE mimo_layer_b_vertical)
+
+add_library(mimo_layer_c_vertical STATIC models/mimo/layer_c.cpp)
+target_include_directories(mimo_layer_c_vertical PUBLIC models/mimo)
+target_link_libraries(mimo_layer_c_vertical PUBLIC mimo_layer_vertical)

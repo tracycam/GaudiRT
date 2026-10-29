@@ -193,7 +193,7 @@ int run(int argc, char** argv) {
   arena.copy_h2d_sync(runtime.h2d_stream(), directions.data(),
                       moe_weights.down_combine_directions_u8, directions.size());
 
-  gaudirt::runtime::MimoMoeLayer1 moe(rank, moe_weights);
+  gaudirt::runtime::MimoMoeLayer1 moe(rank, moe_weights, "swa");
   const uint64_t moe_workspace = arena.ensure_workspace(moe.workspace_bytes());
   gaudirt::runtime::MimoMoeLayer1::Inputs moe_inputs{};
   moe_inputs.attention_bf16 = attention_output;

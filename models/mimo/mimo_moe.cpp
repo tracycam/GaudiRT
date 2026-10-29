@@ -49,10 +49,14 @@ static_assert(sizeof(RouterPostParams) == 12);
 
 }  // namespace
 
-MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights)
+MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
+                             const char* graph_variant)
     : tp_rank_(tp_rank) {
   if (tp_rank_ >= kTpSize) {
     throw std::invalid_argument("MimoMoeLayer1: TP rank must be in [0,8)");
+  }
+  if (graph_variant == nullptr || *graph_variant == '\0') {
+    throw std::invalid_argument("MimoMoeLayer1: graph variant must not be empty");
   }
   validate_addresses(
       std::array<uint64_t, 9>{weights.post_attention_gamma_bf16,
@@ -104,8 +108,10 @@ MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights)
 
     auto temporary = [&](const char* name, synDataType dtype,
                          Sizes sizes) -> synTensor {
+      const std::string full_name =
+          std::string("mimo_") + graph_variant + "_" + name;
       synTensorDescriptor descriptor{};
-      descriptor.m_name = name;
+      descriptor.m_name = full_name.c_str();
       descriptor.m_dataType = dtype;
       descriptor.m_dims = static_cast<unsigned>(sizes.size());
       unsigned dim = 0;
@@ -242,7 +248,8 @@ MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights)
          sizeof(combine_topk));
 
     const std::string recipe_name =
-        "mimo_layer1_moe_b1_m1_tp8_rank" + std::to_string(tp_rank_);
+        std::string("mimo_") + graph_variant + "_moe_b1_m1_tp8_rank" +
+        std::to_string(tp_rank_);
     check(synGraphCompile(&recipe_, graph, recipe_name.c_str(), nullptr),
           "synGraphCompile");
     check(synWorkspaceGetSize(&workspace_bytes_, recipe_),
