@@ -91,6 +91,11 @@ struct LayerEntry {
   uint64_t layer_output = 0;
 };
 
+struct PendingWeights {
+  std::vector<runtime::WeightTensor> attention;
+  std::vector<runtime::WeightTensor> dense;
+};
+
 struct Instance {
   Kind kind;
   uint32_t cache_slots = 0;
@@ -114,7 +119,8 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
  public:
   PrivateProgram(uint32_t rank, uint32_t world,
                  const std::filesystem::path& unique_id,
-                 const std::filesystem::path& recipe_cache)
+                 const std::filesystem::path& recipe_cache,
+                 uint64_t hbm_bytes)
       : rank_(rank), runtime_([&] {
           runtime::DeviceRuntime::Config config;
           config.module_id = rank;
@@ -123,7 +129,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
           config.pin_cpu = rank * 4;
           return config;
         }()),
-        arena_(runtime_.device_id(), 4 * 1024 * 1024 * 1024ULL),
+        arena_(runtime_.device_id(), hbm_bytes),
         recipe_cache_(recipe_cache.empty()
                           ? std::filesystem::path{}
                           : recipe_cache / ("rank" + std::to_string(rank))) {
@@ -137,30 +143,89 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
                       const std::string& attention_weights,
                       const std::string& dense_weights,
                       uint32_t cache_slots, uint32_t page_count) {
-    const Kind kind = checked_kind(kind_value);
-    if (layer_id >= 70) {
-      throw std::invalid_argument("PrivateUse1: layer_id must be in [0,70)");
+    auto attention = std::make_shared<runtime::WeightManifest>(
+        std::filesystem::path(attention_weights) / ("rank" + std::to_string(rank_)),
+        runtime_, arena_);
+    std::shared_ptr<runtime::WeightManifest> dense;
+    if (!dense_weights.empty()) {
+      dense = std::make_shared<runtime::WeightManifest>(
+          std::filesystem::path(dense_weights) / ("rank" + std::to_string(rank_)),
+          runtime_, arena_);
     }
-    if (entries_.count(layer_id)) {
-      throw std::invalid_argument("PrivateUse1: duplicate layer_id");
+    register_layer_manifest(layer_id, checked_kind(kind_value), std::move(attention),
+                            std::move(dense), cache_slots, page_count);
+  }
+
+  void upload_weight(uint32_t layer_id, bool dense, const std::string& name,
+                     const at::Tensor& tensor) {
+    if (layer_id >= 70 || entries_.count(layer_id)) {
+      throw std::invalid_argument("PrivateUse1: invalid or finalized weight layer_id");
+    }
+    if (name.empty() || tensor.device().type() != c10::kCPU ||
+        !tensor.is_contiguous() || tensor.dim() <= 0 ||
+        tensor.dim() > HABANA_DIM_MAX || tensor.numel() <= 0) {
+      throw std::invalid_argument("PrivateUse1: weights must be named contiguous CPU tensors");
+    }
+    runtime::WeightTensor item;
+    item.name = name;
+    switch (tensor.scalar_type()) {
+      case at::kBFloat16: item.dtype = syn_type_bf16; break;
+      case at::kFloat: item.dtype = syn_type_float; break;
+      case at::kFloat8_e4m3fn: item.dtype = syn_type_fp8_143; break;
+      case at::kByte: item.dtype = syn_type_uint8; break;
+      default:
+        throw std::invalid_argument("PrivateUse1: unsupported weight dtype");
+    }
+    item.elements = static_cast<uint64_t>(tensor.numel());
+    item.bytes = tensor.nbytes();
+    for (const int64_t size : tensor.sizes()) {
+      item.shape.push_back(static_cast<uint64_t>(size));
+    }
+    std::reverse(item.shape.begin(), item.shape.end());
+    auto& pending = pending_[layer_id];
+    auto& tensors = dense ? pending.dense : pending.attention;
+    if (std::any_of(tensors.begin(), tensors.end(), [&](const auto& existing) {
+          return existing.name == name;
+        })) {
+      throw std::invalid_argument("PrivateUse1: duplicate streamed weight " + name);
+    }
+    item.device_address = arena_.allocate(item.bytes);
+    arena_.copy_h2d_sync(runtime_.h2d_stream(), tensor.data_ptr(),
+                         item.device_address, item.bytes);
+    tensors.push_back(std::move(item));
+  }
+
+  void register_streamed_layer(uint32_t layer_id, int64_t kind_value,
+                               uint32_t cache_slots, uint32_t page_count) {
+    const auto it = pending_.find(layer_id);
+    if (it == pending_.end() || it->second.attention.empty()) {
+      throw std::invalid_argument("PrivateUse1: streamed attention weights are incomplete");
+    }
+    auto attention = std::make_shared<runtime::WeightManifest>(
+        std::move(it->second.attention));
+    std::shared_ptr<runtime::WeightManifest> dense;
+    if (!it->second.dense.empty()) {
+      dense = std::make_shared<runtime::WeightManifest>(std::move(it->second.dense));
+    }
+    register_layer_manifest(layer_id, checked_kind(kind_value), std::move(attention),
+                            std::move(dense), cache_slots, page_count);
+    pending_.erase(it);
+  }
+
+  void register_layer_manifest(
+      uint32_t layer_id, Kind kind,
+      std::shared_ptr<runtime::WeightManifest> attention,
+      std::shared_ptr<runtime::WeightManifest> dense,
+      uint32_t cache_slots, uint32_t page_count) {
+    if (layer_id >= 70 || entries_.count(layer_id)) {
+      throw std::invalid_argument("PrivateUse1: invalid or duplicate layer_id");
     }
     if (cache_slots == 0 || cache_slots % 128 != 0 || page_count == 0 ||
         (kind == Kind::C && page_count != 2) ||
         (kind != Kind::C && page_count > 64)) {
       throw std::invalid_argument("PrivateUse1: invalid cache or page geometry");
     }
-    auto attention = std::make_shared<runtime::WeightManifest>(
-        std::filesystem::path(attention_weights) / ("rank" + std::to_string(rank_)),
-        runtime_, arena_);
-    std::shared_ptr<runtime::WeightManifest> dense;
-    if (kind == Kind::A) {
-      if (dense_weights.empty()) {
-        throw std::invalid_argument("PrivateUse1: Type A requires dense weights");
-      }
-      dense = std::make_shared<runtime::WeightManifest>(
-          std::filesystem::path(dense_weights) / ("rank" + std::to_string(rank_)),
-          runtime_, arena_);
-    } else if (!dense_weights.empty()) {
+    if ((kind == Kind::A) != static_cast<bool>(dense)) {
       throw std::invalid_argument("PrivateUse1: dense weights are only valid for Type A");
     }
     LayerEntry entry{kind, std::move(attention), std::move(dense),
@@ -386,6 +451,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   runtime::RecipeCache recipe_cache_;
   std::unordered_map<Kind, std::unique_ptr<Instance>> instances_;
   std::unordered_map<uint32_t, LayerEntry> entries_;
+  std::unordered_map<uint32_t, PendingWeights> pending_;
 };
 
 std::mutex registry_mutex;
@@ -576,15 +642,28 @@ at::Tensor empty_strided(at::IntArrayRef size, at::IntArrayRef stride,
 }
 
 void initialize(uint32_t rank, uint32_t world, const std::string& unique_id,
-                const std::string& recipe_cache) {
+                const std::string& recipe_cache, uint64_t hbm_bytes) {
+  if (hbm_bytes == 0) {
+    throw std::invalid_argument("PrivateUse1: HBM budget must be greater than zero");
+  }
   initialize_backend();
   auto instance = std::make_shared<PrivateProgram>(rank, world, unique_id,
-                                                   recipe_cache);
+                                                   recipe_cache, hbm_bytes);
   std::lock_guard<std::mutex> lock(registry_mutex);
   if (!registry.empty()) {
     throw std::runtime_error("PrivateUse1: only one rank may be initialized per process");
   }
   registry.emplace(rank, std::move(instance));
+}
+
+void upload_weight(uint32_t rank, uint32_t layer_id, bool dense,
+                   const std::string& name, const at::Tensor& tensor) {
+  get(rank)->upload_weight(layer_id, dense, name, tensor);
+}
+
+void register_streamed_layer(uint32_t rank, uint32_t layer_id, int64_t kind,
+                             uint32_t cache_slots, uint32_t page_count) {
+  get(rank)->register_streamed_layer(layer_id, kind, cache_slots, page_count);
 }
 
 void register_layer(uint32_t rank, uint32_t layer_id, int64_t kind,
@@ -658,6 +737,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   gaudirt::mimo::initialize_backend();
   m.def("initialize", &gaudirt::mimo::initialize);
   m.def("register_layer", &gaudirt::mimo::register_layer);
+  m.def("upload_weight", &gaudirt::mimo::upload_weight);
+  m.def("register_streamed_layer", &gaudirt::mimo::register_streamed_layer);
   m.def("recipe_identity", &gaudirt::mimo::recipe_identity);
   m.def("recipe_cache_stats", &gaudirt::mimo::recipe_cache_stats);
   m.def("shutdown", &gaudirt::mimo::shutdown);
