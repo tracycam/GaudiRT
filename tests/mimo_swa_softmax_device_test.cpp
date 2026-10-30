@@ -59,7 +59,7 @@ int main() {
     check(synTensorCreate(&tensors[i], &desc, sections[i], 0));
     bindings[i].tensorName = names[i]; bindings[i].tensorType = DATA_TENSOR;
   }
-  const float scale = std::log(2.0f);
+  const float scale = 1.0f / std::sqrt(192.0f);
   check(synNodeCreate(graph, tensors.data(), tensors.data() + 7, 7, 1, &scale,
                       sizeof(scale), "gk_swa128_avgroup_group_v0", "swa_boundary", nullptr, nullptr));
   check(synGraphCompile(&recipe, graph, "swa_softmax_test", nullptr));
@@ -74,8 +74,13 @@ int main() {
   std::array<uint16_t, 128 * 128> value{};
   std::array<uint16_t, 16> sinks{};
   std::array<uint16_t, 128 * 16> output{};
-  for (int head = 0; head < 16; ++head) query[head * 192] = narrow_exact(static_cast<float>(head + 1));
-  key[192] = narrow_exact(-1.0f);
+  for (int head = 0; head < 16; ++head)
+    for (int i = 0; i < 3; ++i) query[head * 192 + i] = narrow_exact(static_cast<float>(head + 1));
+  // These exact BF16 terms sum to log(2)/scale in FP32, so the first head
+  // reaches -log(2) with the model's actual 1/sqrt(192) attention scale.
+  key[192] = narrow_exact(-9.625f);
+  key[193] = narrow_exact(0.0205078125f);
+  key[194] = narrow_exact(-0.00003719329833984375f);
   std::fill(value.begin() + 128, value.begin() + 256, narrow_exact(1.0f));
   sinks.fill(narrow_exact(-100.0f));
   const int32_t page = 0, group = 0, position = 1;
@@ -92,7 +97,7 @@ int main() {
   double max_error = 0;
   int worst_head = -1;
   for (int head = 0; head < 16; ++head) {
-    const float score = static_cast<float>(head + 1) * scale;
+    const float score = static_cast<float>(head + 1) * std::log(2.0f);
     const double expected = 1.0 / (1.0 + std::exp(static_cast<double>(score)));
     for (int channel = 0; channel < 128; ++channel) {
       const double error = std::abs(widen(output[head * 128 + channel]) - expected);
