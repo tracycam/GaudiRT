@@ -36,6 +36,7 @@ add_library(mimo_layer_vertical STATIC
     models/mimo/mimo_full_attention.cpp
     models/mimo/mimo_dense_mlp.cpp
     models/mimo/mimo_moe.cpp
+    models/mimo/model_head.cpp
 )
 target_include_directories(mimo_layer_vertical PUBLIC models/mimo)
 target_link_libraries(mimo_layer_vertical PUBLIC gaudirt)
