@@ -64,6 +64,9 @@ target_link_libraries(mimo_full_attention_output_device_test PRIVATE mimo_layer_
 add_executable(mimo_full_mme_softmax_device_test tests/mimo_full_mme_softmax_device_test.cpp)
 target_link_libraries(mimo_full_mme_softmax_device_test PRIVATE gaudirt)
 
+add_executable(mimo_swa_softmax_device_test tests/mimo_swa_softmax_device_test.cpp)
+target_link_libraries(mimo_swa_softmax_device_test PRIVATE gaudirt)
+
 add_executable(mimo_swa_output_device_test tests/mimo_swa_output_device_test.cpp)
 target_link_libraries(mimo_swa_output_device_test PRIVATE mimo_layer_vertical)
 
