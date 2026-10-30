@@ -173,3 +173,11 @@ receipt SHA256 is
 `befaaaf5c5656ddd15adbe68a7b6a99a4d059b2034bb3f42a896b8a1f7055cf9`.
 Previous results against the FP32 reference remain unchanged; they do not
 establish the candidate result against the new reference.
+
+An untimed run of the same candidate matched the unprofiled run's first
+logits and its first 128 generated tokens on all eight ranks. Each step's KV
+slot was checked for every layer and rank, and all untouched KV bytes were
+unchanged. Against the independent FP64 reference, `max_kl` was `0.003756`
+and `relative_l2` / `max_row_relative_l2` were `0.023605`; the `0.02` gate
+still fails. The separate audit receipt SHA256 is
+`abcdb5aa0e8bc460c81ca316d37ecf5fdb11922a81de4de6dcfc03b71cd79f2f`.
