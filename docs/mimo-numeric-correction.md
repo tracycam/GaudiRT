@@ -226,3 +226,14 @@ untouched KV was unchanged. The corrected provider compiles grouped AV from
 C instead of using the original hand-scheduled assembly. Whole-model quality
 and performance remain to be measured. The single-card receipt SHA256 is
 `a9e0f47f940ea70fdcdcf60cad5a854698e16a49e415d4baa75b09256e4cf86d`.
+
+The SWA boundary test also reproduces the same errors with the model's
+`1/sqrt(192)` attention scale. One unprofiled 70-layer run with the
+corrected SWA provider measured `11.061298 ms` p50 and `11.113407 ms` mean;
+all eight ranks agreed on 144 generated tokens, and final untouched KV was
+bitwise unchanged. The first logits were unchanged, so relative L2 remained
+`0.0205696` against FP32 and `0.0236053` against FP64: both exceed `0.02`.
+The generated sequence later differs from the previously audited candidate,
+so its per-step KV audit cannot be reused. This single run is not an ABBA
+acceptance. Its receipt SHA256 is
+`bb6c5be08e99ec5597feb26a970f90f467615cf5021329c1c84c52a4a3f2bcc8`.
