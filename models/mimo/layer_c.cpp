@@ -19,10 +19,11 @@ void check(hcclResult_t status, const char* operation) {
 
 LayerC::LayerC(runtime::HbmArena& arena, runtime::DeviceRuntime& runtime,
                const runtime::WeightManifest& weights, uint32_t cache_slots,
-               runtime::RecipeCache* cache)
+               runtime::RecipeCache* cache, bool fused_model)
     : arena_(arena),
-      attention_(arena, weights, cache_slots, cache),
-      attention_reduce_(arena, 6144, syn_type_bf16),
+      attention_(arena, weights, cache_slots, cache, fused_model),
+      attention_reduce_(fused_model ? nullptr :
+                        std::make_unique<runtime::TpReduce>(arena, 6144, syn_type_bf16)),
       moe_(runtime.rank(), [&] {
         moe_weights_.post_attention_gamma_bf16 =
             weights.get("post_attention_layernorm").device_address;
@@ -41,24 +42,29 @@ LayerC::LayerC(runtime::HbmArena& arena, runtime::DeviceRuntime& runtime,
         arena.copy_h2d_sync(runtime.h2d_stream(), directions.data(),
                             moe_weights_.down_combine_directions_u8, directions.size());
         return moe_weights_;
-      }(), "swa", cache),
-      moe_reduce_(arena, 6144, syn_type_float), comm_(runtime.comm()) {
+      }(), "swa", cache, fused_model, syn_type_bf16),
+      moe_reduce_(fused_model ? nullptr :
+                  std::make_unique<runtime::TpReduce>(arena, 6144, syn_type_float)),
+      comm_(runtime.comm()), fused_model_(fused_model) {
   if (!comm_) throw std::invalid_argument("MiMo Type C: missing HCCL");
   arena.ensure_workspace(std::max(
-      {attention_.workspace_bytes(), attention_reduce_.workspace_bytes(),
-       moe_.workspace_bytes(), moe_reduce_.workspace_bytes()}));
+      {attention_.workspace_bytes(), attention_reduce_ ? attention_reduce_->workspace_bytes() : 0,
+       moe_.workspace_bytes(), moe_reduce_ ? moe_reduce_->workspace_bytes() : 0}));
 }
 
 PreparedLayer LayerC::prepare(const Io& io) {
   PreparedLayer result;
   result.attention.push_back(attention_.prepare(io.attention));
-  result.attention_reduce = attention_reduce_.prepare(io.attention_gathered_bf16,
-                                                      io.attention_output_bf16);
+  if (!fused_model_)
+    result.attention_reduce = attention_reduce_->prepare(io.attention_gathered_bf16,
+                                                          io.attention_output_bf16);
   result.feed_forward.push_back(moe_.prepare(
-      {io.attention_output_bf16, io.attention.residual_out}, io.moe_outputs,
+      {fused_model_ ? io.attention_gathered_bf16 : io.attention_output_bf16,
+       io.attention.residual_out}, io.moe_outputs,
       arena_.workspace_addr()));
-  result.output_reduce = moe_reduce_.prepare(io.moe_gathered_fp32,
-                                              io.layer_output_bf16);
+  if (!fused_model_)
+    result.output_reduce = moe_reduce_->prepare(io.moe_gathered_fp32,
+                                                 io.layer_output_bf16);
   result.attention_local = io.attention.output_local;
   result.attention_gathered = io.attention_gathered_bf16;
   result.feed_forward_local = io.moe_outputs.moe_local_fp32;
@@ -70,6 +76,8 @@ PreparedLayer LayerC::prepare(const Io& io) {
 }
 
 void LayerC::execute(const Io& io, synStreamHandle stream) {
+  if (fused_model_)
+    throw std::invalid_argument("MiMo Type C: fused model requires prepared execution");
   if (!stream || !io.attention_output_bf16 || !io.attention_gathered_bf16 ||
       !io.moe_gathered_fp32 || !io.layer_output_bf16) {
     throw std::invalid_argument("MiMo Type C: invalid execution buffers");
@@ -82,8 +90,8 @@ void LayerC::execute(const Io& io, synStreamHandle stream) {
                       reinterpret_cast<void*>(io.attention_gathered_bf16), 6144,
                       hcclBfloat16, comm_, stream),
         "attention AllGather");
-  attention_reduce_.execute(io.attention_gathered_bf16, io.attention_output_bf16,
-                            stream);
+  attention_reduce_->execute(io.attention_gathered_bf16, io.attention_output_bf16,
+                             stream);
   moe_.launch(stream,
               {io.attention_output_bf16, io.attention.residual_out},
               io.moe_outputs, arena_.workspace_addr());
@@ -91,7 +99,7 @@ void LayerC::execute(const Io& io, synStreamHandle stream) {
                       reinterpret_cast<void*>(io.moe_gathered_fp32), 6144,
                       hcclFloat32, comm_, stream),
         "MoE AllGather");
-  moe_reduce_.execute(io.moe_gathered_fp32, io.layer_output_bf16, stream);
+  moe_reduce_->execute(io.moe_gathered_fp32, io.layer_output_bf16, stream);
 }
 
 void LayerC::rebind_weights(const runtime::WeightManifest& weights) {

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "mimo_dense_mlp.hpp"
+#include "tp_reduce_graph.hpp"
 
 #include "gaudirt/runtime/hbm_arena.hpp"
 #include "gaudirt/runtime/recipe_registry.hpp"
@@ -29,6 +30,8 @@ void check(synStatus status, const std::string& operation) {
 
 enum class Binding {
   kAttention,
+  kAttentionRank0, kAttentionRank1, kAttentionRank2, kAttentionRank3,
+  kAttentionRank4, kAttentionRank5, kAttentionRank6, kAttentionRank7,
   kResidualIn,
   kGamma,
   kResidualOut,
@@ -78,8 +81,10 @@ const WeightTensor& expect_dynamic_weight(const WeightManifest& weights,
 struct MimoDenseMlp::Impl {
   HbmArena& arena;
   const WeightManifest* weights;
+  bool gathered_attention;
   synGraphHandle gate_up_graph = nullptr;
   synGraphHandle down_graph = nullptr;
+  synSectionHandle reduction_section = nullptr;
   synRecipeHandle gate_up_recipe = nullptr;
   synRecipeHandle down_recipe = nullptr;
   RecipeCache* cache = nullptr;
@@ -92,8 +97,8 @@ struct MimoDenseMlp::Impl {
   std::vector<synLaunchTensorInfo> gate_up_launch;
   std::vector<synLaunchTensorInfo> down_launch;
 
-  Impl(HbmArena& arena, const WeightManifest& weights)
-      : arena(arena), weights(&weights) {}
+  Impl(HbmArena& arena, const WeightManifest& weights, bool gathered_attention)
+      : arena(arena), weights(&weights), gathered_attention(gathered_attention) {}
 
   ~Impl() {
     if (gate_up_recipe) synRecipeDestroy(gate_up_recipe);
@@ -105,6 +110,10 @@ struct MimoDenseMlp::Impl {
     if (gate_up_graph) synGraphDestroy(gate_up_graph);
     if (down_graph) synGraphDestroy(down_graph);
     gate_up_graph = down_graph = nullptr;
+    if (reduction_section) {
+      synSectionDestroy(reduction_section);
+      reduction_section = nullptr;
+    }
     for (auto& external : gate_up_externals) {
       if (external.section) {
         synSectionDestroy(external.section);
@@ -215,8 +224,22 @@ struct MimoDenseMlp::Impl {
   void build_gate_up(uint64_t groups) {
     check(synGraphCreate(&gate_up_graph, synDeviceGaudi2),
           "create gate_up graph");
-    synTensor attention = external(gate_up_graph, gate_up_externals, "attention",
-                                   Binding::kAttention, syn_type_bf16, {6144, 1});
+    synTensor attention = nullptr;
+    if (gathered_attention) {
+      constexpr const char* names[] = {
+          "attention_rank0", "attention_rank1", "attention_rank2", "attention_rank3",
+          "attention_rank4", "attention_rank5", "attention_rank6", "attention_rank7"};
+      std::array<synTensor, 8> ranks{};
+      for (unsigned rank = 0; rank < ranks.size(); ++rank)
+        ranks[rank] = external(gate_up_graph, gate_up_externals, names[rank],
+            static_cast<Binding>(static_cast<int>(Binding::kAttentionRank0) + rank),
+            syn_type_float, {6144, 1});
+      attention = gaudirt::mimo::append_tp8_reduce(gate_up_graph, ranks, syn_type_float,
+                                                   reduction_section);
+    } else {
+      attention = external(gate_up_graph, gate_up_externals, "attention",
+                           Binding::kAttention, syn_type_bf16, {6144, 1});
+    }
     synTensor residual_in = external(gate_up_graph, gate_up_externals,
                                      "residual_in", Binding::kResidualIn,
                                      syn_type_bf16, {6144, 1});
@@ -253,7 +276,7 @@ struct MimoDenseMlp::Impl {
     gate_up_recipe = compile_cached(
         gate_up_graph, "mimo_dense_gate_up_b1_m1_tp8",
         "dense_gate_up_n" + std::to_string(gate_up_n) + "_g" +
-            std::to_string(groups), cache);
+            std::to_string(groups) + (gathered_attention ? "_gathered" : "_direct"), cache);
     check(synWorkspaceGetSize(&gate_up_workspace_size, gate_up_recipe),
           "get gate_up workspace size");
     arena.ensure_workspace(gate_up_workspace_size);
@@ -312,6 +335,13 @@ struct MimoDenseMlp::Impl {
                    const Outputs& outputs) const {
     switch (binding) {
       case Binding::kAttention: return inputs.attention_bf16;
+      case Binding::kAttentionRank0: case Binding::kAttentionRank1:
+      case Binding::kAttentionRank2: case Binding::kAttentionRank3:
+      case Binding::kAttentionRank4: case Binding::kAttentionRank5:
+      case Binding::kAttentionRank6: case Binding::kAttentionRank7:
+        return inputs.attention_bf16 +
+               static_cast<uint64_t>(static_cast<int>(binding) -
+                                     static_cast<int>(Binding::kAttentionRank0)) * 6144 * 4;
       case Binding::kResidualIn: return inputs.residual_in_bf16;
       case Binding::kGamma: return inputs.post_attention_gamma_bf16;
       case Binding::kResidualOut: return outputs.residual_out_bf16;
@@ -386,8 +416,8 @@ struct MimoDenseMlp::Impl {
 };
 
 MimoDenseMlp::MimoDenseMlp(HbmArena& arena, const WeightManifest& weights,
-                           RecipeCache* cache)
-    : impl_(std::make_unique<Impl>(arena, weights)) {
+                           RecipeCache* cache, bool gathered_attention)
+    : impl_(std::make_unique<Impl>(arena, weights, gathered_attention)) {
   impl_->cache = cache;
   impl_->build();
 }

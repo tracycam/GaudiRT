@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "mimo_moe.hpp"
+#include "tp_reduce_graph.hpp"
 
 #include "gaudirt/runtime/recipe_registry.hpp"
 
@@ -50,14 +51,19 @@ static_assert(sizeof(RouterPostParams) == 12);
 }  // namespace
 
 MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
-                             const char* graph_variant, RecipeCache* cache)
-    : tp_rank_(tp_rank) {
+                             const char* graph_variant, RecipeCache* cache,
+                             bool gathered_attention, synDataType gathered_type)
+    : tp_rank_(tp_rank), gathered_attention_(gathered_attention),
+      gathered_type_(gathered_type) {
   if (tp_rank_ >= kTpSize) {
     throw std::invalid_argument("MimoMoeLayer1: TP rank must be in [0,8)");
   }
   if (graph_variant == nullptr || *graph_variant == '\0') {
     throw std::invalid_argument("MimoMoeLayer1: graph variant must not be empty");
   }
+  if (gathered_attention_ && gathered_type_ != syn_type_bf16 &&
+      gathered_type_ != syn_type_float)
+    throw std::invalid_argument("MimoMoeLayer1: invalid gathered dtype");
   validate_addresses(
       std::array<uint64_t, 9>{weights.post_attention_gamma_bf16,
                               weights.router_weight_bf16,
@@ -72,7 +78,7 @@ MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
 
   synGraphHandle graph = nullptr;
   std::vector<synSectionHandle> sections;
-  sections.reserve(kSlotCount);
+  sections.reserve(kGatheredSlotCount);
   try {
     check(synGraphCreate(&graph, synDeviceGaudi2), "synGraphCreate");
 
@@ -124,8 +130,24 @@ MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
       return tensor;
     };
 
-    synTensor attention = external(kAttention, "mimo1_attention", syn_type_bf16,
-                                   {kHiddenSize, 1}, 0);
+    synTensor attention = nullptr;
+    if (gathered_attention_) {
+      constexpr const char* names[] = {
+          "mimo1_attention_rank0", "mimo1_attention_rank1",
+          "mimo1_attention_rank2", "mimo1_attention_rank3",
+          "mimo1_attention_rank4", "mimo1_attention_rank5",
+          "mimo1_attention_rank6", "mimo1_attention_rank7"};
+      std::array<synTensor, 8> ranks{};
+      for (unsigned rank = 0; rank < ranks.size(); ++rank) {
+        const auto slot = static_cast<Slot>(rank == 0 ? kAttention : kSlotCount + rank - 1);
+        ranks[rank] = external(slot, names[rank], gathered_type_, {kHiddenSize, 1}, 0);
+      }
+      sections.push_back(nullptr);
+      attention = gaudirt::mimo::append_tp8_reduce(graph, ranks, gathered_type_, sections.back());
+    } else {
+      attention = external(kAttention, "mimo1_attention", syn_type_bf16,
+                           {kHiddenSize, 1}, 0);
+    }
     synTensor residual_in =
         external(kResidualIn, "mimo1_residual_in", syn_type_bf16,
                  {kHiddenSize, 1}, 0);
@@ -252,12 +274,13 @@ MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
         std::to_string(tp_rank_);
     recipe_ = compile_cached(
         graph, recipe_name,
-        std::string("moe_") + graph_variant + "_rank" + std::to_string(tp_rank_),
+        std::string("moe_") + graph_variant + "_rank" + std::to_string(tp_rank_) +
+            (gathered_attention_ ? "_gathered" : "_direct"),
         cache);
     check(synWorkspaceGetSize(&workspace_bytes_, recipe_),
           "synWorkspaceGetSize");
     initialize_launch_tensor_ids(recipe_, launch_tensors_.data(),
-                                 launch_tensors_.size());
+                                 gathered_attention_ ? kGatheredSlotCount : kSlotCount);
 
     synGraphDestroy(graph);
     graph = nullptr;
@@ -318,13 +341,19 @@ PreparedLaunch MimoMoeLayer1::prepare(const Inputs& inputs,
     throw std::invalid_argument("MimoMoeLayer1: invalid prepared workspace");
   auto tensors = launch_tensors_;
   tensors[kAttention].pTensorAddress = inputs.attention_bf16;
+  const size_t count = gathered_attention_ ? kGatheredSlotCount : kSlotCount;
+  if (gathered_attention_) {
+    const uint64_t rank_bytes = kHiddenSize * (gathered_type_ == syn_type_bf16 ? 2 : 4);
+    for (size_t rank = 1; rank < kTpSize; ++rank)
+      tensors[kSlotCount + rank - 1].pTensorAddress = inputs.attention_bf16 + rank * rank_bytes;
+  }
   tensors[kResidualIn].pTensorAddress = inputs.residual_in_bf16;
   tensors[kResidualOut].pTensorAddress = outputs.residual_out_bf16;
   tensors[kNormalized].pTensorAddress = outputs.normalized_bf16;
   tensors[kTopkIds].pTensorAddress = outputs.topk_ids_i32;
   tensors[kTopkWeights].pTensorAddress = outputs.topk_weights_fp32;
   tensors[kMoeOut].pTensorAddress = outputs.moe_local_fp32;
-  std::array<uint64_t, kSlotCount> addresses{};
+  std::vector<uint64_t> addresses(count);
   for (size_t i = 0; i < addresses.size(); ++i)
     addresses[i] = tensors[i].pTensorAddress;
   for (size_t i = 0; i < addresses.size(); ++i) {
@@ -335,13 +364,15 @@ PreparedLaunch MimoMoeLayer1::prepare(const Inputs& inputs,
       throw std::invalid_argument("MimoMoeLayer1: workspace aliases a binding");
   }
   PreparedLaunch result{recipe_, workspace_addr,
-                        {tensors.begin(), tensors.end()}, 0};
+                        {tensors.begin(), tensors.begin() + count}, 0};
   result.validate();
   return result;
 }
 
 void MimoMoeLayer1::launch(synStreamHandle stream, const Inputs& inputs,
                            const Outputs& outputs, uint64_t workspace_addr) {
+  if (gathered_attention_)
+    throw std::invalid_argument("MimoMoeLayer1: gathered model requires prepared launch");
   if (stream == nullptr) {
     throw std::invalid_argument("MimoMoeLayer1: null launch stream");
   }
@@ -371,7 +402,7 @@ void MimoMoeLayer1::launch(synStreamHandle stream, const Inputs& inputs,
   }
 
   check(synLaunch(stream, launch_tensors_.data(),
-                  static_cast<uint32_t>(launch_tensors_.size()), workspace_addr,
+                  static_cast<uint32_t>(kSlotCount), workspace_addr,
                   recipe_, 0),
         "synLaunch");
 }

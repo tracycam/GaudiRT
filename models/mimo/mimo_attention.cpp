@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "mimo_attention.hpp"
+#include "tp_reduce_graph.hpp"
 
 #include "gaudirt/runtime/hbm_arena.hpp"
 #include "gaudirt/runtime/recipe_registry.hpp"
@@ -31,6 +32,8 @@ void check(synStatus status, const std::string& operation) {
 
 enum class Binding {
   kHiddenStates,
+  kHiddenRank0, kHiddenRank1, kHiddenRank2, kHiddenRank3,
+  kHiddenRank4, kHiddenRank5, kHiddenRank6, kHiddenRank7,
   kResidual,
   kResidualOut,
   kNormalized,
@@ -83,7 +86,9 @@ struct MimoAttention::Impl {
   HbmArena& arena;
   const WeightManifest* weights;
   uint32_t cache_slots;
+  bool gathered_input;
   synGraphHandle graph = nullptr;
+  synSectionHandle reduction_section = nullptr;
   synRecipeHandle recipe = nullptr;
   RecipeCache* cache = nullptr;
   uint64_t workspace_size = 0;
@@ -103,8 +108,10 @@ struct MimoAttention::Impl {
   synTensor context = nullptr;
   synTensor output_local = nullptr;
 
-  Impl(HbmArena& arena, const WeightManifest& weights, uint32_t cache_slots)
-      : arena(arena), weights(&weights), cache_slots(cache_slots) {}
+  Impl(HbmArena& arena, const WeightManifest& weights, uint32_t cache_slots,
+       bool gathered_input)
+      : arena(arena), weights(&weights), cache_slots(cache_slots),
+        gathered_input(gathered_input) {}
 
   ~Impl() { close(); }
 
@@ -116,6 +123,10 @@ struct MimoAttention::Impl {
     if (graph) {
       synGraphDestroy(graph);
       graph = nullptr;
+    }
+    if (reduction_section) {
+      synSectionDestroy(reduction_section);
+      reduction_section = nullptr;
     }
     for (auto& external : externals) {
       if (external.section) {
@@ -231,8 +242,21 @@ struct MimoAttention::Impl {
 
     check(synGraphCreate(&graph, synDeviceGaudi2), "create graph");
 
-    hidden_states = external("hidden_states", Binding::kHiddenStates,
-                             syn_type_bf16, {6144, 1});
+    if (gathered_input) {
+      constexpr const char* names[] = {
+          "hidden_rank0", "hidden_rank1", "hidden_rank2", "hidden_rank3",
+          "hidden_rank4", "hidden_rank5", "hidden_rank6", "hidden_rank7"};
+      std::array<synTensor, 8> ranks{};
+      for (unsigned rank = 0; rank < ranks.size(); ++rank)
+        ranks[rank] = external(names[rank],
+                               static_cast<Binding>(static_cast<int>(Binding::kHiddenRank0) + rank),
+                               syn_type_float, {6144, 1});
+      hidden_states = gaudirt::mimo::append_tp8_reduce(graph, ranks, syn_type_float,
+                                                       reduction_section);
+    } else {
+      hidden_states = external("hidden_states", Binding::kHiddenStates,
+                               syn_type_bf16, {6144, 1});
+    }
     residual = external("residual", Binding::kResidual, syn_type_bf16,
                         {6144, 1});
     residual_out = external("residual_out", Binding::kResidualOut,
@@ -330,7 +354,8 @@ struct MimoAttention::Impl {
          sizeof(oproj_gemm_params), "gemm", "oproj_bf16_mme_local");
 
     recipe = compile_cached(graph, "mimo_layer1_attention_b1_m1_tp8",
-                            "swa_c" + std::to_string(cache_slots), cache);
+                            "swa_c" + std::to_string(cache_slots) +
+                                (gathered_input ? "_gathered" : "_direct"), cache);
     check(synWorkspaceGetSize(&workspace_size, recipe), "get workspace size");
     arena.ensure_workspace(workspace_size);
     if (graph) {
@@ -358,6 +383,13 @@ struct MimoAttention::Impl {
   uint64_t resolve(Binding binding, const MimoAttentionIo& io) const {
     switch (binding) {
       case Binding::kHiddenStates: return io.hidden_states;
+      case Binding::kHiddenRank0: case Binding::kHiddenRank1:
+      case Binding::kHiddenRank2: case Binding::kHiddenRank3:
+      case Binding::kHiddenRank4: case Binding::kHiddenRank5:
+      case Binding::kHiddenRank6: case Binding::kHiddenRank7:
+        return io.hidden_states +
+               static_cast<uint64_t>(static_cast<int>(binding) -
+                                     static_cast<int>(Binding::kHiddenRank0)) * 6144 * 4;
       case Binding::kResidual: return io.residual;
       case Binding::kResidualOut: return io.residual_out;
       case Binding::kNormalized: return io.normalized;
@@ -421,8 +453,9 @@ struct MimoAttention::Impl {
 };
 
 MimoAttention::MimoAttention(HbmArena& arena, const WeightManifest& weights,
-                             uint32_t cache_slots, RecipeCache* cache)
-    : impl_(std::make_unique<Impl>(arena, weights, cache_slots)) {
+                             uint32_t cache_slots, RecipeCache* cache,
+                             bool gathered_input)
+    : impl_(std::make_unique<Impl>(arena, weights, cache_slots, gathered_input)) {
   impl_->cache = cache;
   impl_->build();
 }

@@ -65,7 +65,8 @@ class MimoAttention {
   static constexpr uint32_t kKvBlockSize = 128;
 
   MimoAttention(HbmArena& arena, const WeightManifest& weights,
-                uint32_t cache_slots, RecipeCache* cache = nullptr);
+                uint32_t cache_slots, RecipeCache* cache = nullptr,
+                bool gathered_input = false);
   ~MimoAttention();
 
   MimoAttention(const MimoAttention&) = delete;

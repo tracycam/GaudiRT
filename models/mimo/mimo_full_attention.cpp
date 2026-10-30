@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "mimo_full_attention.hpp"
+#include "tp_reduce_graph.hpp"
 
 #include "gaudirt/runtime/hbm_arena.hpp"
 #include "gaudirt/runtime/recipe_registry.hpp"
@@ -33,6 +34,8 @@ void check(synStatus status, const std::string& operation) {
 
 enum class Binding {
   kHiddenStates,
+  kHiddenRank0, kHiddenRank1, kHiddenRank2, kHiddenRank3,
+  kHiddenRank4, kHiddenRank5, kHiddenRank6, kHiddenRank7,
   kResidual,
   kResidualOut,
   kNormalized,
@@ -85,9 +88,11 @@ struct MimoFullAttention::Impl {
   const WeightManifest* weights;
   uint32_t cache_slots;
   bool pure_rmsnorm;
+  bool gathered_input;
   uint32_t page_count;
   synGraphHandle prepare_graph = nullptr;
   synGraphHandle finish_graph = nullptr;
+  synSectionHandle reduction_section = nullptr;
   synRecipeHandle prepare_recipe = nullptr;
   synRecipeHandle finish_recipe = nullptr;
   RecipeCache* cache = nullptr;
@@ -99,9 +104,13 @@ struct MimoFullAttention::Impl {
   std::vector<synLaunchTensorInfo> finish_launch;
 
   Impl(HbmArena& arena, const WeightManifest& weights, uint32_t cache_slots,
-       bool pure_rmsnorm, uint32_t page_count)
+       bool pure_rmsnorm, uint32_t page_count, bool gathered_input)
       : arena(arena), weights(&weights), cache_slots(cache_slots),
-        pure_rmsnorm(pure_rmsnorm), page_count(page_count) {}
+        pure_rmsnorm(pure_rmsnorm), gathered_input(gathered_input),
+        page_count(page_count) {
+    if (pure_rmsnorm && gathered_input)
+      throw std::invalid_argument("MimoFullAttention: pure input cannot be gathered");
+  }
 
   ~Impl() { close(); }
 
@@ -115,6 +124,10 @@ struct MimoFullAttention::Impl {
     if (prepare_graph) synGraphDestroy(prepare_graph);
     if (finish_graph) synGraphDestroy(finish_graph);
     prepare_graph = finish_graph = nullptr;
+    if (reduction_section) {
+      synSectionDestroy(reduction_section);
+      reduction_section = nullptr;
+    }
     for (auto& external : prepare_externals) {
       if (external.section) {
         synSectionDestroy(external.section);
@@ -226,9 +239,22 @@ struct MimoFullAttention::Impl {
 
   void build_prepare() {
     check(synGraphCreate(&prepare_graph, synDeviceGaudi2), "create prepare graph");
-    synTensor hidden_states = external(
-        prepare_graph, prepare_externals, "hidden_states",
-        Binding::kHiddenStates, syn_type_bf16, {6144, 1});
+    synTensor hidden_states = nullptr;
+    if (gathered_input) {
+      constexpr const char* names[] = {
+          "hidden_rank0", "hidden_rank1", "hidden_rank2", "hidden_rank3",
+          "hidden_rank4", "hidden_rank5", "hidden_rank6", "hidden_rank7"};
+      std::array<synTensor, 8> ranks{};
+      for (unsigned rank = 0; rank < ranks.size(); ++rank)
+        ranks[rank] = external(prepare_graph, prepare_externals, names[rank],
+            static_cast<Binding>(static_cast<int>(Binding::kHiddenRank0) + rank),
+            syn_type_float, {6144, 1});
+      hidden_states = gaudirt::mimo::append_tp8_reduce(prepare_graph, ranks, syn_type_float,
+                                                       reduction_section);
+    } else {
+      hidden_states = external(prepare_graph, prepare_externals, "hidden_states",
+                               Binding::kHiddenStates, syn_type_bf16, {6144, 1});
+    }
     synTensor normalized = external(
         prepare_graph, prepare_externals, "normalized", Binding::kNormalized,
         syn_type_bf16, {6144, 1});
@@ -352,7 +378,8 @@ struct MimoFullAttention::Impl {
     prepare_recipe = compile_cached(
         prepare_graph, recipe_name,
         std::string("full_prepare_") + (pure_rmsnorm ? "pure" : "residual") +
-            "_c" + std::to_string(cache_slots) + "_p" + std::to_string(page_count),
+            "_c" + std::to_string(cache_slots) + "_p" + std::to_string(page_count) +
+            (gathered_input ? "_gathered" : "_direct"),
         cache);
     check(synWorkspaceGetSize(&prepare_workspace_size, prepare_recipe),
           "get prepare workspace size");
@@ -414,6 +441,13 @@ struct MimoFullAttention::Impl {
   uint64_t resolve(Binding binding, const MimoAttentionIo& io) const {
     switch (binding) {
       case Binding::kHiddenStates: return io.hidden_states;
+      case Binding::kHiddenRank0: case Binding::kHiddenRank1:
+      case Binding::kHiddenRank2: case Binding::kHiddenRank3:
+      case Binding::kHiddenRank4: case Binding::kHiddenRank5:
+      case Binding::kHiddenRank6: case Binding::kHiddenRank7:
+        return io.hidden_states +
+               static_cast<uint64_t>(static_cast<int>(binding) -
+                                     static_cast<int>(Binding::kHiddenRank0)) * 6144 * 4;
       case Binding::kResidual: return io.residual;
       case Binding::kResidualOut: return io.residual_out;
       case Binding::kNormalized: return io.normalized;
@@ -498,9 +532,10 @@ struct MimoFullAttention::Impl {
 MimoFullAttention::MimoFullAttention(HbmArena& arena,
                                      const WeightManifest& weights,
                                      uint32_t cache_slots, bool pure_rmsnorm,
-                                     uint32_t page_count, RecipeCache* cache)
+                                     uint32_t page_count, RecipeCache* cache,
+                                     bool gathered_input)
     : impl_(std::make_unique<Impl>(arena, weights, cache_slots, pure_rmsnorm,
-                                  page_count)) {
+                                  page_count, gathered_input)) {
   impl_->cache = cache;
   impl_->build();
 }

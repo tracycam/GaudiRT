@@ -171,6 +171,12 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     if (token_host_) synHostFree(runtime_.device_id(), token_host_, 0);
   }
 
+  void enable_model_fusion() {
+    if (fused_model_ || !entries_.empty() || !pending_.empty() || model_finalized_)
+      throw std::invalid_argument("PrivateUse1: enable model fusion before registering weights");
+    fused_model_ = true;
+  }
+
   void register_layer(uint32_t layer_id, int64_t kind_value,
                       const std::string& attention_weights,
                       const std::string& dense_weights,
@@ -392,7 +398,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     arena_.copy_h2d_sync(runtime_.h2d_stream(), &initial_token, token_device_, sizeof(initial_token));
     embedding_ = std::make_unique<ModelEmbedding>(arena_, model_weights_.at("embedding"), nullptr);
     head_ = std::make_unique<ModelHead>(arena_, model_weights_.at("final_norm"),
-                                        model_weights_.at("lm_head"), nullptr);
+                                        model_weights_.at("lm_head"), nullptr, fused_model_);
     argmax_ = std::make_unique<ModelArgmax>(arena_, nullptr);
     const uint64_t workspace = arena_.workspace_addr();
     model_embedding_launch_ = embedding_->prepare(token_device_, embedding_device_,
@@ -412,8 +418,9 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
           base + offsetof(StepMetadata, full_usage),
           base + (full ? offsetof(StepMetadata, full_groups) : offsetof(StepMetadata, window_groups)),
           base + offsetof(StepMetadata, position)};
-      model_layers_.push_back(prepare_layer(layer, addresses));
-      hidden = entries_.at(layer).layer_output;
+      auto prepared = prepare_layer(layer, addresses);
+      hidden = fused_model_ ? prepared.feed_forward_gathered : entries_.at(layer).layer_output;
+      model_layers_.push_back(std::move(prepared));
       residual = entries_.at(layer).residual_output;
     }
     model_head_launch_ = head_->prepare(hidden, residual, normalized_device_, logits_device_);
@@ -440,7 +447,11 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     check_syn(synStreamWaitEvent(runtime_.compute_stream(), metadata_ready_, 0), "metadata wait");
     const auto stream = runtime_.compute_stream();
     model_embedding_launch_.execute(stream);
-    for (const auto& layer : model_layers_) layer.execute(stream);
+    if (fused_model_) {
+      for (const auto& layer : model_layers_) layer.execute_fused(stream);
+    } else {
+      for (const auto& layer : model_layers_) layer.execute(stream);
+    }
     model_head_launch_.execute(stream);
     model_argmax_launch_.execute(stream);
     check_syn(synEventRecord(compute_done_, runtime_.compute_stream()), "compute event record");
@@ -480,6 +491,8 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
 
   std::vector<at::Tensor> forward(uint32_t layer_id,
                                   const std::vector<at::Tensor>& inputs) {
+    if (fused_model_)
+      throw std::invalid_argument("PrivateUse1: fused model does not expose standalone layers");
     auto& entry = entries_.at(layer_id);
     auto& instance = *instances_.at(entry.kind);
     const auto addresses = validate_inputs(instance, inputs);
@@ -617,7 +630,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     if (kind == Kind::A) {
       instance->a = std::make_unique<Layer0>(arena_, runtime_, attention_weights,
                                              *dense_weights, cache_slots, page_count,
-                                             &recipe_cache_);
+                                             &recipe_cache_, fused_model_);
       auto& io = instance->a_io;
       io.attention.normalized = arena_.allocate(12288);
       io.attention.qkv = arena_.allocate(3392 * 2);
@@ -633,7 +646,8 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       io.down_gathered_fp32 = arena_.allocate(8 * 6144 * 4);
     } else if (kind == Kind::B) {
       instance->b = std::make_unique<LayerB>(arena_, runtime_, attention_weights,
-                                             cache_slots, page_count, &recipe_cache_);
+                                             cache_slots, page_count, &recipe_cache_,
+                                             fused_model_);
       auto& io = instance->b_io;
       io.attention.residual_out = arena_.allocate(12288);
       io.attention.normalized = arena_.allocate(12288);
@@ -652,7 +666,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       io.moe_gathered_fp32 = arena_.allocate(8 * 6144 * 4);
     } else {
       instance->c = std::make_unique<LayerC>(arena_, runtime_, attention_weights,
-                                             cache_slots, &recipe_cache_);
+                                             cache_slots, &recipe_cache_, fused_model_);
       auto& io = instance->c_io;
       io.attention.residual_out = arena_.allocate(12288);
       io.attention.normalized = arena_.allocate(12288);
@@ -736,6 +750,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   uint32_t model_position_ = 0;
   bool model_finalized_ = false;
   bool model_pending_ = false;
+  bool fused_model_ = false;
   void* metadata_host_ = nullptr;
   void* token_host_ = nullptr;
   synEventHandle metadata_ready_ = nullptr;
@@ -960,6 +975,8 @@ void upload_weight(uint32_t rank, uint32_t layer_id, bool dense,
   get(rank)->upload_weight(layer_id, dense, name, tensor);
 }
 
+void enable_model_fusion(uint32_t rank) { get(rank)->enable_model_fusion(); }
+
 void register_streamed_layer(uint32_t rank, uint32_t layer_id, int64_t kind,
                              uint32_t cache_slots, uint32_t page_count) {
   get(rank)->register_streamed_layer(layer_id, kind, cache_slots, page_count);
@@ -1071,6 +1088,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   gaudirt::mimo::initialize_backend();
   m.def("initialize", &gaudirt::mimo::initialize);
+  m.def("enable_model_fusion", &gaudirt::mimo::enable_model_fusion);
   m.def("register_layer", &gaudirt::mimo::register_layer);
   m.def("upload_weight", &gaudirt::mimo::upload_weight);
   m.def("register_streamed_layer", &gaudirt::mimo::register_streamed_layer);

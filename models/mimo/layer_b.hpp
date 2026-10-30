@@ -8,6 +8,7 @@
 #include "gaudirt/runtime/tp_reduce.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace gaudirt::mimo {
@@ -25,7 +26,8 @@ class LayerB final {
 
   LayerB(runtime::HbmArena& arena, runtime::DeviceRuntime& runtime,
          const runtime::WeightManifest& weights, uint32_t cache_slots,
-         uint32_t page_count = 64, runtime::RecipeCache* cache = nullptr);
+         uint32_t page_count = 64, runtime::RecipeCache* cache = nullptr,
+         bool fused_model = false);
 
   LayerB(const LayerB&) = delete;
   LayerB& operator=(const LayerB&) = delete;
@@ -41,11 +43,12 @@ class LayerB final {
  private:
   runtime::HbmArena& arena_;
   runtime::MimoFullAttention attention_;
-  runtime::TpReduce attention_reduce_;
+  std::unique_ptr<runtime::TpReduce> attention_reduce_;
   runtime::MimoMoeLayer1::Weights moe_weights_{};
   runtime::MimoMoeLayer1 moe_;
-  runtime::TpReduce moe_reduce_;
+  std::unique_ptr<runtime::TpReduce> moe_reduce_;
   hcclComm_t comm_;
+  bool fused_model_ = false;
 };
 
 }  // namespace gaudirt::mimo

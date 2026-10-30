@@ -70,7 +70,9 @@ class MimoMoeLayer1 final {
   // driver. This constructor builds and compiles the graph but does not acquire
   // a device, initialize HCCL, upload weights, or launch work.
   MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
-                const char* graph_variant, RecipeCache* cache = nullptr);
+                const char* graph_variant, RecipeCache* cache = nullptr,
+                bool gathered_attention = false,
+                synDataType gathered_type = syn_type_float);
   ~MimoMoeLayer1();
 
   MimoMoeLayer1(const MimoMoeLayer1&) = delete;
@@ -122,11 +124,14 @@ class MimoMoeLayer1 final {
   };
 
   static_assert(kSlotCount == 16);
+  static constexpr size_t kGatheredSlotCount = kSlotCount + 7;
 
   uint32_t tp_rank_;
+  bool gathered_attention_ = false;
+  synDataType gathered_type_ = syn_type_float;
   synRecipeHandle recipe_ = nullptr;
   uint64_t workspace_bytes_ = 0;
-  std::array<synLaunchTensorInfo, kSlotCount> launch_tensors_{};
+  std::array<synLaunchTensorInfo, kGatheredSlotCount> launch_tensors_{};
 };
 
 }  // namespace gaudirt::runtime

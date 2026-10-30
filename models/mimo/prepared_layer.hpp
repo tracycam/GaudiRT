@@ -32,20 +32,24 @@ struct PreparedLayer {
       throw std::invalid_argument("PreparedLayer: invalid collective bindings");
   }
 
-  void execute(synStreamHandle stream) const {
+  template <bool fused>
+  void execute_graphs(synStreamHandle stream) const {
     for (const auto& launch : attention) launch.execute(stream);
     if (hcclAllGather(reinterpret_cast<const void*>(attention_local),
                       reinterpret_cast<void*>(attention_gathered), 6144,
                       attention_type, comm, stream) != hcclSuccess)
       throw std::runtime_error("PreparedLayer: attention AllGather failed");
-    attention_reduce.execute(stream);
+    if constexpr (!fused) attention_reduce.execute(stream);
     for (const auto& launch : feed_forward) launch.execute(stream);
     if (hcclAllGather(reinterpret_cast<const void*>(feed_forward_local),
                       reinterpret_cast<void*>(feed_forward_gathered), 6144,
                       hcclFloat32, comm, stream) != hcclSuccess)
       throw std::runtime_error("PreparedLayer: feed-forward AllGather failed");
-    output_reduce.execute(stream);
+    if constexpr (!fused) output_reduce.execute(stream);
   }
+
+  void execute(synStreamHandle stream) const { execute_graphs<false>(stream); }
+  void execute_fused(synStreamHandle stream) const { execute_graphs<true>(stream); }
 };
 
 }  // namespace gaudirt::mimo

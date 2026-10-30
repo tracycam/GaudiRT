@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "model_head.hpp"
+#include "tp_reduce_graph.hpp"
 
 #include "gaudirt/runtime/hbm_arena.hpp"
 #include "gaudirt/runtime/recipe_registry.hpp"
@@ -25,14 +26,15 @@ void check(synStatus status, const char* operation) {
 }  // namespace
 
 ModelHead::ModelHead(runtime::HbmArena& arena, uint64_t final_norm_gamma,
-                     uint64_t lm_head_weight, runtime::RecipeCache* cache)
-    : arena_(arena) {
+                     uint64_t lm_head_weight, runtime::RecipeCache* cache,
+                     bool gathered_input)
+    : arena_(arena), gathered_input_(gathered_input) {
   if (final_norm_gamma == 0 || lm_head_weight == 0) {
     throw std::invalid_argument("MiMo model head: null weight address");
   }
   synGraphHandle graph = nullptr;
   std::vector<synSectionHandle> sections;
-  sections.reserve(kSlotCount);
+  sections.reserve(kGatheredSlotCount);
   try {
     check(synGraphCreate(&graph, synDeviceGaudi2), "synGraphCreate");
     auto external = [&](Slot slot, const char* name, synDataType dtype,
@@ -79,8 +81,22 @@ ModelHead::ModelHead(runtime::HbmArena& arena, uint64_t final_norm_gamma,
       return tensor;
     };
 
-    synTensor hidden = external(kHidden, "model_final_hidden", syn_type_bf16,
-                                {6144, 1}, 0);
+    synTensor hidden = nullptr;
+    if (gathered_input_) {
+      constexpr const char* names[] = {
+          "model_hidden_rank0", "model_hidden_rank1", "model_hidden_rank2", "model_hidden_rank3",
+          "model_hidden_rank4", "model_hidden_rank5", "model_hidden_rank6", "model_hidden_rank7"};
+      std::array<synTensor, 8> ranks{};
+      for (unsigned rank = 0; rank < ranks.size(); ++rank) {
+        const auto slot = static_cast<Slot>(rank == 0 ? kHidden : kSlotCount + rank - 1);
+        ranks[rank] = external(slot, names[rank], syn_type_float, {6144, 1}, 0);
+      }
+      sections.push_back(nullptr);
+      hidden = append_tp8_reduce(graph, ranks, syn_type_float, sections.back());
+    } else {
+      hidden = external(kHidden, "model_final_hidden", syn_type_bf16,
+                        {6144, 1}, 0);
+    }
     synTensor residual = external(kResidual, "model_final_residual", syn_type_bf16,
                                   {6144, 1}, 0);
     synTensor gamma = external(kGamma, "model_final_gamma", syn_type_bf16,
@@ -107,11 +123,11 @@ ModelHead::ModelHead(runtime::HbmArena& arena, uint64_t final_norm_gamma,
                         nullptr),
           "lm_head GEMM");
     recipe_ = runtime::compile_cached(graph, "mimo_final_rmsnorm_lm_head_b1_m1",
-                                      "model_head_v1", cache);
+                                      gathered_input_ ? "model_head_gathered_v1" : "model_head_v1", cache);
     check(synWorkspaceGetSize(&workspace_bytes_, recipe_), "synWorkspaceGetSize");
     arena_.ensure_workspace(workspace_bytes_);
     runtime::initialize_launch_tensor_ids(recipe_, launch_tensors_.data(),
-                                          launch_tensors_.size());
+                                          gathered_input_ ? kGatheredSlotCount : kSlotCount);
     synGraphDestroy(graph);
     graph = nullptr;
     for (synSectionHandle& section : sections) {
@@ -139,17 +155,24 @@ runtime::PreparedLaunch ModelHead::prepare(uint64_t hidden, uint64_t residual,
                                            uint64_t normalized, uint64_t logits) {
   auto tensors = launch_tensors_;
   tensors[kHidden].pTensorAddress = hidden;
+  const size_t count = gathered_input_ ? kGatheredSlotCount : kSlotCount;
+  if (gathered_input_) {
+    for (size_t rank = 1; rank < 8; ++rank)
+      tensors[kSlotCount + rank - 1].pTensorAddress = hidden + rank * 6144 * 4;
+  }
   tensors[kResidual].pTensorAddress = residual;
   tensors[kNormalized].pTensorAddress = normalized;
   tensors[kLogits].pTensorAddress = logits;
   runtime::PreparedLaunch result{recipe_, arena_.ensure_workspace(workspace_bytes_),
-                                 {tensors.begin(), tensors.end()}, 0};
+                                 {tensors.begin(), tensors.begin() + count}, 0};
   result.validate();
   return result;
 }
 
 void ModelHead::execute(uint64_t hidden, uint64_t residual, uint64_t normalized,
                         uint64_t logits, synStreamHandle stream) {
+  if (gathered_input_)
+    throw std::invalid_argument("MiMo model head: gathered input requires prepared launch");
   if (!stream || !hidden || !residual || !normalized || !logits) {
     throw std::invalid_argument("MiMo model head: invalid execution address");
   }
@@ -159,7 +182,7 @@ void ModelHead::execute(uint64_t hidden, uint64_t residual, uint64_t normalized,
   launch_tensors_[kLogits].pTensorAddress = logits;
   const uint64_t workspace = arena_.ensure_workspace(workspace_bytes_);
   check(synLaunch(stream, launch_tensors_.data(),
-                  static_cast<uint32_t>(launch_tensors_.size()), workspace, recipe_, 0),
+                  static_cast<uint32_t>(kSlotCount), workspace, recipe_, 0),
         "synLaunch");
 }
 
