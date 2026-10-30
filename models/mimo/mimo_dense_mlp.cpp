@@ -30,8 +30,6 @@ void check(synStatus status, const std::string& operation) {
 
 enum class Binding {
   kAttention,
-  kAttentionRank0, kAttentionRank1, kAttentionRank2, kAttentionRank3,
-  kAttentionRank4, kAttentionRank5, kAttentionRank6, kAttentionRank7,
   kResidualIn,
   kGamma,
   kResidualOut,
@@ -226,15 +224,9 @@ struct MimoDenseMlp::Impl {
           "create gate_up graph");
     synTensor attention = nullptr;
     if (gathered_attention) {
-      constexpr const char* names[] = {
-          "attention_rank0", "attention_rank1", "attention_rank2", "attention_rank3",
-          "attention_rank4", "attention_rank5", "attention_rank6", "attention_rank7"};
-      std::array<synTensor, 8> ranks{};
-      for (unsigned rank = 0; rank < ranks.size(); ++rank)
-        ranks[rank] = external(gate_up_graph, gate_up_externals, names[rank],
-            static_cast<Binding>(static_cast<int>(Binding::kAttentionRank0) + rank),
-            syn_type_float, {6144, 1});
-      attention = gaudirt::mimo::append_tp8_reduce(gate_up_graph, ranks, syn_type_float,
+      synTensor gathered = external(gate_up_graph, gate_up_externals, "attention_gathered",
+                                     Binding::kAttention, syn_type_float, {6144, 8});
+      attention = gaudirt::mimo::append_tp8_reduce(gate_up_graph, gathered, syn_type_float,
                                                    reduction_section);
     } else {
       attention = external(gate_up_graph, gate_up_externals, "attention",
@@ -276,7 +268,7 @@ struct MimoDenseMlp::Impl {
     gate_up_recipe = compile_cached(
         gate_up_graph, "mimo_dense_gate_up_b1_m1_tp8",
         "dense_gate_up_n" + std::to_string(gate_up_n) + "_g" +
-            std::to_string(groups) + (gathered_attention ? "_gathered" : "_direct"), cache);
+            std::to_string(groups) + (gathered_attention ? "_gathered_tp1" : "_direct"), cache);
     check(synWorkspaceGetSize(&gate_up_workspace_size, gate_up_recipe),
           "get gate_up workspace size");
     arena.ensure_workspace(gate_up_workspace_size);
@@ -335,13 +327,6 @@ struct MimoDenseMlp::Impl {
                    const Outputs& outputs) const {
     switch (binding) {
       case Binding::kAttention: return inputs.attention_bf16;
-      case Binding::kAttentionRank0: case Binding::kAttentionRank1:
-      case Binding::kAttentionRank2: case Binding::kAttentionRank3:
-      case Binding::kAttentionRank4: case Binding::kAttentionRank5:
-      case Binding::kAttentionRank6: case Binding::kAttentionRank7:
-        return inputs.attention_bf16 +
-               static_cast<uint64_t>(static_cast<int>(binding) -
-                                     static_cast<int>(Binding::kAttentionRank0)) * 6144 * 4;
       case Binding::kResidualIn: return inputs.residual_in_bf16;
       case Binding::kGamma: return inputs.post_attention_gamma_bf16;
       case Binding::kResidualOut: return outputs.residual_out_bf16;

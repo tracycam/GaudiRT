@@ -45,7 +45,8 @@ class RmsGraph {
     std::vector<synSectionHandle> sections;
     check(synGraphCreate(&graph, synDeviceGaudi2));
     try {
-      auto external = [&](const char* name, synDataType dtype, bool vector = false) {
+      auto external = [&](const char* name, synDataType dtype, bool vector = false,
+                          uint64_t rows = 1) {
         synSectionHandle section = nullptr;
         check(synSectionCreate(&section, 0, graph));
         sections.push_back(section);
@@ -55,26 +56,22 @@ class RmsGraph {
         descriptor.m_dataType = dtype;
         descriptor.m_dims = vector ? 1 : 2;
         descriptor.m_sizes[0] = descriptor.m_minSizes[0] = kHidden;
-        if (!vector) descriptor.m_sizes[1] = descriptor.m_minSizes[1] = 1;
+        if (!vector) descriptor.m_sizes[1] = descriptor.m_minSizes[1] = rows;
         synTensor tensor = nullptr;
         check(synTensorCreate(&tensor, &descriptor, section, 0));
         synLaunchTensorInfo info{};
         info.tensorName = name;
         info.tensorType = DATA_TENSOR;
         info.tensorSize[0] = kHidden;
-        if (!vector) info.tensorSize[1] = 1;
+        if (!vector) info.tensorSize[1] = rows;
         launch_.push_back(info);
         return tensor;
       };
       synTensor attention = nullptr;
       if (fused_) {
-        constexpr const char* names[] = {"rank0", "rank1", "rank2", "rank3",
-                                         "rank4", "rank5", "rank6", "rank7"};
-        std::array<synTensor, 8> ranks{};
-        for (size_t rank = 0; rank < ranks.size(); ++rank)
-          ranks[rank] = external(names[rank], input_type_);
+        synTensor gathered = external("gathered", input_type_, false, 8);
         synSectionHandle reduced_section = nullptr;
-        attention = gaudirt::mimo::append_tp8_reduce(graph, ranks, input_type_, reduced_section);
+        attention = gaudirt::mimo::append_tp8_reduce(graph, gathered, input_type_, reduced_section);
         sections.push_back(reduced_section);
       } else {
         attention = external("attention", syn_type_bf16);
@@ -110,14 +107,11 @@ class RmsGraph {
   void execute(uint64_t attention, uint64_t residual, uint64_t gamma,
                uint64_t residual_out, uint64_t normalized, synStreamHandle stream) {
     auto tensors = launch_;
-    const size_t ranks = fused_ ? 8 : 1;
-    const uint64_t rank_bytes = kHidden * (input_type_ == syn_type_float ? 4 : 2);
-    for (size_t rank = 0; rank < ranks; ++rank)
-      tensors[rank].pTensorAddress = attention + rank * rank_bytes;
-    tensors[ranks].pTensorAddress = residual;
-    tensors[ranks + 1].pTensorAddress = gamma;
-    tensors[ranks + 2].pTensorAddress = residual_out;
-    tensors[ranks + 3].pTensorAddress = normalized;
+    tensors[0].pTensorAddress = attention;
+    tensors[1].pTensorAddress = residual;
+    tensors[2].pTensorAddress = gamma;
+    tensors[3].pTensorAddress = residual_out;
+    tensors[4].pTensorAddress = normalized;
     gaudirt::runtime::PreparedLaunch prepared{recipe_, arena_.ensure_workspace(workspace_bytes_),
                                               std::move(tensors), 0};
     prepared.validate();

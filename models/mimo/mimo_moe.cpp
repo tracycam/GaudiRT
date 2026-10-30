@@ -78,7 +78,7 @@ MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
 
   synGraphHandle graph = nullptr;
   std::vector<synSectionHandle> sections;
-  sections.reserve(kGatheredSlotCount);
+  sections.reserve(kSlotCount);
   try {
     check(synGraphCreate(&graph, synDeviceGaudi2), "synGraphCreate");
 
@@ -132,18 +132,10 @@ MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
 
     synTensor attention = nullptr;
     if (gathered_attention_) {
-      constexpr const char* names[] = {
-          "mimo1_attention_rank0", "mimo1_attention_rank1",
-          "mimo1_attention_rank2", "mimo1_attention_rank3",
-          "mimo1_attention_rank4", "mimo1_attention_rank5",
-          "mimo1_attention_rank6", "mimo1_attention_rank7"};
-      std::array<synTensor, 8> ranks{};
-      for (unsigned rank = 0; rank < ranks.size(); ++rank) {
-        const auto slot = static_cast<Slot>(rank == 0 ? kAttention : kSlotCount + rank - 1);
-        ranks[rank] = external(slot, names[rank], gathered_type_, {kHiddenSize, 1}, 0);
-      }
+      synTensor gathered = external(kAttention, "mimo1_attention_gathered", gathered_type_,
+                                    {kHiddenSize, kTpSize}, 0);
       sections.push_back(nullptr);
-      attention = gaudirt::mimo::append_tp8_reduce(graph, ranks, gathered_type_, sections.back());
+      attention = gaudirt::mimo::append_tp8_reduce(graph, gathered, gathered_type_, sections.back());
     } else {
       attention = external(kAttention, "mimo1_attention", syn_type_bf16,
                            {kHiddenSize, 1}, 0);
@@ -271,12 +263,12 @@ MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
     recipe_ = compile_cached(
         graph, recipe_name,
         std::string("moe_internal_v2_") + graph_variant + "_rank" + std::to_string(tp_rank_) +
-            (gathered_attention_ ? "_gathered" : "_direct"),
+            (gathered_attention_ ? "_gathered_tp1" : "_direct"),
         cache);
     check(synWorkspaceGetSize(&workspace_bytes_, recipe_),
           "synWorkspaceGetSize");
     initialize_launch_tensor_ids(recipe_, launch_tensors_.data(),
-                                 gathered_attention_ ? kGatheredSlotCount : kSlotCount);
+                                 kSlotCount);
 
     synGraphDestroy(graph);
     graph = nullptr;
@@ -337,12 +329,7 @@ PreparedLaunch MimoMoeLayer1::prepare(const Inputs& inputs,
     throw std::invalid_argument("MimoMoeLayer1: invalid prepared workspace");
   auto tensors = launch_tensors_;
   tensors[kAttention].pTensorAddress = inputs.attention_bf16;
-  const size_t count = gathered_attention_ ? kGatheredSlotCount : kSlotCount;
-  if (gathered_attention_) {
-    const uint64_t rank_bytes = kHiddenSize * (gathered_type_ == syn_type_bf16 ? 2 : 4);
-    for (size_t rank = 1; rank < kTpSize; ++rank)
-      tensors[kSlotCount + rank - 1].pTensorAddress = inputs.attention_bf16 + rank * rank_bytes;
-  }
+  const size_t count = kSlotCount;
   tensors[kResidualIn].pTensorAddress = inputs.residual_in_bf16;
   tensors[kResidualOut].pTensorAddress = outputs.residual_out_bf16;
   tensors[kMoeOut].pTensorAddress = outputs.moe_local_fp32;

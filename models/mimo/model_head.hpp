@@ -49,8 +49,7 @@ class ModelHead final {
   bool gathered_input_ = false;
   synRecipeHandle recipe_ = nullptr;
   uint64_t workspace_bytes_ = 0;
-  static constexpr size_t kGatheredSlotCount = kSlotCount + 7;
-  std::array<synLaunchTensorInfo, kGatheredSlotCount> launch_tensors_{};
+  std::array<synLaunchTensorInfo, kSlotCount> launch_tensors_{};
 };
 
 }  // namespace gaudirt::mimo

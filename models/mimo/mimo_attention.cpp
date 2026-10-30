@@ -32,8 +32,6 @@ void check(synStatus status, const std::string& operation) {
 
 enum class Binding {
   kHiddenStates,
-  kHiddenRank0, kHiddenRank1, kHiddenRank2, kHiddenRank3,
-  kHiddenRank4, kHiddenRank5, kHiddenRank6, kHiddenRank7,
   kResidual,
   kResidualOut,
   kRopeCos,
@@ -236,15 +234,9 @@ struct MimoAttention::Impl {
     check(synGraphCreate(&graph, synDeviceGaudi2), "create graph");
 
     if (gathered_input) {
-      constexpr const char* names[] = {
-          "hidden_rank0", "hidden_rank1", "hidden_rank2", "hidden_rank3",
-          "hidden_rank4", "hidden_rank5", "hidden_rank6", "hidden_rank7"};
-      std::array<synTensor, 8> ranks{};
-      for (unsigned rank = 0; rank < ranks.size(); ++rank)
-        ranks[rank] = external(names[rank],
-                               static_cast<Binding>(static_cast<int>(Binding::kHiddenRank0) + rank),
-                               syn_type_float, {6144, 1});
-      hidden_states = gaudirt::mimo::append_tp8_reduce(graph, ranks, syn_type_float,
+      synTensor gathered = external("hidden_gathered", Binding::kHiddenStates,
+                                    syn_type_float, {6144, 8});
+      hidden_states = gaudirt::mimo::append_tp8_reduce(graph, gathered, syn_type_float,
                                                        reduction_section);
     } else {
       hidden_states = external("hidden_states", Binding::kHiddenStates,
@@ -342,7 +334,7 @@ struct MimoAttention::Impl {
 
     recipe = compile_cached(graph, "mimo_layer1_attention_b1_m1_tp8",
                             "swa_neumaier_v5_c" + std::to_string(cache_slots) +
-                                (gathered_input ? "_gathered" : "_direct"), cache);
+                                (gathered_input ? "_gathered_tp1" : "_direct"), cache);
     check(synWorkspaceGetSize(&workspace_size, recipe), "get workspace size");
     arena.ensure_workspace(workspace_size);
     if (graph) {
@@ -370,13 +362,6 @@ struct MimoAttention::Impl {
   uint64_t resolve(Binding binding, const MimoAttentionIo& io) const {
     switch (binding) {
       case Binding::kHiddenStates: return io.hidden_states;
-      case Binding::kHiddenRank0: case Binding::kHiddenRank1:
-      case Binding::kHiddenRank2: case Binding::kHiddenRank3:
-      case Binding::kHiddenRank4: case Binding::kHiddenRank5:
-      case Binding::kHiddenRank6: case Binding::kHiddenRank7:
-        return io.hidden_states +
-               static_cast<uint64_t>(static_cast<int>(binding) -
-                                     static_cast<int>(Binding::kHiddenRank0)) * 6144 * 4;
       case Binding::kResidual: return io.residual;
       case Binding::kResidualOut: return io.residual_out;
       case Binding::kRopeCos: return io.rope_cos;

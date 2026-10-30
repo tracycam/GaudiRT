@@ -118,14 +118,13 @@ class MimoMoeLayer1 final {
   };
 
   static_assert(kSlotCount == 13);
-  static constexpr size_t kGatheredSlotCount = kSlotCount + 7;
 
   uint32_t tp_rank_;
   bool gathered_attention_ = false;
   synDataType gathered_type_ = syn_type_float;
   synRecipeHandle recipe_ = nullptr;
   uint64_t workspace_bytes_ = 0;
-  std::array<synLaunchTensorInfo, kGatheredSlotCount> launch_tensors_{};
+  std::array<synLaunchTensorInfo, kSlotCount> launch_tensors_{};
 };
 
 }  // namespace gaudirt::runtime

@@ -34,8 +34,6 @@ void check(synStatus status, const std::string& operation) {
 
 enum class Binding {
   kHiddenStates,
-  kHiddenRank0, kHiddenRank1, kHiddenRank2, kHiddenRank3,
-  kHiddenRank4, kHiddenRank5, kHiddenRank6, kHiddenRank7,
   kResidual,
   kResidualOut,
   kRopeCos,
@@ -221,15 +219,9 @@ struct MimoFullAttention::Impl {
     check(synGraphCreate(&prepare_graph, synDeviceGaudi2), "create prepare graph");
     synTensor hidden_states = nullptr;
     if (gathered_input) {
-      constexpr const char* names[] = {
-          "hidden_rank0", "hidden_rank1", "hidden_rank2", "hidden_rank3",
-          "hidden_rank4", "hidden_rank5", "hidden_rank6", "hidden_rank7"};
-      std::array<synTensor, 8> ranks{};
-      for (unsigned rank = 0; rank < ranks.size(); ++rank)
-        ranks[rank] = external(prepare_graph, prepare_externals, names[rank],
-            static_cast<Binding>(static_cast<int>(Binding::kHiddenRank0) + rank),
-            syn_type_float, {6144, 1});
-      hidden_states = gaudirt::mimo::append_tp8_reduce(prepare_graph, ranks, syn_type_float,
+      synTensor gathered = external(prepare_graph, prepare_externals, "hidden_gathered",
+                                   Binding::kHiddenStates, syn_type_float, {6144, 8});
+      hidden_states = gaudirt::mimo::append_tp8_reduce(prepare_graph, gathered, syn_type_float,
                                                        reduction_section);
     } else {
       hidden_states = external(prepare_graph, prepare_externals, "hidden_states",
@@ -365,7 +357,7 @@ struct MimoFullAttention::Impl {
         prepare_graph, recipe_name,
         std::string("full_neumaier_v1_") + (pure_rmsnorm ? "pure" : "residual") +
             "_c" + std::to_string(cache_slots) + "_p" + std::to_string(page_count) +
-            (gathered_input ? "_gathered" : "_direct"),
+            (gathered_input ? "_gathered_tp1" : "_direct"),
         cache);
     check(synWorkspaceGetSize(&prepare_workspace_size, prepare_recipe),
           "get prepare workspace size");
@@ -386,13 +378,6 @@ struct MimoFullAttention::Impl {
   uint64_t resolve(Binding binding, const MimoAttentionIo& io) const {
     switch (binding) {
       case Binding::kHiddenStates: return io.hidden_states;
-      case Binding::kHiddenRank0: case Binding::kHiddenRank1:
-      case Binding::kHiddenRank2: case Binding::kHiddenRank3:
-      case Binding::kHiddenRank4: case Binding::kHiddenRank5:
-      case Binding::kHiddenRank6: case Binding::kHiddenRank7:
-        return io.hidden_states +
-               static_cast<uint64_t>(static_cast<int>(binding) -
-                                     static_cast<int>(Binding::kHiddenRank0)) * 6144 * 4;
       case Binding::kResidual: return io.residual;
       case Binding::kResidualOut: return io.residual_out;
       case Binding::kRopeCos: return io.rope_cos;
