@@ -112,3 +112,11 @@ layer outputs exceeded `0.001` relative L2; the largest was layer 44 at
 `0.002572`. This check did not record candidate router IDs, so it does not
 attribute any difference to expert selection. Its receipt SHA256 is
 `d237fcc06255f75b35a02dd88b90db4680b9b07a9ec274e4adf1ecf8965e9cf6`.
+
+A targeted layer-44 comparison verified the diagnostic output bitwise against
+the plain layer output. All ranks selected the same expert set as the CPU
+reference and as FP64 routing on the actual input. On that same actual input,
+the MoE output still differed from the CPU reference by `0.001368` relative
+L2, so this layer's excess error cannot be attributed to an expert flip.
+Its receipt SHA256 is
+`c5d1fcf279e60a10f62fdae407e571702f0fa5f36eccd5179ec9fe41b6495083`.
