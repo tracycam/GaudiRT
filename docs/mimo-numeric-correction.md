@@ -237,3 +237,22 @@ The generated sequence later differs from the previously audited candidate,
 so its per-step KV audit cannot be reused. This single run is not an ABBA
 acceptance. Its receipt SHA256 is
 `bb6c5be08e99ec5597feb26a970f90f467615cf5021329c1c84c52a4a3f2bcc8`.
+
+On the frozen FP64 layer-39 input, the plain and diagnostic device outputs
+matched bitwise on all ranks. The candidate selected the same eight experts
+as both CPU references; the device input's eighth/ninth score gap was
+`0.03417`. Device output relative L2 was `0.002903` against CPU FP32 and
+`0.002438` against CPU FP64. With the device's actual normalized input,
+MoE output relative L2 against FP64 was `1.92e-7`; its expert set was the
+same. These receipts have SHA256
+`0a3fe791d0e92f14856936302b2695578a5eb4d5182e933e4fe9faa50f859eff` and
+`63d2757d468655dd09746010992c35eef5704133b600193ba7c9587062848066`.
+
+On that layer's same input, the device Full Attention output relative L2
+was `0.0007283` against FP64; CPU FP32 versus FP64 was `0.0007974`.
+The rank reduction and post-attention normalization matched their CPU
+checks bitwise on the actual device inputs. The resulting normalized input
+difference against the FP64 trajectory was `0.0008517`; subsequent MoE
+amplifies it in the layer output. This does not establish the cause of the
+attention difference. The receipt SHA256 is
+`e52e4214d1743e4ea5f62487060d5ca782f2a41dcff407a8700baa4f4861f3a5`.
