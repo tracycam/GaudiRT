@@ -91,6 +91,11 @@ int main(int argc, char** argv) {
     auto digest = [&](const char* name, uint64_t address, size_t size) {
       std::vector<uint8_t> bytes(size);
       arena.copy_d2h_sync(runtime.d2h_stream(), address, bytes.data(), bytes.size());
+      if (std::string(name) == "attention_local") {
+        std::ofstream values(std::string(argv[3]) + ".attention.bin", std::ios::binary);
+        values.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        if (!values) throw std::runtime_error("cannot write attention output");
+      }
       out << name << ' ' << gaudirt::common::sha256_bytes(bytes.data(), bytes.size()) << '\n';
     };
     digest("attention_local", io.output_local, 6144 * 2);
