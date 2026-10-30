@@ -292,7 +292,7 @@ struct MimoFullAttention::Impl {
                                    Binding::kNewValue, syn_type_bf16, {128, 1, 1});
     node(prepare_graph, {qkv, rope_cos, rope_sin},
          {query, new_key, new_value}, &kValueScale, sizeof(kValueScale),
-         "gk_qkv_post_bf16_bf16_v1", "qkv_split_rope_vscale");
+         "gk_qkv_post_f32_bf16_v1", "qkv_split_rope_vscale");
 
     synTensor key_cache = external(prepare_graph, prepare_externals, "key_cache",
                                    Binding::kKeyCache, syn_type_bf16,

@@ -277,7 +277,7 @@ struct MimoAttention::Impl {
     new_value = external("new_value", Binding::kNewValue, syn_type_bf16,
                          {128, 1, 1});
     node({qkv, rope_cos, rope_sin}, {query, new_key, new_value}, &kValueScale,
-         sizeof(kValueScale), "gk_qkv_post_bf16_bf16_v1",
+         sizeof(kValueScale), "gk_qkv_post_f32_bf16_v1",
          "qkv_split_rope_vscale");
 
     synTensor key_cache = external("key_cache", Binding::kKeyCache,
