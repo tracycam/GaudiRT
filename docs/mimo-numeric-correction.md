@@ -120,3 +120,7 @@ the MoE output still differed from the CPU reference by `0.001368` relative
 L2, so this layer's excess error cannot be attributed to an expert flip.
 Its receipt SHA256 is
 `c5d1fcf279e60a10f62fdae407e571702f0fa5f36eccd5179ec9fe41b6495083`.
+An independent FP64 calculation on the same input measured candidate relative
+L2 `0.001364`; the CPU FP32 path differed from FP64 by `0.000288`. The FP64
+receipt SHA256 is
+`0549e0965d88d00ca6bc83f6c91d75c989b533b9327c67d913d7af3fa8bfee1f`.
