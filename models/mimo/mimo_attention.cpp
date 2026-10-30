@@ -262,7 +262,7 @@ struct MimoAttention::Impl {
     node({hidden_states, residual, norm_gamma},
          {residual_out, activation_q, activation_scale},
          &kRmsNormEpsilon, sizeof(kRmsNormEpsilon),
-         "gk_norm_block128_grid24_v1", "input_residual_norm_block128_quant");
+         "gk_norm_block128_grid24_fp32_v1", "input_residual_norm_block128_quant");
 
     synTensor qkv_accumulator = intermediate("qkv_accumulator_fp32",
                                              syn_type_float, {3392, 1, 48});
@@ -333,7 +333,7 @@ struct MimoAttention::Impl {
          sizeof(oproj_gemm_params), "gemm", "oproj_bf16_mme_local");
 
     recipe = compile_cached(graph, "mimo_layer1_attention_b1_m1_tp8",
-                            "swa_neumaier_v5_c" + std::to_string(cache_slots) +
+                            "swa_grid24_fp32_v6_c" + std::to_string(cache_slots) +
                                 (gathered_input ? "_gathered_tp1" : "_direct"), cache);
     check(synWorkspaceGetSize(&workspace_size, recipe), "get workspace size");
     arena.ensure_workspace(workspace_size);
