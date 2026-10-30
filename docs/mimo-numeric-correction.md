@@ -148,3 +148,22 @@ unchanged at the end. The first-step `max_kl` was `0.0007722`, while
 `0.02` quality gate still fails. This run is not final ABBA and did not check
 KV after every step. Its receipt SHA256 is
 `a233d8df875d0e950e7a1509a225d3e1bae1387e676519edcb555c664879ca0c`.
+
+The layer-44 same-input follow-up found that post-attention normalization and
+the corrected MoE output matched the then-current CPU reference bitwise on
+their respective actual inputs. The reduced attention output had `0.000669`
+relative L2 difference; summing the eight captured rank outputs reproduced
+the device reduction bitwise. The receipts have SHA256
+`176229b91432c9fd0b6c765e425b841276d84e3400d526cb17bc3179b1baaab0` and
+`06b58cd8a67ed2046026c14ee21f0acf2a462673fefaee278ea9efa496d15ee3`.
+
+A subsequent comparison exposed a reference rounding limitation. One QKV
+value was within `1.28e-8` of a BF16 midpoint. PyTorch's binary64-to-BF16
+conversion on this environment first rounds through binary32, selecting the
+opposite neighbor from direct binary64 round-to-nearest-even. The device
+selected the direct-rounding neighbor on that sample. The earlier statement
+that this value was a device error is withdrawn; its receipt SHA256 is
+`d30f789b4b234dc19c281c428ffcfdc472196775da1b5d3db08e833b9ab7efe3`.
+A separate full-model FP64 reference with direct BF16 rounding is being
+generated. Previous results against the FP32 reference remain unchanged;
+they do not establish the result against the new reference.
