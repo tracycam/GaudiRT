@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "gaudirt/runtime/prepared_launch.hpp"
+
 #include <synapse_api.h>
 
 #include <array>
@@ -24,6 +26,8 @@ class ModelArgmax final {
 
   void execute(uint64_t logits, uint64_t embedding_status, uint64_t next_token,
                synStreamHandle stream);
+  runtime::PreparedLaunch prepare(uint64_t logits, uint64_t embedding_status,
+                                  uint64_t next_token);
 
  private:
   enum Slot : size_t { kLogits, kEmbeddingStatus, kNextToken, kSlotCount };

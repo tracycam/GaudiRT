@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "gaudirt/runtime/tp_reduce.hpp"
+#include "gaudirt/runtime/recipe_registry.hpp"
 
 #include <perf_lib_layer_params.h>
 #include <synapse_common_types.hpp>
@@ -96,6 +97,20 @@ TpReduce::TpReduce(HbmArena& arena, uint32_t elements,
           "compile graph");
     check(synWorkspaceGetSize(&workspace_bytes_, recipe_), "workspace size");
     arena_.ensure_workspace(workspace_bytes_);
+    const char* names[] = {"rank0", "rank1", "rank2", "rank3",
+                           "rank4", "rank5", "rank6", "rank7"};
+    for (unsigned rank = 0; rank < 8; ++rank) {
+      prepared_template_[rank].tensorName = names[rank];
+      prepared_template_[rank].tensorType = DATA_TENSOR;
+      prepared_template_[rank].tensorSize[0] = elements_;
+      prepared_template_[rank].tensorSize[1] = 1;
+    }
+    prepared_template_[8].tensorName = "output";
+    prepared_template_[8].tensorType = DATA_TENSOR;
+    prepared_template_[8].tensorSize[0] = elements_;
+    prepared_template_[8].tensorSize[1] = 1;
+    initialize_launch_tensor_ids(recipe_, prepared_template_.data(),
+                                 prepared_template_.size());
   } catch (...) {
     if (recipe_) synRecipeDestroy(recipe_);
     if (graph_) synGraphDestroy(graph_);
@@ -118,6 +133,23 @@ TpReduce::~TpReduce() {
     if (section) synSectionDestroy(section);
   }
   if (output_section_) synSectionDestroy(output_section_);
+}
+
+PreparedLaunch TpReduce::prepare(uint64_t gathered, uint64_t output) {
+  const uint64_t gathered_bytes = 8 * rank_bytes_;
+  const uint64_t output_bytes = static_cast<uint64_t>(elements_) * 2;
+  if (!gathered || !output || gathered + gathered_bytes < gathered ||
+      output + output_bytes < output ||
+      (gathered < output + output_bytes && output < gathered + gathered_bytes))
+    throw std::invalid_argument("TpReduce: invalid or overlapping bindings");
+  auto tensors = prepared_template_;
+  for (unsigned rank = 0; rank < 8; ++rank)
+    tensors[rank].pTensorAddress = gathered + rank * rank_bytes_;
+  tensors[8].pTensorAddress = output;
+  PreparedLaunch result{recipe_, arena_.ensure_workspace(workspace_bytes_),
+                        {tensors.begin(), tensors.end()}, 0};
+  result.validate();
+  return result;
 }
 
 void TpReduce::execute(uint64_t gathered, uint64_t output,

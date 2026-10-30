@@ -394,6 +394,32 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     head_ = std::make_unique<ModelHead>(arena_, model_weights_.at("final_norm"),
                                         model_weights_.at("lm_head"), nullptr);
     argmax_ = std::make_unique<ModelArgmax>(arena_, nullptr);
+    const uint64_t workspace = arena_.workspace_addr();
+    model_embedding_launch_ = embedding_->prepare(token_device_, embedding_device_,
+                                                   embedding_status_);
+    model_layers_.reserve(70);
+    uint64_t hidden = embedding_device_;
+    uint64_t residual = embedding_device_;
+    for (uint32_t layer = 0; layer < 70; ++layer) {
+      const bool full = is_full_layer(layer);
+      const uint64_t base = metadata_device_;
+      std::array<uint64_t, 11> addresses{
+          hidden, residual,
+          base + (full ? offsetof(StepMetadata, full_cos) : offsetof(StepMetadata, swa_cos)),
+          base + (full ? offsetof(StepMetadata, full_sin) : offsetof(StepMetadata, swa_sin)),
+          model_keys_[layer], model_values_[layer], base + offsetof(StepMetadata, slot),
+          base + (full ? offsetof(StepMetadata, full_pages) : offsetof(StepMetadata, window_pages)),
+          base + offsetof(StepMetadata, full_usage),
+          base + (full ? offsetof(StepMetadata, full_groups) : offsetof(StepMetadata, window_groups)),
+          base + offsetof(StepMetadata, position)};
+      model_layers_.push_back(prepare_layer(layer, addresses));
+      hidden = entries_.at(layer).layer_output;
+      residual = entries_.at(layer).residual_output;
+    }
+    model_head_launch_ = head_->prepare(hidden, residual, normalized_device_, logits_device_);
+    model_argmax_launch_ = argmax_->prepare(logits_device_, embedding_status_, token_device_);
+    if (arena_.workspace_addr() != workspace)
+      throw std::runtime_error("PrivateUse1: workspace changed during model binding");
     model_position_ = 4096;
     model_finalized_ = true;
     return wrap(trigger_device_, {1}, at::kInt);
@@ -412,27 +438,11 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
               "step metadata H2D");
     check_syn(synEventRecord(metadata_ready_, runtime_.h2d_stream()), "metadata event record");
     check_syn(synStreamWaitEvent(runtime_.compute_stream(), metadata_ready_, 0), "metadata wait");
-    embedding_->execute(token_device_, embedding_device_, embedding_status_, runtime_.compute_stream());
-    uint64_t hidden = embedding_device_;
-    uint64_t residual = embedding_device_;
-    for (uint32_t layer = 0; layer < 70; ++layer) {
-      const bool full = is_full_layer(layer);
-      const uint64_t base = metadata_device_;
-      std::array<uint64_t, 11> addresses{
-          hidden, residual,
-          base + (full ? offsetof(StepMetadata, full_cos) : offsetof(StepMetadata, swa_cos)),
-          base + (full ? offsetof(StepMetadata, full_sin) : offsetof(StepMetadata, swa_sin)),
-          model_keys_[layer], model_values_[layer], base + offsetof(StepMetadata, slot),
-          base + (full ? offsetof(StepMetadata, full_pages) : offsetof(StepMetadata, window_pages)),
-          base + offsetof(StepMetadata, full_usage),
-          base + (full ? offsetof(StepMetadata, full_groups) : offsetof(StepMetadata, window_groups)),
-          base + offsetof(StepMetadata, position)};
-      execute_layer(layer, addresses);
-      hidden = entries_.at(layer).layer_output;
-      residual = entries_.at(layer).residual_output;
-    }
-    head_->execute(hidden, residual, normalized_device_, logits_device_, runtime_.compute_stream());
-    argmax_->execute(logits_device_, embedding_status_, token_device_, runtime_.compute_stream());
+    const auto stream = runtime_.compute_stream();
+    model_embedding_launch_.execute(stream);
+    for (const auto& layer : model_layers_) layer.execute(stream);
+    model_head_launch_.execute(stream);
+    model_argmax_launch_.execute(stream);
     check_syn(synEventRecord(compute_done_, runtime_.compute_stream()), "compute event record");
     check_syn(synStreamWaitEvent(runtime_.d2h_stream(), compute_done_, 0), "output wait");
     check_syn(synMemCopyAsync(runtime_.d2h_stream(), token_device_, sizeof(int32_t),
@@ -476,6 +486,37 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     execute_layer(layer_id, addresses);
     return {wrap(entry.residual_output, {1, 6144}, at::kBFloat16),
             wrap(entry.layer_output, {1, 6144}, at::kBFloat16)};
+  }
+
+  PreparedLayer prepare_layer(uint32_t layer_id,
+                              const std::array<uint64_t, 11>& addresses) {
+    auto& entry = entries_.at(layer_id);
+    auto& instance = *instances_.at(entry.kind);
+    if (entry.kind == Kind::A) {
+      instance.a->rebind_weights(*entry.attention_weights, *entry.dense_weights);
+      auto io = instance.a_io;
+      set_common_attention(io.attention, addresses);
+      io.attention.residual = addresses[0];
+      io.dense_outputs.residual_out_bf16 = entry.residual_output;
+      io.layer_output_bf16 = entry.layer_output;
+      return instance.a->prepare(io);
+    }
+    if (entry.kind == Kind::B) {
+      instance.b->rebind_weights(*entry.attention_weights);
+      auto io = instance.b_io;
+      set_common_attention(io.attention, addresses);
+      io.moe_outputs.residual_out_bf16 = entry.residual_output;
+      io.layer_output_bf16 = entry.layer_output;
+      return instance.b->prepare(io);
+    }
+    instance.c->rebind_weights(*entry.attention_weights);
+    auto io = instance.c_io;
+    set_common_attention(io.attention, addresses);
+    io.attention.window_pages = addresses[7];
+    io.attention.window_groups = addresses[9];
+    io.moe_outputs.residual_out_bf16 = entry.residual_output;
+    io.layer_output_bf16 = entry.layer_output;
+    return instance.c->prepare(io);
   }
 
   void execute_layer(uint32_t layer_id, const std::array<uint64_t, 11>& addresses) {
@@ -681,6 +722,10 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   std::unordered_map<uint32_t, LayerEntry> entries_;
   std::unordered_map<uint32_t, PendingWeights> pending_;
   std::unordered_map<std::string, uint64_t> model_weights_;
+  std::vector<PreparedLayer> model_layers_;
+  runtime::PreparedLaunch model_embedding_launch_;
+  runtime::PreparedLaunch model_head_launch_;
+  runtime::PreparedLaunch model_argmax_launch_;
   std::array<uint64_t, 70> model_keys_{};
   std::array<uint64_t, 70> model_values_{};
   std::array<int32_t, 64> model_pages_{};

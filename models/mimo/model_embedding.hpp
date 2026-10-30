@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "gaudirt/runtime/prepared_launch.hpp"
+
 #include <synapse_api.h>
 
 #include <array>
@@ -25,6 +27,8 @@ class ModelEmbedding final {
 
   void execute(uint64_t token, uint64_t embedding, uint64_t status,
                synStreamHandle stream);
+  runtime::PreparedLaunch prepare(uint64_t token, uint64_t embedding,
+                                  uint64_t status);
 
  private:
   enum Slot : size_t { kTable, kToken, kEmbedding, kStatus, kSlotCount };

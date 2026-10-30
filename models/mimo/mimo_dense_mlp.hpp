@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "gaudirt/runtime/prepared_launch.hpp"
+
 #include <synapse_api.h>
 
 #include <cstdint>
+#include <array>
 #include <memory>
 #include <utility>
 
@@ -37,6 +40,8 @@ class MimoDenseMlp final {
   void execute(const Inputs& inputs, const Outputs& outputs,
                synStreamHandle stream);
   void rebind_weights(const WeightManifest& weights);
+  std::array<PreparedLaunch, 2> prepare(const Inputs& inputs,
+                                        const Outputs& outputs);
 
   uint64_t workspace_bytes() const noexcept;
   std::pair<uint64_t, uint64_t> recipe_identity() const noexcept;

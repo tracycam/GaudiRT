@@ -425,6 +425,38 @@ void test_foundation_on_hardware() {
   arena.copy_d2h_sync(rt.d2h_stream(), reduced_addr, reduced.data(),
                       reduced.size() * sizeof(uint16_t));
   for (const uint16_t value : reduced) assert(value == 0x4210);
+
+  const uint64_t prepared_addr = arena.allocate(kElems * sizeof(uint16_t));
+  auto prepared = reduce.prepare(gathered_addr, prepared_addr);
+  prepared.execute(rt.compute_stream());
+  assert(synStreamSynchronize(rt.compute_stream()) == synSuccess);
+  std::vector<uint16_t> prepared_result(kElems);
+  arena.copy_d2h_sync(rt.d2h_stream(), prepared_addr, prepared_result.data(),
+                      prepared_result.size() * sizeof(uint16_t));
+  assert(prepared_result == reduced);
+  bool overlap_rejected = false;
+  try {
+    static_cast<void>(reduce.prepare(gathered_addr, gathered_addr));
+  } catch (const std::invalid_argument&) {
+    overlap_rejected = true;
+  }
+  assert(overlap_rejected);
+
+  const std::array<uint16_t, 8> rank_bf16 = {
+      0x3f80, 0x4000, 0x4040, 0x4080, 0x40a0, 0x40c0, 0x40e0, 0x4100};
+  std::vector<uint16_t> gathered_bf16(8 * kElems);
+  for (size_t rank = 0; rank < 8; ++rank)
+    std::fill_n(gathered_bf16.begin() + rank * kElems, kElems, rank_bf16[rank]);
+  const uint64_t gathered_bf16_addr = arena.allocate(gathered_bf16.size() * sizeof(uint16_t));
+  arena.copy_h2d_sync(rt.h2d_stream(), gathered_bf16.data(), gathered_bf16_addr,
+                      gathered_bf16.size() * sizeof(uint16_t));
+  TpReduce reduce_bf16(arena, kElems, syn_type_bf16);
+  auto prepared_bf16 = reduce_bf16.prepare(gathered_bf16_addr, prepared_addr);
+  prepared_bf16.execute(rt.compute_stream());
+  assert(synStreamSynchronize(rt.compute_stream()) == synSuccess);
+  arena.copy_d2h_sync(rt.d2h_stream(), prepared_addr, prepared_result.data(),
+                      prepared_result.size() * sizeof(uint16_t));
+  assert(prepared_result == reduced);
 }
 
 void test_invalid_module_fails() {

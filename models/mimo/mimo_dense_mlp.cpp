@@ -330,6 +330,32 @@ struct MimoDenseMlp::Impl {
     throw std::runtime_error("MimoDenseMlp: invalid tensor binding");
   }
 
+  PreparedLaunch bind_graph(synRecipeHandle recipe,
+                            const std::vector<ExternalTensor>& externals,
+                            const std::vector<synLaunchTensorInfo>& prototype,
+                            uint64_t workspace_size, const Inputs& inputs,
+                            const Outputs& outputs) {
+    auto tensors = prototype;
+    for (size_t i = 0; i < externals.size(); ++i) {
+      tensors[i].pTensorAddress = resolve(externals[i].binding, inputs, outputs);
+      if (!tensors[i].pTensorAddress)
+        throw std::runtime_error(std::string("MimoDenseMlp: null address for ") +
+                                 externals[i].name);
+    }
+    PreparedLaunch result{recipe, arena.ensure_workspace(workspace_size),
+                          std::move(tensors), 0};
+    result.validate();
+    return result;
+  }
+
+  std::array<PreparedLaunch, 2> prepare(const Inputs& inputs,
+                                         const Outputs& outputs) {
+    return {bind_graph(gate_up_recipe, gate_up_externals, gate_up_launch,
+                       gate_up_workspace_size, inputs, outputs),
+            bind_graph(down_recipe, down_externals, down_launch,
+                       down_workspace_size, inputs, outputs)};
+  }
+
   void launch(synRecipeHandle recipe, std::vector<ExternalTensor>& externals,
               std::vector<synLaunchTensorInfo>& launch, uint64_t workspace_size,
               const Inputs& inputs, const Outputs& outputs, synStreamHandle stream,
@@ -371,6 +397,11 @@ MimoDenseMlp::~MimoDenseMlp() = default;
 void MimoDenseMlp::execute(const Inputs& inputs, const Outputs& outputs,
                            synStreamHandle stream) {
   impl_->execute(inputs, outputs, stream);
+}
+
+std::array<PreparedLaunch, 2> MimoDenseMlp::prepare(
+    const Inputs& inputs, const Outputs& outputs) {
+  return impl_->prepare(inputs, outputs);
 }
 
 void MimoDenseMlp::rebind_weights(const WeightManifest& weights) {

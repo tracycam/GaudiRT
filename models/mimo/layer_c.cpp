@@ -49,6 +49,26 @@ LayerC::LayerC(runtime::HbmArena& arena, runtime::DeviceRuntime& runtime,
        moe_.workspace_bytes(), moe_reduce_.workspace_bytes()}));
 }
 
+PreparedLayer LayerC::prepare(const Io& io) {
+  PreparedLayer result;
+  result.attention.push_back(attention_.prepare(io.attention));
+  result.attention_reduce = attention_reduce_.prepare(io.attention_gathered_bf16,
+                                                      io.attention_output_bf16);
+  result.feed_forward.push_back(moe_.prepare(
+      {io.attention_output_bf16, io.attention.residual_out}, io.moe_outputs,
+      arena_.workspace_addr()));
+  result.output_reduce = moe_reduce_.prepare(io.moe_gathered_fp32,
+                                              io.layer_output_bf16);
+  result.attention_local = io.attention.output_local;
+  result.attention_gathered = io.attention_gathered_bf16;
+  result.feed_forward_local = io.moe_outputs.moe_local_fp32;
+  result.feed_forward_gathered = io.moe_gathered_fp32;
+  result.attention_type = hcclBfloat16;
+  result.comm = comm_;
+  result.validate();
+  return result;
+}
+
 void LayerC::execute(const Io& io, synStreamHandle stream) {
   if (!stream || !io.attention_output_bf16 || !io.attention_gathered_bf16 ||
       !io.moe_gathered_fp32 || !io.layer_output_bf16) {

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "gaudirt/runtime/prepared_launch.hpp"
+
 #include <synapse_api.h>
 
 #include <array>
@@ -84,6 +86,8 @@ class MimoMoeLayer1 final {
   void launch(synStreamHandle stream, const Inputs& inputs,
               const Outputs& outputs, uint64_t workspace_addr);
   void rebind_weights(const Weights& weights);
+  PreparedLaunch prepare(const Inputs& inputs, const Outputs& outputs,
+                         uint64_t workspace_addr);
 
   uint32_t tp_rank() const noexcept { return tp_rank_; }
   uint64_t workspace_bytes() const noexcept { return workspace_bytes_; }

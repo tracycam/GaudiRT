@@ -135,6 +135,19 @@ ModelHead::~ModelHead() {
   if (recipe_ != nullptr) synRecipeDestroy(recipe_);
 }
 
+runtime::PreparedLaunch ModelHead::prepare(uint64_t hidden, uint64_t residual,
+                                           uint64_t normalized, uint64_t logits) {
+  auto tensors = launch_tensors_;
+  tensors[kHidden].pTensorAddress = hidden;
+  tensors[kResidual].pTensorAddress = residual;
+  tensors[kNormalized].pTensorAddress = normalized;
+  tensors[kLogits].pTensorAddress = logits;
+  runtime::PreparedLaunch result{recipe_, arena_.ensure_workspace(workspace_bytes_),
+                                 {tensors.begin(), tensors.end()}, 0};
+  result.validate();
+  return result;
+}
+
 void ModelHead::execute(uint64_t hidden, uint64_t residual, uint64_t normalized,
                         uint64_t logits, synStreamHandle stream) {
   if (!stream || !hidden || !residual || !normalized || !logits) {

@@ -443,6 +443,30 @@ struct MimoFullAttention::Impl {
     throw std::runtime_error("MimoFullAttention: invalid tensor binding");
   }
 
+  PreparedLaunch bind_graph(synRecipeHandle recipe,
+                            const std::vector<ExternalTensor>& externals,
+                            const std::vector<synLaunchTensorInfo>& prototype,
+                            uint64_t workspace_size, const MimoAttentionIo& io) {
+    auto tensors = prototype;
+    for (size_t i = 0; i < externals.size(); ++i) {
+      tensors[i].pTensorAddress = resolve(externals[i].binding, io);
+      if (!tensors[i].pTensorAddress)
+        throw std::runtime_error(std::string("MimoFullAttention: null address for ") +
+                                 externals[i].name);
+    }
+    PreparedLaunch result{recipe, arena.ensure_workspace(workspace_size),
+                          std::move(tensors), 0};
+    result.validate();
+    return result;
+  }
+
+  std::array<PreparedLaunch, 2> prepare(const MimoAttentionIo& io) {
+    return {bind_graph(prepare_recipe, prepare_externals, prepare_launch,
+                       prepare_workspace_size, io),
+            bind_graph(finish_recipe, finish_externals, finish_launch,
+                       finish_workspace_size, io)};
+  }
+
   void launch(synRecipeHandle recipe, std::vector<ExternalTensor>& externals,
               std::vector<synLaunchTensorInfo>& launch, uint64_t workspace_size,
               const MimoAttentionIo& io, synStreamHandle stream,
@@ -486,6 +510,11 @@ MimoFullAttention::~MimoFullAttention() = default;
 void MimoFullAttention::execute(const MimoAttentionIo& io,
                                 synStreamHandle stream) {
   impl_->execute(io, stream);
+}
+
+std::array<PreparedLaunch, 2> MimoFullAttention::prepare(
+    const MimoAttentionIo& io) {
+  return impl_->prepare(io);
 }
 
 void MimoFullAttention::rebind_weights(const WeightManifest& weights) {

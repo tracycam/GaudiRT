@@ -388,6 +388,20 @@ struct MimoAttention::Impl {
     throw std::runtime_error("MimoAttention: invalid tensor binding");
   }
 
+  PreparedLaunch prepare(const MimoAttentionIo& io) {
+    auto tensors = launch;
+    for (size_t i = 0; i < externals.size(); ++i) {
+      tensors[i].pTensorAddress = resolve(externals[i].binding, io);
+      if (!tensors[i].pTensorAddress)
+        throw std::runtime_error(std::string("MimoAttention: null address for ") +
+                                 externals[i].name);
+    }
+    PreparedLaunch result{recipe, arena.ensure_workspace(workspace_size),
+                          std::move(tensors), 0};
+    result.validate();
+    return result;
+  }
+
   void execute(const MimoAttentionIo& io, synStreamHandle stream) {
     if (!stream || !recipe) {
       throw std::runtime_error("MimoAttention: invalid stream or recipe");
@@ -417,6 +431,10 @@ MimoAttention::~MimoAttention() = default;
 
 void MimoAttention::execute(const MimoAttentionIo& io, synStreamHandle stream) {
   impl_->execute(io, stream);
+}
+
+PreparedLaunch MimoAttention::prepare(const MimoAttentionIo& io) {
+  return impl_->prepare(io);
 }
 
 void MimoAttention::rebind_weights(const WeightManifest& weights) {

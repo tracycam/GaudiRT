@@ -4,6 +4,7 @@
 #include "gaudirt/runtime/device_runtime.hpp"
 #include "mimo_attention.hpp"
 #include "mimo_moe.hpp"
+#include "prepared_layer.hpp"
 #include "gaudirt/runtime/tp_reduce.hpp"
 
 #include <cstdint>
@@ -30,6 +31,7 @@ class LayerC final {
   LayerC& operator=(const LayerC&) = delete;
 
   void execute(const Io& io, synStreamHandle stream);
+  PreparedLayer prepare(const Io& io);
   void rebind_weights(const runtime::WeightManifest& weights);
   std::vector<uint64_t> recipe_identity() const {
     return {attention_.recipe_identity(), moe_.recipe_identity()};

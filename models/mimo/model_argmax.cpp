@@ -93,6 +93,18 @@ ModelArgmax::~ModelArgmax() {
   if (recipe_) synRecipeDestroy(recipe_);
 }
 
+runtime::PreparedLaunch ModelArgmax::prepare(uint64_t logits, uint64_t status,
+                                             uint64_t next_token) {
+  auto tensors = launch_tensors_;
+  tensors[kLogits].pTensorAddress = logits;
+  tensors[kEmbeddingStatus].pTensorAddress = status;
+  tensors[kNextToken].pTensorAddress = next_token;
+  runtime::PreparedLaunch result{recipe_, arena_.ensure_workspace(workspace_bytes_),
+                                 {tensors.begin(), tensors.end()}, 0};
+  result.validate();
+  return result;
+}
+
 void ModelArgmax::execute(uint64_t logits, uint64_t status, uint64_t next_token,
                           synStreamHandle stream) {
   if (!stream || !logits || !status || !next_token)

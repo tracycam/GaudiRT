@@ -311,6 +311,35 @@ void MimoMoeLayer1::rebind_weights(const Weights& weights) {
   launch_tensors_[kDirections].pTensorAddress = weights.down_combine_directions_u8;
 }
 
+PreparedLaunch MimoMoeLayer1::prepare(const Inputs& inputs,
+                                      const Outputs& outputs,
+                                      uint64_t workspace_addr) {
+  if ((workspace_bytes_ == 0) != (workspace_addr == 0))
+    throw std::invalid_argument("MimoMoeLayer1: invalid prepared workspace");
+  auto tensors = launch_tensors_;
+  tensors[kAttention].pTensorAddress = inputs.attention_bf16;
+  tensors[kResidualIn].pTensorAddress = inputs.residual_in_bf16;
+  tensors[kResidualOut].pTensorAddress = outputs.residual_out_bf16;
+  tensors[kNormalized].pTensorAddress = outputs.normalized_bf16;
+  tensors[kTopkIds].pTensorAddress = outputs.topk_ids_i32;
+  tensors[kTopkWeights].pTensorAddress = outputs.topk_weights_fp32;
+  tensors[kMoeOut].pTensorAddress = outputs.moe_local_fp32;
+  std::array<uint64_t, kSlotCount> addresses{};
+  for (size_t i = 0; i < addresses.size(); ++i)
+    addresses[i] = tensors[i].pTensorAddress;
+  for (size_t i = 0; i < addresses.size(); ++i) {
+    for (size_t j = i + 1; j < addresses.size(); ++j)
+      if (addresses[i] == addresses[j])
+        throw std::invalid_argument("MimoMoeLayer1: aliased prepared bindings");
+    if (workspace_addr && addresses[i] == workspace_addr)
+      throw std::invalid_argument("MimoMoeLayer1: workspace aliases a binding");
+  }
+  PreparedLaunch result{recipe_, workspace_addr,
+                        {tensors.begin(), tensors.end()}, 0};
+  result.validate();
+  return result;
+}
+
 void MimoMoeLayer1::launch(synStreamHandle stream, const Inputs& inputs,
                            const Outputs& outputs, uint64_t workspace_addr) {
   if (stream == nullptr) {

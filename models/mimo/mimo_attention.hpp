@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "gaudirt/runtime/prepared_launch.hpp"
+
 #include <synapse_api.h>
 
 #include <cstdint>
@@ -71,6 +73,7 @@ class MimoAttention {
 
   void execute(const MimoAttentionIo& io, synStreamHandle stream);
   void rebind_weights(const WeightManifest& weights);
+  PreparedLaunch prepare(const MimoAttentionIo& io);
 
   uint32_t cache_slots() const noexcept;
   uint64_t workspace_bytes() const noexcept;

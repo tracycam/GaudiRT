@@ -4,6 +4,7 @@
 #include "gaudirt/runtime/device_runtime.hpp"
 #include "mimo_dense_mlp.hpp"
 #include "mimo_full_attention.hpp"
+#include "prepared_layer.hpp"
 #include "gaudirt/runtime/tp_reduce.hpp"
 
 #include <cstdint>
@@ -31,6 +32,7 @@ class Layer0 final {
   Layer0& operator=(const Layer0&) = delete;
 
   void execute(const Io& io, synStreamHandle stream);
+  PreparedLayer prepare(const Io& io);
   void rebind_weights(const runtime::WeightManifest& attention_weights,
                       const runtime::WeightManifest& dense_weights);
   std::vector<uint64_t> recipe_identity() const {

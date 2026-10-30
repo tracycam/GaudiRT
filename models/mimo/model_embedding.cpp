@@ -89,6 +89,19 @@ ModelEmbedding::~ModelEmbedding() {
   if (recipe_) synRecipeDestroy(recipe_);
 }
 
+runtime::PreparedLaunch ModelEmbedding::prepare(uint64_t token,
+                                                uint64_t embedding,
+                                                uint64_t status) {
+  auto tensors = launch_tensors_;
+  tensors[kToken].pTensorAddress = token;
+  tensors[kEmbedding].pTensorAddress = embedding;
+  tensors[kStatus].pTensorAddress = status;
+  runtime::PreparedLaunch result{recipe_, arena_.ensure_workspace(workspace_bytes_),
+                                 {tensors.begin(), tensors.end()}, 0};
+  result.validate();
+  return result;
+}
+
 void ModelEmbedding::execute(uint64_t token, uint64_t embedding, uint64_t status,
                              synStreamHandle stream) {
   if (!stream || !token || !embedding || !status)
