@@ -2,6 +2,10 @@
 #include "layer0.hpp"
 #include "layer_b.hpp"
 #include "layer_c.hpp"
+#include "model_argmax.hpp"
+#include "model_embedding.hpp"
+#include "model_head.hpp"
+#include "step_metadata.hpp"
 
 #include "gaudirt/runtime/weight_manifest.hpp"
 
@@ -20,6 +24,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -96,6 +101,19 @@ struct PendingWeights {
   std::vector<runtime::WeightTensor> dense;
 };
 
+bool is_full_layer(uint32_t layer) {
+  constexpr std::array<uint32_t, 10> full{0, 7, 15, 23, 31, 39, 47, 55, 62, 69};
+  return std::find(full.begin(), full.end(), layer) != full.end();
+}
+
+void check_syn(synStatus status, const char* operation) {
+  if (status != synSuccess) {
+    throw std::runtime_error(std::string("PrivateUse1: ") + operation +
+                             " failed with Synapse status " +
+                             std::to_string(static_cast<int>(status)));
+  }
+}
+
 struct Instance {
   Kind kind;
   uint32_t cache_slots = 0;
@@ -136,7 +154,20 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     if (world != 8 || rank >= world) {
       throw std::invalid_argument("PrivateUse1: only TP8 is supported");
     }
+    if (recipe_cache_.enabled()) {
+      throw std::invalid_argument("PrivateUse1: persistent recipe provenance is not verified");
+    }
     runtime_.init_comm(exchange_unique_id(rank, unique_id));
+  }
+
+  ~PrivateProgram() {
+    if (metadata_host_ || token_host_ || metadata_ready_ || compute_done_) {
+      try { runtime_.synchronize_all(); } catch (...) {}
+    }
+    if (metadata_ready_) synEventDestroy(metadata_ready_);
+    if (compute_done_) synEventDestroy(compute_done_);
+    if (metadata_host_) synHostFree(runtime_.device_id(), metadata_host_, 0);
+    if (token_host_) synHostFree(runtime_.device_id(), token_host_, 0);
   }
 
   void register_layer(uint32_t layer_id, int64_t kind_value,
@@ -246,11 +277,207 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     }
   }
 
+  void upload_model_weight(const std::string& name, const at::Tensor& tensor) {
+    if (model_finalized_ || model_weights_.count(name) ||
+        tensor.device().type() != c10::kCPU || !tensor.is_contiguous() ||
+        tensor.scalar_type() != at::kBFloat16) {
+      throw std::invalid_argument("PrivateUse1: invalid or duplicate model weight");
+    }
+    if (name == "embedding" || name == "lm_head") {
+      if (tensor.dim() != 2 || tensor.size(0) != 152576 || tensor.size(1) != 6144)
+        throw std::invalid_argument("PrivateUse1: invalid model matrix geometry");
+    } else if (name == "final_norm") {
+      if (tensor.dim() != 1 || tensor.size(0) != 6144)
+        throw std::invalid_argument("PrivateUse1: invalid final norm geometry");
+    } else {
+      throw std::invalid_argument("PrivateUse1: unknown model weight");
+    }
+    const uint64_t address = arena_.allocate(tensor.nbytes());
+    arena_.copy_h2d_sync(runtime_.h2d_stream(), tensor.data_ptr(), address, tensor.nbytes());
+    model_weights_.emplace(name, address);
+  }
+
+  void register_model_kv(uint32_t layer, const at::Tensor& key, const at::Tensor& value) {
+    if (model_finalized_ || layer >= 70 || model_keys_[layer] || !entries_.count(layer))
+      throw std::invalid_argument("PrivateUse1: invalid or duplicate model KV layer");
+    const auto& instance = *instances_.at(entries_.at(layer).kind);
+    if (key.scalar_type() != at::kBFloat16 || value.scalar_type() != at::kBFloat16 ||
+        key.numel() != static_cast<int64_t>(instance.cache_slots) * 192 ||
+        value.numel() != static_cast<int64_t>(instance.cache_slots) * 128)
+      throw std::invalid_argument("PrivateUse1: invalid model KV geometry");
+    const uint64_t key_address = address_of(key);
+    const uint64_t value_address = address_of(value);
+    const uint64_t key_bytes = key.nbytes();
+    const uint64_t value_bytes = value.nbytes();
+    const uint64_t limit = arena_.base_addr() + arena_.used_bytes();
+    if (key_bytes > limit - key_address || value_bytes > limit - value_address)
+      throw std::invalid_argument("PrivateUse1: model KV extends outside the arena");
+    const auto overlaps = [](uint64_t a, uint64_t as, uint64_t b, uint64_t bs) {
+      return a < b + bs && b < a + as;
+    };
+    if (overlaps(key_address, key_bytes, value_address, value_bytes))
+      throw std::invalid_argument("PrivateUse1: model key and value buffers overlap");
+    for (uint32_t other = 0; other < 70; ++other) {
+      if (!model_keys_[other]) continue;
+      const auto& other_instance = *instances_.at(entries_.at(other).kind);
+      const uint64_t other_key_bytes = static_cast<uint64_t>(other_instance.cache_slots) * 192 * 2;
+      const uint64_t other_value_bytes = static_cast<uint64_t>(other_instance.cache_slots) * 128 * 2;
+      if (overlaps(key_address, key_bytes, model_keys_[other], other_key_bytes) ||
+          overlaps(key_address, key_bytes, model_values_[other], other_value_bytes) ||
+          overlaps(value_address, value_bytes, model_keys_[other], other_key_bytes) ||
+          overlaps(value_address, value_bytes, model_values_[other], other_value_bytes))
+        throw std::invalid_argument("PrivateUse1: model KV layers overlap");
+    }
+    model_keys_[layer] = key_address;
+    model_values_[layer] = value_address;
+  }
+
+  at::Tensor finalize_model(const at::Tensor& full_rope, const at::Tensor& swa_rope,
+                            const at::Tensor& pages, int32_t initial_token) {
+    if (model_finalized_ || entries_.size() != 70 || model_weights_.size() != 3 ||
+        !model_weights_.count("embedding") || !model_weights_.count("lm_head") ||
+        !model_weights_.count("final_norm") || initial_token < 0 || initial_token >= 152576)
+      throw std::invalid_argument("PrivateUse1: incomplete model or invalid initial token");
+    for (uint32_t layer = 0; layer < 70; ++layer) {
+      if (!entries_.count(layer) || !model_keys_[layer] || !model_values_[layer])
+        throw std::invalid_argument("PrivateUse1: missing model layer or KV");
+      const Kind expected = layer == 0 ? Kind::A : (is_full_layer(layer) ? Kind::B : Kind::C);
+      if (entries_.at(layer).kind != expected)
+        throw std::invalid_argument("PrivateUse1: unexpected model layer kind");
+    }
+    const auto cpu = [](const at::Tensor& tensor, at::ScalarType dtype) {
+      return tensor.device().type() == c10::kCPU && tensor.is_contiguous() &&
+             tensor.scalar_type() == dtype;
+    };
+    if (!cpu(full_rope, at::kBFloat16) || !cpu(swa_rope, at::kBFloat16) ||
+        !cpu(pages, at::kInt) || full_rope.dim() != 2 || swa_rope.dim() != 2 ||
+        full_rope.size(1) != 64 || full_rope.sizes() != swa_rope.sizes() ||
+        full_rope.size(0) < 128 || full_rope.size(0) > 4096 || pages.numel() != 64)
+      throw std::invalid_argument("PrivateUse1: invalid shared decode metadata");
+    const auto slots = instances_.at(Kind::A)->cache_slots;
+    if (instances_.at(Kind::B)->cache_slots != slots ||
+        instances_.at(Kind::C)->cache_slots != slots ||
+        instances_.at(Kind::A)->page_count != 64 || instances_.at(Kind::B)->page_count != 64)
+      throw std::invalid_argument("PrivateUse1: model layers must share KV page geometry");
+    cache_slots_ = slots;
+    rope_rows_ = static_cast<uint32_t>(full_rope.size(0));
+    full_rope_.resize(static_cast<size_t>(full_rope.numel()));
+    swa_rope_.resize(static_cast<size_t>(swa_rope.numel()));
+    std::memcpy(full_rope_.data(), full_rope.data_ptr(), full_rope.nbytes());
+    std::memcpy(swa_rope_.data(), swa_rope.data_ptr(), swa_rope.nbytes());
+    std::memcpy(model_pages_.data(), pages.data_ptr(), pages.nbytes());
+    StepMetadata initial{};
+    fill_step_metadata(initial, 4096, 4096, rope_rows_, full_rope_.data(),
+                       swa_rope_.data(), model_pages_, cache_slots_);
+    check_syn(synHostMalloc(runtime_.device_id(), sizeof(StepMetadata), 0, &metadata_host_),
+              "metadata pinned allocation");
+    if (reinterpret_cast<uintptr_t>(metadata_host_) % alignof(StepMetadata) != 0)
+      throw std::runtime_error("PrivateUse1: pinned metadata is not aligned");
+    new (metadata_host_) StepMetadata{};
+    check_syn(synHostMalloc(runtime_.device_id(), sizeof(int32_t), 0, &token_host_),
+              "token pinned allocation");
+    check_syn(synEventCreate(&metadata_ready_, runtime_.device_id(), 0), "metadata event creation");
+    check_syn(synEventCreate(&compute_done_, runtime_.device_id(), 0), "compute event creation");
+    metadata_device_ = arena_.allocate(sizeof(StepMetadata));
+    trigger_device_ = arena_.allocate(sizeof(int32_t));
+    token_device_ = arena_.allocate(sizeof(int32_t));
+    embedding_device_ = arena_.allocate(6144 * sizeof(uint16_t));
+    embedding_status_ = arena_.allocate(sizeof(int32_t));
+    normalized_device_ = arena_.allocate(6144 * sizeof(uint16_t));
+    logits_device_ = arena_.allocate(152576 * sizeof(uint16_t));
+    const int32_t trigger_value = 0;
+    arena_.copy_h2d_sync(runtime_.h2d_stream(), &trigger_value, trigger_device_, sizeof(trigger_value));
+    arena_.copy_h2d_sync(runtime_.h2d_stream(), &initial_token, token_device_, sizeof(initial_token));
+    embedding_ = std::make_unique<ModelEmbedding>(arena_, model_weights_.at("embedding"), nullptr);
+    head_ = std::make_unique<ModelHead>(arena_, model_weights_.at("final_norm"),
+                                        model_weights_.at("lm_head"), nullptr);
+    argmax_ = std::make_unique<ModelArgmax>(arena_, nullptr);
+    model_position_ = 4096;
+    model_finalized_ = true;
+    return wrap(trigger_device_, {1}, at::kInt);
+  }
+
+  at::Tensor forward_model(const at::Tensor& trigger) {
+    if (!model_finalized_ || model_pending_ || trigger.scalar_type() != at::kInt ||
+        trigger.numel() != 1 || address_of(trigger) != trigger_device_)
+      throw std::invalid_argument("PrivateUse1: invalid model step or unfinished previous step");
+    auto& metadata = *static_cast<StepMetadata*>(metadata_host_);
+    fill_step_metadata(metadata, model_position_, 4096, rope_rows_, full_rope_.data(),
+                       swa_rope_.data(), model_pages_, cache_slots_);
+    model_pending_ = true;
+    check_syn(synMemCopyAsync(runtime_.h2d_stream(), reinterpret_cast<uint64_t>(metadata_host_),
+                              sizeof(StepMetadata), metadata_device_, HOST_TO_DRAM),
+              "step metadata H2D");
+    check_syn(synEventRecord(metadata_ready_, runtime_.h2d_stream()), "metadata event record");
+    check_syn(synStreamWaitEvent(runtime_.compute_stream(), metadata_ready_, 0), "metadata wait");
+    embedding_->execute(token_device_, embedding_device_, embedding_status_, runtime_.compute_stream());
+    uint64_t hidden = embedding_device_;
+    uint64_t residual = embedding_device_;
+    for (uint32_t layer = 0; layer < 70; ++layer) {
+      const bool full = is_full_layer(layer);
+      const uint64_t base = metadata_device_;
+      std::array<uint64_t, 11> addresses{
+          hidden, residual,
+          base + (full ? offsetof(StepMetadata, full_cos) : offsetof(StepMetadata, swa_cos)),
+          base + (full ? offsetof(StepMetadata, full_sin) : offsetof(StepMetadata, swa_sin)),
+          model_keys_[layer], model_values_[layer], base + offsetof(StepMetadata, slot),
+          base + (full ? offsetof(StepMetadata, full_pages) : offsetof(StepMetadata, window_pages)),
+          base + offsetof(StepMetadata, full_usage),
+          base + (full ? offsetof(StepMetadata, full_groups) : offsetof(StepMetadata, window_groups)),
+          base + offsetof(StepMetadata, position)};
+      execute_layer(layer, addresses);
+      hidden = entries_.at(layer).layer_output;
+      residual = entries_.at(layer).residual_output;
+    }
+    head_->execute(hidden, residual, normalized_device_, logits_device_, runtime_.compute_stream());
+    argmax_->execute(logits_device_, embedding_status_, token_device_, runtime_.compute_stream());
+    check_syn(synEventRecord(compute_done_, runtime_.compute_stream()), "compute event record");
+    check_syn(synStreamWaitEvent(runtime_.d2h_stream(), compute_done_, 0), "output wait");
+    check_syn(synMemCopyAsync(runtime_.d2h_stream(), token_device_, sizeof(int32_t),
+                              reinterpret_cast<uint64_t>(token_host_), DRAM_TO_HOST),
+              "token D2H");
+    return wrap(token_device_, {1}, at::kInt);
+  }
+
+  int32_t finish_model_step() {
+    if (!model_pending_) throw std::invalid_argument("PrivateUse1: no pending model step");
+    check_syn(synStreamSynchronize(runtime_.d2h_stream()), "token D2H completion");
+    model_pending_ = false;
+    const int32_t token = *static_cast<int32_t*>(token_host_);
+    if (token < 0 || token >= 152576) {
+      model_finalized_ = false;
+      throw std::runtime_error("PrivateUse1: invalid token or nonfinite model logits");
+    }
+    ++model_position_;
+    return token;
+  }
+
+  at::Tensor model_logits() {
+    if (!model_finalized_ || model_pending_ || model_position_ == 4096)
+      throw std::invalid_argument("PrivateUse1: model logits are not ready");
+    return wrap(logits_device_, {1, 152576}, at::kBFloat16);
+  }
+
+  std::vector<at::Tensor> model_kv(uint32_t layer) {
+    if (!model_finalized_ || model_pending_ || model_position_ == 4096 || layer >= 70)
+      throw std::invalid_argument("PrivateUse1: model KV is not ready");
+    return {wrap(model_keys_[layer], {cache_slots_, 192}, at::kBFloat16),
+            wrap(model_values_[layer], {cache_slots_, 128}, at::kBFloat16)};
+  }
+
   std::vector<at::Tensor> forward(uint32_t layer_id,
                                   const std::vector<at::Tensor>& inputs) {
     auto& entry = entries_.at(layer_id);
     auto& instance = *instances_.at(entry.kind);
     const auto addresses = validate_inputs(instance, inputs);
+    execute_layer(layer_id, addresses);
+    return {wrap(entry.residual_output, {1, 6144}, at::kBFloat16),
+            wrap(entry.layer_output, {1, 6144}, at::kBFloat16)};
+  }
+
+  void execute_layer(uint32_t layer_id, const std::array<uint64_t, 11>& addresses) {
+    auto& entry = entries_.at(layer_id);
+    auto& instance = *instances_.at(entry.kind);
     if (entry.kind == Kind::A) {
       instance.a->rebind_weights(*entry.attention_weights, *entry.dense_weights);
       auto& io = instance.a_io;
@@ -276,8 +503,6 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       io.layer_output_bf16 = entry.layer_output;
       instance.c->execute(io, runtime_.compute_stream());
     }
-    return {wrap(entry.residual_output, {1, 6144}, at::kBFloat16),
-            wrap(entry.layer_output, {1, 6144}, at::kBFloat16)};
   }
 
   std::vector<uint64_t> recipe_identity(int64_t kind_value) const {
@@ -452,6 +677,31 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   std::unordered_map<Kind, std::unique_ptr<Instance>> instances_;
   std::unordered_map<uint32_t, LayerEntry> entries_;
   std::unordered_map<uint32_t, PendingWeights> pending_;
+  std::unordered_map<std::string, uint64_t> model_weights_;
+  std::array<uint64_t, 70> model_keys_{};
+  std::array<uint64_t, 70> model_values_{};
+  std::array<int32_t, 64> model_pages_{};
+  std::vector<uint16_t> full_rope_;
+  std::vector<uint16_t> swa_rope_;
+  uint32_t cache_slots_ = 0;
+  uint32_t rope_rows_ = 0;
+  uint32_t model_position_ = 0;
+  bool model_finalized_ = false;
+  bool model_pending_ = false;
+  void* metadata_host_ = nullptr;
+  void* token_host_ = nullptr;
+  synEventHandle metadata_ready_ = nullptr;
+  synEventHandle compute_done_ = nullptr;
+  uint64_t metadata_device_ = 0;
+  uint64_t trigger_device_ = 0;
+  uint64_t token_device_ = 0;
+  uint64_t embedding_device_ = 0;
+  uint64_t embedding_status_ = 0;
+  uint64_t normalized_device_ = 0;
+  uint64_t logits_device_ = 0;
+  std::unique_ptr<ModelEmbedding> embedding_;
+  std::unique_ptr<ModelHead> head_;
+  std::unique_ptr<ModelArgmax> argmax_;
 };
 
 std::mutex registry_mutex;
@@ -666,6 +916,29 @@ void register_streamed_layer(uint32_t rank, uint32_t layer_id, int64_t kind,
   get(rank)->register_streamed_layer(layer_id, kind, cache_slots, page_count);
 }
 
+void upload_model_weight(uint32_t rank, const std::string& name, const at::Tensor& tensor) {
+  get(rank)->upload_model_weight(name, tensor);
+}
+
+void register_model_kv(uint32_t rank, uint32_t layer_id,
+                       const at::Tensor& key, const at::Tensor& value) {
+  get(rank)->register_model_kv(layer_id, key, value);
+}
+
+at::Tensor finalize_model(uint32_t rank, const at::Tensor& full_rope,
+                          const at::Tensor& swa_rope, const at::Tensor& pages,
+                          int32_t initial_token) {
+  return get(rank)->finalize_model(full_rope, swa_rope, pages, initial_token);
+}
+
+int32_t finish_model_step(uint32_t rank) { return get(rank)->finish_model_step(); }
+
+at::Tensor model_logits(uint32_t rank) { return get(rank)->model_logits(); }
+
+std::vector<at::Tensor> model_kv(uint32_t rank, uint32_t layer) {
+  return get(rank)->model_kv(layer);
+}
+
 void register_layer(uint32_t rank, uint32_t layer_id, int64_t kind,
                     const std::string& attention_weights,
                     const std::string& dense_weights,
@@ -712,19 +985,32 @@ std::vector<at::Tensor> forward_meta(int64_t layer_id,
   return {at::empty({1, 6144}, options), at::empty({1, 6144}, options)};
 }
 
+at::Tensor model_step(const at::Tensor& trigger) {
+  return get_sole_instance()->forward_model(trigger);
+}
+
+at::Tensor model_step_meta(const at::Tensor& trigger) {
+  if (trigger.scalar_type() != at::kInt || trigger.numel() != 1)
+    throw std::invalid_argument("PrivateUse1: invalid meta model trigger");
+  return at::empty({1}, at::TensorOptions().device(at::kMeta).dtype(at::kInt));
+}
+
 }  // namespace
 }  // namespace gaudirt::mimo
 
 TORCH_LIBRARY(gaudirt, m) {
   m.def("layer(int layer_id, Tensor[] inputs) -> Tensor[]");
+  m.def("model_step(Tensor trigger) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(gaudirt, PrivateUse1, m) {
   m.impl("layer", &gaudirt::mimo::forward);
+  m.impl("model_step", &gaudirt::mimo::model_step);
 }
 
 TORCH_LIBRARY_IMPL(gaudirt, Meta, m) {
   m.impl("layer", &gaudirt::mimo::forward_meta);
+  m.impl("model_step", &gaudirt::mimo::model_step_meta);
 }
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
@@ -739,6 +1025,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("register_layer", &gaudirt::mimo::register_layer);
   m.def("upload_weight", &gaudirt::mimo::upload_weight);
   m.def("register_streamed_layer", &gaudirt::mimo::register_streamed_layer);
+  m.def("upload_model_weight", &gaudirt::mimo::upload_model_weight);
+  m.def("register_model_kv", &gaudirt::mimo::register_model_kv);
+  m.def("finalize_model", &gaudirt::mimo::finalize_model);
+  m.def("finish_model_step", &gaudirt::mimo::finish_model_step);
+  m.def("model_logits", &gaudirt::mimo::model_logits);
+  m.def("model_kv", &gaudirt::mimo::model_kv);
   m.def("recipe_identity", &gaudirt::mimo::recipe_identity);
   m.def("recipe_cache_stats", &gaudirt::mimo::recipe_cache_stats);
   m.def("shutdown", &gaudirt::mimo::shutdown);

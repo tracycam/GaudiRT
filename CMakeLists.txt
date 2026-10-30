@@ -49,6 +49,9 @@ target_link_libraries(mimo_embedding_device_test PRIVATE mimo_layer_vertical)
 add_executable(mimo_argmax_device_test tests/mimo_argmax_device_test.cpp)
 target_link_libraries(mimo_argmax_device_test PRIVATE mimo_layer_vertical)
 
+add_executable(mimo_step_metadata_test tests/mimo_step_metadata_test.cpp)
+target_include_directories(mimo_step_metadata_test PRIVATE models/mimo)
+
 add_executable(mimo_layer1 models/mimo/layer1_main.cpp)
 target_link_libraries(mimo_layer1 PRIVATE mimo_layer_vertical)
 
