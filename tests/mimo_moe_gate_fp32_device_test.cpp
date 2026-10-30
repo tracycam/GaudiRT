@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -74,6 +75,28 @@ int main() {
     random ^= random << 13; random ^= random >> 17; random ^= random << 5;
     value = (static_cast<int32_t>(random % 20001) - 10000) / 4096.0f;
   }
+  // Include the observed input and neighboring range-reduction boundaries.
+  std::array<float, 750> boundaries{};
+  size_t boundary_count = 0;
+  const float ln2 = std::log(2.0f);
+  for (int multiple = 1; multiple <= 125; ++multiple) {
+    for (float sign : {-1.0f, 1.0f}) {
+      const float value = sign * static_cast<float>(multiple) * ln2;
+      boundaries[boundary_count++] = std::nextafter(value, -std::numeric_limits<float>::infinity());
+      boundaries[boundary_count++] = value;
+      boundaries[boundary_count++] = std::nextafter(value, std::numeric_limits<float>::infinity());
+    }
+  }
+  for (size_t index = 0; index < boundary_count; ++index) {
+    const int slot = index / 256;
+    const int row = index % 256;
+    const int packed_row = (row / 128) * 128 + (row % 128) / 2 + (row % 2) * 64;
+    const int gate_base = slot * 3 * 512 + packed_row;
+    for (int split = 0; split < 3; ++split) {
+      partial[gate_base + split * 512] = split == 0 ? boundaries[index] : 0.0f;
+      partial[gate_base + 256 + split * 512] = split == 0 ? 0.2160845696926117f : 0.0f;
+    }
+  }
   std::array<int32_t, 8> ids{1, 7, 19, 31, 47, 99, 150, 383};
   std::vector<uint16_t> actual(8 * 256);
   bindings[0].pTensorAddress = arena.allocate(partial.size() * sizeof(float));
@@ -89,6 +112,7 @@ int main() {
                       actual.data(), actual.size() * sizeof(uint16_t));
   double error_sq = 0, expected_sq = 0;
   float max_abs = 0;
+  unsigned boundary_failures = 0;
   for (int slot = 0; slot < 8; ++slot) {
     for (int row = 0; row < 256; ++row) {
       // The MME partial stores even lanes followed by odd lanes in each block.
@@ -103,6 +127,11 @@ int main() {
       const double expected = widen(bf16(static_cast<float>(
           static_cast<double>(gate) / (1.0 + std::exp(-static_cast<double>(gate))) * up)));
       const double difference = widen(actual[slot * 256 + row]) - expected;
+      if (static_cast<size_t>(slot * 256 + row) < boundary_count && difference != 0) {
+        std::printf("boundary gate=%.9g actual=%.9g expected=%.9g\n", gate,
+                    widen(actual[slot * 256 + row]), expected);
+        ++boundary_failures;
+      }
       error_sq += difference * difference; expected_sq += expected * expected;
       max_abs = std::max(max_abs, static_cast<float>(std::abs(difference)));
     }
@@ -110,5 +139,6 @@ int main() {
   const double relative = std::sqrt(error_sq / expected_sq);
   std::printf("FP32 MoE gate relative_l2=%.9g max_abs=%.9g\n", relative, max_abs);
   check(synRecipeDestroy(recipe));
+  if (boundary_failures) throw std::runtime_error("FP32 MoE gate fails boundary inputs");
   if (!(relative <= 1e-3)) throw std::runtime_error("FP32 MoE gate exceeds mathematical tolerance");
 }
