@@ -105,3 +105,10 @@ After those runs, fixed page-table checks were moved to model initialization.
 The metadata unit test covers the 144 positions across a page boundary and
 rejects a duplicate future page. The updated runtime extension compiles; this
 subsequent change has not yet been measured in an end-to-end run.
+
+An independent 8-rank, 70-layer teacher-forced check used the mathematical
+trajectory's frozen inputs and standalone unfused layer graphs. Forty-five
+layer outputs exceeded `0.001` relative L2; the largest was layer 44 at
+`0.002572`. This check did not record candidate router IDs, so it does not
+attribute any difference to expert selection. Its receipt SHA256 is
+`d237fcc06255f75b35a02dd88b90db4680b9b07a9ec274e4adf1ecf8965e9cf6`.
