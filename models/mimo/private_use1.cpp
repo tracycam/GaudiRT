@@ -7,6 +7,7 @@
 #include "model_head.hpp"
 #include "step_metadata.hpp"
 
+#include "gaudirt/common/sha256.hpp"
 #include "gaudirt/runtime/weight_manifest.hpp"
 
 #include <ATen/detail/PrivateUse1HooksInterface.h>
@@ -19,7 +20,9 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <dlfcn.h>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -33,6 +36,40 @@
 
 namespace gaudirt::mimo {
 namespace {
+
+std::filesystem::path recipe_cache_directory(const std::filesystem::path& root,
+                                             uint32_t rank) {
+  if (root.empty()) return {};
+  Dl_info builder{}, compiler{};
+  if (!dladdr(reinterpret_cast<void*>(&recipe_cache_directory), &builder) ||
+      !dladdr(reinterpret_cast<void*>(&synGraphCompile), &compiler)) {
+    throw std::runtime_error("PrivateUse1: cannot identify recipe compiler inputs");
+  }
+  const char* kernels = std::getenv("GC_KERNEL_PATH");
+  if (!kernels || !*kernels)
+    throw std::invalid_argument("PrivateUse1: recipe cache requires GC_KERNEL_PATH");
+  std::string inputs = "gaudirt-recipe-cache-v1\n";
+  const auto add = [&](const std::filesystem::path& file) {
+    inputs += common::sha256_file(file);
+    inputs += '\n';
+  };
+  add(builder.dli_fname);
+  add(compiler.dli_fname);
+  add(std::filesystem::path(compiler.dli_fname).parent_path() / "libSynapseMme.so");
+  const std::string paths(kernels);
+  for (size_t start = 0; start < paths.size();) {
+    const size_t end = paths.find(':', start);
+    const std::string file = paths.substr(start, end - start);
+    if (file.empty()) throw std::invalid_argument("PrivateUse1: empty TPC library path");
+    add(file);
+    if (end == std::string::npos) break;
+    start = end + 1;
+    if (start == paths.size()) throw std::invalid_argument("PrivateUse1: empty TPC library path");
+  }
+  const auto digest = common::sha256_bytes(
+      reinterpret_cast<const uint8_t*>(inputs.data()), inputs.size());
+  return root / digest / ("rank" + std::to_string(rank));
+}
 
 std::vector<uint8_t> read_file(const std::filesystem::path& path) {
   const uint64_t bytes = std::filesystem::file_size(path);
@@ -148,14 +185,9 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
           return config;
         }()),
         arena_(runtime_.device_id(), hbm_bytes),
-        recipe_cache_(recipe_cache.empty()
-                          ? std::filesystem::path{}
-                          : recipe_cache / ("rank" + std::to_string(rank))) {
+        recipe_cache_(recipe_cache_directory(recipe_cache, rank)) {
     if (world != 8 || rank >= world) {
       throw std::invalid_argument("PrivateUse1: only TP8 is supported");
-    }
-    if (recipe_cache_.enabled()) {
-      throw std::invalid_argument("PrivateUse1: persistent recipe provenance is not verified");
     }
     runtime_.init_comm(exchange_unique_id(rank, unique_id));
   }
@@ -396,10 +428,10 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     const int32_t trigger_value = 0;
     arena_.copy_h2d_sync(runtime_.h2d_stream(), &trigger_value, trigger_device_, sizeof(trigger_value));
     arena_.copy_h2d_sync(runtime_.h2d_stream(), &initial_token, token_device_, sizeof(initial_token));
-    embedding_ = std::make_unique<ModelEmbedding>(arena_, model_weights_.at("embedding"), nullptr);
+    embedding_ = std::make_unique<ModelEmbedding>(arena_, model_weights_.at("embedding"), &recipe_cache_);
     head_ = std::make_unique<ModelHead>(arena_, model_weights_.at("final_norm"),
-                                        model_weights_.at("lm_head"), nullptr, fused_model_);
-    argmax_ = std::make_unique<ModelArgmax>(arena_, nullptr);
+                                        model_weights_.at("lm_head"), &recipe_cache_, fused_model_);
+    argmax_ = std::make_unique<ModelArgmax>(arena_, &recipe_cache_);
     const uint64_t workspace = arena_.workspace_addr();
     model_embedding_launch_ = embedding_->prepare(token_device_, embedding_device_,
                                                    embedding_status_);
