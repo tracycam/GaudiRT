@@ -32,3 +32,12 @@ checked only layers 6 and 7. Their selected experts matched both FP64 routing
 on the candidate input and the full-model mathematical reference; this does
 not establish the routing of other layers. The diagnostic receipt SHA256 is
 `17ffe228509191bf9867cc8cfd5056231f7fd11afad5632acb9c5bd3a73e2048`.
+
+Of eight later sampled route sets, only layer 30 differed from the full-model
+reference: the candidate selected expert 127 where the reference selected 316.
+FP64 routing on the candidate's own layer-30 input selected the same set as
+the candidate. That input's relative L2 against the full mathematical
+trajectory was `0.07207`, so the observed divergence precedes this router.
+These samples do not establish which earlier layer caused it. Their receipts
+have SHA256 `35fb0e3ed3fed62c67512f546644ee24e72ae663eb3ce6cdf61bb464a80591f5`
+and `c4a990cc855b7d5dd208efb82068fa28ac9237e5165f980f1d8e0ad9df96323a`.
