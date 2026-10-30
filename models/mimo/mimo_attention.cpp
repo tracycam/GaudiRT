@@ -92,7 +92,6 @@ struct MimoAttention::Impl {
   synTensor hidden_states = nullptr;
   synTensor residual = nullptr;
   synTensor residual_out = nullptr;
-  synTensor normalized = nullptr;
   synTensor qkv = nullptr;
   synTensor query = nullptr;
   synTensor new_key = nullptr;
@@ -255,12 +254,8 @@ struct MimoAttention::Impl {
                         {6144, 1});
     residual_out = external("residual_out", Binding::kResidualOut,
                             syn_type_bf16, {6144, 1});
-    normalized = intermediate("normalized", syn_type_bf16, {6144, 1});
     synTensor norm_gamma = external("input_layernorm", Binding::kInputLayernorm,
                                     syn_type_bf16, {6144});
-    node({hidden_states, residual, norm_gamma}, {residual_out, normalized},
-         &kRmsNormEpsilon, sizeof(kRmsNormEpsilon),
-         "gk_residual_rmsnorm_bf16_v1", "input_residual_rmsnorm");
 
     synTensor qkv_packed = external("qkv_weight", Binding::kQkvWeight,
                                     syn_type_fp8_143, {128, 3392, 48});
@@ -272,8 +267,10 @@ struct MimoAttention::Impl {
                                           {128, 1, 48});
     synTensor activation_scale = intermediate("qkv_activation_scale_fp32",
                                               syn_type_float, {1, 1, 48});
-    node({normalized}, {activation_q, activation_scale}, nullptr, 0,
-         "gk_block128_quant_v1", "qkv_block128_activation_quant");
+    node({hidden_states, residual, norm_gamma},
+         {residual_out, activation_q, activation_scale},
+         &kRmsNormEpsilon, sizeof(kRmsNormEpsilon),
+         "gk_norm_block128_grid24_v1", "input_residual_norm_block128_quant");
 
     synTensor qkv_accumulator = intermediate("qkv_accumulator_fp32",
                                              syn_type_float, {3392, 1, 48});
@@ -344,7 +341,7 @@ struct MimoAttention::Impl {
          sizeof(oproj_gemm_params), "gemm", "oproj_bf16_mme_local");
 
     recipe = compile_cached(graph, "mimo_layer1_attention_b1_m1_tp8",
-                            "swa_internal_v3_c" + std::to_string(cache_slots) +
+                            "swa_internal_v4_c" + std::to_string(cache_slots) +
                                 (gathered_input ? "_gathered" : "_direct"), cache);
     check(synWorkspaceGetSize(&workspace_size, recipe), "get workspace size");
     arena.ensure_workspace(workspace_size);

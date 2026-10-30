@@ -6,6 +6,7 @@
 #include "gaudirt/runtime/weight_manifest.hpp"
 #include "mimo_attention.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <filesystem>
@@ -65,7 +66,12 @@ int main(int argc, char** argv) {
     io.rope_sin = upload_bytes(sin.data(), sizeof(sin));
     io.key_cache = upload(layer / "key_cache.bin");
     io.value_cache = upload(layer / "value_cache.bin");
-    io.slot_mapping = upload(layer / "slot_mapping.bin");
+    const auto slot_bytes = read(layer / "slot_mapping.bin");
+    if (slot_bytes.size() != sizeof(int32_t)) throw std::runtime_error("invalid slot fixture");
+    int32_t slot = 0;
+    std::memcpy(&slot, slot_bytes.data(), sizeof(slot));
+    if (slot < 0 || static_cast<uint64_t>(slot) >= slots) throw std::runtime_error("slot out of range");
+    io.slot_mapping = upload_bytes(slot_bytes.data(), slot_bytes.size());
     const auto page_bytes = read(layer / "window_pages.bin");
     if (page_bytes.size() != 8) throw std::runtime_error("invalid window pages");
     std::array<int32_t, 2> pages{}, groups{};
@@ -95,6 +101,20 @@ int main(int argc, char** argv) {
         std::ofstream values(std::string(argv[3]) + ".attention.bin", std::ios::binary);
         values.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
         if (!values) throw std::runtime_error("cannot write attention output");
+      }
+      if (std::string(name) == "key_cache" || std::string(name) == "value_cache") {
+        const bool is_key = std::string(name) == "key_cache";
+        const auto before = read(layer / (is_key ? "key_cache.bin" : "value_cache.bin"));
+        const size_t width = (is_key ? 192 : 128) * 2;
+        const size_t first = static_cast<size_t>(slot) * width;
+        if (before.size() != bytes.size() ||
+            !std::equal(bytes.begin(), bytes.begin() + first, before.begin()) ||
+            !std::equal(bytes.begin() + first + width, bytes.end(), before.begin() + first + width))
+          throw std::runtime_error("untouched KV changed");
+        std::ofstream values(std::string(argv[3]) + (is_key ? ".key.bin" : ".value.bin"),
+                             std::ios::binary);
+        values.write(reinterpret_cast<const char*>(bytes.data() + first), width);
+        if (!values) throw std::runtime_error("cannot write updated KV slot");
       }
       out << name << ' ' << gaudirt::common::sha256_bytes(bytes.data(), bytes.size()) << '\n';
     };
