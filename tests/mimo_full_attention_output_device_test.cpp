@@ -6,6 +6,7 @@
 #include "gaudirt/runtime/weight_manifest.hpp"
 #include "mimo_full_attention.hpp"
 
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -32,6 +33,12 @@ int main(int argc, char** argv) {
     const auto fixture = std::filesystem::path(argv[2]);
     const auto slots = std::filesystem::file_size(fixture / "key_cache_before.bin") / (192 * 2);
     const auto pages = std::filesystem::file_size(fixture / "block_list.bin") / 4;
+    const auto slot_bytes = read(fixture / "slot_mapping.bin");
+    if (slot_bytes.size() != sizeof(int32_t)) throw std::runtime_error("invalid slot fixture");
+    int32_t slot = 0;
+    std::memcpy(&slot, slot_bytes.data(), sizeof(slot));
+    if (slot < 0 || static_cast<size_t>(slot) >= slots)
+      throw std::runtime_error("slot outside KV cache");
     DeviceRuntime::Config config{};
     config.module_id = 0;
     DeviceRuntime runtime(config);
@@ -72,11 +79,35 @@ int main(int argc, char** argv) {
     auto digest = [&](const char* name, uint64_t address, size_t size) {
       std::vector<uint8_t> bytes(size);
       arena.copy_d2h_sync(runtime.d2h_stream(), address, bytes.data(), bytes.size());
+      if (std::string(name) == "attention_local") {
+        std::ofstream values(std::string(argv[3]) + ".attention.bin", std::ios::binary);
+        values.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        if (!values) throw std::runtime_error("cannot write attention output");
+      }
       out << name << ' ' << gaudirt::common::sha256_bytes(bytes.data(), bytes.size()) << '\n';
+    };
+    auto check_untouched = [&](const char* label, const char* filename,
+                               uint64_t address, size_t bytes_per_slot) {
+      const auto before = read(fixture / filename);
+      std::vector<uint8_t> after(before.size());
+      arena.copy_d2h_sync(runtime.d2h_stream(), address, after.data(), after.size());
+      const size_t offset = static_cast<size_t>(slot) * bytes_per_slot;
+      if (offset + bytes_per_slot > before.size() ||
+          std::memcmp(before.data(), after.data(), offset) != 0 ||
+          std::memcmp(before.data() + offset + bytes_per_slot,
+                      after.data() + offset + bytes_per_slot,
+                      before.size() - offset - bytes_per_slot) != 0)
+        throw std::runtime_error(std::string(label) + " touched another KV slot");
+      std::ofstream values(std::string(argv[3]) + "." + label + ".bin", std::ios::binary);
+      values.write(reinterpret_cast<const char*>(after.data() + offset), bytes_per_slot);
+      if (!values) throw std::runtime_error("cannot write updated KV slot");
+      out << label << "_untouched identical\n";
     };
     digest("attention_local", io.output_local_fp32, 6144 * 4);
     digest("key_cache", io.key_cache, slots * 192 * 2);
     digest("value_cache", io.value_cache, slots * 128 * 2);
+    check_untouched("key", "key_cache_before.bin", io.key_cache, 192 * 2);
+    check_untouched("value", "value_cache_before.bin", io.value_cache, 128 * 2);
     if (!out) throw std::runtime_error("cannot write results");
     return 0;
   } catch (const std::exception& error) {

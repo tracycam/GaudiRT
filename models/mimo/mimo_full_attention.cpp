@@ -24,6 +24,11 @@ constexpr float kRmsNormEpsilon = 1e-5F;
 constexpr float kValueScale = 0.612F;
 constexpr float kAttentionScale = 0.07216878364870322F;
 
+struct FullMmaSoftmaxParams {
+  float scale;
+  int32_t physical_pages;
+};
+
 void check(synStatus status, const std::string& operation) {
   if (status != synSuccess) {
     throw std::runtime_error("MimoFullAttention: " + operation +
@@ -322,20 +327,53 @@ struct MimoFullAttention::Impl {
     synTensor block_groups = external(prepare_graph, prepare_externals, "block_groups",
                                       Binding::kFullBlockGroups, syn_type_int32,
                                       {page_count});
-    synTensor block_max = intermediate(prepare_graph, "full_attention_block_max",
-                                       syn_type_float, {page_count * 16});
-    synTensor block_sums = intermediate(prepare_graph, "full_attention_block_sums",
-                                        syn_type_float, {page_count * 16});
-    synTensor block_values = intermediate(prepare_graph, "full_attention_block_values",
-                                          syn_type_float, {128, page_count, 16});
+    const uint64_t tokens = static_cast<uint64_t>(page_count) * 128;
+    synTensor gathered_key = intermediate(prepare_graph, "full_gathered_key",
+                                          syn_type_bf16, {192, tokens});
+    synTensor gathered_value = intermediate(prepare_graph, "full_gathered_value",
+                                            syn_type_bf16, {128, tokens});
     node(prepare_graph,
-         {query, key_cache_after, value_cache_after, block_list, block_usage,
-          block_groups},
-         {block_max, block_sums, block_values}, &kAttentionScale,
-         sizeof(kAttentionScale), "gk_full_diffkv_block_fp32_v0", "full_diffkv_pages");
+         {key_cache_after, value_cache_after, block_list, block_usage, block_groups},
+         {gathered_key, gathered_value}, nullptr, 0,
+         "gk_full_mme_gather_v1", "full_gather_shared_kv");
+    synTensor query_matrix = intermediate(prepare_graph, "full_query_matrix",
+                                           syn_type_bf16, {192, 16});
+    node(prepare_graph, {query}, {query_matrix}, nullptr, 0, "reshape", "full_query_reshape");
+    synTensor scores = intermediate(prepare_graph, "full_attention_scores",
+                                     syn_type_float, {tokens, 16});
+    const synGEMMParams scores_params{false, true};
+    node(prepare_graph, {query_matrix, gathered_key}, {scores}, &scores_params,
+         sizeof(scores_params), "gemm", "full_qk_mme");
+    synTensor probabilities = intermediate(prepare_graph, "full_attention_probabilities",
+                                            syn_type_bf16, {tokens, 16});
+    synTensor corrections = intermediate(prepare_graph, "full_attention_probabilities_correction",
+                                        syn_type_bf16, {tokens, 16});
+    const FullMmaSoftmaxParams softmax_params{kAttentionScale,
+                                               static_cast<int32_t>(cache_slots / 128)};
+    node(prepare_graph, {scores, block_list, block_usage, block_groups}, {probabilities, corrections},
+         &softmax_params, sizeof(softmax_params), "gk_full_mme_softmax_v2",
+         "full_masked_softmax");
+    synTensor context_main = intermediate(prepare_graph, "full_context_main",
+                                          syn_type_float, {128, 16});
+    synTensor context_correction = intermediate(prepare_graph, "full_context_correction",
+                                                syn_type_float, {128, 16});
+    synTensor context_float = intermediate(prepare_graph, "full_context_float",
+                                           syn_type_float, {128, 16});
+    synTensor context_matrix = intermediate(prepare_graph, "full_context_matrix",
+                                            syn_type_bf16, {128, 16});
+    const synGEMMParams context_params{false, false};
+    node(prepare_graph, {probabilities, gathered_value}, {context_main}, &context_params,
+         sizeof(context_params), "gemm", "full_pv_mme");
+    node(prepare_graph, {corrections, gathered_value}, {context_correction}, &context_params,
+         sizeof(context_params), "gemm", "full_pv_correction_mme");
+    node(prepare_graph, {context_main, context_correction}, {context_float}, nullptr, 0,
+         "add_fwd_f32", "full_pv_combine");
+    ns_CastKernel::ParamsV3 context_cast{};
+    context_cast.round_mode = CAST_ROUND_HALF_NE;
+    node(prepare_graph, {context_float}, {context_matrix}, &context_cast, sizeof(context_cast),
+         "cast_f32_to_bf16", "full_context_round");
     synTensor context = intermediate(prepare_graph, "context", syn_type_bf16, {128, 16, 1});
-    node(prepare_graph, {block_max, block_sums, block_values}, {context}, nullptr, 0,
-         "gk_full_diffkv_reduce_fp32_v0", "full_diffkv_normalize");
+    node(prepare_graph, {context_matrix}, {context}, nullptr, 0, "reshape", "full_context_reshape");
 
     synTensor context_flat = intermediate(prepare_graph, "context_flat",
                                           syn_type_bf16, {2048, 1});
@@ -355,7 +393,7 @@ struct MimoFullAttention::Impl {
         : "mimo_full_attention_b1_m1_tp8_residual";
     prepare_recipe = compile_cached(
         prepare_graph, recipe_name,
-        std::string("full_neumaier_v1_") + (pure_rmsnorm ? "pure" : "residual") +
+        std::string("full_mme_neumaier_v3_") + (pure_rmsnorm ? "pure" : "residual") +
             "_c" + std::to_string(cache_slots) + "_p" + std::to_string(page_count) +
             (gathered_input ? "_gathered_tp1" : "_direct"),
         cache);
