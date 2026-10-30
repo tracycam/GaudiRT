@@ -256,3 +256,19 @@ difference against the FP64 trajectory was `0.0008517`; subsequent MoE
 amplifies it in the layer output. This does not establish the cause of the
 attention difference. The receipt SHA256 is
 `e52e4214d1743e4ea5f62487060d5ca782f2a41dcff407a8700baa4f4861f3a5`.
+
+For layer 39, the two BF16 probability parts reproduced the dominant
+softmax error when evaluated independently on CPU. Adding a third BF16
+residual reduced the synthetic maximum probability error from `3.39e-6`
+to `6.97e-8`. On the same frozen TP8 layer, output relative L2 against
+FP64 decreased from `0.002438` to `0.0000246`; the layer receipt SHA256 is
+`8b27831edf97454b8274710fa42e24853e5fdde02afa0a9d7f3d2a0d30f86f21`.
+
+The resulting unprofiled full-model run measured `11.261994 ms` p50 and
+`11.283988 ms` mean. All ranks agreed on 144 generated tokens and untouched
+KV was bitwise unchanged at the end; per-step KV was not audited. The first
+logits failed the unchanged `0.02` relative L2 gate against both independent
+references: FP32 `0.0306621` (`max_kl=0.0060240`) and FP64 `0.0303310`
+(`max_kl=0.0020335`). This is an unqualified experiment, not an ABBA or
+an end-to-end accuracy improvement. Its receipt SHA256 is
+`b540498ffe290e7f3df8cf076f835bc96c826bb8f68469beaa1dafabca068018`.
