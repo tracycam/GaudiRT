@@ -70,6 +70,9 @@ the FP64 reference with the current BF16 gate boundaries differed by
 `1.27e-7`. This local result does not establish an end-to-end improvement.
 The receipt SHA256 is
 `68a8d47d7014b2e4f6c1cb5d22a9bc802ea84573bae06524607f9e6f1716475e`.
+With FP32 gate arithmetic, the same frozen input and expert set produced a
+rank-0 local MoE relative L2 of `1.26e-7` versus FP64. Its receipt SHA256 is
+`8acc465d322029be1319bbcfbee5ab28b3467f3c43b28d04f9f4486af6439a6c`.
 
 On a shared frozen input at normal-context layer 18, rank-0 SWA attention
 had `0.001819` relative L2 versus the CPU mathematical result. Substituting
