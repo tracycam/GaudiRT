@@ -36,6 +36,7 @@ add_library(mimo_layer_vertical STATIC
     models/mimo/mimo_full_attention.cpp
     models/mimo/mimo_dense_mlp.cpp
     models/mimo/mimo_moe.cpp
+    models/mimo/model_argmax.cpp
     models/mimo/model_embedding.cpp
     models/mimo/model_head.cpp
 )
@@ -44,6 +45,9 @@ target_link_libraries(mimo_layer_vertical PUBLIC gaudirt)
 
 add_executable(mimo_embedding_device_test tests/mimo_embedding_device_test.cpp)
 target_link_libraries(mimo_embedding_device_test PRIVATE mimo_layer_vertical)
+
+add_executable(mimo_argmax_device_test tests/mimo_argmax_device_test.cpp)
+target_link_libraries(mimo_argmax_device_test PRIVATE mimo_layer_vertical)
 
 add_executable(mimo_layer1 models/mimo/layer1_main.cpp)
 target_link_libraries(mimo_layer1 PRIVATE mimo_layer_vertical)
