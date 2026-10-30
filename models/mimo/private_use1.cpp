@@ -632,12 +632,6 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
                                              *dense_weights, cache_slots, page_count,
                                              &recipe_cache_, fused_model_);
       auto& io = instance->a_io;
-      io.attention.normalized = arena_.allocate(12288);
-      io.attention.qkv = arena_.allocate(3392 * 2);
-      io.attention.query = arena_.allocate(16 * 192 * 2);
-      io.attention.new_key = arena_.allocate(192 * 2);
-      io.attention.new_value = arena_.allocate(128 * 2);
-      io.attention.context = arena_.allocate(16 * 128 * 2);
       io.attention.output_local_fp32 = arena_.allocate(6144 * 4);
       io.dense_outputs.activation_fp32 = arena_.allocate(2048 * 4);
       io.dense_outputs.output_local_fp32 = arena_.allocate(6144 * 4);
@@ -650,12 +644,6 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
                                              fused_model_);
       auto& io = instance->b_io;
       io.attention.residual_out = arena_.allocate(12288);
-      io.attention.normalized = arena_.allocate(12288);
-      io.attention.qkv = arena_.allocate(3392 * 2);
-      io.attention.query = arena_.allocate(16 * 192 * 2);
-      io.attention.new_key = arena_.allocate(192 * 2);
-      io.attention.new_value = arena_.allocate(128 * 2);
-      io.attention.context = arena_.allocate(16 * 128 * 2);
       io.attention.output_local_fp32 = arena_.allocate(6144 * 4);
       io.moe_outputs.moe_local_fp32 = arena_.allocate(6144 * 4);
       io.attention_output_bf16 = arena_.allocate(12288);
@@ -666,12 +654,6 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
                                              cache_slots, &recipe_cache_, fused_model_);
       auto& io = instance->c_io;
       io.attention.residual_out = arena_.allocate(12288);
-      io.attention.normalized = arena_.allocate(12288);
-      io.attention.qkv = arena_.allocate(3392 * 2);
-      io.attention.query = arena_.allocate(16 * 192 * 2);
-      io.attention.new_key = arena_.allocate(192 * 2);
-      io.attention.new_value = arena_.allocate(128 * 2);
-      io.attention.context = arena_.allocate(16 * 128 * 2);
       io.attention.output_local = arena_.allocate(12288);
       io.moe_outputs.moe_local_fp32 = arena_.allocate(6144 * 4);
       io.attention_output_bf16 = arena_.allocate(12288);

@@ -23,10 +23,10 @@ class MimoFullAttention final {
 
   void execute(const MimoAttentionIo& io, synStreamHandle stream);
   void rebind_weights(const WeightManifest& weights);
-  std::array<PreparedLaunch, 2> prepare(const MimoAttentionIo& io);
+  PreparedLaunch prepare(const MimoAttentionIo& io);
 
   uint64_t workspace_bytes() const noexcept;
-  std::pair<uint64_t, uint64_t> recipe_identity() const noexcept;
+  uint64_t recipe_identity() const noexcept;
 
  private:
   struct Impl;

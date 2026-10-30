@@ -36,8 +36,7 @@ class LayerB final {
   PreparedLayer prepare(const Io& io);
   void rebind_weights(const runtime::WeightManifest& weights);
   std::vector<uint64_t> recipe_identity() const {
-    auto attention = attention_.recipe_identity();
-    return {attention.first, attention.second, moe_.recipe_identity()};
+    return {attention_.recipe_identity(), moe_.recipe_identity()};
   }
 
  private:

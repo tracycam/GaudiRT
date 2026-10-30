@@ -187,7 +187,6 @@ int run(int argc, char** argv) {
   io.hidden_states = upload(arena, runtime, fixture_dir / "residual_in.bin");
   io.residual = io.hidden_states;
   io.residual_out = arena.allocate(12288);
-  io.normalized = arena.allocate(12288);
   io.rope_cos = upload(arena, runtime, fixture_dir / "rope_cos.bin");
   io.rope_sin = upload(arena, runtime, fixture_dir / "rope_sin.bin");
   io.key_cache = upload(arena, runtime, fixture_dir / "key_cache_before.bin");
@@ -196,11 +195,6 @@ int run(int argc, char** argv) {
   io.full_block_list = upload(arena, runtime, fixture_dir / "block_list.bin");
   io.full_block_usage = upload(arena, runtime, fixture_dir / "block_usage.bin");
   io.full_block_groups = upload(arena, runtime, fixture_dir / "block_groups.bin");
-  io.qkv = arena.allocate(3392 * 2);
-  io.query = arena.allocate(16 * 192 * 2);
-  io.new_key = arena.allocate(192 * 2);
-  io.new_value = arena.allocate(128 * 2);
-  io.context = arena.allocate(16 * 128 * 2);
   io.output_local_fp32 = arena.allocate(6144 * 4);
 
   gaudirt::runtime::MimoFullAttention attention(arena, weights, cache_slots, true,
@@ -254,9 +248,6 @@ int run(int argc, char** argv) {
     pass &= compare_numerics(actual, read_file(fixture_dir / reference), name, rank,
                              row_size, false);
   };
-  check_bytes("query", "query.bin", io.query, 16 * 192 * 2);
-  check_bytes("new_key", "new_key.bin", io.new_key, 192 * 2);
-  check_bytes("new_value", "new_value.bin", io.new_value, 128 * 2);
   check_large("key_cache_after", "key_cache_after.bin", io.key_cache,
               cache_slots * 192 * 2);
   check_large("value_cache_after", "value_cache_after.bin", io.value_cache,
@@ -267,11 +258,7 @@ int run(int argc, char** argv) {
               page_count * sizeof(int32_t));
   check_bytes("block_groups", "block_groups.bin", io.full_block_groups,
               page_count * sizeof(int32_t));
-  check_numeric("attention_context", "fp64_attention_context.bin", io.context,
-                16 * 128 * 2);
   check_numeric("attention", "fp64_attention.bin", attention_output, 12288);
-  check_legacy("attention_context_legacy_flat_pa", "attention_context.bin", io.context,
-               16 * 128 * 2);
   check_legacy("attention_legacy_flat_pa", "attention.bin", attention_output, 12288);
   std::cout << "MIMO_FULL_RESULT rank=" << rank
             << " status=" << (pass ? "PASS" : "FAIL") << '\n';

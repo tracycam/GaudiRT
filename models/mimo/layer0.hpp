@@ -38,9 +38,8 @@ class Layer0 final {
   void rebind_weights(const runtime::WeightManifest& attention_weights,
                       const runtime::WeightManifest& dense_weights);
   std::vector<uint64_t> recipe_identity() const {
-    auto attention = attention_.recipe_identity();
     auto dense = dense_.recipe_identity();
-    return {attention.first, attention.second, dense.first, dense.second};
+    return {attention_.recipe_identity(), dense.first, dense.second};
   }
 
  private:

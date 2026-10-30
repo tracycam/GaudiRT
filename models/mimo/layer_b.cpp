@@ -53,9 +53,8 @@ LayerB::LayerB(runtime::HbmArena& arena, runtime::DeviceRuntime& runtime,
 }
 
 PreparedLayer LayerB::prepare(const Io& io) {
-  auto attention = attention_.prepare(io.attention);
   PreparedLayer result;
-  result.attention = {std::move(attention[0]), std::move(attention[1])};
+  result.attention.push_back(attention_.prepare(io.attention));
   if (!fused_model_)
     result.attention_reduce = attention_reduce_->prepare(io.attention_gathered_fp32,
                                                           io.attention_output_bf16);

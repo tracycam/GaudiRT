@@ -182,7 +182,6 @@ int run(int argc, char** argv) {
   io.attention.hidden_states = upload(arena, runtime, fixture_dir / "residual_in.bin");
   io.attention.residual = upload(arena, runtime, fixture_dir / "residual.bin");
   io.attention.residual_out = arena.allocate(12288);
-  io.attention.normalized = arena.allocate(12288);
   io.attention.rope_cos = upload(arena, runtime, fixture_dir / "rope_cos.bin");
   io.attention.rope_sin = upload(arena, runtime, fixture_dir / "rope_sin.bin");
   io.attention.key_cache = upload(arena, runtime, fixture_dir / "key_cache_before.bin");
@@ -191,11 +190,6 @@ int run(int argc, char** argv) {
   io.attention.full_block_list = upload(arena, runtime, fixture_dir / "block_list.bin");
   io.attention.full_block_usage = upload(arena, runtime, fixture_dir / "block_usage.bin");
   io.attention.full_block_groups = upload(arena, runtime, fixture_dir / "block_groups.bin");
-  io.attention.qkv = arena.allocate(3392 * 2);
-  io.attention.query = arena.allocate(16 * 192 * 2);
-  io.attention.new_key = arena.allocate(192 * 2);
-  io.attention.new_value = arena.allocate(128 * 2);
-  io.attention.context = arena.allocate(16 * 128 * 2);
   io.attention.output_local_fp32 = arena.allocate(6144 * 4);
   io.moe_outputs.residual_out_bf16 = arena.allocate(12288);
   io.moe_outputs.moe_local_fp32 = arena.allocate(6144 * 4);
@@ -237,9 +231,6 @@ int run(int argc, char** argv) {
     pass &= compare_numerics(actual, read_file(fixture_dir / reference), name, rank,
                              row_size, gate);
   };
-  check_bytes("query", "query.bin", io.attention.query, 16 * 192 * 2);
-  check_bytes("new_key", "new_key.bin", io.attention.new_key, 192 * 2);
-  check_bytes("new_value", "new_value.bin", io.attention.new_value, 128 * 2);
   check_large("key_cache_after", "key_cache_after.bin", io.attention.key_cache,
               cache_slots * 192 * 2);
   check_large("value_cache_after", "value_cache_after.bin", io.attention.value_cache,
@@ -252,8 +243,6 @@ int run(int argc, char** argv) {
               page_count * sizeof(int32_t));
   check_bytes("attention_residual", "attention_residual.bin", io.attention.residual_out,
               12288);
-  check_numeric("attention_context", "fp64_attention_context.bin", io.attention.context,
-                4096, true);
   check_numeric("attention", "fp64_attention.bin", io.attention_output_bf16, 12288, true);
   check_numeric("residual_out", "fp64_residual_out.bin", io.moe_outputs.residual_out_bf16,
                 12288, true);

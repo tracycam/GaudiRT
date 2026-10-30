@@ -36,7 +36,6 @@ enum class Binding {
   kHiddenRank4, kHiddenRank5, kHiddenRank6, kHiddenRank7,
   kResidual,
   kResidualOut,
-  kNormalized,
   kRopeCos,
   kRopeSin,
   kKeyCache,
@@ -45,11 +44,6 @@ enum class Binding {
   kWindowPages,
   kWindowGroups,
   kPosition,
-  kQkv,
-  kQuery,
-  kNewKey,
-  kNewValue,
-  kContext,
   kOutputLocal,
   kInputLayernorm,
   kQkvWeight,
@@ -261,8 +255,7 @@ struct MimoAttention::Impl {
                         {6144, 1});
     residual_out = external("residual_out", Binding::kResidualOut,
                             syn_type_bf16, {6144, 1});
-    normalized = external("normalized", Binding::kNormalized, syn_type_bf16,
-                          {6144, 1});
+    normalized = intermediate("normalized", syn_type_bf16, {6144, 1});
     synTensor norm_gamma = external("input_layernorm", Binding::kInputLayernorm,
                                     syn_type_bf16, {6144});
     node({hidden_states, residual, norm_gamma}, {residual_out, normalized},
@@ -285,7 +278,7 @@ struct MimoAttention::Impl {
     synTensor qkv_accumulator = intermediate("qkv_accumulator_fp32",
                                              syn_type_float, {3392, 1, 48});
     synGEMMParams qkv_gemm_params{false, true};
-    qkv = external("qkv", Binding::kQkv, syn_type_bf16, {3392, 1});
+    qkv = intermediate("qkv", syn_type_bf16, {3392, 1});
     node({activation_q, qkv_packed}, {qkv_accumulator}, &qkv_gemm_params,
          sizeof(qkv_gemm_params), "batch_gemm", "qkv_block128_fp8_batch_gemm");
     node({qkv_accumulator, activation_scale, qkv_scale, qkv_zero_bias}, {qkv},
@@ -295,11 +288,9 @@ struct MimoAttention::Impl {
                                   {64, 1, 1});
     synTensor rope_sin = external("rope_sin", Binding::kRopeSin, syn_type_bf16,
                                   {64, 1, 1});
-    query = external("query", Binding::kQuery, syn_type_bf16, {192, 16, 1});
-    new_key = external("new_key", Binding::kNewKey, syn_type_bf16,
-                       {192, 1, 1});
-    new_value = external("new_value", Binding::kNewValue, syn_type_bf16,
-                         {128, 1, 1});
+    query = intermediate("query", syn_type_bf16, {192, 16, 1});
+    new_key = intermediate("new_key", syn_type_bf16, {192, 1, 1});
+    new_value = intermediate("new_value", syn_type_bf16, {128, 1, 1});
     node({qkv, rope_cos, rope_sin}, {query, new_key, new_value}, &kValueScale,
          sizeof(kValueScale), "gk_qkv_post_f32_bf16_v1",
          "qkv_split_rope_vscale");
@@ -335,8 +326,7 @@ struct MimoAttention::Impl {
                                   syn_type_int32, {1});
     synTensor sink = external("attention_sink", Binding::kAttentionSink,
                               syn_type_bf16, {16});
-    context = external("context", Binding::kContext, syn_type_bf16,
-                       {128, 16, 1});
+    context = intermediate("context", syn_type_bf16, {128, 16, 1});
     node({query, key_cache_after, value_cache_after, window_pages,
           window_groups, position, sink},
          {context}, &kAttentionScale, sizeof(kAttentionScale),
@@ -354,7 +344,7 @@ struct MimoAttention::Impl {
          sizeof(oproj_gemm_params), "gemm", "oproj_bf16_mme_local");
 
     recipe = compile_cached(graph, "mimo_layer1_attention_b1_m1_tp8",
-                            "swa_c" + std::to_string(cache_slots) +
+                            "swa_internal_v2_c" + std::to_string(cache_slots) +
                                 (gathered_input ? "_gathered" : "_direct"), cache);
     check(synWorkspaceGetSize(&workspace_size, recipe), "get workspace size");
     arena.ensure_workspace(workspace_size);
@@ -392,7 +382,6 @@ struct MimoAttention::Impl {
                                      static_cast<int>(Binding::kHiddenRank0)) * 6144 * 4;
       case Binding::kResidual: return io.residual;
       case Binding::kResidualOut: return io.residual_out;
-      case Binding::kNormalized: return io.normalized;
       case Binding::kRopeCos: return io.rope_cos;
       case Binding::kRopeSin: return io.rope_sin;
       case Binding::kKeyCache: return io.key_cache;
@@ -401,11 +390,6 @@ struct MimoAttention::Impl {
       case Binding::kWindowPages: return io.window_pages;
       case Binding::kWindowGroups: return io.window_groups;
       case Binding::kPosition: return io.position;
-      case Binding::kQkv: return io.qkv;
-      case Binding::kQuery: return io.query;
-      case Binding::kNewKey: return io.new_key;
-      case Binding::kNewValue: return io.new_value;
-      case Binding::kContext: return io.context;
       case Binding::kOutputLocal: return io.output_local;
       case Binding::kInputLayernorm:
         return weights->get("input_layernorm").device_address;

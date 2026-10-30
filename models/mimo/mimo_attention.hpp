@@ -14,10 +14,9 @@ class HbmArena;
 class WeightManifest;
 class RecipeCache;
 
-// BF16 shapes are fastest-first: hidden_states/residual/residual_out/normalized
-// and output_local [6144,1]; qkv [3392,1]; query [192,16,1]; new_key
-// [192,1,1]; new_value/context [128,1,1] and [128,16,1]. rope_cos/rope_sin
-// are [64,1,1], with each 32-value half of the loaded cache row repeated twice.
+// BF16 shapes are fastest-first: hidden_states/residual/residual_out and
+// output_local [6144,1]. rope_cos/rope_sin are [64,1,1], with each 32-value
+// half of the loaded cache row repeated twice.
 // key_cache/value_cache are [192,1,cache_slots]/[128,1,cache_slots].
 // slot_mapping/position are I32[1]; window_pages/window_groups are I32[2].
 // Full-Attention block list/usage/groups are I32[page_count], page_count <= 64.
@@ -25,7 +24,6 @@ struct MimoAttentionIo {
   uint64_t hidden_states = 0;
   uint64_t residual = 0;
   uint64_t residual_out = 0;
-  uint64_t normalized = 0;
   uint64_t rope_cos = 0;
   uint64_t rope_sin = 0;
 
@@ -39,11 +37,6 @@ struct MimoAttentionIo {
   uint64_t full_block_groups = 0;
   uint64_t position = 0;
 
-  uint64_t qkv = 0;
-  uint64_t query = 0;
-  uint64_t new_key = 0;
-  uint64_t new_value = 0;
-  uint64_t context = 0;
   uint64_t output_local = 0;
   uint64_t output_local_fp32 = 0;
 };

@@ -151,7 +151,6 @@ int run(int argc, char** argv) {
   attention_io.hidden_states = upload(arena, runtime, attention_dir / "hidden.bin");
   attention_io.residual = upload(arena, runtime, attention_dir / "residual.bin");
   attention_io.residual_out = arena.allocate(12288);
-  attention_io.normalized = arena.allocate(12288);
   attention_io.rope_cos = upload(arena, runtime, attention_dir / "rope_cos.bin");
   attention_io.rope_sin = upload(arena, runtime, attention_dir / "rope_sin.bin");
   attention_io.key_cache = upload(arena, runtime, attention_dir / "key_cache.bin");
@@ -160,11 +159,6 @@ int run(int argc, char** argv) {
   attention_io.window_pages = upload(arena, runtime, attention_dir / "window_pages.bin");
   attention_io.window_groups = upload(arena, runtime, attention_dir / "window_groups.bin");
   attention_io.position = upload(arena, runtime, attention_dir / "position.bin");
-  attention_io.qkv = arena.allocate(3392 * 2);
-  attention_io.query = arena.allocate(16 * 192 * 2);
-  attention_io.new_key = arena.allocate(192 * 2);
-  attention_io.new_value = arena.allocate(128 * 2);
-  attention_io.context = arena.allocate(16 * 128 * 2);
   attention_io.output_local = arena.allocate(12288);
 
   gaudirt::runtime::MimoAttention attention(arena, weights, kCacheSlots);
@@ -258,17 +252,6 @@ int run(int argc, char** argv) {
   pass &= compare(download(arena, runtime, attention_io.residual_out, 12288),
                   read_file(attention_dir / "residual_out_reference.bin"),
                   "attention_residual_out", rank);
-  pass &= compare(download(arena, runtime, attention_io.normalized, 12288),
-                  read_file(attention_dir / "norm_reference.bin"),
-                  "attention_normalized", rank);
-  pass &= compare(download(arena, runtime, attention_io.qkv, 3392 * 2),
-                  read_file(attention_dir / "qkv_reference.bin"), "qkv", rank);
-  pass &= compare(download(arena, runtime, attention_io.query, 16 * 192 * 2),
-                  read_file(attention_dir / "query_reference.bin"), "query", rank);
-  pass &= compare(download(arena, runtime, attention_io.new_key, 192 * 2),
-                  read_file(attention_dir / "new_key_reference.bin"), "new_key", rank);
-  pass &= compare(download(arena, runtime, attention_io.new_value, 128 * 2),
-                  read_file(attention_dir / "new_value_reference.bin"), "new_value", rank);
   auto expected_key_cache = read_file(attention_dir / "key_cache.bin");
   auto expected_value_cache = read_file(attention_dir / "value_cache.bin");
   const auto expected_new_key = read_file(attention_dir / "new_key_reference.bin");
@@ -295,8 +278,6 @@ int run(int argc, char** argv) {
   pass &= compare(download(arena, runtime, attention_io.value_cache,
                            expected_value_cache.size()),
                   expected_value_cache, "value_cache", rank);
-  pass &= compare(download(arena, runtime, attention_io.context, 16 * 128 * 2),
-                  read_file(attention_dir / "context_reference.bin"), "context", rank);
   pass &= compare(download(arena, runtime, attention_io.output_local, 12288),
                   read_file(attention_dir / "oproj_local_reference.bin"),
                   "oproj_local", rank);

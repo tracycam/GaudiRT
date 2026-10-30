@@ -41,12 +41,11 @@ Layer0::Layer0(runtime::HbmArena& arena, runtime::DeviceRuntime& runtime,
 }
 
 PreparedLayer Layer0::prepare(const Io& io) {
-  auto attention = attention_.prepare(io.attention);
   auto dense = dense_.prepare({fused_model_ ? io.attention_gathered_fp32 : io.attention_output_bf16,
                                io.attention.hidden_states,
                                post_attention_gamma_}, io.dense_outputs);
   PreparedLayer result;
-  result.attention = {std::move(attention[0]), std::move(attention[1])};
+  result.attention.push_back(attention_.prepare(io.attention));
   if (!fused_model_)
     result.attention_reduce = attention_reduce_->prepare(io.attention_gathered_fp32,
                                                           io.attention_output_bf16);

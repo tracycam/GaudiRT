@@ -38,7 +38,6 @@ enum class Binding {
   kHiddenRank4, kHiddenRank5, kHiddenRank6, kHiddenRank7,
   kResidual,
   kResidualOut,
-  kNormalized,
   kRopeCos,
   kRopeSin,
   kKeyCache,
@@ -48,11 +47,6 @@ enum class Binding {
   kFullBlockUsage,
   kFullBlockGroups,
   kPosition,
-  kQkv,
-  kQuery,
-  kNewKey,
-  kNewValue,
-  kContext,
   kOutputLocal,
   kInputLayernorm,
   kQkvWeight,
@@ -91,17 +85,12 @@ struct MimoFullAttention::Impl {
   bool gathered_input;
   uint32_t page_count;
   synGraphHandle prepare_graph = nullptr;
-  synGraphHandle finish_graph = nullptr;
   synSectionHandle reduction_section = nullptr;
   synRecipeHandle prepare_recipe = nullptr;
-  synRecipeHandle finish_recipe = nullptr;
   RecipeCache* cache = nullptr;
   uint64_t prepare_workspace_size = 0;
-  uint64_t finish_workspace_size = 0;
   std::vector<ExternalTensor> prepare_externals;
-  std::vector<ExternalTensor> finish_externals;
   std::vector<synLaunchTensorInfo> prepare_launch;
-  std::vector<synLaunchTensorInfo> finish_launch;
 
   Impl(HbmArena& arena, const WeightManifest& weights, uint32_t cache_slots,
        bool pure_rmsnorm, uint32_t page_count, bool gathered_input)
@@ -116,25 +105,17 @@ struct MimoFullAttention::Impl {
 
   void close() noexcept {
     if (prepare_recipe) synRecipeDestroy(prepare_recipe);
-    if (finish_recipe) synRecipeDestroy(finish_recipe);
     destroy_graphs();
   }
 
   void destroy_graphs() noexcept {
     if (prepare_graph) synGraphDestroy(prepare_graph);
-    if (finish_graph) synGraphDestroy(finish_graph);
-    prepare_graph = finish_graph = nullptr;
+    prepare_graph = nullptr;
     if (reduction_section) {
       synSectionDestroy(reduction_section);
       reduction_section = nullptr;
     }
     for (auto& external : prepare_externals) {
-      if (external.section) {
-        synSectionDestroy(external.section);
-        external.section = nullptr;
-      }
-    }
-    for (auto& external : finish_externals) {
       if (external.section) {
         synSectionDestroy(external.section);
         external.section = nullptr;
@@ -233,7 +214,6 @@ struct MimoFullAttention::Impl {
     expect_weight(*weights, "qkv_bias", syn_type_float, {3392});
     expect_weight(*weights, "oproj_weight", syn_type_bf16, {2048, 6144});
     build_prepare();
-    build_finish();
     destroy_graphs();
   }
 
@@ -255,9 +235,7 @@ struct MimoFullAttention::Impl {
       hidden_states = external(prepare_graph, prepare_externals, "hidden_states",
                                Binding::kHiddenStates, syn_type_bf16, {6144, 1});
     }
-    synTensor normalized = external(
-        prepare_graph, prepare_externals, "normalized", Binding::kNormalized,
-        syn_type_bf16, {6144, 1});
+    synTensor normalized = intermediate(prepare_graph, "normalized", syn_type_bf16, {6144, 1});
     synTensor norm_gamma = external(
         prepare_graph, prepare_externals, "input_layernorm",
         Binding::kInputLayernorm, syn_type_bf16, {6144});
@@ -297,8 +275,7 @@ struct MimoFullAttention::Impl {
                                              "qkv_accumulator_fp32",
                                              syn_type_float, {3392, 1, 48});
     synGEMMParams qkv_gemm_params{false, true};
-    synTensor qkv = external(prepare_graph, prepare_externals, "qkv",
-                             Binding::kQkv, syn_type_bf16, {3392, 1});
+    synTensor qkv = intermediate(prepare_graph, "qkv", syn_type_bf16, {3392, 1});
     node(prepare_graph, {activation_q, qkv_packed}, {qkv_accumulator},
          &qkv_gemm_params, sizeof(qkv_gemm_params), "batch_gemm",
          "qkv_block128_fp8_batch_gemm");
@@ -310,12 +287,9 @@ struct MimoFullAttention::Impl {
                                   Binding::kRopeCos, syn_type_bf16, {64, 1, 1});
     synTensor rope_sin = external(prepare_graph, prepare_externals, "rope_sin",
                                   Binding::kRopeSin, syn_type_bf16, {64, 1, 1});
-    synTensor query = external(prepare_graph, prepare_externals, "query",
-                               Binding::kQuery, syn_type_bf16, {192, 16, 1});
-    synTensor new_key = external(prepare_graph, prepare_externals, "new_key",
-                                 Binding::kNewKey, syn_type_bf16, {192, 1, 1});
-    synTensor new_value = external(prepare_graph, prepare_externals, "new_value",
-                                   Binding::kNewValue, syn_type_bf16, {128, 1, 1});
+    synTensor query = intermediate(prepare_graph, "query", syn_type_bf16, {192, 16, 1});
+    synTensor new_key = intermediate(prepare_graph, "new_key", syn_type_bf16, {192, 1, 1});
+    synTensor new_value = intermediate(prepare_graph, "new_value", syn_type_bf16, {128, 1, 1});
     node(prepare_graph, {qkv, rope_cos, rope_sin},
          {query, new_key, new_value}, &kValueScale, sizeof(kValueScale),
          "gk_qkv_post_f32_bf16_v1", "qkv_split_rope_vscale");
@@ -367,17 +341,29 @@ struct MimoFullAttention::Impl {
           block_groups},
          {block_max, block_sums, block_values}, &kAttentionScale,
          sizeof(kAttentionScale), "gk_full_diffkv_block_fp32_v0", "full_diffkv_pages");
-    synTensor context = external(prepare_graph, prepare_externals, "context",
-                                 Binding::kContext, syn_type_bf16, {128, 16, 1});
+    synTensor context = intermediate(prepare_graph, "context", syn_type_bf16, {128, 16, 1});
     node(prepare_graph, {block_max, block_sums, block_values}, {context}, nullptr, 0,
          "gk_full_diffkv_reduce_fp32_v0", "full_diffkv_normalize");
 
+    synTensor context_flat = intermediate(prepare_graph, "context_flat",
+                                          syn_type_bf16, {2048, 1});
+    node(prepare_graph, {context}, {context_flat}, nullptr, 0, "reshape",
+         "flatten_context");
+    synTensor oproj = external(prepare_graph, prepare_externals, "oproj_weight",
+                               Binding::kOprojWeight, syn_type_bf16, {2048, 6144});
+    synTensor output_local = external(prepare_graph, prepare_externals,
+                                      "output_local", Binding::kOutputLocal,
+                                      syn_type_float, {6144, 1});
+    synGEMMParams oproj_gemm_params{false, true};
+    node(prepare_graph, {context_flat, oproj}, {output_local},
+         &oproj_gemm_params, sizeof(oproj_gemm_params), "gemm",
+         "oproj_bf16_fp32_mme_local");
     const std::string recipe_name = pure_rmsnorm
-        ? "mimo_full_attention_prepare_b1_m1_tp8_pure"
-        : "mimo_full_attention_prepare_b1_m1_tp8_residual";
+        ? "mimo_full_attention_b1_m1_tp8_pure"
+        : "mimo_full_attention_b1_m1_tp8_residual";
     prepare_recipe = compile_cached(
         prepare_graph, recipe_name,
-        std::string("full_prepare_") + (pure_rmsnorm ? "pure" : "residual") +
+        std::string("full_internal_v2_") + (pure_rmsnorm ? "pure" : "residual") +
             "_c" + std::to_string(cache_slots) + "_p" + std::to_string(page_count) +
             (gathered_input ? "_gathered" : "_direct"),
         cache);
@@ -397,47 +383,6 @@ struct MimoFullAttention::Impl {
                                  prepare_launch.size());
   }
 
-  void build_finish() {
-    check(synGraphCreate(&finish_graph, synDeviceGaudi2), "create finish graph");
-    synTensor context = external(finish_graph, finish_externals, "context",
-                                 Binding::kContext, syn_type_bf16, {128, 16, 1});
-    synTensor context_flat = intermediate(finish_graph, "context_flat",
-                                          syn_type_bf16, {2048, 1});
-    node(finish_graph, {context}, {context_flat}, nullptr, 0, "reshape",
-         "flatten_context");
-    synTensor oproj = external(finish_graph, finish_externals, "oproj_weight",
-                               Binding::kOprojWeight, syn_type_bf16, {2048, 6144});
-    synTensor output_local = external(finish_graph, finish_externals,
-                                      "output_local", Binding::kOutputLocal,
-                                      syn_type_float, {6144, 1});
-    synGEMMParams oproj_gemm_params{false, true};
-    node(finish_graph, {context_flat, oproj}, {output_local},
-         &oproj_gemm_params, sizeof(oproj_gemm_params), "gemm",
-         "oproj_bf16_fp32_mme_local");
-    const std::string recipe_name = pure_rmsnorm
-        ? "mimo_full_attention_oproj_b1_m1_tp8_pure"
-        : "mimo_full_attention_oproj_b1_m1_tp8_residual";
-    finish_recipe = compile_cached(
-        finish_graph, recipe_name,
-        std::string("full_oproj_") + (pure_rmsnorm ? "pure" : "residual") +
-            "_c" + std::to_string(cache_slots) + "_p" + std::to_string(page_count),
-        cache);
-    check(synWorkspaceGetSize(&finish_workspace_size, finish_recipe),
-          "get finish workspace size");
-    arena.ensure_workspace(finish_workspace_size);
-    finish_launch.resize(finish_externals.size());
-    for (size_t i = 0; i < finish_externals.size(); ++i) {
-      finish_launch[i] = {};
-      finish_launch[i].tensorName = finish_externals[i].name;
-      finish_launch[i].tensorType = DATA_TENSOR;
-      for (size_t dim = 0; dim < finish_externals[i].shape.size(); ++dim) {
-        finish_launch[i].tensorSize[dim] = finish_externals[i].shape[dim];
-      }
-    }
-    initialize_launch_tensor_ids(finish_recipe, finish_launch.data(),
-                                 finish_launch.size());
-  }
-
   uint64_t resolve(Binding binding, const MimoAttentionIo& io) const {
     switch (binding) {
       case Binding::kHiddenStates: return io.hidden_states;
@@ -450,7 +395,6 @@ struct MimoFullAttention::Impl {
                                      static_cast<int>(Binding::kHiddenRank0)) * 6144 * 4;
       case Binding::kResidual: return io.residual;
       case Binding::kResidualOut: return io.residual_out;
-      case Binding::kNormalized: return io.normalized;
       case Binding::kRopeCos: return io.rope_cos;
       case Binding::kRopeSin: return io.rope_sin;
       case Binding::kKeyCache: return io.key_cache;
@@ -460,11 +404,6 @@ struct MimoFullAttention::Impl {
       case Binding::kFullBlockUsage: return io.full_block_usage;
       case Binding::kFullBlockGroups: return io.full_block_groups;
       case Binding::kPosition: return io.position;
-      case Binding::kQkv: return io.qkv;
-      case Binding::kQuery: return io.query;
-      case Binding::kNewKey: return io.new_key;
-      case Binding::kNewValue: return io.new_value;
-      case Binding::kContext: return io.context;
       case Binding::kOutputLocal: return io.output_local_fp32;
       case Binding::kInputLayernorm:
         return weights->get("input_layernorm").device_address;
@@ -494,11 +433,9 @@ struct MimoFullAttention::Impl {
     return result;
   }
 
-  std::array<PreparedLaunch, 2> prepare(const MimoAttentionIo& io) {
-    return {bind_graph(prepare_recipe, prepare_externals, prepare_launch,
-                       prepare_workspace_size, io),
-            bind_graph(finish_recipe, finish_externals, finish_launch,
-                       finish_workspace_size, io)};
+  PreparedLaunch prepare(const MimoAttentionIo& io) {
+    return bind_graph(prepare_recipe, prepare_externals, prepare_launch,
+                      prepare_workspace_size, io);
   }
 
   void launch(synRecipeHandle recipe, std::vector<ExternalTensor>& externals,
@@ -523,9 +460,7 @@ struct MimoFullAttention::Impl {
 
   void execute(const MimoAttentionIo& io, synStreamHandle stream) {
     launch(prepare_recipe, prepare_externals, prepare_launch,
-           prepare_workspace_size, io, stream, "prepare graph");
-    launch(finish_recipe, finish_externals, finish_launch, finish_workspace_size,
-           io, stream, "finish graph");
+           prepare_workspace_size, io, stream, "attention graph");
   }
 };
 
@@ -547,7 +482,7 @@ void MimoFullAttention::execute(const MimoAttentionIo& io,
   impl_->execute(io, stream);
 }
 
-std::array<PreparedLaunch, 2> MimoFullAttention::prepare(
+PreparedLaunch MimoFullAttention::prepare(
     const MimoAttentionIo& io) {
   return impl_->prepare(io);
 }
@@ -562,12 +497,11 @@ void MimoFullAttention::rebind_weights(const WeightManifest& weights) {
 }
 
 uint64_t MimoFullAttention::workspace_bytes() const noexcept {
-  return std::max(impl_->prepare_workspace_size, impl_->finish_workspace_size);
+  return impl_->prepare_workspace_size;
 }
 
-std::pair<uint64_t, uint64_t> MimoFullAttention::recipe_identity() const noexcept {
-  return {reinterpret_cast<uint64_t>(impl_->prepare_recipe),
-          reinterpret_cast<uint64_t>(impl_->finish_recipe)};
+uint64_t MimoFullAttention::recipe_identity() const noexcept {
+  return reinterpret_cast<uint64_t>(impl_->prepare_recipe);
 }
 
 }  // namespace gaudirt::runtime
