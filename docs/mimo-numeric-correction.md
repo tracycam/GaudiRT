@@ -206,3 +206,23 @@ The full-run receipt SHA256 is
 `6a7137e44dc299aafa16235921d32e471add0c19a1e5340d98a38939a49a5e2b`;
 the two-reference comparison receipt SHA256 is
 `dfc4b17144dc376aaa270c36a692f8d732f43486d27dddb6c67a7037947fbd84`.
+
+An 8-rank same-input check of 70 standalone layers against the FP64
+mathematical trajectory found 34 layer outputs above `0.001` relative L2;
+the largest was layer 39 at `0.002438`. Candidate expert IDs were not
+recorded, so the result does not attribute these differences to routing.
+The receipt SHA256 is
+`d4a9c2e88abd545dc9fe56be9ee3d1b7bb60dbc88b3b599afa875dca157c27da`.
+Separately, on the same frozen layer-39 input the CPU FP32 and FP64
+references had the same expert set but differed by `0.002891` relative L2.
+That comparison does not establish candidate correctness. Its receipt SHA256
+is `e3bf5bc7dadd7c03fc943adbabcd3649c792cd9493682a94f8d2c2b770d8b7ea`.
+
+The SWA fast kernel also uses the affected exponential. A single-card
+boundary test measured original maximum absolute error `0.166667` and
+corrected error `0.0006511` in BF16 output. On one real frozen layer-18
+input, the corrected candidate matched the CPU output and written KV bitwise;
+untouched KV was unchanged. The corrected provider compiles grouped AV from
+C instead of using the original hand-scheduled assembly. Whole-model quality
+and performance remain to be measured. The single-card receipt SHA256 is
+`a9e0f47f940ea70fdcdcf60cad5a854698e16a49e415d4baa75b09256e4cf86d`.
