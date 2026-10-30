@@ -164,6 +164,12 @@ opposite neighbor from direct binary64 round-to-nearest-even. The device
 selected the direct-rounding neighbor on that sample. The earlier statement
 that this value was a device error is withdrawn; its receipt SHA256 is
 `d30f789b4b234dc19c281c428ffcfdc472196775da1b5d3db08e833b9ab7efe3`.
-A separate full-model FP64 reference with direct BF16 rounding is being
-generated. Previous results against the FP32 reference remain unchanged;
-they do not establish the result against the new reference.
+A separate full-model FP64 reference with direct BF16 rounding is complete;
+its logits SHA256 is
+`042f2bcfe915660fefa65e1d38e4f259cf8a097db6a73b1374465f4f5d246691`.
+The earlier full-model FP32 reference differs from it by `0.024443` relative
+L2, with different selected expert sets on 16 layers. The reference comparison
+receipt SHA256 is
+`befaaaf5c5656ddd15adbe68a7b6a99a4d059b2034bb3f42a896b8a1f7055cf9`.
+Previous results against the FP32 reference remain unchanged; they do not
+establish the candidate result against the new reference.
