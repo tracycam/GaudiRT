@@ -166,6 +166,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     }
     if (metadata_ready_) synEventDestroy(metadata_ready_);
     if (compute_done_) synEventDestroy(compute_done_);
+    if (token_ready_) synEventDestroy(token_ready_);
     if (metadata_host_) synHostFree(runtime_.device_id(), metadata_host_, 0);
     if (token_host_) synHostFree(runtime_.device_id(), token_host_, 0);
   }
@@ -378,6 +379,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
               "token pinned allocation");
     check_syn(synEventCreate(&metadata_ready_, runtime_.device_id(), 0), "metadata event creation");
     check_syn(synEventCreate(&compute_done_, runtime_.device_id(), 0), "compute event creation");
+    check_syn(synEventCreate(&token_ready_, runtime_.device_id(), 0), "token event creation");
     metadata_device_ = arena_.allocate(sizeof(StepMetadata));
     trigger_device_ = arena_.allocate(sizeof(int32_t));
     token_device_ = arena_.allocate(sizeof(int32_t));
@@ -436,12 +438,13 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     check_syn(synMemCopyAsync(runtime_.d2h_stream(), token_device_, sizeof(int32_t),
                               reinterpret_cast<uint64_t>(token_host_), DRAM_TO_HOST),
               "token D2H");
+    check_syn(synEventRecord(token_ready_, runtime_.d2h_stream()), "token completion event");
     return wrap(token_device_, {1}, at::kInt);
   }
 
   int32_t finish_model_step() {
     if (!model_pending_) throw std::invalid_argument("PrivateUse1: no pending model step");
-    check_syn(synStreamSynchronize(runtime_.d2h_stream()), "token D2H completion");
+    check_syn(synEventSynchronize(token_ready_), "token D2H completion");
     model_pending_ = false;
     const int32_t token = *static_cast<int32_t*>(token_host_);
     if (token < 0 || token >= 152576) {
@@ -692,6 +695,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   void* token_host_ = nullptr;
   synEventHandle metadata_ready_ = nullptr;
   synEventHandle compute_done_ = nullptr;
+  synEventHandle token_ready_ = nullptr;
   uint64_t metadata_device_ = 0;
   uint64_t trigger_device_ = 0;
   uint64_t token_device_ = 0;
