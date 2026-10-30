@@ -289,7 +289,7 @@ struct MimoFullAttention::Impl {
     synTensor new_value = intermediate(prepare_graph, "new_value", syn_type_bf16, {128, 1, 1});
     node(prepare_graph, {qkv, rope_cos, rope_sin},
          {query, new_key, new_value}, &kValueScale, sizeof(kValueScale),
-         "gk_qkv_post_f32_bf16_v1", "qkv_split_rope_vscale");
+         "gk_qkv_post_f32_f32_v1", "qkv_split_rope_vscale");
 
     synTensor key_cache = external(prepare_graph, prepare_externals, "key_cache",
                                    Binding::kKeyCache, syn_type_bf16,
@@ -393,7 +393,7 @@ struct MimoFullAttention::Impl {
         : "mimo_full_attention_b1_m1_tp8_residual";
     prepare_recipe = compile_cached(
         prepare_graph, recipe_name,
-        std::string("full_mme_neumaier_v3_") + (pure_rmsnorm ? "pure" : "residual") +
+        std::string("full_mme_neumaier_v4_") + (pure_rmsnorm ? "pure" : "residual") +
             "_c" + std::to_string(cache_slots) + "_p" + std::to_string(page_count) +
             (gathered_input ? "_gathered_tp1" : "_direct"),
         cache);

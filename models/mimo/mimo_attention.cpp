@@ -281,7 +281,7 @@ struct MimoAttention::Impl {
     new_key = intermediate("new_key", syn_type_bf16, {192, 1, 1});
     new_value = intermediate("new_value", syn_type_bf16, {128, 1, 1});
     node({qkv, rope_cos, rope_sin}, {query, new_key, new_value}, &kValueScale,
-         sizeof(kValueScale), "gk_qkv_post_f32_bf16_v1",
+         sizeof(kValueScale), "gk_qkv_post_f32_f32_v1",
          "qkv_split_rope_vscale");
 
     synTensor key_cache = external("key_cache", Binding::kKeyCache,
@@ -333,7 +333,7 @@ struct MimoAttention::Impl {
          sizeof(oproj_gemm_params), "gemm", "oproj_bf16_mme_local");
 
     recipe = compile_cached(graph, "mimo_layer1_attention_b1_m1_tp8",
-                            "swa_grid24_fp32_v6_c" + std::to_string(cache_slots) +
+                            "swa_grid24_fp32_v7_c" + std::to_string(cache_slots) +
                                 (gathered_input ? "_gathered_tp1" : "_direct"), cache);
     check(synWorkspaceGetSize(&workspace_size, recipe), "get workspace size");
     arena.ensure_workspace(workspace_size);
