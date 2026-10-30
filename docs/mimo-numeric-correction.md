@@ -48,3 +48,17 @@ from `0.024301` to `0.025228`; the one-run p50 was `11.280414 ms`. This is not
 an ABBA performance result and quality still failed, so the replacement was
 reverted. Its receipt SHA256 is
 `e2fd6a610a143e5f86ae5425dc27794b69e34a60c3183e84cb0dc56c3d643c9c`.
+
+A 31-layer diagnostic prefix matched the complete candidate's layer-30
+router input bitwise. Within sampled layers 21–30, the first expert-set
+difference was at layer 25; FP64 routing on that same candidate input selected
+the candidate's set. The layer-25 input differed from the rolling mathematical
+reference by `0.016289` relative L2. The receipt SHA256 is
+`53b3b4f15d6e957adc87863305362b9a66d3bb24ac0cb0bee0aba22c7664cb0f`.
+
+A 22-layer prefix also matched the verified prefix's layer-21 router input
+bitwise. All sampled layers 11–21 chose the reference expert sets, but input
+relative L2 increased from `0.000560` at layer 17 to `0.012680` at layer 21.
+This identifies an earlier numerical trajectory difference, not its cause.
+The receipt SHA256 is
+`9fc3fc867444b7014ed84c41b940576e449e7c47f10ce45d2df4a0b17637bb98`.
