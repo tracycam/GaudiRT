@@ -139,3 +139,12 @@ on the same frozen rank-7 input its relative L2 error against FP64 fell to
 `0.0000641`. The latter receipt SHA256 is
 `e40cd3a74f785f4d5c5dfd0dd640fefd8b3ad2e6ff076aec18da48686461ba26`.
 These checks do not establish full-model quality or performance.
+
+An unprofiled full-model run with that correction and initialization-time
+metadata validation measured `11.221187 ms` p50 and `11.219819 ms` mean.
+The eight ranks agreed on 144 generated tokens, and untouched KV bytes were
+unchanged at the end. The first-step `max_kl` was `0.0007722`, while
+`relative_l2` and `max_row_relative_l2` were `0.0205696`: the unchanged
+`0.02` quality gate still fails. This run is not final ABBA and did not check
+KV after every step. Its receipt SHA256 is
+`a233d8df875d0e950e7a1509a225d3e1bae1387e676519edcb555c664879ca0c`.
