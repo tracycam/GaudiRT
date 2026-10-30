@@ -41,3 +41,10 @@ trajectory was `0.07207`, so the observed divergence precedes this router.
 These samples do not establish which earlier layer caused it. Their receipts
 have SHA256 `35fb0e3ed3fed62c67512f546644ee24e72ae663eb3ce6cdf61bb464a80591f5`
 and `c4a990cc855b7d5dd208efb82068fa28ac9237e5165f980f1d8e0ad9df96323a`.
+
+Replacing only the MoE gate activation with an FP32 variant passed its
+single-card arithmetic check, but the full-model first-step relative L2 rose
+from `0.024301` to `0.025228`; the one-run p50 was `11.280414 ms`. This is not
+an ABBA performance result and quality still failed, so the replacement was
+reverted. Its receipt SHA256 is
+`e2fd6a610a143e5f86ae5425dc27794b69e34a60c3183e84cb0dc56c3d643c9c`.
