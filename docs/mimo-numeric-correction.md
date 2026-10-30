@@ -90,3 +90,10 @@ were unchanged after generation. First-step `max_kl=0.000976` and
 This single run is not an ABBA result and did not audit KV after each step.
 Its receipt SHA256 is
 `e89f66017d06c28ebb8788067f548e1a11efbb7792758687adc5c544ffe36754`.
+
+A separate untimed run used the same graph, matched that run's first-step
+logits bitwise and reproduced its first 128 tokens on all ranks. It checked
+each step's key and value slot on all 70 layers, verified no later overwrite,
+and found untouched KV bytes unchanged. The quality gate still failed.
+The audit receipt SHA256 is
+`cc41fcf0d5fabcc1394b370da9983f1995325f58271e52eae3d4e3b3ae1ed803`.
