@@ -70,3 +70,14 @@ the FP64 reference with the current BF16 gate boundaries differed by
 `1.27e-7`. This local result does not establish an end-to-end improvement.
 The receipt SHA256 is
 `68a8d47d7014b2e4f6c1cb5d22a9bc802ea84573bae06524607f9e6f1716475e`.
+
+On a shared frozen input at normal-context layer 18, rank-0 SWA attention
+had `0.001819` relative L2 versus the CPU mathematical result. Substituting
+the device-written KV in that reference reduced the difference to `0.000052`;
+the previous value write differed by `0.003873` relative L2. After selecting
+FP32 value scaling, the local output, key and value matched that reference
+bitwise, and untouched KV bytes were unchanged. These are single-layer
+results, not whole-model quality or performance. The before and after receipt
+SHA256 values are
+`81b71b04ef0f4b48934dd554d9b0f4a795df86efc12bece9d1eab49716271a2b` and
+`350e5e4306c15215aec7961a937dbb707b2dcb57f1d482a0781a675de2a59c1c`.
