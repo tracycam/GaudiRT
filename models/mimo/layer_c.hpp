@@ -36,13 +36,13 @@ class LayerC final {
   }
 
  private:
+  runtime::HbmArena& arena_;
   runtime::MimoAttention attention_;
   runtime::TpReduce attention_reduce_;
   runtime::MimoMoeLayer1::Weights moe_weights_{};
   runtime::MimoMoeLayer1 moe_;
   runtime::TpReduce moe_reduce_;
   hcclComm_t comm_;
-  uint64_t moe_workspace_ = 0;
 };
 
 }  // namespace gaudirt::mimo

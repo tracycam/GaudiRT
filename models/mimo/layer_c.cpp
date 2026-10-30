@@ -20,7 +20,8 @@ void check(hcclResult_t status, const char* operation) {
 LayerC::LayerC(runtime::HbmArena& arena, runtime::DeviceRuntime& runtime,
                const runtime::WeightManifest& weights, uint32_t cache_slots,
                runtime::RecipeCache* cache)
-    : attention_(arena, weights, cache_slots, cache),
+    : arena_(arena),
+      attention_(arena, weights, cache_slots, cache),
       attention_reduce_(arena, 6144, syn_type_bf16),
       moe_(runtime.rank(), [&] {
         moe_weights_.post_attention_gamma_bf16 =
@@ -43,7 +44,7 @@ LayerC::LayerC(runtime::HbmArena& arena, runtime::DeviceRuntime& runtime,
       }(), "swa", cache),
       moe_reduce_(arena, 6144, syn_type_float), comm_(runtime.comm()) {
   if (!comm_) throw std::invalid_argument("MiMo Type C: missing HCCL");
-  moe_workspace_ = arena.ensure_workspace(std::max(
+  arena.ensure_workspace(std::max(
       {attention_.workspace_bytes(), attention_reduce_.workspace_bytes(),
        moe_.workspace_bytes(), moe_reduce_.workspace_bytes()}));
 }
@@ -52,6 +53,9 @@ void LayerC::execute(const Io& io, synStreamHandle stream) {
   if (!stream || !io.attention_output_bf16 || !io.attention_gathered_bf16 ||
       !io.moe_gathered_fp32 || !io.layer_output_bf16) {
     throw std::invalid_argument("MiMo Type C: invalid execution buffers");
+  }
+  if (arena_.workspace_bytes() < moe_.workspace_bytes()) {
+    throw std::runtime_error("MiMo Type C: shared workspace is too small");
   }
   attention_.execute(io.attention, stream);
   check(hcclAllGather(reinterpret_cast<const void*>(io.attention.output_local),
@@ -62,7 +66,7 @@ void LayerC::execute(const Io& io, synStreamHandle stream) {
                             stream);
   moe_.launch(stream,
               {io.attention_output_bf16, io.attention.residual_out},
-              io.moe_outputs, moe_workspace_);
+              io.moe_outputs, arena_.workspace_addr());
   check(hcclAllGather(reinterpret_cast<const void*>(io.moe_outputs.moe_local_fp32),
                       reinterpret_cast<void*>(io.moe_gathered_fp32), 6144,
                       hcclFloat32, comm_, stream),
