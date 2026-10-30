@@ -62,3 +62,11 @@ relative L2 increased from `0.000560` at layer 17 to `0.012680` at layer 21.
 This identifies an earlier numerical trajectory difference, not its cause.
 The receipt SHA256 is
 `9fc3fc867444b7014ed84c41b940576e449e7c47f10ce45d2df4a0b17637bb98`.
+
+On the captured normal-context layer-18 router input, a streamed-weight
+single-rank MoE probe reproduced the candidate input and selected experts
+bitwise. Its local output had `0.004364` relative L2 versus FP64 gate math;
+the FP64 reference with the current BF16 gate boundaries differed by
+`1.27e-7`. This local result does not establish an end-to-end improvement.
+The receipt SHA256 is
+`68a8d47d7014b2e4f6c1cb5d22a9bc802ea84573bae06524607f9e6f1716475e`.
