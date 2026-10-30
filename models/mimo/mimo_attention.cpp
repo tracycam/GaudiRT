@@ -279,7 +279,7 @@ struct MimoAttention::Impl {
     node({activation_q, qkv_packed}, {qkv_accumulator}, &qkv_gemm_params,
          sizeof(qkv_gemm_params), "batch_gemm", "qkv_block128_fp8_batch_gemm");
     node({qkv_accumulator, activation_scale, qkv_scale, qkv_zero_bias}, {qkv},
-         nullptr, 0, "gk_block128_reduce_bias_v1", "qkv_block128_scale_finish");
+         nullptr, 0, "gk_neumaier_isa_handschedule_v1", "qkv_block128_scale_finish");
 
     synTensor rope_cos = external("rope_cos", Binding::kRopeCos, syn_type_bf16,
                                   {64, 1, 1});
@@ -341,7 +341,7 @@ struct MimoAttention::Impl {
          sizeof(oproj_gemm_params), "gemm", "oproj_bf16_mme_local");
 
     recipe = compile_cached(graph, "mimo_layer1_attention_b1_m1_tp8",
-                            "swa_internal_v4_c" + std::to_string(cache_slots) +
+                            "swa_neumaier_v5_c" + std::to_string(cache_slots) +
                                 (gathered_input ? "_gathered" : "_direct"), cache);
     check(synWorkspaceGetSize(&workspace_size, recipe), "get workspace size");
     arena.ensure_workspace(workspace_size);

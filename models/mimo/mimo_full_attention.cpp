@@ -281,7 +281,7 @@ struct MimoFullAttention::Impl {
          "qkv_block128_fp8_batch_gemm");
     node(prepare_graph,
          {qkv_accumulator, activation_scale, qkv_scale, qkv_zero_bias}, {qkv},
-         nullptr, 0, "gk_block128_reduce_bias_v1", "qkv_block128_scale_finish");
+         nullptr, 0, "gk_neumaier_isa_handschedule_v1", "qkv_block128_scale_finish");
 
     synTensor rope_cos = external(prepare_graph, prepare_externals, "rope_cos",
                                   Binding::kRopeCos, syn_type_bf16, {64, 1, 1});
@@ -363,7 +363,7 @@ struct MimoFullAttention::Impl {
         : "mimo_full_attention_b1_m1_tp8_residual";
     prepare_recipe = compile_cached(
         prepare_graph, recipe_name,
-        std::string("full_internal_v2_") + (pure_rmsnorm ? "pure" : "residual") +
+        std::string("full_neumaier_v1_") + (pure_rmsnorm ? "pure" : "residual") +
             "_c" + std::to_string(cache_slots) + "_p" + std::to_string(page_count) +
             (gathered_input ? "_gathered" : "_direct"),
         cache);
