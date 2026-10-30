@@ -245,7 +245,7 @@ MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
          {gate_up_partial}, nullptr, 0);
 
     const int32_t gate_splits = 3;
-    node("ub_compact_gate", "mimo1_gate_silu", {gate_up_partial, route_ids},
+    node("gk_mimo_moe_gate_fp32_v1", "mimo1_gate_silu", {gate_up_partial, route_ids},
          {gate_activation}, &gate_splits, sizeof(gate_splits));
 
     node("downact_direct_down_broadcast", "mimo1_down_mxfp4",
@@ -262,7 +262,7 @@ MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
         std::to_string(tp_rank_);
     recipe_ = compile_cached(
         graph, recipe_name,
-        std::string("moe_internal_v2_") + graph_variant + "_rank" + std::to_string(tp_rank_) +
+        std::string("moe_fp32_gate_v3_") + graph_variant + "_rank" + std::to_string(tp_rank_) +
             (gathered_attention_ ? "_gathered_tp1" : "_direct"),
         cache);
     check(synWorkspaceGetSize(&workspace_bytes_, recipe_),
