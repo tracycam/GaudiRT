@@ -198,9 +198,6 @@ int run(int argc, char** argv) {
   io.attention.context = arena.allocate(16 * 128 * 2);
   io.attention.output_local_fp32 = arena.allocate(6144 * 4);
   io.moe_outputs.residual_out_bf16 = arena.allocate(12288);
-  io.moe_outputs.normalized_bf16 = arena.allocate(12288);
-  io.moe_outputs.topk_ids_i32 = arena.allocate(32);
-  io.moe_outputs.topk_weights_fp32 = arena.allocate(32);
   io.moe_outputs.moe_local_fp32 = arena.allocate(6144 * 4);
   io.attention_output_bf16 = arena.allocate(12288);
   io.attention_gathered_fp32 = arena.allocate(world * 6144 * 4);

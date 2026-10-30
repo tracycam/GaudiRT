@@ -184,13 +184,9 @@ MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
     synTensor residual_out =
         external(kResidualOut, "mimo1_residual_out", syn_type_bf16,
                  {kHiddenSize, 1}, 0);
-    synTensor normalized = external(kNormalized, "mimo1_normalized",
-                                    syn_type_bf16, {kHiddenSize, 1}, 0);
-    synTensor route_ids = external(kTopkIds, "mimo1_topk_ids", syn_type_int32,
-                                   {kTopK, 1}, 0);
-    synTensor route_weights =
-        external(kTopkWeights, "mimo1_topk_weights", syn_type_single,
-                 {kTopK, 1}, 0);
+    synTensor normalized = temporary("normalized", syn_type_bf16, {kHiddenSize, 1});
+    synTensor route_ids = temporary("topk_ids", syn_type_int32, {kTopK, 1});
+    synTensor route_weights = temporary("topk_weights", syn_type_single, {kTopK, 1});
     synTensor moe_out = external(kMoeOut, "mimo1_moe_local_fp32",
                                  syn_type_single, {kHiddenSize, 1}, 0);
 
@@ -274,7 +270,7 @@ MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
         std::to_string(tp_rank_);
     recipe_ = compile_cached(
         graph, recipe_name,
-        std::string("moe_") + graph_variant + "_rank" + std::to_string(tp_rank_) +
+        std::string("moe_internal_v2_") + graph_variant + "_rank" + std::to_string(tp_rank_) +
             (gathered_attention_ ? "_gathered" : "_direct"),
         cache);
     check(synWorkspaceGetSize(&workspace_bytes_, recipe_),
@@ -349,9 +345,6 @@ PreparedLaunch MimoMoeLayer1::prepare(const Inputs& inputs,
   }
   tensors[kResidualIn].pTensorAddress = inputs.residual_in_bf16;
   tensors[kResidualOut].pTensorAddress = outputs.residual_out_bf16;
-  tensors[kNormalized].pTensorAddress = outputs.normalized_bf16;
-  tensors[kTopkIds].pTensorAddress = outputs.topk_ids_i32;
-  tensors[kTopkWeights].pTensorAddress = outputs.topk_weights_fp32;
   tensors[kMoeOut].pTensorAddress = outputs.moe_local_fp32;
   std::vector<uint64_t> addresses(count);
   for (size_t i = 0; i < addresses.size(); ++i)
@@ -384,9 +377,6 @@ void MimoMoeLayer1::launch(synStreamHandle stream, const Inputs& inputs,
   launch_tensors_[kAttention].pTensorAddress = inputs.attention_bf16;
   launch_tensors_[kResidualIn].pTensorAddress = inputs.residual_in_bf16;
   launch_tensors_[kResidualOut].pTensorAddress = outputs.residual_out_bf16;
-  launch_tensors_[kNormalized].pTensorAddress = outputs.normalized_bf16;
-  launch_tensors_[kTopkIds].pTensorAddress = outputs.topk_ids_i32;
-  launch_tensors_[kTopkWeights].pTensorAddress = outputs.topk_weights_fp32;
   launch_tensors_[kMoeOut].pTensorAddress = outputs.moe_local_fp32;
 
   std::array<uint64_t, kSlotCount> addresses{};

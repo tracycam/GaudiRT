@@ -52,6 +52,9 @@ target_link_libraries(mimo_argmax_device_test PRIVATE mimo_layer_vertical)
 add_executable(mimo_fused_reduce_device_test tests/mimo_fused_reduce_device_test.cpp)
 target_link_libraries(mimo_fused_reduce_device_test PRIVATE mimo_layer_vertical)
 
+add_executable(mimo_moe_output_device_test tests/mimo_moe_output_device_test.cpp)
+target_link_libraries(mimo_moe_output_device_test PRIVATE mimo_layer_vertical)
+
 add_executable(mimo_step_metadata_test tests/mimo_step_metadata_test.cpp)
 target_include_directories(mimo_step_metadata_test PRIVATE models/mimo)
 

@@ -60,9 +60,6 @@ class MimoMoeLayer1 final {
 
   struct Outputs {
     uint64_t residual_out_bf16 = 0;
-    uint64_t normalized_bf16 = 0;
-    uint64_t topk_ids_i32 = 0;
-    uint64_t topk_weights_fp32 = 0;
     uint64_t moe_local_fp32 = 0;
   };
 
@@ -116,14 +113,11 @@ class MimoMoeLayer1 final {
     kLut,
     kDirections,
     kResidualOut,
-    kNormalized,
-    kTopkIds,
-    kTopkWeights,
     kMoeOut,
     kSlotCount
   };
 
-  static_assert(kSlotCount == 16);
+  static_assert(kSlotCount == 13);
   static constexpr size_t kGatheredSlotCount = kSlotCount + 7;
 
   uint32_t tp_rank_;

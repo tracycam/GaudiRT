@@ -657,9 +657,6 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       io.attention.new_value = arena_.allocate(128 * 2);
       io.attention.context = arena_.allocate(16 * 128 * 2);
       io.attention.output_local_fp32 = arena_.allocate(6144 * 4);
-      io.moe_outputs.normalized_bf16 = arena_.allocate(12288);
-      io.moe_outputs.topk_ids_i32 = arena_.allocate(32);
-      io.moe_outputs.topk_weights_fp32 = arena_.allocate(32);
       io.moe_outputs.moe_local_fp32 = arena_.allocate(6144 * 4);
       io.attention_output_bf16 = arena_.allocate(12288);
       io.attention_gathered_fp32 = arena_.allocate(8 * 6144 * 4);
@@ -676,9 +673,6 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       io.attention.new_value = arena_.allocate(128 * 2);
       io.attention.context = arena_.allocate(16 * 128 * 2);
       io.attention.output_local = arena_.allocate(12288);
-      io.moe_outputs.normalized_bf16 = arena_.allocate(12288);
-      io.moe_outputs.topk_ids_i32 = arena_.allocate(32);
-      io.moe_outputs.topk_weights_fp32 = arena_.allocate(32);
       io.moe_outputs.moe_local_fp32 = arena_.allocate(6144 * 4);
       io.attention_output_bf16 = arena_.allocate(12288);
       io.attention_gathered_bf16 = arena_.allocate(8 * 6144 * 2);

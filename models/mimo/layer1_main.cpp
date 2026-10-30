@@ -201,9 +201,6 @@ int run(int argc, char** argv) {
       arena, runtime, residual_dir / "layer1.post_attention_residual_in.bf16");
   gaudirt::runtime::MimoMoeLayer1::Outputs moe_outputs{};
   moe_outputs.residual_out_bf16 = arena.allocate(12288);
-  moe_outputs.normalized_bf16 = arena.allocate(12288);
-  moe_outputs.topk_ids_i32 = arena.allocate(32);
-  moe_outputs.topk_weights_fp32 = arena.allocate(32);
   moe_outputs.moe_local_fp32 = arena.allocate(24576);
   const uint64_t layer_output = arena.allocate(12288);
   const uint64_t moe_gathered = arena.allocate(world * 24576);
@@ -309,12 +306,6 @@ int run(int argc, char** argv) {
   pass &= compare(download(arena, runtime, moe_outputs.residual_out_bf16, 12288),
                   read_file(residual_dir / "layer1.post_attention_residual_out.bf16"),
                   "post_residual_out", rank);
-  pass &= compare(download(arena, runtime, moe_outputs.normalized_bf16, 12288),
-                  read_file(moe_dir / "normalized.bin"), "moe_normalized", rank);
-  pass &= compare(download(arena, runtime, moe_outputs.topk_ids_i32, 32),
-                  read_file(moe_dir / "topk_ids.bin"), "topk_ids", rank);
-  pass &= compare(download(arena, runtime, moe_outputs.topk_weights_fp32, 32),
-                  read_file(moe_dir / "topk_weights.bin"), "topk_weights", rank);
   pass &= compare(download(arena, runtime, moe_outputs.moe_local_fp32, 24576),
                   read_file(moe_dir / "moe_local.bin"), "moe_local", rank);
   pass &= compare(download(arena, runtime, layer_output, 12288),
@@ -324,8 +315,6 @@ int run(int argc, char** argv) {
              download(arena, runtime, attention_io.output_local, 12288));
   write_file(output / "attention.bin",
              download(arena, runtime, attention_output, 12288));
-  write_file(output / "moe_normalized.bin",
-             download(arena, runtime, moe_outputs.normalized_bf16, 12288));
   write_file(output / "moe_local.bin",
              download(arena, runtime, moe_outputs.moe_local_fp32, 24576));
   write_file(output / "layer_output.bin",
