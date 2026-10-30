@@ -18,3 +18,17 @@ The combined candidate's four-arm performance receipt has SHA256
 `bf3392ea0c813cf8930a6d952de43a18fcd780d61dc50ec04665dac9391b8ec9`;
 its first-step full-vocabulary relative L2 is `0.028297`, above the `0.02`
 quality threshold. Performance alone does not qualify the candidate.
+
+The FP32-residual fused variant matches the separate FP32 norm path bitwise on
+that single-rank input, including the written KV values. One unprofiled
+70-layer run measured `11.368715 ms` p50 and `11.342459 ms` mean, with first-step
+`max_kl=0.001260` and `relative_l2=0.024301`; neither the historical latency
+target nor the quality threshold was met. This single run is not an ABBA
+comparison. Its receipt SHA256 is
+`df81e2a536ba4d2f30ed0d8f68f9c1f878505161d41d4979934ee51020af6583`.
+
+A separate first-step diagnostic preserved the candidate logits bitwise and
+checked only layers 6 and 7. Their selected experts matched both FP64 routing
+on the candidate input and the full-model mathematical reference; this does
+not establish the routing of other layers. The diagnostic receipt SHA256 is
+`17ffe228509191bf9867cc8cfd5056231f7fd11afad5632acb9c5bd3a73e2048`.
