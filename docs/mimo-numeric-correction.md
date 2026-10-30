@@ -100,3 +100,8 @@ each step's key and value slot on all 70 layers, verified no later overwrite,
 and found untouched KV bytes unchanged. The quality gate still failed.
 The audit receipt SHA256 is
 `cc41fcf0d5fabcc1394b370da9983f1995325f58271e52eae3d4e3b3ae1ed803`.
+
+After those runs, fixed page-table checks were moved to model initialization.
+The metadata unit test covers the 144 positions across a page boundary and
+rejects a duplicate future page. The updated runtime extension compiles; this
+subsequent change has not yet been measured in an end-to-end run.
