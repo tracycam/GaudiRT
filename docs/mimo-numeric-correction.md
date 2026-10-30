@@ -124,3 +124,18 @@ An independent FP64 calculation on the same input measured candidate relative
 L2 `0.001364`; the CPU FP32 path differed from FP64 by `0.000288`. The FP64
 receipt SHA256 is
 `0549e0965d88d00ca6bc83f6c91d75c989b533b9327c67d913d7af3fa8bfee1f`.
+
+On the frozen layer-44 input, rank 7's local MoE output had `0.001311`
+relative L2 error against FP64 while ranks 0–6 were near FP64. The captured
+partial projections and downstream projection were close to FP64; one gate
+activation differed substantially. The diagnostic receipt SHA256 is
+`b5464632811c0e7fdbfaac3349650a11482322dae4d42d0faacc6a7a17a25e99`.
+
+A single-card arithmetic check identified range-boundary errors in Gaudi2's
+FP32 exponential, including `exp(-ln(2))` returning `1` instead of `0.5`.
+The corrected MoE gate uses a second exponential decomposition to recognize
+this error. It passed 750 boundary and adjacent inputs against CPU math, and
+on the same frozen rank-7 input its relative L2 error against FP64 fell to
+`0.0000641`. The latter receipt SHA256 is
+`e40cd3a74f785f4d5c5dfd0dd640fefd8b3ad2e6ff076aec18da48686461ba26`.
+These checks do not establish full-model quality or performance.
