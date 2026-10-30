@@ -81,3 +81,12 @@ results, not whole-model quality or performance. The before and after receipt
 SHA256 values are
 `81b71b04ef0f4b48934dd554d9b0f4a795df86efc12bece9d1eab49716271a2b` and
 `350e5e4306c15215aec7961a937dbb707b2dcb57f1d482a0781a675de2a59c1c`.
+
+One unprofiled 70-layer run combining FP32 SWA normalization, value scaling,
+and MoE gate arithmetic measured `11.0428975 ms` p50 and `11.063560 ms` mean.
+All eight ranks agreed on 144 generated tokens and all untouched KV bytes
+were unchanged after generation. First-step `max_kl=0.000976` and
+`relative_l2=0.021370`; the latter still exceeds the unchanged `0.02` gate.
+This single run is not an ABBA result and did not audit KV after each step.
+Its receipt SHA256 is
+`e89f66017d06c28ebb8788067f548e1a11efbb7792758687adc5c544ffe36754`.
