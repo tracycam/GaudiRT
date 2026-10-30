@@ -181,3 +181,11 @@ unchanged. Against the independent FP64 reference, `max_kl` was `0.003756`
 and `relative_l2` / `max_row_relative_l2` were `0.023605`; the `0.02` gate
 still fails. The separate audit receipt SHA256 is
 `abcdb5aa0e8bc460c81ca316d37ecf5fdb11922a81de4de6dcfc03b71cd79f2f`.
+
+The Full Attention MME softmax also used the affected exponential. In a
+single-card masked-softmax boundary test, the original maximum absolute
+probability error was `0.166667`; the corrected kernel measured `3.39e-6`.
+On a separate frozen real Full Attention layer, output and KV were bitwise
+unchanged on all eight ranks. The local receipt SHA256 is
+`286c537925034796eeeb6ce159e58f7fa5264f0a5408af6fc97c8a05f9416fd4`.
+Neither check establishes an end-to-end quality or performance improvement.
