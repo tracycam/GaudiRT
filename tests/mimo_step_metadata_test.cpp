@@ -14,6 +14,8 @@ void require(bool value) {
 int main() {
   using gaudirt::mimo::StepMetadata;
   using gaudirt::mimo::fill_step_metadata;
+  using gaudirt::mimo::fill_step_metadata_prevalidated;
+  using gaudirt::mimo::validate_step_metadata;
   constexpr uint32_t kRows = 144;
   std::array<uint16_t, kRows * 64> full{}, swa{};
   for (size_t i = 0; i < full.size(); ++i) {
@@ -23,8 +25,17 @@ int main() {
   std::array<int32_t, 64> pages{};
   for (size_t i = 0; i < pages.size(); ++i) pages[i] = static_cast<int32_t>(i + 34);
   StepMetadata step{};
+  StepMetadata prevalidated{};
+  validate_step_metadata(4096 + kRows - 1, 4096, kRows, full.data(), swa.data(), pages, 205184);
   for (uint32_t i = 0; i < kRows; ++i) {
     fill_step_metadata(step, 4096 + i, 4096, kRows, full.data(), swa.data(), pages, 205184);
+    fill_step_metadata_prevalidated(prevalidated, 4096 + i, 4096, full.data(), swa.data(), pages);
+    require(prevalidated.position == step.position && prevalidated.slot == step.slot &&
+            prevalidated.full_cos == step.full_cos && prevalidated.full_sin == step.full_sin &&
+            prevalidated.swa_cos == step.swa_cos && prevalidated.swa_sin == step.swa_sin &&
+            prevalidated.full_pages == step.full_pages && prevalidated.full_usage == step.full_usage &&
+            prevalidated.full_groups == step.full_groups && prevalidated.window_pages == step.window_pages &&
+            prevalidated.window_groups == step.window_groups);
     require(step.position == static_cast<int32_t>(4096 + i));
     const bool next_page = i >= 128;
     const int32_t expected_slot = next_page
@@ -59,6 +70,15 @@ int main() {
   }
   require(rejected);
   pages[32] = 66;
+  pages[33] = pages[32];
+  rejected = false;
+  try {
+    validate_step_metadata(4096 + kRows - 1, 4096, kRows, full.data(), swa.data(), pages, 205184);
+  } catch (const std::invalid_argument&) {
+    rejected = true;
+  }
+  require(rejected);
+  pages[33] = 67;
   rejected = false;
   try {
     fill_step_metadata(step, 4240, 4096, kRows, full.data(), swa.data(), pages, 205184);

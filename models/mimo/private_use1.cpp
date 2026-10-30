@@ -373,9 +373,9 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     std::memcpy(full_rope_.data(), full_rope.data_ptr(), full_rope.nbytes());
     std::memcpy(swa_rope_.data(), swa_rope.data_ptr(), swa_rope.nbytes());
     std::memcpy(model_pages_.data(), pages.data_ptr(), pages.nbytes());
-    StepMetadata initial{};
-    fill_step_metadata(initial, 4096, 4096, rope_rows_, full_rope_.data(),
-                       swa_rope_.data(), model_pages_, cache_slots_);
+    validate_step_metadata(4096 + rope_rows_ - 1, 4096, rope_rows_,
+                           full_rope_.data(), swa_rope_.data(), model_pages_,
+                           cache_slots_);
     check_syn(synHostMalloc(runtime_.device_id(), sizeof(StepMetadata), 0, &metadata_host_),
               "metadata pinned allocation");
     if (reinterpret_cast<uintptr_t>(metadata_host_) % alignof(StepMetadata) != 0)
@@ -436,9 +436,11 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     if (!model_finalized_ || model_pending_ || trigger.scalar_type() != at::kInt ||
         trigger.numel() != 1 || address_of(trigger) != trigger_device_)
       throw std::invalid_argument("PrivateUse1: invalid model step or unfinished previous step");
+    if (model_position_ - 4096 >= rope_rows_)
+      throw std::invalid_argument("PrivateUse1: model position exceeds registered RoPE rows");
     auto& metadata = *static_cast<StepMetadata*>(metadata_host_);
-    fill_step_metadata(metadata, model_position_, 4096, rope_rows_, full_rope_.data(),
-                       swa_rope_.data(), model_pages_, cache_slots_);
+    fill_step_metadata_prevalidated(metadata, model_position_, 4096, full_rope_.data(),
+                                    swa_rope_.data(), model_pages_);
     model_pending_ = true;
     check_syn(synMemCopyAsync(runtime_.h2d_stream(), reinterpret_cast<uint64_t>(metadata_host_),
                               sizeof(StepMetadata), metadata_device_, HOST_TO_DRAM),

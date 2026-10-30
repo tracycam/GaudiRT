@@ -29,13 +29,12 @@ struct alignas(256) StepMetadata {
 static_assert(std::is_trivially_copyable_v<StepMetadata>);
 static_assert(sizeof(StepMetadata) <= 4096);
 
-// RoPE rows contain 32 cosine and 32 sine BF16 values. Inputs and physical
-// page mapping are fixed at initialization; only the decode position changes.
-inline void fill_step_metadata(StepMetadata& result, uint32_t position,
-                               uint32_t first_position, uint32_t rope_rows,
-                               const uint16_t* full_rope, const uint16_t* swa_rope,
-                               const std::array<int32_t, 64>& pages,
-                               uint32_t cache_slots) {
+// Validate the complete page range once when the fixed mapping is registered.
+inline void validate_step_metadata(uint32_t position, uint32_t first_position,
+                                   uint32_t rope_rows, const uint16_t* full_rope,
+                                   const uint16_t* swa_rope,
+                                   const std::array<int32_t, 64>& pages,
+                                   uint32_t cache_slots) {
   if (!full_rope || !swa_rope || rope_rows == 0 || position < first_position ||
       position - first_position >= rope_rows || position >= 64 * 128 ||
       cache_slots == 0 || cache_slots > INT32_MAX || cache_slots % 128 != 0) {
@@ -49,6 +48,16 @@ inline void fill_step_metadata(StepMetadata& result, uint32_t position,
       throw std::invalid_argument("MiMo step: invalid or duplicate active physical page");
     }
   }
+}
+
+// RoPE rows contain 32 cosine and 32 sine BF16 values. The caller has already
+// validated the fixed tables and the page mapping through the last position.
+inline void fill_step_metadata_prevalidated(StepMetadata& result, uint32_t position,
+                                            uint32_t first_position,
+                                            const uint16_t* full_rope,
+                                            const uint16_t* swa_rope,
+                                            const std::array<int32_t, 64>& pages) {
+  const uint32_t current_page = position / 128;
   const size_t row = static_cast<size_t>(position - first_position) * 64;
   for (size_t i = 0; i < 64; ++i) {
     result.full_cos[i] = full_rope[row + i % 32];
@@ -70,6 +79,17 @@ inline void fill_step_metadata(StepMetadata& result, uint32_t position,
   const bool second = window_first < current_page;
   result.window_pages[1] = second ? pages[window_first + 1] : -1;
   result.window_groups[1] = second ? 0 : -1;
+}
+
+inline void fill_step_metadata(StepMetadata& result, uint32_t position,
+                               uint32_t first_position, uint32_t rope_rows,
+                               const uint16_t* full_rope, const uint16_t* swa_rope,
+                               const std::array<int32_t, 64>& pages,
+                               uint32_t cache_slots) {
+  validate_step_metadata(position, first_position, rope_rows, full_rope, swa_rope,
+                         pages, cache_slots);
+  fill_step_metadata_prevalidated(result, position, first_position, full_rope,
+                                   swa_rope, pages);
 }
 
 }  // namespace gaudirt::mimo
