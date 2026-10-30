@@ -189,3 +189,20 @@ On a separate frozen real Full Attention layer, output and KV were bitwise
 unchanged on all eight ranks. The local receipt SHA256 is
 `286c537925034796eeeb6ce159e58f7fa5264f0a5408af6fc97c8a05f9416fd4`.
 Neither check establishes an end-to-end quality or performance improvement.
+
+One unprofiled full-model run with the corrected Full Attention softmax
+measured `11.250428 ms` p50 and `11.244075 ms` mean. All eight ranks agreed
+on 144 generated tokens, and all untouched KV bytes were unchanged at the
+end. First-step logits were bitwise identical to the previous candidate.
+Against the full-model FP32 reference, `max_kl=0.0007722` and
+`relative_l2=max_row_relative_l2=0.0205696`; against the full-model FP64
+reference, these values were `0.0037558` and `0.0236053`, respectively.
+Both remain above the unchanged `0.02` relative-error gate. The candidate
+tokens first differed from the previous candidate at the seventh warm step;
+the earlier per-step KV audit therefore does not establish this candidate's
+per-step KV behavior. The one-run result is not an ABBA acceptance.
+
+The full-run receipt SHA256 is
+`6a7137e44dc299aafa16235921d32e471add0c19a1e5340d98a38939a49a5e2b`;
+the two-reference comparison receipt SHA256 is
+`dfc4b17144dc376aaa270c36a692f8d732f43486d27dddb6c67a7037947fbd84`.
