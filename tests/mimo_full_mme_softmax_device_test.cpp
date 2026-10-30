@@ -31,14 +31,14 @@ int main() {
   HbmArena arena(runtime.device_id(), 64ULL * 1024 * 1024);
   synGraphHandle graph = nullptr;
   synRecipeHandle recipe = nullptr;
-  std::array<synSectionHandle, 6> sections{};
-  std::array<synTensor, 6> tensors{};
-  std::array<synLaunchTensorInfo, 6> bindings{};
-  const char* names[] = {"scores", "pages", "usage", "groups", "high", "low"};
+  std::array<synSectionHandle, 7> sections{};
+  std::array<synTensor, 7> tensors{};
+  std::array<synLaunchTensorInfo, 7> bindings{};
+  const char* names[] = {"scores", "pages", "usage", "groups", "high", "low", "tail"};
   const synDataType types[] = {syn_type_float, syn_type_int32, syn_type_int32,
-                               syn_type_int32, syn_type_bf16, syn_type_bf16};
-  const uint64_t widths[] = {128, 1, 1, 1, 128, 128};
-  const uint64_t rows[] = {16, 1, 1, 1, 16, 16};
+                               syn_type_int32, syn_type_bf16, syn_type_bf16, syn_type_bf16};
+  const uint64_t widths[] = {128, 1, 1, 1, 128, 128, 128};
+  const uint64_t rows[] = {16, 1, 1, 1, 16, 16, 16};
   check(synGraphCreate(&graph, synDeviceGaudi2));
   for (size_t i = 0; i < tensors.size(); ++i) {
     check(synSectionCreate(&sections[i], 0, graph));
@@ -54,8 +54,8 @@ int main() {
     if (desc.m_dims == 2) bindings[i].tensorSize[1] = rows[i];
   }
   struct Params { float scale; int32_t physical_pages; } params{1.0f, 1};
-  check(synNodeCreate(graph, tensors.data(), tensors.data() + 4, 4, 2, &params,
-                      sizeof(params), "gk_full_mme_softmax_v2", "test_softmax", nullptr, nullptr));
+  check(synNodeCreate(graph, tensors.data(), tensors.data() + 4, 4, 3, &params,
+                      sizeof(params), "gk_full_mme_softmax_v3", "test_softmax", nullptr, nullptr));
   check(synGraphCompile(&recipe, graph, "full_mme_softmax_test", nullptr));
   uint64_t workspace = 0;
   check(synWorkspaceGetSize(&workspace, recipe));
@@ -72,10 +72,10 @@ int main() {
     scores[head * 128 + 1] = -value;
   }
   const std::array<int32_t, 1> pages{0}, usage{2}, groups{0};
-  std::array<uint16_t, 128 * 16> high{}, low{};
+  std::array<uint16_t, 128 * 16> high{}, low{}, tail{};
   const void* input[] = {scores.data(), pages.data(), usage.data(), groups.data()};
   const size_t bytes[] = {sizeof(scores), sizeof(pages), sizeof(usage), sizeof(groups),
-                          sizeof(high), sizeof(low)};
+                          sizeof(high), sizeof(low), sizeof(tail)};
   for (size_t i = 0; i < tensors.size(); ++i) {
     bindings[i].pTensorAddress = arena.allocate(bytes[i]);
     if (i < 4)
@@ -86,18 +86,19 @@ int main() {
   launch.validate(); launch.execute(runtime.compute_stream()); runtime.synchronize_compute();
   arena.copy_d2h_sync(runtime.d2h_stream(), bindings[4].pTensorAddress, high.data(), sizeof(high));
   arena.copy_d2h_sync(runtime.d2h_stream(), bindings[5].pTensorAddress, low.data(), sizeof(low));
+  arena.copy_d2h_sync(runtime.d2h_stream(), bindings[6].pTensorAddress, tail.data(), sizeof(tail));
   double max_error = 0;
   for (int head = 0; head < 16; ++head) {
     const double p1 = 1.0 / (1.0 + std::exp(-static_cast<double>(scores[head * 128 + 1])));
     const double expected[] = {1.0 - p1, p1};
     for (int token = 0; token < 128; ++token) {
       const int index = head * 128 + token;
-      const double actual = widen(high[index]) + widen(low[index]);
+      const double actual = static_cast<double>(widen(high[index])) + widen(low[index]) + widen(tail[index]);
       const double target = token < 2 ? expected[token] : 0.0;
       max_error = std::max(max_error, std::abs(actual - target));
     }
   }
   std::printf("Full MME softmax max_abs=%.9g\n", max_error);
   check(synRecipeDestroy(recipe));
-  if (!(max_error <= 5e-5)) throw std::runtime_error("softmax exceeds mathematical tolerance");
+  if (!(max_error <= 5e-7)) throw std::runtime_error("softmax exceeds mathematical tolerance");
 }

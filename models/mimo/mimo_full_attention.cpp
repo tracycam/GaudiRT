@@ -348,15 +348,22 @@ struct MimoFullAttention::Impl {
                                             syn_type_bf16, {tokens, 16});
     synTensor corrections = intermediate(prepare_graph, "full_attention_probabilities_correction",
                                         syn_type_bf16, {tokens, 16});
+    synTensor tails = intermediate(prepare_graph, "full_attention_probabilities_tail",
+                                   syn_type_bf16, {tokens, 16});
     const FullMmaSoftmaxParams softmax_params{kAttentionScale,
                                                static_cast<int32_t>(cache_slots / 128)};
-    node(prepare_graph, {scores, block_list, block_usage, block_groups}, {probabilities, corrections},
-         &softmax_params, sizeof(softmax_params), "gk_full_mme_softmax_v2",
+    node(prepare_graph, {scores, block_list, block_usage, block_groups},
+         {probabilities, corrections, tails}, &softmax_params, sizeof(softmax_params),
+         "gk_full_mme_softmax_v3",
          "full_masked_softmax");
     synTensor context_main = intermediate(prepare_graph, "full_context_main",
                                           syn_type_float, {128, 16});
     synTensor context_correction = intermediate(prepare_graph, "full_context_correction",
                                                 syn_type_float, {128, 16});
+    synTensor context_tail = intermediate(prepare_graph, "full_context_tail",
+                                          syn_type_float, {128, 16});
+    synTensor context_corrections = intermediate(prepare_graph, "full_context_corrections",
+                                                 syn_type_float, {128, 16});
     synTensor context_float = intermediate(prepare_graph, "full_context_float",
                                            syn_type_float, {128, 16});
     synTensor context_matrix = intermediate(prepare_graph, "full_context_matrix",
@@ -366,7 +373,11 @@ struct MimoFullAttention::Impl {
          sizeof(context_params), "gemm", "full_pv_mme");
     node(prepare_graph, {corrections, gathered_value}, {context_correction}, &context_params,
          sizeof(context_params), "gemm", "full_pv_correction_mme");
-    node(prepare_graph, {context_main, context_correction}, {context_float}, nullptr, 0,
+    node(prepare_graph, {tails, gathered_value}, {context_tail}, &context_params,
+         sizeof(context_params), "gemm", "full_pv_tail_mme");
+    node(prepare_graph, {context_correction, context_tail}, {context_corrections}, nullptr, 0,
+         "add_fwd_f32", "full_pv_corrections_combine");
+    node(prepare_graph, {context_main, context_corrections}, {context_float}, nullptr, 0,
          "add_fwd_f32", "full_pv_combine");
     ns_CastKernel::ParamsV3 context_cast{};
     context_cast.round_mode = CAST_ROUND_HALF_NE;
