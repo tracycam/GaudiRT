@@ -331,3 +331,14 @@ output hashes matched the uninstrumented standalone graph on all ranks and
 layers. The receipt SHA256 is
 `36e8472ddf295499288e01c2ce124ae3737ac50c828c4b925e2fdf71989ed6a5`.
 This does not establish full-model cache equivalence or final ABBA performance.
+
+For the fused 70-layer model, a fresh fingerprinted cache saved ten recipes
+per rank. A new warm process loaded ten and saved none on every rank; recipe
+contents and modification times were unchanged. Cold and warm first logits,
+128 greedy tokens and the full final KV states matched bitwise, and the first
+logits and tokens also matched the previously audited run. This check compared
+every untouched KV byte to the common fixture and directly compared the
+written bytes; `max_abs=0.0`. The full-model cold and warm runs did not expose
+their internal router IDs; the separate frozen-input route check above covers
+router IDs on standalone layers. The cache receipt SHA256 is
+`a9790363dd1e1668e28f3c4cc775eab4d80eaaedf2f7793117ec1f1f7dd07d00`.
