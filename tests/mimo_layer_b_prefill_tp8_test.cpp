@@ -57,6 +57,9 @@ int main(int argc,char** argv) {
     if(residual_row.size()!=6144*2) throw std::runtime_error("invalid residual fixture");
     std::vector<uint8_t> residual(residual_row.size()*kRows);
     for(unsigned r=0;r<kRows;++r) std::copy(residual_row.begin(),residual_row.end(),residual.begin()+r*residual_row.size());
+    const auto* prompt_rows=std::getenv("GAUDIRT_PROMPT_ROWS");
+    if(prompt_rows) { if(!empty) throw std::invalid_argument("prompt rows require empty KV"); hidden=read(std::filesystem::path(prompt_rows)/"embedding.bf16"); residual=hidden; }
+    if(hidden.size()!=kRows*6144*2) throw std::runtime_error("invalid prompt rows");
     std::vector<float> gathered_hidden(8*kRows*6144);
     for(unsigned rank=0;rank<8;++rank) for(unsigned row=0;row<kRows;++row) for(unsigned c=0;c<6144;++c) {
       uint16_t value; std::memcpy(&value,hidden.data()+(row*6144+c)*2,2); uint32_t bits=uint32_t(value)<<16;
@@ -67,13 +70,13 @@ int main(int argc,char** argv) {
       for(unsigned rank=0;rank<8;++rank) std::copy_n(gathered_hidden.data()+(rank*kRows+row)*6144,6144,data.data()+rank*6144);
       gathered_single[row]=upload(data.data(),data.size()*4);
     }
-    const auto rope=read(fixture/"layer0/rope.bin"); if(rope.size()<kRows*64*2) throw std::runtime_error("invalid rope fixture");
+    const auto rope=read(prompt_rows ? std::filesystem::path(prompt_rows)/"full-rope.bf16" : fixture/"layer0/rope.bin"); if(rope.size()<kRows*64*2) throw std::runtime_error("invalid rope fixture");
     std::vector<uint16_t> cos(kRows*64),sin(kRows*64);
     for(unsigned r=0;r<kRows;++r) for(unsigned i=0;i<64;++i) {
       std::memcpy(&cos[r*64+i],rope.data()+(r*64+i%32)*2,2);
       std::memcpy(&sin[r*64+i],rope.data()+(r*64+32+i%32)*2,2);
     }
-    if(empty) { std::fill(cos.begin(),cos.end(),0x3f80); std::fill(sin.begin(),sin.end(),0); }
+    if(empty && !prompt_rows) { std::fill(cos.begin(),cos.end(),0x3f80); std::fill(sin.begin(),sin.end(),0); }
     const auto slot_bytes=read(layer/"slot_mapping.bin"),page_bytes=read(layer/"block_list.bin"),
                usage_bytes=read(layer/"block_usage.bin"),group_bytes=read(layer/"block_groups.bin");
     if(slot_bytes.size()!=4 || page_bytes.size()!=kPages*4 || usage_bytes.size()!=kPages*4 || group_bytes.size()!=kPages*4)

@@ -77,18 +77,20 @@ int main(int argc, char** argv) {
       return data;
     };
     const auto* teacher = std::getenv("GAUDIRT_TEACHER_ROOT");
-    const auto hidden = repeat(read(teacher ? std::filesystem::path(teacher) / "layer01/output.bf16" : fixture / "layer1/layer_output.bin"));
-    const auto residual = repeat(read(teacher ? std::filesystem::path(teacher) / "layer01/residual.bf16" : fixture / "layer1/residual_out.bin"));
+    auto hidden = repeat(read(teacher ? std::filesystem::path(teacher) / "layer01/output.bf16" : fixture / "layer1/layer_output.bin"));
+    auto residual = repeat(read(teacher ? std::filesystem::path(teacher) / "layer01/residual.bf16" : fixture / "layer1/residual_out.bin"));
+    const auto* prompt_rows = std::getenv("GAUDIRT_PROMPT_ROWS");
+    if(prompt_rows) { if(!empty) throw std::invalid_argument("prompt rows require empty KV"); hidden=read(std::filesystem::path(prompt_rows)/"embedding.bf16"); residual=hidden; }
     if (hidden.size() != 6144*2*kRows || residual.size() != hidden.size())
       throw std::runtime_error("invalid hidden or residual fixture");
-    const auto rope = read(fixture / "layer1/rope.bin");
+    const auto rope = read(prompt_rows ? std::filesystem::path(prompt_rows)/"swa-rope.bf16" : fixture / "layer1/rope.bin");
     if (rope.size() < kRows*64*2) throw std::runtime_error("invalid rope fixture");
     std::vector<uint16_t> cos(kRows*64), sin(kRows*64);
     for (unsigned r=0; r<kRows; ++r) for (unsigned i=0; i<64; ++i) {
       std::memcpy(&cos[r*64+i], rope.data()+(r*64+i%32)*2,2);
       std::memcpy(&sin[r*64+i], rope.data()+(r*64+32+i%32)*2,2);
     }
-    if(empty) { std::fill(cos.begin(),cos.end(),0x3f80); std::fill(sin.begin(),sin.end(),0); }
+    if(empty && !prompt_rows) { std::fill(cos.begin(),cos.end(),0x3f80); std::fill(sin.begin(),sin.end(),0); }
     const auto slot_bytes = read(layer / "slot_mapping.bin");
     const auto page_bytes = read(layer / "window_pages.bin");
     if (slot_bytes.size()!=4 || page_bytes.size()!=8) throw std::runtime_error("invalid page fixture");
