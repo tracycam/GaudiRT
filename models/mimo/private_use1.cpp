@@ -538,6 +538,17 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
             wrap(model_values_[layer], {cache_slots_, 128}, at::kBFloat16)};
   }
 
+  std::vector<at::Tensor> model_kv_slots(uint32_t layer, uint32_t first,
+                                         uint32_t count) {
+    if (!model_finalized_ || model_pending_ || model_position_ == 4096 ||
+        layer >= 70 || count == 0 || first >= cache_slots_ || count > cache_slots_ - first)
+      throw std::invalid_argument("PrivateUse1: invalid model KV slot range");
+    return {wrap(model_keys_[layer] + static_cast<uint64_t>(first) * 192 * sizeof(uint16_t),
+                 {count, 192}, at::kBFloat16),
+            wrap(model_values_[layer] + static_cast<uint64_t>(first) * 128 * sizeof(uint16_t),
+                 {count, 128}, at::kBFloat16)};
+  }
+
   std::vector<at::Tensor> forward(uint32_t layer_id,
                                   const std::vector<at::Tensor>& inputs) {
     if (fused_model_)
@@ -1043,6 +1054,11 @@ std::vector<at::Tensor> model_kv(uint32_t rank, uint32_t layer) {
   return get(rank)->model_kv(layer);
 }
 
+std::vector<at::Tensor> model_kv_slots(uint32_t rank, uint32_t layer,
+                                       uint32_t first, uint32_t count) {
+  return get(rank)->model_kv_slots(layer, first, count);
+}
+
 void register_layer(uint32_t rank, uint32_t layer_id, int64_t kind,
                     const std::string& attention_weights,
                     const std::string& dense_weights,
@@ -1138,6 +1154,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("finish_model_step", &gaudirt::mimo::finish_model_step);
   m.def("model_logits", &gaudirt::mimo::model_logits);
   m.def("model_kv", &gaudirt::mimo::model_kv);
+  m.def("model_kv_slots", &gaudirt::mimo::model_kv_slots);
   m.def("recipe_identity", &gaudirt::mimo::recipe_identity);
   m.def("recipe_cache_stats", &gaudirt::mimo::recipe_cache_stats);
   m.def("shutdown", &gaudirt::mimo::shutdown);
