@@ -285,3 +285,23 @@ corresponding uninstrumented layers. Their output relative L2 values were
 `0.0018340` and `0.0023714`; expert flips therefore do not explain these
 two deviations. The route-check receipt SHA256 is
 `bf2773a3a0ebcd8edf1b2e8e0bd73fe2055d24ebff3645b33ecf6c3d2d278152`.
+
+For layer 55, FP64 MoE evaluated on the device's actual normalized input
+matched the device numerically; its preceding Full Attention output had
+`0.0007076` relative L2 error. A QKV value differed from direct FP64 BF16
+rounding; an ideal FP32 intermediate lands on the BF16 midpoint and
+reproduces the device value. The receipts are
+`d4c4bc38e63f391cb276557e143ac6af5bf1be8348190687e27003966f4acaca`,
+`4d4302899a8aa6a2b1426b5f8b90133c5780c8f3a5f3834312759bef72e3aef0`, and
+`a494d88b488e88b565ae140d8af50601a7fe7c6f7c1b5210006a68b10749d4c7`.
+
+A separate compensated QKV prototype reduced that layer's relative error
+to `0.001368` but still missed `0.001`; a one-card mechanism timing measured
+`18.867 us` versus `7.794 us` for the existing kernel. Neither is an
+end-to-end result. The prototype was discarded. The three-part softmax was
+also reverted because both full-model reference errors worsened. The active
+code returns to the earlier unqualified candidate, whose FP32 and FP64
+relative errors were `0.0205696` and `0.0236053`, respectively. The QKV
+layer receipt is `5b5802ea844dd0e571c30d186f9e89471ca9991ca19d228fcad70a158f2dcf77`;
+the one-card mechanism receipt is
+`71f0ba11114e98ebfcb35d281b85ea4ba2469b26afb4c1d042c2b67b2094b3c3`.
