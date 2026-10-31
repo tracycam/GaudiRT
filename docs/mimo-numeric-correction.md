@@ -279,3 +279,9 @@ candidate found 31 outputs above `0.001` relative L2. The largest was layer
 `0.04422`. The check did not record device expert IDs, so it cannot determine
 whether routing caused any particular difference. Its receipt SHA256 is
 `873b9bb777742c382e3cfd0693d79ddfd1bed9348edd97841fb7721fbf4bdaa4`.
+In separate checks on layers 31 and 55, all eight ranks selected the same
+experts as the FP64 reference, while diagnostic output hashes matched the
+corresponding uninstrumented layers. Their output relative L2 values were
+`0.0018340` and `0.0023714`; expert flips therefore do not explain these
+two deviations. The route-check receipt SHA256 is
+`bf2773a3a0ebcd8edf1b2e8e0bd73fe2055d24ebff3645b33ecf6c3d2d278152`.
