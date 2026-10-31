@@ -350,3 +350,20 @@ written bytes; `max_abs=0.0`. The full-model cold and warm runs did not expose
 their internal router IDs; the separate frozen-input route check above covers
 router IDs on standalone layers. The cache receipt SHA256 is
 `a9790363dd1e1668e28f3c4cc775eab4d80eaaedf2f7793117ec1f1f7dd07d00`.
+
+An unprofiled A1-B1-B2-A2 run produced p50 values of `11.3253`, `11.1807`,
+`11.4139`, and `11.3795 ms`; the corresponding means were `11.3698`,
+`11.2263`, `11.3904`, and `11.4100 ms`. Each arm recorded 128 decode steps.
+The B2 rank-0 process aborted after writing its samples, and its runner
+returned 1. B1 returned 0 but its rank-0 log contained the same native
+termination message; the source of either message has not been established.
+This is a failed final acceptance, including because B2 exceeded `11.284 ms`.
+Production p50 drifted by `0.48%` and candidate p50 by `2.09%` between arms.
+
+Both production arms generated identical token sequences, and both candidate
+arms matched each other and the audited candidate. Production and candidate
+differed at 130 of 144 aligned steps, first at zero-based step 6. Candidate
+timing included the production client output processor; production timed the
+complete engine step. Their engine scheduling and IPC implementations differ.
+The receipt SHA256 is
+`175f6c06c7bbd7f1bb404c431fbe6ed346579480be139f861c45ed48517b4b03`.
