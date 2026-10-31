@@ -12,6 +12,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -75,8 +76,9 @@ int main(int argc, char** argv) {
       for (unsigned i=0; i<kRows; ++i) std::copy(row.begin(),row.end(),data.begin()+i*row.size());
       return data;
     };
-    const auto hidden = repeat(read(fixture / "layer1/layer_output.bin"));
-    const auto residual = repeat(read(fixture / "layer1/residual_out.bin"));
+    const auto* teacher = std::getenv("GAUDIRT_TEACHER_ROOT");
+    const auto hidden = repeat(read(teacher ? std::filesystem::path(teacher) / "layer01/output.bf16" : fixture / "layer1/layer_output.bin"));
+    const auto residual = repeat(read(teacher ? std::filesystem::path(teacher) / "layer01/residual.bf16" : fixture / "layer1/residual_out.bin"));
     if (hidden.size() != 6144*2*kRows || residual.size() != hidden.size())
       throw std::runtime_error("invalid hidden or residual fixture");
     const auto rope = read(fixture / "layer1/rope.bin");
@@ -185,6 +187,16 @@ int main(int argc, char** argv) {
     std::cout << "M32 TP8 real-weight SWA layer vs sequential M1: max_abs=" << max_abs
               << " max_row_relative_l2=" << max_row_relative_l2 << " KV=bitwise empty=" << empty << "\n";
     if (max_row_relative_l2>0.003) throw std::runtime_error("attention row exceeds quick-screen tolerance");
+    if(const char* output_dir=std::getenv("GAUDIRT_TEST_OUTPUT_DIR")) {
+      const auto prefix=std::filesystem::path(output_dir)/(std::string("rank")+module+"-C");
+      std::ofstream partial(prefix.string()+"-partial.f32",std::ios::binary);
+      for(unsigned rank=0;rank<8;++rank) partial.write(reinterpret_cast<const char*>(actual.data()+rank*kRows*6144),6144*4);
+      std::vector<uint16_t> residual_row(6144);
+      arena.copy_d2h_sync(runtime.d2h_stream(),batch_io.moe_outputs.residual_out_bf16,residual_row.data(),residual_row.size()*2);
+      std::ofstream residual_file(prefix.string()+"-residual.bf16",std::ios::binary);
+      residual_file.write(reinterpret_cast<const char*>(residual_row.data()),residual_row.size()*2);
+      if(!partial || !residual_file) throw std::runtime_error("cannot write layer comparison output");
+    }
     float marker=1.0f; const auto barrier=upload(&marker,sizeof(marker));
     if(hcclAllReduce(reinterpret_cast<const void*>(barrier),reinterpret_cast<void*>(barrier),1,hcclFloat32,hcclSum,runtime.comm(),runtime.compute_stream())!=hcclSuccess) throw std::runtime_error("barrier failed");
     runtime.synchronize_compute();
