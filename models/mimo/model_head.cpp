@@ -103,9 +103,10 @@ ModelHead::ModelHead(runtime::HbmArena& arena, uint64_t final_norm_gamma,
                                 {vocab_size, 1}, 0);
     synTensor normalized = external(kNormalized, "model_final_normalized",
                                     syn_type_bf16, {6144, 1}, 0);
-    synTensor residual_out = temporary(vocab_size == kVocabSize ? "model_final_residual_out" :
-                                        "model_final_residual_out_shard", syn_type_bf16,
-                                       {6144, 1});
+    const char* residual_name = vocab_size == kVocabSize
+        ? (gathered_input_ ? "model_final_residual_out_full_gathered" : "model_final_residual_out_full_direct")
+        : (gathered_input_ ? "model_final_residual_out_shard_gathered" : "model_final_residual_out_shard_direct");
+    synTensor residual_out = temporary(residual_name, syn_type_bf16, {6144, 1});
     const float epsilon = 1e-5F;
     synTensor norm_inputs[] = {hidden, residual, gamma};
     synTensor norm_outputs[] = {residual_out, normalized};
