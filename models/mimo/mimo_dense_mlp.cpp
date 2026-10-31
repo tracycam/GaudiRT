@@ -80,6 +80,7 @@ struct MimoDenseMlp::Impl {
   HbmArena& arena;
   const WeightManifest* weights;
   bool gathered_attention;
+  uint32_t rows;
   synGraphHandle gate_up_graph = nullptr;
   synGraphHandle down_graph = nullptr;
   synSectionHandle reduction_section = nullptr;
@@ -95,8 +96,8 @@ struct MimoDenseMlp::Impl {
   std::vector<synLaunchTensorInfo> gate_up_launch;
   std::vector<synLaunchTensorInfo> down_launch;
 
-  Impl(HbmArena& arena, const WeightManifest& weights, bool gathered_attention)
-      : arena(arena), weights(&weights), gathered_attention(gathered_attention) {}
+  Impl(HbmArena& arena, const WeightManifest& weights, bool gathered_attention, uint32_t rows)
+      : arena(arena), weights(&weights), gathered_attention(gathered_attention), rows(rows) {}
 
   ~Impl() {
     if (gate_up_recipe) synRecipeDestroy(gate_up_recipe);
@@ -169,7 +170,8 @@ struct MimoDenseMlp::Impl {
   synTensor intermediate(synGraphHandle, const char* name, synDataType dtype,
                          std::initializer_list<uint64_t> sizes) {
     synTensorDescriptor descriptor = {};
-    descriptor.m_name = name;
+    const std::string tensor_name = rows == 1 ? name : "dense_m32_" + std::string(name);
+    descriptor.m_name = tensor_name.c_str();
     descriptor.m_dataType = dtype;
     descriptor.m_dims = sizes.size();
     unsigned dim = 0;
@@ -193,6 +195,8 @@ struct MimoDenseMlp::Impl {
   }
 
   void build() {
+    if (rows != 1 && rows != 32)
+      throw std::invalid_argument("MimoDenseMlp: rows must be 1 or 32");
     const auto& gate_up_weight =
         expect_dynamic_weight(*weights, "gate_up_weight", syn_type_fp8_143, 3);
     gate_up_n = gate_up_weight.shape[1];
@@ -225,27 +229,28 @@ struct MimoDenseMlp::Impl {
     synTensor attention = nullptr;
     if (gathered_attention) {
       synTensor gathered = external(gate_up_graph, gate_up_externals, "attention_gathered",
-                                     Binding::kAttention, syn_type_float, {6144, 8});
+                                     Binding::kAttention, syn_type_float, {6144, 8 * rows});
       attention = gaudirt::mimo::append_tp8_reduce(gate_up_graph, gathered, syn_type_float,
-                                                   reduction_section);
+                                                   reduction_section, rows);
     } else {
       attention = external(gate_up_graph, gate_up_externals, "attention",
-                           Binding::kAttention, syn_type_bf16, {6144, 1});
+                           Binding::kAttention, syn_type_bf16, {6144, rows});
     }
     synTensor residual_in = external(gate_up_graph, gate_up_externals,
                                      "residual_in", Binding::kResidualIn,
-                                     syn_type_bf16, {6144, 1});
+                                     syn_type_bf16, {6144, rows});
     synTensor gamma = external(gate_up_graph, gate_up_externals,
                                "post_attention_gamma", Binding::kGamma,
                                syn_type_bf16, {6144});
     synTensor residual_out = external(gate_up_graph, gate_up_externals,
                                       "residual_out", Binding::kResidualOut,
-                                      syn_type_bf16, {6144, 1});
+                                      syn_type_bf16, {6144, rows});
     synTensor normalized = intermediate(gate_up_graph, "normalized_fp32",
-                                        syn_type_float, {6144, 1});
+                                        syn_type_float, {6144, rows});
     node(gate_up_graph, {attention, residual_in, gamma},
          {residual_out, normalized}, &kRmsNormEpsilon, sizeof(kRmsNormEpsilon),
-         "gk_dense_residual_rmsnorm_fp32_v1", "post_residual_rmsnorm_fp32");
+         rows == 1 ? "gk_dense_residual_rmsnorm_fp32_v1" : "gk_dense_residual_rmsnorm_prefill_fp32_v1",
+         "post_residual_rmsnorm_fp32");
 
     synTensor weight = external(gate_up_graph, gate_up_externals,
                                 "gate_up_weight", Binding::kGateUpWeight,
@@ -257,18 +262,19 @@ struct MimoDenseMlp::Impl {
     synTensor bias = external(gate_up_graph, gate_up_externals, "gate_up_bias",
                               Binding::kGateUpBias, syn_type_float, {gate_up_n});
     synTensor gate_up = intermediate(gate_up_graph, "gate_up_fp32",
-                                     syn_type_float, {gate_up_n, 1});
+                                     syn_type_float, {gate_up_n, rows});
     node(gate_up_graph, {normalized, weight, weight_scale, bias}, {gate_up}, nullptr, 0,
-         "gk_dense_linear_fp32_v1", "gate_up_fp32_linear");
+         rows == 1 ? "gk_dense_linear_fp32_v1" : "gk_dense_linear_prefill_fp32_v1", "gate_up_fp32_linear");
     synTensor activation_wide = external(gate_up_graph, gate_up_externals,
                                          "activation_fp32", Binding::kActivationFp32,
-                                         syn_type_float, {down_k, 1});
+                                         syn_type_float, {down_k, rows});
     node(gate_up_graph, {gate_up}, {activation_wide}, nullptr, 0,
-         "gk_dense_swiglu_fp32_v1", "swiglu_fp32");
+         rows == 1 ? "gk_dense_swiglu_fp32_v1" : "gk_dense_swiglu_prefill_fp32_v1", "swiglu_fp32");
     gate_up_recipe = compile_cached(
-        gate_up_graph, "mimo_dense_gate_up_b1_m1_tp8",
+        gate_up_graph, rows == 1 ? "mimo_dense_gate_up_b1_m1_tp8" : "mimo_dense_gate_up_b1_m32_tp8",
         "dense_gate_up_n" + std::to_string(gate_up_n) + "_g" +
-            std::to_string(groups) + (gathered_attention ? "_gathered_tp1" : "_direct"), cache);
+            std::to_string(groups) + (gathered_attention ? "_gathered_tp1" : "_direct") +
+            (rows == 1 ? "" : "_m32"), cache);
     check(synWorkspaceGetSize(&gate_up_workspace_size, gate_up_recipe),
           "get gate_up workspace size");
     arena.ensure_workspace(gate_up_workspace_size);
@@ -289,7 +295,7 @@ struct MimoDenseMlp::Impl {
     check(synGraphCreate(&down_graph, synDeviceGaudi2), "create down graph");
     synTensor activation = external(down_graph, down_externals, "activation",
                                     Binding::kActivation, syn_type_float,
-                                    {down_k, 1});
+                                    {down_k, rows});
     synTensor weight = external(down_graph, down_externals, "down_weight",
                                 Binding::kDownWeight, syn_type_fp8_143,
                                 {128, 6144, groups});
@@ -300,12 +306,12 @@ struct MimoDenseMlp::Impl {
                               Binding::kDownBias, syn_type_float, {6144});
     synTensor output_local = external(down_graph, down_externals, "output_local",
                                       Binding::kOutputLocal, syn_type_float,
-                                      {6144, 1});
+                                      {6144, rows});
     node(down_graph, {activation, weight, weight_scale, bias}, {output_local},
-         nullptr, 0, "gk_dense_linear_fp32_v1", "down_fp32_linear");
+         nullptr, 0, rows == 1 ? "gk_dense_linear_fp32_v1" : "gk_dense_linear_prefill_fp32_v1", "down_fp32_linear");
     down_recipe = compile_cached(
-        down_graph, "mimo_dense_down_b1_m1_tp8",
-        "dense_down_k" + std::to_string(down_k) + "_g" + std::to_string(groups),
+        down_graph, rows == 1 ? "mimo_dense_down_b1_m1_tp8" : "mimo_dense_down_b1_m32_tp8",
+        "dense_down_k" + std::to_string(down_k) + "_g" + std::to_string(groups) + (rows == 1 ? "" : "_m32"),
         cache);
     check(synWorkspaceGetSize(&down_workspace_size, down_recipe),
           "get down workspace size");
@@ -401,8 +407,8 @@ struct MimoDenseMlp::Impl {
 };
 
 MimoDenseMlp::MimoDenseMlp(HbmArena& arena, const WeightManifest& weights,
-                           RecipeCache* cache, bool gathered_attention)
-    : impl_(std::make_unique<Impl>(arena, weights, gathered_attention)) {
+                           RecipeCache* cache, bool gathered_attention, uint32_t rows)
+    : impl_(std::make_unique<Impl>(arena, weights, gathered_attention, rows)) {
   impl_->cache = cache;
   impl_->build();
 }

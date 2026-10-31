@@ -31,7 +31,8 @@ class MimoDenseMlp final {
   };
 
   MimoDenseMlp(HbmArena& arena, const WeightManifest& weights,
-               RecipeCache* cache = nullptr, bool gathered_attention = false);
+               RecipeCache* cache = nullptr, bool gathered_attention = false,
+               uint32_t rows = 1);
   ~MimoDenseMlp();
 
   MimoDenseMlp(const MimoDenseMlp&) = delete;
