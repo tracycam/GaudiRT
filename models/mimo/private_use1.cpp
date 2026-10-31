@@ -6,6 +6,7 @@
 #include "model_embedding.hpp"
 #include "model_head.hpp"
 #include "step_metadata.hpp"
+#include "prefill_metadata.hpp"
 
 #include "gaudirt/common/sha256.hpp"
 #include "gaudirt/runtime/weight_manifest.hpp"
@@ -131,6 +132,7 @@ struct LayerEntry {
   std::shared_ptr<runtime::WeightManifest> dense_weights;
   uint64_t residual_output = 0;
   uint64_t layer_output = 0;
+  uint64_t prefill_residual_output = 0;
 };
 
 struct PendingWeights {
@@ -210,6 +212,12 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     if (fused_model_ || !entries_.empty() || !pending_.empty() || model_finalized_)
       throw std::invalid_argument("PrivateUse1: enable model fusion before registering weights");
     fused_model_ = true;
+  }
+
+  void enable_prefill() {
+    if (!fused_model_ || prefill_enabled_ || !entries_.empty() || !pending_.empty())
+      throw std::invalid_argument("PrivateUse1: enable prefill after fusion and before weights");
+    prefill_enabled_ = true;
   }
 
   void register_layer(uint32_t layer_id, int64_t kind_value,
@@ -302,7 +310,8 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       throw std::invalid_argument("PrivateUse1: dense weights are only valid for Type A");
     }
     LayerEntry entry{kind, std::move(attention), std::move(dense),
-                     arena_.allocate(12288), arena_.allocate(12288)};
+                     arena_.allocate(12288), arena_.allocate(12288),
+                     prefill_enabled_ ? arena_.allocate(12288 * 32) : 0};
     auto [entry_it, inserted] = entries_.emplace(layer_id, std::move(entry));
     if (!inserted) {
       throw std::invalid_argument("PrivateUse1: duplicate layer_id");
@@ -311,6 +320,9 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       instances_.emplace(kind, create_instance(kind, cache_slots, page_count,
                                                *entry_it->second.attention_weights,
                                                entry_it->second.dense_weights.get()));
+      if (prefill_enabled_)
+        prefill_instances_.emplace(kind, create_instance(kind, cache_slots, page_count,
+            *entry_it->second.attention_weights, entry_it->second.dense_weights.get(), 32));
     } else {
       const auto& instance = instances_.at(kind);
       if (instance->cache_slots != cache_slots || instance->page_count != page_count) {
@@ -346,7 +358,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   }
 
   void register_model_kv(uint32_t layer, const at::Tensor& key, const at::Tensor& value) {
-    if (model_finalized_ || layer >= 70 || model_keys_[layer] || !entries_.count(layer))
+    if (prefill_enabled_ || model_finalized_ || layer >= 70 || model_keys_[layer] || !entries_.count(layer))
       throw std::invalid_argument("PrivateUse1: invalid or duplicate model KV layer");
     const auto& instance = *instances_.at(entries_.at(layer).kind);
     if (key.scalar_type() != at::kBFloat16 || value.scalar_type() != at::kBFloat16 ||
@@ -378,6 +390,19 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     }
     model_keys_[layer] = key_address;
     model_values_[layer] = value_address;
+  }
+
+  void register_empty_model_kv(uint32_t layer) {
+    if (!prefill_enabled_ || model_finalized_ || layer >= 70 || model_keys_[layer] || !entries_.count(layer))
+      throw std::invalid_argument("PrivateUse1: invalid empty KV registration");
+    const auto slots = instances_.at(entries_.at(layer).kind)->cache_slots;
+    const size_t key_bytes = static_cast<size_t>(slots) * 192 * 2;
+    const size_t value_bytes = static_cast<size_t>(slots) * 128 * 2;
+    std::vector<uint8_t> zeros(key_bytes, 0);
+    model_keys_[layer] = arena_.allocate(key_bytes);
+    model_values_[layer] = arena_.allocate(value_bytes);
+    arena_.copy_h2d_sync(runtime_.h2d_stream(), zeros.data(), model_keys_[layer], key_bytes);
+    arena_.copy_h2d_sync(runtime_.h2d_stream(), zeros.data(), model_values_[layer], value_bytes);
   }
 
   at::Tensor finalize_model(const at::Tensor& full_rope, const at::Tensor& swa_rope,
@@ -443,6 +468,16 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
                                         model_weights_.at("lm_head"), &recipe_cache_, fused_model_,
                                         ModelHead::kLocalVocabSize);
     argmax_ = std::make_unique<ModelArgmax>(arena_, &recipe_cache_);
+    if (prefill_enabled_) {
+      prefill_tokens_device_ = arena_.allocate(4096 * sizeof(int32_t));
+      prefill_metadata_device_ = arena_.allocate(128 * sizeof(PrefillMetadata));
+      prefill_embedding_device_ = arena_.allocate(32 * 6144 * sizeof(uint16_t));
+      prefill_status_device_ = arena_.allocate(32 * sizeof(int32_t));
+      prefill_reduced_device_ = arena_.allocate(32 * 6144 * sizeof(uint16_t));
+      prefill_embedding_ = std::make_unique<ModelEmbedding>(arena_, model_weights_.at("embedding"), &recipe_cache_, 32);
+      prefill_head_ = std::make_unique<ModelHead>(arena_, model_weights_.at("final_norm"), model_weights_.at("lm_head"), &recipe_cache_, false, ModelHead::kLocalVocabSize);
+      prefill_reduce_ = std::make_unique<runtime::TpReduce>(arena_, 32 * 6144, syn_type_float, &recipe_cache_);
+    }
     const uint64_t workspace = arena_.workspace_addr();
     model_embedding_launch_ = embedding_->prepare(token_device_, embedding_device_,
                                                    embedding_status_);
@@ -475,8 +510,78 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     return wrap(trigger_device_, {1}, at::kInt);
   }
 
+  int32_t prefill(const at::Tensor& tokens, const at::Tensor& full_rope,
+                  const at::Tensor& swa_rope) {
+    if (!prefill_enabled_ || !model_finalized_ || model_pending_ || prefill_started_ ||
+        model_position_ != 4096)
+      throw std::invalid_argument("PrivateUse1: prefill is not ready");
+    const auto cpu = [](const at::Tensor& t, at::ScalarType type) {
+      return t.device().type() == c10::kCPU && t.is_contiguous() && t.scalar_type() == type;
+    };
+    if (!cpu(tokens, at::kInt) || tokens.numel() != 4096 ||
+        !cpu(full_rope, at::kBFloat16) || !cpu(swa_rope, at::kBFloat16) ||
+        full_rope.dim() != 2 || full_rope.size(0) != 4096 || full_rope.size(1) != 64 ||
+        full_rope.sizes() != swa_rope.sizes())
+      throw std::invalid_argument("PrivateUse1: invalid prompt or prefill RoPE");
+    const auto* token_data = tokens.data_ptr<int32_t>();
+    for (int i = 0; i < 4096; ++i)
+      if (token_data[i] < 0 || token_data[i] >= 152576)
+        throw std::invalid_argument("PrivateUse1: prompt token out of range");
+    const auto* full = reinterpret_cast<const uint16_t*>(full_rope.data_ptr());
+    const auto* swa = reinterpret_cast<const uint16_t*>(swa_rope.data_ptr());
+    std::vector<PrefillMetadata> metadata(128);
+    for (uint32_t chunk = 0; chunk < 128; ++chunk)
+      fill_prefill_metadata(metadata[chunk], chunk * 32, 4096, full, swa, model_pages_, cache_slots_);
+    prefill_started_ = true;
+    arena_.copy_h2d_sync(runtime_.h2d_stream(), token_data, prefill_tokens_device_, tokens.nbytes());
+    arena_.copy_h2d_sync(runtime_.h2d_stream(), metadata.data(), prefill_metadata_device_,
+                         metadata.size() * sizeof(PrefillMetadata));
+    const auto stream = runtime_.compute_stream();
+    uint64_t last_hidden = 0, last_residual = 0;
+    for (uint32_t chunk = 0; chunk < 128; ++chunk) {
+      prefill_embedding_->prepare(prefill_tokens_device_ + chunk * 32 * sizeof(int32_t),
+                                  prefill_embedding_device_, prefill_status_device_).execute(stream);
+      uint64_t hidden = prefill_embedding_device_, residual = prefill_embedding_device_;
+      const uint64_t base = prefill_metadata_device_ + chunk * sizeof(PrefillMetadata);
+      for (uint32_t layer = 0; layer < 70; ++layer) {
+        const bool full_attention = is_full_layer(layer);
+        std::array<uint64_t, 11> addresses{
+          hidden, residual,
+          base + (full_attention ? offsetof(PrefillMetadata, full_cos) : offsetof(PrefillMetadata, swa_cos)),
+          base + (full_attention ? offsetof(PrefillMetadata, full_sin) : offsetof(PrefillMetadata, swa_sin)),
+          model_keys_[layer], model_values_[layer], base + offsetof(PrefillMetadata, slots),
+          base + (full_attention ? offsetof(PrefillMetadata, full_pages) : offsetof(PrefillMetadata, window_pages)),
+          base + offsetof(PrefillMetadata, full_usage),
+          base + (full_attention ? offsetof(PrefillMetadata, full_groups) : offsetof(PrefillMetadata, window_groups)),
+          base + offsetof(PrefillMetadata, positions)};
+        auto prepared = prepare_layer(layer, addresses, true);
+        prepared.execute_fused(stream);
+        hidden = prepared.feed_forward_gathered;
+        residual = entries_.at(layer).prefill_residual_output;
+      }
+      last_hidden = hidden;
+      last_residual = residual;
+    }
+    prefill_reduce_->prepare(last_hidden, prefill_reduced_device_).execute(stream);
+    prefill_head_->prepare(prefill_reduced_device_ + 31 * 6144 * sizeof(uint16_t),
+                           last_residual + 31 * 6144 * sizeof(uint16_t),
+                           normalized_device_, local_logits_device_).execute(stream);
+    if (hcclAllGather(reinterpret_cast<const void*>(local_logits_device_),
+                      reinterpret_cast<void*>(logits_device_), ModelHead::kLocalVocabSize,
+                      hcclBfloat16, runtime_.comm(), stream) != hcclSuccess)
+      throw std::runtime_error("PrivateUse1: prefill logits AllGather failed");
+    argmax_->prepare(logits_device_, prefill_status_device_, token_device_).execute(stream);
+    runtime_.synchronize_compute();
+    arena_.copy_d2h_sync(runtime_.d2h_stream(), token_device_, token_host_, sizeof(int32_t));
+    const int32_t token = *static_cast<int32_t*>(token_host_);
+    if (token < 0 || token >= 152576) throw std::runtime_error("PrivateUse1: invalid prefill token or logits");
+    prefill_complete_ = true;
+    return token;
+  }
+
   at::Tensor forward_model(const at::Tensor& trigger) {
-    if (!model_finalized_ || model_pending_ || trigger.scalar_type() != at::kInt ||
+    if (!model_finalized_ || model_pending_ || (prefill_enabled_ && !prefill_complete_) ||
+        trigger.scalar_type() != at::kInt ||
         trigger.numel() != 1 || address_of(trigger) != trigger_device_)
       throw std::invalid_argument("PrivateUse1: invalid model step or unfinished previous step");
     if (model_position_ - 4096 >= rope_rows_)
@@ -526,13 +631,13 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   }
 
   at::Tensor model_logits() {
-    if (!model_finalized_ || model_pending_ || model_position_ == 4096)
+    if (!model_finalized_ || model_pending_ || (model_position_ == 4096 && !prefill_complete_))
       throw std::invalid_argument("PrivateUse1: model logits are not ready");
     return wrap(logits_device_, {1, 152576}, at::kBFloat16);
   }
 
   std::vector<at::Tensor> model_kv(uint32_t layer) {
-    if (!model_finalized_ || model_pending_ || model_position_ == 4096 || layer >= 70)
+    if (!model_finalized_ || model_pending_ || (model_position_ == 4096 && !prefill_complete_) || layer >= 70)
       throw std::invalid_argument("PrivateUse1: model KV is not ready");
     return {wrap(model_keys_[layer], {cache_slots_, 192}, at::kBFloat16),
             wrap(model_values_[layer], {cache_slots_, 128}, at::kBFloat16)};
@@ -540,7 +645,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
 
   std::vector<at::Tensor> model_kv_slots(uint32_t layer, uint32_t first,
                                          uint32_t count) {
-    if (!model_finalized_ || model_pending_ || model_position_ == 4096 ||
+    if (!model_finalized_ || model_pending_ || (model_position_ == 4096 && !prefill_complete_) ||
         layer >= 70 || count == 0 || first >= cache_slots_ || count > cache_slots_ - first)
       throw std::invalid_argument("PrivateUse1: invalid model KV slot range");
     return {wrap(model_keys_[layer] + static_cast<uint64_t>(first) * 192 * sizeof(uint16_t),
@@ -562,15 +667,17 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   }
 
   PreparedLayer prepare_layer(uint32_t layer_id,
-                              const std::array<uint64_t, 11>& addresses) {
+                              const std::array<uint64_t, 11>& addresses,
+                              bool prefill = false) {
     auto& entry = entries_.at(layer_id);
-    auto& instance = *instances_.at(entry.kind);
+    auto& instance = *(prefill ? prefill_instances_ : instances_).at(entry.kind);
+    const uint64_t residual_output = prefill ? entry.prefill_residual_output : entry.residual_output;
     if (entry.kind == Kind::A) {
       instance.a->rebind_weights(*entry.attention_weights, *entry.dense_weights);
       auto io = instance.a_io;
       set_common_attention(io.attention, addresses);
       io.attention.residual = addresses[0];
-      io.dense_outputs.residual_out_bf16 = entry.residual_output;
+      io.dense_outputs.residual_out_bf16 = residual_output;
       io.layer_output_bf16 = entry.layer_output;
       return instance.a->prepare(io);
     }
@@ -578,7 +685,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       instance.b->rebind_weights(*entry.attention_weights);
       auto io = instance.b_io;
       set_common_attention(io.attention, addresses);
-      io.moe_outputs.residual_out_bf16 = entry.residual_output;
+      io.moe_outputs.residual_out_bf16 = residual_output;
       io.layer_output_bf16 = entry.layer_output;
       return instance.b->prepare(io);
     }
@@ -587,7 +694,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     set_common_attention(io.attention, addresses);
     io.attention.window_pages = addresses[7];
     io.attention.window_groups = addresses[9];
-    io.moe_outputs.residual_out_bf16 = entry.residual_output;
+    io.moe_outputs.residual_out_bf16 = residual_output;
     io.layer_output_bf16 = entry.layer_output;
     return instance.c->prepare(io);
   }
@@ -693,7 +800,8 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   std::unique_ptr<Instance> create_instance(Kind kind, uint32_t cache_slots,
                                             uint32_t page_count,
                                             runtime::WeightManifest& attention_weights,
-                                            runtime::WeightManifest* dense_weights) {
+                                            runtime::WeightManifest* dense_weights,
+                                            uint32_t rows = 1) {
     auto instance = std::make_unique<Instance>();
     instance->kind = kind;
     instance->cache_slots = cache_slots;
@@ -701,35 +809,35 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     if (kind == Kind::A) {
       instance->a = std::make_unique<Layer0>(arena_, runtime_, attention_weights,
                                              *dense_weights, cache_slots, page_count,
-                                             &recipe_cache_, fused_model_);
+                                             &recipe_cache_, fused_model_, rows);
       auto& io = instance->a_io;
-      io.attention.output_local_fp32 = arena_.allocate(6144 * 4);
-      io.dense_outputs.activation_fp32 = arena_.allocate(2048 * 4);
-      io.dense_outputs.output_local_fp32 = arena_.allocate(6144 * 4);
-      io.attention_output_bf16 = arena_.allocate(12288);
-      io.attention_gathered_fp32 = arena_.allocate(8 * 6144 * 4);
-      io.down_gathered_fp32 = arena_.allocate(8 * 6144 * 4);
+      io.attention.output_local_fp32 = arena_.allocate(rows * 6144 * 4);
+      io.dense_outputs.activation_fp32 = arena_.allocate(rows * 2048 * 4);
+      io.dense_outputs.output_local_fp32 = arena_.allocate(rows * 6144 * 4);
+      io.attention_output_bf16 = arena_.allocate(rows * 12288);
+      io.attention_gathered_fp32 = arena_.allocate(rows * 8 * 6144 * 4);
+      io.down_gathered_fp32 = arena_.allocate(rows * 8 * 6144 * 4);
     } else if (kind == Kind::B) {
       instance->b = std::make_unique<LayerB>(arena_, runtime_, attention_weights,
                                              cache_slots, page_count, &recipe_cache_,
-                                             fused_model_);
+                                             fused_model_, rows);
       auto& io = instance->b_io;
-      io.attention.residual_out = arena_.allocate(12288);
-      io.attention.output_local_fp32 = arena_.allocate(6144 * 4);
-      io.moe_outputs.moe_local_fp32 = arena_.allocate(6144 * 4);
-      io.attention_output_bf16 = arena_.allocate(12288);
-      io.attention_gathered_fp32 = arena_.allocate(8 * 6144 * 4);
-      io.moe_gathered_fp32 = arena_.allocate(8 * 6144 * 4);
+      io.attention.residual_out = arena_.allocate(rows * 12288);
+      io.attention.output_local_fp32 = arena_.allocate(rows * 6144 * 4);
+      io.moe_outputs.moe_local_fp32 = arena_.allocate(rows * 6144 * 4);
+      io.attention_output_bf16 = arena_.allocate(rows * 12288);
+      io.attention_gathered_fp32 = arena_.allocate(rows * 8 * 6144 * 4);
+      io.moe_gathered_fp32 = arena_.allocate(rows * 8 * 6144 * 4);
     } else {
       instance->c = std::make_unique<LayerC>(arena_, runtime_, attention_weights,
-                                             cache_slots, &recipe_cache_, fused_model_);
+                                             cache_slots, &recipe_cache_, fused_model_, rows);
       auto& io = instance->c_io;
-      io.attention.residual_out = arena_.allocate(12288);
-      io.attention.output_local = arena_.allocate(12288);
-      io.moe_outputs.moe_local_fp32 = arena_.allocate(6144 * 4);
-      io.attention_output_bf16 = arena_.allocate(12288);
-      io.attention_gathered_bf16 = arena_.allocate(8 * 6144 * 2);
-      io.moe_gathered_fp32 = arena_.allocate(8 * 6144 * 4);
+      io.attention.residual_out = arena_.allocate(rows * 12288);
+      io.attention.output_local = arena_.allocate(rows * 12288);
+      io.moe_outputs.moe_local_fp32 = arena_.allocate(rows * 6144 * 4);
+      io.attention_output_bf16 = arena_.allocate(rows * 12288);
+      io.attention_gathered_bf16 = arena_.allocate(rows * 8 * 6144 * 2);
+      io.moe_gathered_fp32 = arena_.allocate(rows * 8 * 6144 * 4);
     }
     return instance;
   }
@@ -781,6 +889,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   uint64_t shutdown_buffer_ = 0;
   runtime::RecipeCache recipe_cache_;
   std::unordered_map<Kind, std::unique_ptr<Instance>> instances_;
+  std::unordered_map<Kind, std::unique_ptr<Instance>> prefill_instances_;
   std::unordered_map<uint32_t, LayerEntry> entries_;
   std::unordered_map<uint32_t, PendingWeights> pending_;
   std::unordered_map<std::string, uint64_t> model_weights_;
@@ -799,6 +908,9 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   bool model_finalized_ = false;
   bool model_pending_ = false;
   bool fused_model_ = false;
+  bool prefill_enabled_ = false;
+  bool prefill_complete_ = false;
+  bool prefill_started_ = false;
   void* metadata_host_ = nullptr;
   void* token_host_ = nullptr;
   synEventHandle metadata_ready_ = nullptr;
@@ -812,6 +924,14 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   uint64_t normalized_device_ = 0;
   uint64_t local_logits_device_ = 0;
   uint64_t logits_device_ = 0;
+  uint64_t prefill_tokens_device_ = 0;
+  uint64_t prefill_metadata_device_ = 0;
+  uint64_t prefill_embedding_device_ = 0;
+  uint64_t prefill_status_device_ = 0;
+  uint64_t prefill_reduced_device_ = 0;
+  std::unique_ptr<ModelEmbedding> prefill_embedding_;
+  std::unique_ptr<ModelHead> prefill_head_;
+  std::unique_ptr<runtime::TpReduce> prefill_reduce_;
   std::unique_ptr<ModelEmbedding> embedding_;
   std::unique_ptr<ModelHead> head_;
   std::unique_ptr<ModelArgmax> argmax_;
@@ -1025,6 +1145,7 @@ void upload_weight(uint32_t rank, uint32_t layer_id, bool dense,
 }
 
 void enable_model_fusion(uint32_t rank) { get(rank)->enable_model_fusion(); }
+void enable_prefill(uint32_t rank) { get(rank)->enable_prefill(); }
 
 void register_streamed_layer(uint32_t rank, uint32_t layer_id, int64_t kind,
                              uint32_t cache_slots, uint32_t page_count) {
@@ -1038,6 +1159,13 @@ void upload_model_weight(uint32_t rank, const std::string& name, const at::Tenso
 void register_model_kv(uint32_t rank, uint32_t layer_id,
                        const at::Tensor& key, const at::Tensor& value) {
   get(rank)->register_model_kv(layer_id, key, value);
+}
+void register_empty_model_kv(uint32_t rank, uint32_t layer_id) {
+  get(rank)->register_empty_model_kv(layer_id);
+}
+int32_t prefill(uint32_t rank, const at::Tensor& tokens, const at::Tensor& full_rope,
+                const at::Tensor& swa_rope) {
+  return get(rank)->prefill(tokens, full_rope, swa_rope);
 }
 
 at::Tensor finalize_model(uint32_t rank, const at::Tensor& full_rope,
@@ -1145,11 +1273,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   gaudirt::mimo::initialize_backend();
   m.def("initialize", &gaudirt::mimo::initialize);
   m.def("enable_model_fusion", &gaudirt::mimo::enable_model_fusion);
+  m.def("enable_prefill", &gaudirt::mimo::enable_prefill);
   m.def("register_layer", &gaudirt::mimo::register_layer);
   m.def("upload_weight", &gaudirt::mimo::upload_weight);
   m.def("register_streamed_layer", &gaudirt::mimo::register_streamed_layer);
   m.def("upload_model_weight", &gaudirt::mimo::upload_model_weight);
   m.def("register_model_kv", &gaudirt::mimo::register_model_kv);
+  m.def("register_empty_model_kv", &gaudirt::mimo::register_empty_model_kv);
+  m.def("prefill", &gaudirt::mimo::prefill);
   m.def("finalize_model", &gaudirt::mimo::finalize_model);
   m.def("finish_model_step", &gaudirt::mimo::finish_model_step);
   m.def("model_logits", &gaudirt::mimo::model_logits);
