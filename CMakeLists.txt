@@ -79,6 +79,9 @@ target_link_libraries(mimo_full_prefill_softmax_device_test PRIVATE gaudirt)
 add_executable(mimo_full_mme_softmax_device_test tests/mimo_full_mme_softmax_device_test.cpp)
 target_link_libraries(mimo_full_mme_softmax_device_test PRIVATE gaudirt)
 
+add_executable(mimo_layer_b_prefill_tp8_test tests/mimo_layer_b_prefill_tp8_test.cpp)
+target_link_libraries(mimo_layer_b_prefill_tp8_test PRIVATE mimo_layer_vertical)
+
 add_executable(mimo_layer0_prefill_tp8_test tests/mimo_layer0_prefill_tp8_test.cpp)
 target_link_libraries(mimo_layer0_prefill_tp8_test PRIVATE mimo_layer_vertical)
 

@@ -19,9 +19,9 @@ void check(hcclResult_t status, const char* operation) {
 
 LayerB::LayerB(runtime::HbmArena& arena, runtime::DeviceRuntime& runtime,
                const runtime::WeightManifest& weights, uint32_t cache_slots,
-               uint32_t page_count, runtime::RecipeCache* cache, bool fused_model)
+               uint32_t page_count, runtime::RecipeCache* cache, bool fused_model, uint32_t rows)
     : arena_(arena),
-      attention_(arena, weights, cache_slots, false, page_count, cache, fused_model),
+      attention_(arena, weights, cache_slots, false, page_count, cache, fused_model, rows),
       attention_reduce_(fused_model ? nullptr :
                         std::make_unique<runtime::TpReduce>(arena, 6144, syn_type_float)),
       moe_(runtime.rank(), [&] {
@@ -42,10 +42,12 @@ LayerB::LayerB(runtime::HbmArena& arena, runtime::DeviceRuntime& runtime,
         arena.copy_h2d_sync(runtime.h2d_stream(), directions.data(),
                             moe_weights_.down_combine_directions_u8, directions.size());
         return moe_weights_;
-      }(), "full_attention", cache, fused_model, syn_type_float),
+      }(), "full_attention", cache, fused_model, syn_type_float, rows),
       moe_reduce_(fused_model ? nullptr :
                   std::make_unique<runtime::TpReduce>(arena, 6144, syn_type_float)),
-      comm_(runtime.comm()), fused_model_(fused_model) {
+      comm_(runtime.comm()), fused_model_(fused_model), rows_(rows) {
+  if (rows_ != 1 && (rows_ != 32 || !fused_model_))
+    throw std::invalid_argument("MiMo layer: M32 requires fused execution");
   if (!comm_) throw std::invalid_argument("MiMo Type B: missing HCCL");
   arena.ensure_workspace(std::max(
       {attention_.workspace_bytes(), attention_reduce_ ? attention_reduce_->workspace_bytes() : 0,
@@ -71,6 +73,7 @@ PreparedLayer LayerB::prepare(const Io& io) {
   result.feed_forward_gathered = io.moe_gathered_fp32;
   result.attention_type = hcclFloat32;
   result.comm = comm_;
+  result.rows = rows_;
   result.validate();
   return result;
 }
