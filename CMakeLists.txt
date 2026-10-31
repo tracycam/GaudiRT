@@ -91,6 +91,9 @@ target_link_libraries(mimo_swa_softmax_device_test PRIVATE gaudirt)
 add_executable(mimo_swa_output_device_test tests/mimo_swa_output_device_test.cpp)
 target_link_libraries(mimo_swa_output_device_test PRIVATE mimo_layer_vertical)
 
+add_executable(prefill_metadata_test tests/prefill_metadata_test.cpp)
+target_include_directories(prefill_metadata_test PRIVATE models/mimo)
+
 add_executable(mimo_step_metadata_test tests/mimo_step_metadata_test.cpp)
 target_include_directories(mimo_step_metadata_test PRIVATE models/mimo)
 
