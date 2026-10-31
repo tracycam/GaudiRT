@@ -319,3 +319,15 @@ L2 `0.0204918` against the FP32 full-model reference and `0.0235504` against
 the FP64 reference. Both exceed the unchanged `0.02` gate. This is a CPU
 same-input calculation, not a measurement of an FP32 device head. Its receipt
 SHA256 is `9fac64529bf150dbf505265eaa7f563216d2a660e011d4e2c16d258d9d8daf36`.
+
+Under the revised frozen-input contract, all 70 standalone layers passed on
+eight ranks against the independent FP64 trajectory. All 69 MoE layers chose
+the reference expert sets, including all 51 noncritical layers. The largest
+output `max_row_relative_l2` was `0.0024381` at layer 39; the largest element
+`max_abs` was `0.03125` at layer 69. Every same-expert result met its per-layer
+limit, derived from the FP32 linear / FP64 nonlinear reference on the same
+frozen input, with the `0.01` absolute cap. The route-observation graph's
+output hashes matched the uninstrumented standalone graph on all ranks and
+layers. The receipt SHA256 is
+`36e8472ddf295499288e01c2ce124ae3737ac50c828c4b925e2fdf71989ed6a5`.
+This does not establish full-model cache equivalence or final ABBA performance.
