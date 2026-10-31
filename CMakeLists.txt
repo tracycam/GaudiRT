@@ -50,6 +50,9 @@ target_link_libraries(model_embedding_prefill_device_test PRIVATE mimo_layer_ver
 add_executable(mimo_moe_prefill_real_weight_test tests/mimo_moe_prefill_real_weight_test.cpp)
 target_link_libraries(mimo_moe_prefill_real_weight_test PRIVATE mimo_layer_vertical)
 
+add_executable(pinned_host_dma_device_test tests/pinned_host_dma_device_test.cpp)
+target_link_libraries(pinned_host_dma_device_test PRIVATE gaudirt)
+
 add_executable(model_head_dual_device_test tests/model_head_dual_device_test.cpp)
 target_link_libraries(model_head_dual_device_test PRIVATE mimo_layer_vertical)
 

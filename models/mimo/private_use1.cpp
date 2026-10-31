@@ -572,7 +572,10 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       throw std::runtime_error("PrivateUse1: prefill logits AllGather failed");
     argmax_->prepare(logits_device_, prefill_status_device_, token_device_).execute(stream);
     runtime_.synchronize_compute();
-    arena_.copy_d2h_sync(runtime_.d2h_stream(), token_device_, token_host_, sizeof(int32_t));
+    check_syn(synMemCopyAsync(runtime_.d2h_stream(), token_device_, sizeof(int32_t),
+                              reinterpret_cast<uint64_t>(token_host_), DRAM_TO_HOST),
+              "prefill token D2H");
+    check_syn(synStreamSynchronize(runtime_.d2h_stream()), "prefill token completion");
     const int32_t token = *static_cast<int32_t*>(token_host_);
     if (token < 0 || token >= 152576) throw std::runtime_error("PrivateUse1: invalid prefill token or logits");
     prefill_complete_ = true;
