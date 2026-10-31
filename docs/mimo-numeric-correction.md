@@ -383,5 +383,12 @@ In the sharded model's cold-cache 70-layer run, all eight ranks' first logits,
 audited candidate. Every rank saved ten self-compiled recipes. The cold
 receipt SHA256 is
 `d85a2d7a03d3691efe378ab7b7434796bd87c46f885b756b1fa6ed806ebc3498`.
-Warm-cache equivalence, process shutdown, and paired performance remain to be
-validated.
+In one warm-cache run, each rank loaded ten recipes without saving or
+rewriting any. The first logits, greedy tokens, and final KV matched the
+audited candidate; untouched KV had `max_abs=0.0`. The 128-step p50 was
+`10.4727 ms` and mean `10.5245 ms`, including the production client output
+processor. All processes exited successfully and the earlier native
+termination message was absent after coordinating teardown and releasing
+compiled graph references. One successful run does not establish the cause
+of the earlier failure or establish paired performance. The receipt SHA256 is
+`ab1d75721324c1564a6d45e2170738ff6c8631d3ceb44aa7fa9743cbc9cad826`.
