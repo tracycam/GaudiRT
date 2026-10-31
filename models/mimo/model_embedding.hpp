@@ -20,7 +20,7 @@ namespace gaudirt::mimo {
 class ModelEmbedding final {
  public:
   ModelEmbedding(runtime::HbmArena& arena, uint64_t table,
-                 runtime::RecipeCache* cache = nullptr);
+                 runtime::RecipeCache* cache = nullptr, uint32_t rows = 1);
   ~ModelEmbedding();
   ModelEmbedding(const ModelEmbedding&) = delete;
   ModelEmbedding& operator=(const ModelEmbedding&) = delete;

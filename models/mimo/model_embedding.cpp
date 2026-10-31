@@ -23,8 +23,9 @@ void check(synStatus status, const char* operation) {
 }  // namespace
 
 ModelEmbedding::ModelEmbedding(runtime::HbmArena& arena, uint64_t table,
-                               runtime::RecipeCache* cache)
+                               runtime::RecipeCache* cache, uint32_t rows)
     : arena_(arena) {
+  if (rows != 1 && rows != 32) throw std::invalid_argument("MiMo embedding: invalid rows");
   if (!table) throw std::invalid_argument("MiMo embedding: null table");
   synGraphHandle graph = nullptr;
   std::vector<synSectionHandle> sections;
@@ -59,15 +60,16 @@ ModelEmbedding::ModelEmbedding(runtime::HbmArena& arena, uint64_t table,
     };
     synTensor table_tensor = external(kTable, "embedding_table", syn_type_bf16,
                                       {6144, 152576}, table);
-    synTensor token_tensor = external(kToken, "embedding_token", syn_type_int32, {1}, 0);
-    synTensor value_tensor = external(kEmbedding, "embedding_value", syn_type_bf16, {6144, 1}, 0);
-    synTensor status_tensor = external(kStatus, "embedding_status", syn_type_int32, {1}, 0);
+    synTensor token_tensor = external(kToken, "embedding_token", syn_type_int32, {rows}, 0);
+    synTensor value_tensor = external(kEmbedding, "embedding_value", syn_type_bf16, {6144, rows}, 0);
+    synTensor status_tensor = external(kStatus, "embedding_status", syn_type_int32, {rows}, 0);
     synTensor inputs[] = {table_tensor, token_tensor};
     synTensor outputs[] = {value_tensor, status_tensor};
     check(synNodeCreate(graph, inputs, outputs, 2, 2, nullptr, 0,
                         "gk_mimo_embedding_bf16_v1", "mimo_embedding", nullptr, nullptr),
           "synNodeCreate");
-    recipe_ = runtime::compile_cached(graph, "mimo_embedding_b1_m1", "model_embedding_v1", cache);
+    recipe_ = runtime::compile_cached(graph, rows == 1 ? "mimo_embedding_b1_m1" : "mimo_embedding_b1_m32",
+                                      rows == 1 ? "model_embedding_v1" : "model_embedding_m32_v1", cache);
     check(synWorkspaceGetSize(&workspace_bytes_, recipe_), "synWorkspaceGetSize");
     arena_.ensure_workspace(workspace_bytes_);
     runtime::initialize_launch_tensor_ids(recipe_, launch_tensors_.data(), launch_tensors_.size());
