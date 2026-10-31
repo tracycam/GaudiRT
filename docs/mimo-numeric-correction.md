@@ -272,3 +272,10 @@ references: FP32 `0.0306621` (`max_kl=0.0060240`) and FP64 `0.0303310`
 (`max_kl=0.0020335`). This is an unqualified experiment, not an ABBA or
 an end-to-end accuracy improvement. Its receipt SHA256 is
 `b540498ffe290e7f3df8cf076f835bc96c826bb8f68469beaa1dafabca068018`.
+
+An independent same-input check of all 70 standalone layers with this
+candidate found 31 outputs above `0.001` relative L2. The largest was layer
+55 at `0.0023714`; the reference eighth/ninth expert score gap there was
+`0.04422`. The check did not record device expert IDs, so it cannot determine
+whether routing caused any particular difference. Its receipt SHA256 is
+`873b9bb777742c382e3cfd0693d79ddfd1bed9348edd97841fb7721fbf4bdaa4`.
