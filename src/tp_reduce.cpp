@@ -44,7 +44,7 @@ void node(synGraphHandle graph, const std::vector<synTensor>& inputs,
 }  // namespace
 
 TpReduce::TpReduce(HbmArena& arena, uint32_t elements,
-                   synDataType gathered_type)
+                   synDataType gathered_type, RecipeCache* cache)
     : arena_(arena), elements_(elements) {
   if (elements == 0 ||
       (gathered_type != syn_type_bf16 && gathered_type != syn_type_float)) {
@@ -93,8 +93,9 @@ TpReduce::TpReduce(HbmArena& arena, uint32_t elements,
     }
     node(graph_, {sum}, {output}, &cast_params, sizeof(cast_params),
          "cast_f32_to_bf16", "round_final_bf16");
-    check(synGraphCompile(&recipe_, graph_, "tp8_gather_fp32_sum_cast", nullptr),
-          "compile graph");
+    const std::string key = "tp8_gather_sum_v1_" + std::to_string(elements) + "_" +
+                            std::to_string(static_cast<int>(gathered_type));
+    recipe_ = compile_cached(graph_, key, key, cache);
     check(synWorkspaceGetSize(&workspace_bytes_, recipe_), "workspace size");
     arena_.ensure_workspace(workspace_bytes_);
     const char* names[] = {"rank0", "rank1", "rank2", "rank3",

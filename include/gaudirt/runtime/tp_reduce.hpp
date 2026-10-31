@@ -9,9 +9,12 @@
 
 namespace gaudirt::runtime {
 
+class RecipeCache;
+
 class TpReduce {
  public:
-  TpReduce(HbmArena& arena, uint32_t elements, synDataType gathered_type);
+  TpReduce(HbmArena& arena, uint32_t elements, synDataType gathered_type,
+           RecipeCache* cache = nullptr);
   ~TpReduce();
 
   TpReduce(const TpReduce&) = delete;
