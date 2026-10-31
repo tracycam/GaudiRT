@@ -367,3 +367,21 @@ timing included the production client output processor; production timed the
 complete engine step. Their engine scheduling and IPC implementations differ.
 The receipt SHA256 is
 `175f6c06c7bbd7f1bb404c431fbe6ed346579480be139f861c45ed48517b4b03`.
+
+The vocabulary-sharded head was checked on one card using the checkpoint's
+BF16 head weights. Concatenating all eight shard outputs reproduced the full
+head's `152576` logits bitwise. Device-event p50 was `897.493 us` for the
+full head and `214.124 us` for one shard; this excludes TP8 gathering and is
+not an end-to-end speed result. The receipt SHA256 is
+`2e3e4afc1efc040192cde0e0451e076eacbc9c587c324ab1ff05e1f7d726e242`.
+An eight-rank BF16 vocabulary AllGather test had zero mismatches on every
+rank; its receipt SHA256 is
+`a2ad4ca77752008778e328f7330cc1034b60188d8b4ab080339c5241db2cf56c`.
+
+In the sharded model's cold-cache 70-layer run, all eight ranks' first logits,
+128 greedy tokens, and entire final KV were bitwise identical to the prior
+audited candidate. Every rank saved ten self-compiled recipes. The cold
+receipt SHA256 is
+`d85a2d7a03d3691efe378ab7b7434796bd87c46f885b756b1fa6ed806ebc3498`.
+Warm-cache equivalence, process shutdown, and paired performance remain to be
+validated.
