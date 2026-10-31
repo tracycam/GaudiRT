@@ -190,6 +190,9 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       throw std::invalid_argument("PrivateUse1: only TP8 is supported");
     }
     runtime_.init_comm(exchange_unique_id(rank, unique_id));
+    shutdown_buffer_ = arena_.allocate(sizeof(float));
+    const float ready = 1.0f;
+    arena_.copy_h2d_sync(runtime_.h2d_stream(), &ready, shutdown_buffer_, sizeof(ready));
   }
 
   ~PrivateProgram() {
@@ -664,6 +667,17 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   void synchronize_compute() const { runtime_.synchronize_compute(); }
   void synchronize_all() const { runtime_.synchronize_all(); }
 
+  void synchronize_shutdown() {
+    if (model_pending_)
+      throw std::runtime_error("PrivateUse1: finish the pending model step before shutdown");
+    runtime_.synchronize_all();
+    auto* buffer = reinterpret_cast<void*>(shutdown_buffer_);
+    if (hcclAllReduce(buffer, buffer, 1, hcclFloat32, hcclSum,
+                      runtime_.comm(), runtime_.compute_stream()) != hcclSuccess)
+      throw std::runtime_error("PrivateUse1: shutdown rank barrier failed");
+    runtime_.synchronize_compute();
+  }
+
  private:
   std::unique_ptr<Instance> create_instance(Kind kind, uint32_t cache_slots,
                                             uint32_t page_count,
@@ -753,6 +767,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   uint32_t rank_;
   runtime::DeviceRuntime runtime_;
   runtime::HbmArena arena_;
+  uint64_t shutdown_buffer_ = 0;
   runtime::RecipeCache recipe_cache_;
   std::unordered_map<Kind, std::unique_ptr<Instance>> instances_;
   std::unordered_map<uint32_t, LayerEntry> entries_;
@@ -1051,6 +1066,8 @@ std::vector<uint64_t> recipe_cache_stats(uint32_t rank) {
 }
 
 void shutdown(uint32_t rank) {
+  auto instance = get(rank);
+  instance->synchronize_shutdown();
   std::lock_guard<std::mutex> lock(registry_mutex);
   if (registry.erase(rank) != 1) {
     throw std::runtime_error("PrivateUse1: rank is not initialized");
