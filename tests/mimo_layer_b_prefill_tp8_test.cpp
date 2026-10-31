@@ -59,7 +59,13 @@ int main(int argc,char** argv) {
     for(unsigned r=0;r<kRows;++r) std::copy(residual_row.begin(),residual_row.end(),residual.begin()+r*residual_row.size());
     const auto* prompt_rows=std::getenv("GAUDIRT_PROMPT_ROWS");
     if(prompt_rows) { if(!empty) throw std::invalid_argument("prompt rows require empty KV"); hidden=read(std::filesystem::path(prompt_rows)/"embedding.bf16"); residual=hidden; }
+    if(const auto* layer_rows=std::getenv("GAUDIRT_LAYER_ROWS")) {
+      if(!prompt_rows) throw std::invalid_argument("layer rows require prompt RoPE");
+      hidden=read(std::filesystem::path(layer_rows)/"hidden-rows.bf16");
+      residual=read(std::filesystem::path(layer_rows)/"residual-rows.bf16");
+    }
     if(hidden.size()!=kRows*6144*2) throw std::runtime_error("invalid prompt rows");
+    if(residual.size()!=hidden.size()) throw std::runtime_error("invalid residual rows");
     std::vector<float> gathered_hidden(8*kRows*6144);
     for(unsigned rank=0;rank<8;++rank) for(unsigned row=0;row<kRows;++row) for(unsigned c=0;c<6144;++c) {
       uint16_t value; std::memcpy(&value,hidden.data()+(row*6144+c)*2,2); uint32_t bits=uint32_t(value)<<16;
