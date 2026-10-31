@@ -28,11 +28,13 @@ std::vector<uint8_t> read(const std::filesystem::path& path) {
 }
 }
 int main(int argc,char** argv) {
-  if(argc!=5) { std::cerr << "usage: TEST WEIGHTS RANK_FIXTURE MODULE HCCL_ID_FILE\n"; return 2; }
+  if(argc!=5 && argc!=6) { std::cerr << "usage: TEST WEIGHTS RANK_FIXTURE MODULE HCCL_ID_FILE [--empty]\n"; return 2; }
   try {
     using namespace gaudirt::runtime;
     const std::filesystem::path fixture(argv[2]),layer=fixture/"layer7";
-    const auto initial_key=read(layer/"key_cache.bin"),initial_value=read(layer/"value_cache.bin");
+    auto initial_key=read(layer/"key_cache.bin"),initial_value=read(layer/"value_cache.bin");
+    const bool empty=argc==6; if(empty && std::string(argv[5])!="--empty") throw std::invalid_argument("invalid mode");
+    if(empty) { std::fill(initial_key.begin(),initial_key.end(),0); std::fill(initial_value.begin(),initial_value.end(),0); }
     if(initial_key.size()%(192*2) || initial_value.size()%(128*2) ||
        initial_key.size()/(192*2)!=initial_value.size()/(128*2)) throw std::runtime_error("invalid cache geometry");
     const unsigned cache_slots=initial_key.size()/(192*2);
@@ -69,6 +71,7 @@ int main(int argc,char** argv) {
       std::memcpy(&cos[r*64+i],rope.data()+(r*64+i%32)*2,2);
       std::memcpy(&sin[r*64+i],rope.data()+(r*64+32+i%32)*2,2);
     }
+    if(empty) { std::fill(cos.begin(),cos.end(),0x3f80); std::fill(sin.begin(),sin.end(),0); }
     const auto slot_bytes=read(layer/"slot_mapping.bin"),page_bytes=read(layer/"block_list.bin"),
                usage_bytes=read(layer/"block_usage.bin"),group_bytes=read(layer/"block_groups.bin");
     if(slot_bytes.size()!=4 || page_bytes.size()!=kPages*4 || usage_bytes.size()!=kPages*4 || group_bytes.size()!=kPages*4)
@@ -76,23 +79,25 @@ int main(int argc,char** argv) {
     int32_t first; std::array<int32_t,kPages> pages{},usage{},groups{};
     std::memcpy(&first,slot_bytes.data(),4); std::memcpy(pages.data(),page_bytes.data(),page_bytes.size());
     std::memcpy(usage.data(),usage_bytes.data(),usage_bytes.size()); std::memcpy(groups.data(),group_bytes.data(),group_bytes.size());
-    if(first<0 || unsigned(first)+kRows>cache_slots || first%128 || pages[32]*128!=first || usage[32]!=1 || groups[32]!=0)
+    if(empty) { first=0; for(unsigned p=0;p<kPages;++p) { pages[p]=p; usage[p]=1; groups[p]=p==0?0:-1; } }
+    const unsigned active_page=empty?0:32;
+    if(first<0 || unsigned(first)+kRows>cache_slots || first%128 || pages[active_page]*128!=first || usage[active_page]!=1 || groups[active_page]!=0)
       throw std::runtime_error("invalid starting full-attention page");
     std::array<int32_t,kRows> slots{},positions{};
-    for(unsigned r=0;r<kRows;++r) { slots[r]=first+r; positions[r]=4096+r; }
+    for(unsigned r=0;r<kRows;++r) { slots[r]=first+r; positions[r]=(empty?0:4096)+r; }
     MimoAttentionIo batch{};
     batch.hidden_states=upload(gathered_hidden.data(),gathered_hidden.size()*4); batch.residual=upload(residual.data(),residual.size()); batch.residual_out=arena.allocate(residual.size()); batch.rope_cos=upload(cos.data(),cos.size()*2); batch.rope_sin=upload(sin.data(),sin.size()*2);
     batch.key_cache=upload(initial_key.data(),initial_key.size()); batch.value_cache=upload(initial_value.data(),initial_value.size());
     batch.slot_mapping=upload(slots.data(),sizeof(slots)); batch.position=upload(positions.data(),sizeof(positions));
     batch.full_block_list=upload(pages.data(),sizeof(pages)); batch.full_block_groups=upload(groups.data(),sizeof(groups));
-    usage[32]=kRows; batch.full_block_usage=upload(usage.data(),sizeof(usage)); batch.output_local_fp32=arena.allocate(6144*kRows*sizeof(float));
+    usage[active_page]=kRows; batch.full_block_usage=upload(usage.data(),sizeof(usage)); batch.output_local_fp32=arena.allocate(6144*kRows*sizeof(float));
     MimoAttentionIo serial=batch;
     serial.key_cache=upload(initial_key.data(),initial_key.size()); serial.value_cache=upload(initial_value.data(),initial_value.size());
     const uint64_t serial_output=arena.allocate(6144*kRows*sizeof(float));
     std::array<uint64_t,kRows> serial_cos{},serial_sin{},serial_slots{},serial_usage{};
     for(unsigned r=0;r<kRows;++r) {
       serial_cos[r]=upload(cos.data()+r*64,64*2); serial_sin[r]=upload(sin.data()+r*64,64*2);
-      serial_slots[r]=upload(&slots[r],sizeof(slots[r])); usage[32]=r+1; serial_usage[r]=upload(usage.data(),sizeof(usage));
+      serial_slots[r]=upload(&slots[r],sizeof(slots[r])); usage[active_page]=r+1; serial_usage[r]=upload(usage.data(),sizeof(usage));
     }
     gaudirt::mimo::LayerB one(arena,runtime,weights,cache_slots,kPages,nullptr,true);
     gaudirt::mimo::LayerB many(arena,runtime,weights,cache_slots,kPages,nullptr,true,kRows);
@@ -133,7 +138,7 @@ int main(int argc,char** argv) {
       if(!std::equal(x.begin()+begin,x.begin()+end,y.begin()+begin)) throw std::runtime_error("batched and sequential written KV differ");
     };
     verify_kv(batch.key_cache,serial.key_cache,initial_key,192*2); verify_kv(batch.value_cache,serial.value_cache,initial_value,128*2);
-    std::cout << "M32 TP8 real-weight full+MoE layer vs sequential M1: max_abs=" << max_abs << " max_row_relative_l2=" << max_row_relative_l2 << " KV=bitwise\n";
+    std::cout << "M32 TP8 real-weight full+MoE layer vs sequential M1: max_abs=" << max_abs << " max_row_relative_l2=" << max_row_relative_l2 << " KV=bitwise empty=" << empty << "\n";
     if(max_row_relative_l2>0.003) throw std::runtime_error("attention row exceeds quick-screen tolerance");
     float marker=1.0f; const auto barrier=upload(&marker,sizeof(marker));
     if(hcclAllReduce(reinterpret_cast<const void*>(barrier),reinterpret_cast<void*>(barrier),1,hcclFloat32,hcclSum,runtime.comm(),runtime.compute_stream())!=hcclSuccess) throw std::runtime_error("barrier failed");
