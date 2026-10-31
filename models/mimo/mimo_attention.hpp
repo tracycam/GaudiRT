@@ -49,6 +49,8 @@ struct MimoAttentionIo {
 // Required WeightManifest tensors: input_layernorm, qkv_weight, qkv_scales,
 // qkv_bias, attention_sink, oproj_weight. All addresses must stay valid until
 // stream completion, and cache metadata must reference valid physical pages.
+// The model QKV reducer requires zero bias and finite prepared weight scales
+// >= 2^-20; its compensation does not support FP32 subnormal terms.
 class MimoAttention {
  public:
   static constexpr uint32_t kHiddenSize = 6144;

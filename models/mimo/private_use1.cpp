@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -259,6 +260,16 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     }
     item.elements = static_cast<uint64_t>(tensor.numel());
     item.bytes = tensor.nbytes();
+    if (!dense && (name == "qkv_scales" || name == "qkv_bias")) {
+      if (tensor.scalar_type() != at::kFloat)
+        throw std::invalid_argument("PrivateUse1: QKV scales and bias must be FP32");
+      const auto* values = tensor.const_data_ptr<float>();
+      for (uint64_t i = 0; i < item.elements; ++i) {
+        if ((name == "qkv_scales" && (!std::isfinite(values[i]) || values[i] < 0x1p-20f)) ||
+            (name == "qkv_bias" && values[i] != 0.0f))
+          throw std::invalid_argument("PrivateUse1: QKV scale or bias outside model reducer contract");
+      }
+    }
     for (const int64_t size : tensor.sizes()) {
       item.shape.push_back(static_cast<uint64_t>(size));
     }

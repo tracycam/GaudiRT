@@ -275,7 +275,7 @@ struct MimoAttention::Impl {
     node({activation_q, qkv_packed}, {qkv_accumulator}, &qkv_gemm_params,
          sizeof(qkv_gemm_params), "batch_gemm", "qkv_block128_fp8_batch_gemm");
     node({qkv_accumulator, activation_scale, qkv_scale, qkv_zero_bias}, {qkv},
-         nullptr, 0, "gk_neumaier_isa_handschedule_v1", "qkv_block128_scale_finish");
+         nullptr, 0, "gk_block128_neumaier_bf16_compensated_v1", "qkv_block128_scale_finish");
 
     synTensor rope_cos = external("rope_cos", Binding::kRopeCos, syn_type_bf16,
                                   {64, 1, rows});
