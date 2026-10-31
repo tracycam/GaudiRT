@@ -81,6 +81,11 @@ int main(int argc, char** argv) {
     auto residual = repeat(read(teacher ? std::filesystem::path(teacher) / "layer01/residual.bf16" : fixture / "layer1/residual_out.bin"));
     const auto* prompt_rows = std::getenv("GAUDIRT_PROMPT_ROWS");
     if(prompt_rows) { if(!empty) throw std::invalid_argument("prompt rows require empty KV"); hidden=read(std::filesystem::path(prompt_rows)/"embedding.bf16"); residual=hidden; }
+    if(const auto* layer_rows = std::getenv("GAUDIRT_LAYER_ROWS")) {
+      if(!prompt_rows) throw std::invalid_argument("layer rows require prompt RoPE");
+      hidden=read(std::filesystem::path(layer_rows)/"hidden-rows.bf16");
+      residual=read(std::filesystem::path(layer_rows)/"residual-rows.bf16");
+    }
     if (hidden.size() != 6144*2*kRows || residual.size() != hidden.size())
       throw std::runtime_error("invalid hidden or residual fixture");
     const auto rope = read(prompt_rows ? std::filesystem::path(prompt_rows)/"swa-rope.bf16" : fixture / "layer1/rope.bin");
