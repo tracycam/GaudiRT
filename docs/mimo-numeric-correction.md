@@ -392,3 +392,13 @@ termination message was absent after coordinating teardown and releasing
 compiled graph references. One successful run does not establish the cause
 of the earlier failure or establish paired performance. The receipt SHA256 is
 `ab1d75721324c1564a6d45e2170738ff6c8631d3ceb44aa7fa9743cbc9cad826`.
+
+An independent untimed full-model observer recorded the Top-8 router IDs for
+all 69 MoE layers over 128 steps. Cold compilation and warm loading produced
+identical ordered IDs on every rank, and the eight ranks agreed. Each cold
+rank saved ten recipes; each warm rank loaded ten without saving. The
+observer's first logits, token sequence and entire final KV matched the
+uninstrumented sharded candidate bitwise. Exposing IDs makes the observer
+graph different from the release graph, so this is not a direct observation
+of the release graph's internal tensors. Its receipt SHA256 is
+`3e86346d72bd1e7da5747fa8dddad56c7d56065e6e0c0756ec5de3c6b93331ba`.
