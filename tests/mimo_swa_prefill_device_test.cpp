@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Verify a 32-row causal SWA graph and its physical KV writes on an empty cache.
+// Verify a 32-row causal SWA graph and its physical KV writes.
 #include "gaudirt/runtime/device_runtime.hpp"
 #include "gaudirt/runtime/hbm_arena.hpp"
 #include "gaudirt/runtime/prepared_launch.hpp"
@@ -17,7 +17,7 @@
 #include <vector>
 
 namespace {
-constexpr unsigned kRows = 32, kSlots = 256;
+constexpr unsigned kRows = 32, kSlots = 256, kPageEntries = 64;
 void check(synStatus status) {
   if (status != synSuccess) throw std::runtime_error("prefill SWA graph: Synapse failure " + std::to_string(status));
 }
@@ -43,8 +43,12 @@ void node(synGraphHandle graph, std::initializer_list<synTensor> inputs,
 }
 }
 
-int main() {
+int main(int argc, char** argv) {
   using namespace gaudirt::runtime;
+  if (argc > 2 || (argc == 2 && std::string(argv[1]) != "boundary"))
+    throw std::invalid_argument("expected no argument or boundary");
+  const bool boundary = argc == 2;
+  const unsigned first_position = boundary ? 112 : 0;
   DeviceRuntime runtime(DeviceRuntime::Config{});
   HbmArena arena(runtime.device_id(), 128ULL * 1024 * 1024);
   synGraphHandle graph = nullptr; synRecipeHandle recipe = nullptr;
@@ -59,7 +63,7 @@ int main() {
       syn_type_bf16, syn_type_bf16, syn_type_bf16, syn_type_bf16};
   const unsigned dims[] = {2,3,3,3,3,1,1,1,1,1,3,3,3};
   const uint64_t shapes[][3] = {{3392,kRows,1},{64,1,kRows},{64,1,kRows},
-      {192,1,kSlots},{128,1,kSlots},{kRows,1,1},{kRows,1,1},{kRows,1,1},
+      {192,1,kSlots},{128,1,kSlots},{kRows,1,1},{kPageEntries,1,1},{kPageEntries,1,1},
       {kRows,1,1},{16,1,1},{192,1,kSlots},{128,1,kSlots},{128,16,kRows}};
   check(synGraphCreate(&graph, synDeviceGaudi2));
   for (unsigned i = 0; i < n; ++i) {
@@ -94,11 +98,26 @@ int main() {
   std::vector<uint16_t> qkv(3392 * kRows), cosine(64 * kRows, bf16(1)), sine(64 * kRows);
   std::vector<uint16_t> key(192 * kSlots, bf16(-7)), value(128 * kSlots, bf16(-7));
   std::vector<uint16_t> result(128 * 16 * kRows), sink(16, bf16(0));
-  std::array<int32_t, kRows> slots{}, pages{}, groups{}, positions{};
+  std::array<int32_t, kRows> slots{}, positions{};
+  std::array<int32_t, kPageEntries> pages{}, groups{};
+  groups.fill(-1);
+  auto scaled_value = [&](unsigned position) {
+    return bf16((1.0f + 0.25f * (position % 4)) * value_scale);
+  };
+  for (unsigned position = 0; position < first_position; ++position) {
+    std::fill_n(key.begin() + (128 + position) * 192, 192, bf16(0));
+    std::fill_n(value.begin() + (128 + position) * 128, 128, scaled_value(position));
+  }
+  const auto original_key = key, original_value = value;
+  unsigned entry = 0;
   for (unsigned row = 0; row < kRows; ++row) {
-    const auto input = bf16(1.0f + 0.25f * (row % 4));
+    const unsigned position = first_position + row;
+    const auto input = bf16(1.0f + 0.25f * (position % 4));
     std::fill_n(qkv.begin() + row * 3392 + 3264, 128, input);
-    slots[row] = 128 + row; pages[row] = 1; groups[row] = row; positions[row] = row;
+    slots[row] = position < 128 ? 128 + position : position - 128;
+    positions[row] = position;
+    pages[entry] = 1; groups[entry++] = row;
+    if (position >= 128) { pages[entry] = 0; groups[entry++] = row; }
   }
   const void* input[] = {qkv.data(),cosine.data(),sine.data(),key.data(),value.data(),slots.data(),
                          pages.data(),groups.data(),positions.data(),sink.data()};
@@ -115,11 +134,13 @@ int main() {
   arena.copy_d2h_sync(runtime.d2h_stream(), binding[3].pTensorAddress, key.data(), bytes[3]);
   arena.copy_d2h_sync(runtime.d2h_stream(), binding[4].pTensorAddress, value.data(), bytes[4]);
   arena.copy_d2h_sync(runtime.d2h_stream(), binding[12].pTensorAddress, result.data(), bytes[12]);
-  double worst = 0, sum = 0;
+  double worst = 0;
   for (unsigned row = 0; row < kRows; ++row) {
-    const uint16_t expected_v = bf16((1.0f + 0.25f * (row % 4)) * value_scale);
-    sum += widen(expected_v);
-    const double expected = sum / double(row + 2); // visible tokens plus zero-valued sink
+    const unsigned position = first_position + row;
+    const unsigned begin = position > 127 ? position - 127 : 0;
+    double sum = 0;
+    for (unsigned i = begin; i <= position; ++i) sum += widen(scaled_value(i));
+    const double expected = sum / double(position - begin + 2); // visible tokens plus sink
     for (unsigned i = 0; i < 128 * 16; ++i) {
       const double actual = widen(result[row * 128 * 16 + i]);
       if (!std::isfinite(actual)) throw std::runtime_error("non-finite SWA output");
@@ -127,13 +148,18 @@ int main() {
     }
   }
   for (unsigned slot = 0; slot < kSlots; ++slot) {
-    const bool touched = slot >= 128 && slot < 128 + kRows;
-    const uint16_t expected_k = touched ? bf16(0) : bf16(-7);
-    const uint16_t expected_v = touched ? bf16((1.0f + 0.25f * ((slot-128) % 4)) * value_scale) : bf16(-7);
-    for (unsigned i = 0; i < 192; ++i) if (key[slot*192+i] != expected_k) throw std::runtime_error("key cache slot mismatch");
-    for (unsigned i = 0; i < 128; ++i) if (value[slot*128+i] != expected_v) throw std::runtime_error("value cache slot mismatch");
+    const auto it = std::find(slots.begin(), slots.end(), static_cast<int32_t>(slot));
+    const bool touched = it != slots.end();
+    const unsigned row = touched ? static_cast<unsigned>(it - slots.begin()) : 0;
+    for (unsigned i = 0; i < 192; ++i)
+      if (key[slot*192+i] != (touched ? bf16(0) : original_key[slot*192+i]))
+        throw std::runtime_error("key cache slot mismatch");
+    for (unsigned i = 0; i < 128; ++i)
+      if (value[slot*128+i] != (touched ? scaled_value(first_position+row) : original_value[slot*128+i]))
+        throw std::runtime_error("value cache slot mismatch");
   }
-  std::printf("M=32 causal SWA max_abs=%.9g, untouched KV bitwise equal\n",worst);
+  std::printf("M=32 %s causal SWA max_abs=%.9g, untouched KV bitwise equal\n",
+              boundary ? "page-boundary" : "empty-cache", worst);
   check(synRecipeDestroy(recipe));
   if (worst > 0.004) throw std::runtime_error("causal SWA exceeds BF16 tolerance");
 }
