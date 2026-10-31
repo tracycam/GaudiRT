@@ -52,9 +52,11 @@ static_assert(sizeof(RouterPostParams) == 12);
 
 MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
                              const char* graph_variant, RecipeCache* cache,
-                             bool gathered_attention, synDataType gathered_type)
-    : tp_rank_(tp_rank), gathered_attention_(gathered_attention),
+                             bool gathered_attention, synDataType gathered_type, uint32_t rows)
+    : tp_rank_(tp_rank), rows_(rows), gathered_attention_(gathered_attention),
       gathered_type_(gathered_type) {
+  if (rows_ != 1 && rows_ != 32)
+    throw std::invalid_argument("MimoMoeLayer1: rows must be 1 or 32");
   if (tp_rank_ >= kTpSize) {
     throw std::invalid_argument("MimoMoeLayer1: TP rank must be in [0,8)");
   }
@@ -115,7 +117,7 @@ MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
     auto temporary = [&](const char* name, synDataType dtype,
                          Sizes sizes) -> synTensor {
       const std::string full_name =
-          std::string("mimo_") + graph_variant + "_" + name;
+          std::string("mimo_") + graph_variant + (rows_ == 32 ? "_m32_" : "_") + name;
       synTensorDescriptor descriptor{};
       descriptor.m_name = full_name.c_str();
       descriptor.m_dataType = dtype;
@@ -133,16 +135,16 @@ MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
     synTensor attention = nullptr;
     if (gathered_attention_) {
       synTensor gathered = external(kAttention, "mimo1_attention_gathered", gathered_type_,
-                                    {kHiddenSize, kTpSize}, 0);
+                                    {kHiddenSize, kTpSize * rows_}, 0);
       sections.push_back(nullptr);
-      attention = gaudirt::mimo::append_tp8_reduce(graph, gathered, gathered_type_, sections.back());
+      attention = gaudirt::mimo::append_tp8_reduce(graph, gathered, gathered_type_, sections.back(), rows_);
     } else {
       attention = external(kAttention, "mimo1_attention", syn_type_bf16,
-                           {kHiddenSize, 1}, 0);
+                           {kHiddenSize, rows_}, 0);
     }
     synTensor residual_in =
         external(kResidualIn, "mimo1_residual_in", syn_type_bf16,
-                 {kHiddenSize, 1}, 0);
+                 {kHiddenSize, rows_}, 0);
     synTensor gamma = external(kGamma, "mimo1_post_attention_gamma",
                                syn_type_bf16, {kHiddenSize},
                                weights.post_attention_gamma_bf16);
@@ -175,31 +177,31 @@ MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
                  {256, 2}, weights.down_combine_directions_u8);
     synTensor residual_out =
         external(kResidualOut, "mimo1_residual_out", syn_type_bf16,
-                 {kHiddenSize, 1}, 0);
-    synTensor normalized = temporary("normalized", syn_type_bf16, {kHiddenSize, 1});
-    synTensor route_ids = temporary("topk_ids", syn_type_int32, {kTopK, 1});
-    synTensor route_weights = temporary("topk_weights", syn_type_single, {kTopK, 1});
+                 {kHiddenSize, rows_}, 0);
+    synTensor normalized = temporary("normalized", syn_type_bf16, {kHiddenSize, rows_});
+    synTensor route_ids = temporary("topk_ids", syn_type_int32, {kTopK, rows_});
+    synTensor route_weights = temporary("topk_weights", syn_type_single, {kTopK, rows_});
     synTensor moe_out = external(kMoeOut, "mimo1_moe_local_fp32",
-                                 syn_type_single, {kHiddenSize, 1}, 0);
+                                 syn_type_single, {kHiddenSize, rows_}, 0);
 
     synTensor router_logits =
-        temporary("mimo1_router_logits", syn_type_single, {kExpertCount, 1});
+        temporary("mimo1_router_logits", syn_type_single, {kExpertCount, rows_});
     synTensor scores =
-        temporary("mimo1_router_scores", syn_type_single, {kExpertCount, 1});
+        temporary("mimo1_router_scores", syn_type_single, {kExpertCount, rows_});
     synTensor biased_scores = temporary("mimo1_router_biased_scores",
-                                        syn_type_single, {kExpertCount, 1});
+                                        syn_type_single, {kExpertCount, rows_});
     synTensor topk_values =
-        temporary("mimo1_topk_values", syn_type_single, {kTopK, 1});
+        temporary("mimo1_topk_values", syn_type_single, {kTopK, rows_});
     synTensor selected_ids =
-        temporary("mimo1_selected_ids", syn_type_int32, {kTopK, 1});
+        temporary("mimo1_selected_ids", syn_type_int32, {kTopK, rows_});
     synTensor route_weight_sum =
-        temporary("mimo1_route_weight_sum", syn_type_single, {1, 1});
+        temporary("mimo1_route_weight_sum", syn_type_single, {1, rows_});
     synTensor gate_up_partial = temporary(
-        "mimo1_gate_up_partial", syn_type_single, {kTopK * 1536, 1});
+        "mimo1_gate_up_partial", syn_type_single, {kTopK * rows_ * 1536, 1});
     synTensor gate_activation = temporary("mimo1_gate_activation",
-                                          syn_type_bf16, {kLocalDownK, kTopK});
+                                          syn_type_bf16, {kLocalDownK, kTopK * rows_});
     synTensor down_partial = temporary(
-        "mimo1_down_partial", syn_type_single, {kTopK * kHiddenSize, 1});
+        "mimo1_down_partial", syn_type_single, {kTopK * rows_ * kHiddenSize, 1});
 
     auto node = [&](const char* guid, const char* name,
                     std::initializer_list<synTensor> inputs,
@@ -236,7 +238,7 @@ MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
          {topk_values, selected_ids}, &topk_params, sizeof(topk_params));
 
     const RouterPostParams router_post_params{1.0F, 1, 0};
-    node("gk_router_post8_vector_experiment", "mimo1_router_post8",
+    node(rows_ == 32 ? "gk_router_post8_prefill_v1" : "gk_router_post8_vector_experiment", "mimo1_router_post8",
          {scores, selected_ids}, {route_weights, route_ids, route_weight_sum},
          &router_post_params, sizeof(router_post_params));
 
@@ -245,7 +247,7 @@ MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
          {gate_up_partial}, nullptr, 0);
 
     const int32_t gate_splits = 3;
-    node("gk_mimo_moe_gate_fp32_v1", "mimo1_gate_silu", {gate_up_partial, route_ids},
+    node(rows_ == 32 ? "gk_mimo_moe_gate_prefill_fp32_v1" : "gk_mimo_moe_gate_fp32_v1", "mimo1_gate_silu", {gate_up_partial, route_ids},
          {gate_activation}, &gate_splits, sizeof(gate_splits));
 
     node("downact_direct_down_broadcast", "mimo1_down_mxfp4",
@@ -253,17 +255,17 @@ MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
          {down_partial}, nullptr, 0);
 
     const int32_t combine_topk = kTopK;
-    node("pf_combine_f32", "mimo1_fp32_combine",
+    node(rows_ == 32 ? "gk_mimo_moe_combine_prefill_fp32_v1" : "pf_combine_f32", "mimo1_fp32_combine",
          {down_partial, route_weights, directions}, {moe_out}, &combine_topk,
          sizeof(combine_topk));
 
     const std::string recipe_name =
-        std::string("mimo_") + graph_variant + "_moe_b1_m1_tp8_rank" +
+        std::string("mimo_") + graph_variant + (rows_ == 32 ? "_moe_b1_m32_tp8_rank" : "_moe_b1_m1_tp8_rank") +
         std::to_string(tp_rank_);
     recipe_ = compile_cached(
         graph, recipe_name,
         std::string("moe_fp32_gate_v3_") + graph_variant + "_rank" + std::to_string(tp_rank_) +
-            (gathered_attention_ ? "_gathered_tp1" : "_direct"),
+            (gathered_attention_ ? "_gathered_tp1" : "_direct") + (rows_ == 32 ? "_m32" : ""),
         cache);
     check(synWorkspaceGetSize(&workspace_bytes_, recipe_),
           "synWorkspaceGetSize");

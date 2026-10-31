@@ -69,7 +69,7 @@ class MimoMoeLayer1 final {
   MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
                 const char* graph_variant, RecipeCache* cache = nullptr,
                 bool gathered_attention = false,
-                synDataType gathered_type = syn_type_float);
+                synDataType gathered_type = syn_type_float, uint32_t rows = 1);
   ~MimoMoeLayer1();
 
   MimoMoeLayer1(const MimoMoeLayer1&) = delete;
@@ -120,6 +120,7 @@ class MimoMoeLayer1 final {
   static_assert(kSlotCount == 13);
 
   uint32_t tp_rank_;
+  uint32_t rows_;
   bool gathered_attention_ = false;
   synDataType gathered_type_ = syn_type_float;
   synRecipeHandle recipe_ = nullptr;
