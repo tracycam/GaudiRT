@@ -27,11 +27,13 @@ void check(synStatus status, const char* operation) {
 
 ModelHead::ModelHead(runtime::HbmArena& arena, uint64_t final_norm_gamma,
                      uint64_t lm_head_weight, runtime::RecipeCache* cache,
-                     bool gathered_input)
+                     bool gathered_input, uint32_t vocab_size)
     : arena_(arena), gathered_input_(gathered_input) {
   if (final_norm_gamma == 0 || lm_head_weight == 0) {
     throw std::invalid_argument("MiMo model head: null weight address");
   }
+  if (vocab_size != kVocabSize && vocab_size != kLocalVocabSize)
+    throw std::invalid_argument("MiMo model head: unsupported vocabulary size");
   synGraphHandle graph = nullptr;
   std::vector<synSectionHandle> sections;
   sections.reserve(kSlotCount);
@@ -96,12 +98,13 @@ ModelHead::ModelHead(runtime::HbmArena& arena, uint64_t final_norm_gamma,
     synTensor gamma = external(kGamma, "model_final_gamma", syn_type_bf16,
                                {6144}, final_norm_gamma);
     synTensor weight = external(kLmHeadWeight, "model_lm_head_weight", syn_type_bf16,
-                                {6144, 152576}, lm_head_weight);
+                                {6144, vocab_size}, lm_head_weight);
     synTensor logits = external(kLogits, "model_logits", syn_type_bf16,
-                                {152576, 1}, 0);
+                                {vocab_size, 1}, 0);
     synTensor normalized = external(kNormalized, "model_final_normalized",
                                     syn_type_bf16, {6144, 1}, 0);
-    synTensor residual_out = temporary("model_final_residual_out", syn_type_bf16,
+    synTensor residual_out = temporary(vocab_size == kVocabSize ? "model_final_residual_out" :
+                                        "model_final_residual_out_shard", syn_type_bf16,
                                        {6144, 1});
     const float epsilon = 1e-5F;
     synTensor norm_inputs[] = {hidden, residual, gamma};
@@ -116,8 +119,9 @@ ModelHead::ModelHead(runtime::HbmArena& arena, uint64_t final_norm_gamma,
                         sizeof(gemm_params), "gemm", "model_lm_head", nullptr,
                         nullptr),
           "lm_head GEMM");
-    recipe_ = runtime::compile_cached(graph, "mimo_final_rmsnorm_lm_head_b1_m1",
-                                      gathered_input_ ? "model_head_gathered_tp1_v2" : "model_head_v1", cache);
+    const std::string cache_key = std::string(gathered_input_ ? "model_head_gathered_tp1_v2_" : "model_head_v1_") +
+                                  std::to_string(vocab_size);
+    recipe_ = runtime::compile_cached(graph, "mimo_final_rmsnorm_lm_head_b1_m1", cache_key, cache);
     check(synWorkspaceGetSize(&workspace_bytes_, recipe_), "synWorkspaceGetSize");
     arena_.ensure_workspace(workspace_bytes_);
     runtime::initialize_launch_tensor_ids(recipe_, launch_tensors_.data(),

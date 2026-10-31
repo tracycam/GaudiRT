@@ -17,9 +17,12 @@ namespace gaudirt::mimo {
 
 class ModelHead final {
  public:
+  static constexpr uint32_t kVocabSize = 152576;
+  static constexpr uint32_t kLocalVocabSize = kVocabSize / 8;
+
   ModelHead(runtime::HbmArena& arena, uint64_t final_norm_gamma,
             uint64_t lm_head_weight, runtime::RecipeCache* cache = nullptr,
-            bool gathered_input = false);
+            bool gathered_input = false, uint32_t vocab_size = kVocabSize);
   ~ModelHead();
 
   ModelHead(const ModelHead&) = delete;
