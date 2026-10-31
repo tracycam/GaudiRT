@@ -26,7 +26,7 @@ inline synTensor append_tp8_reduce(synGraphHandle graph, synTensor gathered,
   check(synSectionCreate(&output_section, 0, graph), "create output section");
   check(synSectionSetPersistent(output_section, false), "set output section");
   synTensorDescriptor descriptor{};
-  descriptor.m_name = "tp_reduce_bf16";
+  descriptor.m_name = rows == 32 ? "tp_reduce_m32_bf16" : "tp_reduce_bf16";
   descriptor.m_dataType = syn_type_bf16;
   descriptor.m_dims = 2;
   descriptor.m_sizes[0] = descriptor.m_minSizes[0] = 6144;

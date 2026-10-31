@@ -26,7 +26,7 @@ class LayerC final {
 
   LayerC(runtime::HbmArena& arena, runtime::DeviceRuntime& runtime,
          const runtime::WeightManifest& weights, uint32_t cache_slots,
-         runtime::RecipeCache* cache = nullptr, bool fused_model = false);
+         runtime::RecipeCache* cache = nullptr, bool fused_model = false, uint32_t rows = 1);
 
   LayerC(const LayerC&) = delete;
   LayerC& operator=(const LayerC&) = delete;
@@ -47,6 +47,7 @@ class LayerC final {
   std::unique_ptr<runtime::TpReduce> moe_reduce_;
   hcclComm_t comm_;
   bool fused_model_ = false;
+  uint32_t rows_ = 1;
 };
 
 }  // namespace gaudirt::mimo
