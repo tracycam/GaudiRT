@@ -402,3 +402,28 @@ uninstrumented sharded candidate bitwise. Exposing IDs makes the observer
 graph different from the release graph, so this is not a direct observation
 of the release graph's internal tensors. Its receipt SHA256 is
 `3e86346d72bd1e7da5747fa8dddad56c7d56065e6e0c0756ec5de3c6b93331ba`.
+
+The unprofiled A1-B1-B2-A2 run on the sharded candidate measured p50 values
+`11.414471`, `10.511892`, `10.608441`, and `11.244826 ms`; means were
+`11.465220`, `10.531679`, `10.622476`, and `11.290237 ms`. Each arm had
+128 timed steps after 16 decode warmup steps from initial context 4096. Both
+candidate arms were below `11.284 ms` and below both production arms. The
+production p50 drift was `-1.49%`, and the candidate p50 drift was `+0.92%`.
+All four main processes returned zero; both candidate arms loaded ten
+recipes per rank, matched the audited token sequence on all ranks, and had
+no native termination message. Both production arms matched each other,
+while their 144 aligned tokens differed from the candidates at 130 positions.
+The source of those cross-path token differences was not established.
+
+Production timed the complete engine step; the candidate timed the direct
+TP8 model step through token completion and production client output
+processing. Their scheduler and IPC implementations differ, so this result
+does not establish equivalent performance for a candidate integrated into
+the complete production serving engine. On shutdown, each production engine's
+process manager terminated its remaining child processes and the Python
+resource tracker warned about one shared-memory object. The previous
+candidate termination's cause remains unknown. The four-arm receipt SHA256
+is `93c16cb993b1ff0c4f8242e1e70914045c19b1518c01c921e2bc9be0f270a5aa`.
+After both candidate arms, all 80 release-cache files retained their cold
+content, sizes, and modification times; the check receipt SHA256 is
+`070b03c9a97ce8f01c0cc7fb81cc16beaa5eed814d6bb279b1fb511a45c0ea4b`.
