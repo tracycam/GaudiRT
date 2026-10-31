@@ -320,6 +320,14 @@ the FP64 reference. Both exceed the unchanged `0.02` gate. This is a CPU
 same-input calculation, not a measurement of an FP32 device head. Its receipt
 SHA256 is `9fac64529bf150dbf505265eaa7f563216d2a660e011d4e2c16d258d9d8daf36`.
 
+The `0.02` statements above describe the earlier cross-arithmetic gate. The
+revised roadmap treats raw logits L2 as a diagnostic and requires finite
+logits, `max_kl <= 0.01`, and the applicable Top-1/Top-5 check. Against the
+independent FP32 full-model reference, the restored candidate has
+`max_kl=0.0007722`, `relative_l2=0.0205696`, `calc_diff=0.0002108`, and
+matching Top-1. The older quality reporter still records its original L2
+gate as failed; the numerical values themselves have not been changed.
+
 Under the revised frozen-input contract, all 70 standalone layers passed on
 eight ranks against the independent FP64 trajectory. All 69 MoE layers chose
 the reference expert sets, including all 51 noncritical layers. The largest
