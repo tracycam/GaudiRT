@@ -15,7 +15,7 @@ class MimoFullAttention final {
   MimoFullAttention(HbmArena& arena, const WeightManifest& weights,
                     uint32_t cache_slots, bool pure_rmsnorm = false,
                     uint32_t page_count = 64, RecipeCache* cache = nullptr,
-                    bool gathered_input = false);
+                    bool gathered_input = false, uint32_t rows = 1);
   ~MimoFullAttention();
 
   MimoFullAttention(const MimoFullAttention&) = delete;
