@@ -15,10 +15,11 @@ class WeightManifest;
 class RecipeCache;
 
 // BF16 shapes are fastest-first: hidden_states/residual/residual_out and
-// output_local [6144,1]. rope_cos/rope_sin are [64,1,1], with each 32-value
+// output_local [6144,M]. rope_cos/rope_sin are [64,1,M], with each 32-value
 // half of the loaded cache row repeated twice.
 // key_cache/value_cache are [192,1,cache_slots]/[128,1,cache_slots].
-// slot_mapping/position are I32[1]; window_pages/window_groups are I32[2].
+// slot_mapping/position are I32[M]; window_pages/window_groups are I32[2]
+// for decode M=1 or I32[64] for the static prefill bucket M=32.
 // Full-Attention block list/usage/groups are I32[page_count], page_count <= 64.
 struct MimoAttentionIo {
   uint64_t hidden_states = 0;
@@ -59,7 +60,7 @@ class MimoAttention {
 
   MimoAttention(HbmArena& arena, const WeightManifest& weights,
                 uint32_t cache_slots, RecipeCache* cache = nullptr,
-                bool gathered_input = false);
+                bool gathered_input = false, uint32_t rows = 1);
   ~MimoAttention();
 
   MimoAttention(const MimoAttention&) = delete;

@@ -78,6 +78,7 @@ struct MimoAttention::Impl {
   HbmArena& arena;
   const WeightManifest* weights;
   uint32_t cache_slots;
+  uint32_t rows;
   bool gathered_input;
   synGraphHandle graph = nullptr;
   synSectionHandle reduction_section = nullptr;
@@ -100,9 +101,9 @@ struct MimoAttention::Impl {
   synTensor output_local = nullptr;
 
   Impl(HbmArena& arena, const WeightManifest& weights, uint32_t cache_slots,
-       bool gathered_input)
+       bool gathered_input, uint32_t rows)
       : arena(arena), weights(&weights), cache_slots(cache_slots),
-        gathered_input(gathered_input) {}
+        rows(rows), gathered_input(gathered_input) {}
 
   ~Impl() { close(); }
 
@@ -177,7 +178,8 @@ struct MimoAttention::Impl {
 
   synTensor intermediate(const char* name, synDataType dtype,
                          std::initializer_list<uint64_t> sizes) {
-    const std::string full_name = "swa_" + std::string(name);
+    const std::string full_name = (rows == 1 ? "swa_" : "swa_m32_") +
+                                  std::string(name);
     synTensorDescriptor descriptor = {};
     descriptor.m_name = full_name.c_str();
     descriptor.m_dataType = dtype;
@@ -204,6 +206,8 @@ struct MimoAttention::Impl {
   }
 
   void build() {
+    if (rows != 1 && rows != 32)
+      throw std::invalid_argument("MimoAttention: rows must be 1 or 32");
     if (cache_slots < 2 * MimoAttention::kKvBlockSize ||
         cache_slots % MimoAttention::kKvBlockSize != 0 ||
         cache_slots > static_cast<uint32_t>(INT_MAX) /
@@ -235,17 +239,17 @@ struct MimoAttention::Impl {
 
     if (gathered_input) {
       synTensor gathered = external("hidden_gathered", Binding::kHiddenStates,
-                                    syn_type_float, {6144, 8});
+                                    syn_type_float, {6144, 8 * rows});
       hidden_states = gaudirt::mimo::append_tp8_reduce(graph, gathered, syn_type_float,
-                                                       reduction_section);
+                                                       reduction_section, rows);
     } else {
       hidden_states = external("hidden_states", Binding::kHiddenStates,
-                               syn_type_bf16, {6144, 1});
+                               syn_type_bf16, {6144, rows});
     }
     residual = external("residual", Binding::kResidual, syn_type_bf16,
-                        {6144, 1});
+                        {6144, rows});
     residual_out = external("residual_out", Binding::kResidualOut,
-                            syn_type_bf16, {6144, 1});
+                            syn_type_bf16, {6144, rows});
     synTensor norm_gamma = external("input_layernorm", Binding::kInputLayernorm,
                                     syn_type_bf16, {6144});
 
@@ -256,30 +260,30 @@ struct MimoAttention::Impl {
     synTensor qkv_zero_bias = external("qkv_bias", Binding::kQkvBias,
                                        syn_type_float, {3392});
     synTensor activation_q = intermediate("qkv_activation_fp8", syn_type_fp8_143,
-                                          {128, 1, 48});
+                                          {128, rows, 48});
     synTensor activation_scale = intermediate("qkv_activation_scale_fp32",
-                                              syn_type_float, {1, 1, 48});
+                                              syn_type_float, {1, rows, 48});
     node({hidden_states, residual, norm_gamma},
          {residual_out, activation_q, activation_scale},
          &kRmsNormEpsilon, sizeof(kRmsNormEpsilon),
          "gk_norm_block128_grid24_fp32_v1", "input_residual_norm_block128_quant");
 
     synTensor qkv_accumulator = intermediate("qkv_accumulator_fp32",
-                                             syn_type_float, {3392, 1, 48});
+                                             syn_type_float, {3392, rows, 48});
     synGEMMParams qkv_gemm_params{false, true};
-    qkv = intermediate("qkv", syn_type_bf16, {3392, 1});
+    qkv = intermediate("qkv", syn_type_bf16, {3392, rows});
     node({activation_q, qkv_packed}, {qkv_accumulator}, &qkv_gemm_params,
          sizeof(qkv_gemm_params), "batch_gemm", "qkv_block128_fp8_batch_gemm");
     node({qkv_accumulator, activation_scale, qkv_scale, qkv_zero_bias}, {qkv},
          nullptr, 0, "gk_neumaier_isa_handschedule_v1", "qkv_block128_scale_finish");
 
     synTensor rope_cos = external("rope_cos", Binding::kRopeCos, syn_type_bf16,
-                                  {64, 1, 1});
+                                  {64, 1, rows});
     synTensor rope_sin = external("rope_sin", Binding::kRopeSin, syn_type_bf16,
-                                  {64, 1, 1});
-    query = intermediate("query", syn_type_bf16, {192, 16, 1});
-    new_key = intermediate("new_key", syn_type_bf16, {192, 1, 1});
-    new_value = intermediate("new_value", syn_type_bf16, {128, 1, 1});
+                                  {64, 1, rows});
+    query = intermediate("query", syn_type_bf16, {192, 16, rows});
+    new_key = intermediate("new_key", syn_type_bf16, {192, 1, rows});
+    new_value = intermediate("new_value", syn_type_bf16, {128, 1, rows});
     node({qkv, rope_cos, rope_sin}, {query, new_key, new_value}, &kValueScale,
          sizeof(kValueScale), "gk_qkv_post_f32_f32_v1",
          "qkv_split_rope_vscale");
@@ -291,7 +295,7 @@ struct MimoAttention::Impl {
                                      syn_type_bf16, {128, 1, cache_slots});
     const synSectionHandle value_cache_section = externals.back().section;
     synTensor slot_mapping = external("slot_mapping", Binding::kSlotMapping,
-                                      syn_type_int32, {1});
+                                      syn_type_int32, {rows});
     key_cache_after = external("key_cache_after", Binding::kKeyCache,
                                syn_type_bf16, {192, 1, cache_slots},
                                key_cache_section);
@@ -308,33 +312,36 @@ struct MimoAttention::Impl {
          "write_new_value");
 
     synTensor window_pages = external("window_pages", Binding::kWindowPages,
-                                      syn_type_int32, {2});
+                                      syn_type_int32, {rows == 1 ? 2U : 64U});
     synTensor window_groups = external("window_groups", Binding::kWindowGroups,
-                                       syn_type_int32, {2});
+                                       syn_type_int32, {rows == 1 ? 2U : 64U});
     synTensor position = external("position", Binding::kPosition,
-                                  syn_type_int32, {1});
+                                  syn_type_int32, {rows});
     synTensor sink = external("attention_sink", Binding::kAttentionSink,
                               syn_type_bf16, {16});
-    context = intermediate("context", syn_type_bf16, {128, 16, 1});
+    context = intermediate("context", syn_type_bf16, {128, 16, rows});
     node({query, key_cache_after, value_cache_after, window_pages,
           window_groups, position, sink},
          {context}, &kAttentionScale, sizeof(kAttentionScale),
-         "gk_swa128_avgroup_group_v0", "swa128_fp32_attention");
+         rows == 1 ? "gk_swa128_avgroup_group_v0" : "gk_swa128_batch_window_quad_fp32_v2",
+         "swa128_fp32_attention");
 
     synTensor context_flat = intermediate("context_flat", syn_type_bf16,
-                                          {2048, 1});
+                                          {2048, rows});
     node({context}, {context_flat}, nullptr, 0, "reshape", "flatten_context");
     synTensor oproj = external("oproj_weight", Binding::kOprojWeight,
                                syn_type_bf16, {2048, 6144});
     output_local = external("output_local", Binding::kOutputLocal,
-                            syn_type_bf16, {6144, 1});
+                            syn_type_bf16, {6144, rows});
     synGEMMParams oproj_gemm_params{false, true};
     node({context_flat, oproj}, {output_local}, &oproj_gemm_params,
          sizeof(oproj_gemm_params), "gemm", "oproj_bf16_mme_local");
 
-    recipe = compile_cached(graph, "mimo_layer1_attention_b1_m1_tp8",
+    recipe = compile_cached(graph, rows == 1 ? "mimo_layer1_attention_b1_m1_tp8"
+                                             : "mimo_swa_prefill_b1_m32_tp8",
                             "swa_grid24_fp32_v7_c" + std::to_string(cache_slots) +
-                                (gathered_input ? "_gathered_tp1" : "_direct"), cache);
+                                (gathered_input ? "_gathered_tp1" : "_direct") +
+                                (rows == 1 ? "" : "_m32"), cache);
     check(synWorkspaceGetSize(&workspace_size, recipe), "get workspace size");
     arena.ensure_workspace(workspace_size);
     if (graph) {
@@ -420,8 +427,8 @@ struct MimoAttention::Impl {
 
 MimoAttention::MimoAttention(HbmArena& arena, const WeightManifest& weights,
                              uint32_t cache_slots, RecipeCache* cache,
-                             bool gathered_input)
-    : impl_(std::make_unique<Impl>(arena, weights, cache_slots, gathered_input)) {
+                             bool gathered_input, uint32_t rows)
+    : impl_(std::make_unique<Impl>(arena, weights, cache_slots, gathered_input, rows)) {
   impl_->cache = cache;
   impl_->build();
 }
