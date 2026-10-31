@@ -427,3 +427,8 @@ is `93c16cb993b1ff0c4f8242e1e70914045c19b1518c01c921e2bc9be0f270a5aa`.
 After both candidate arms, all 80 release-cache files retained their cold
 content, sizes, and modification times; the check receipt SHA256 is
 `070b03c9a97ce8f01c0cc7fb81cc16beaa5eed814d6bb279b1fb511a45c0ea4b`.
+The raw four-arm receipt's `performance_acceptance` field checks the timing,
+exit, token, layout, and isolation conditions; it does not establish the
+same complete serving path or directly expose release-graph router IDs.
+Those limits are also recorded in qualification receipt SHA256
+`3a1588c0e449fa8df2f3bacc2d860dced6de624322890e7c2308ed77df80d218`.
