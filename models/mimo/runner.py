@@ -4,8 +4,9 @@ import gc
 import os
 import sys
 
-if 'torch' not in sys.modules:
-    os.environ.setdefault('TORCH_DEVICE_BACKEND_AUTOLOAD', '0')
+if os.environ.get('TORCH_DEVICE_BACKEND_AUTOLOAD', '0') != '0':
+    raise RuntimeError('device backend autoload must be disabled')
+os.environ['TORCH_DEVICE_BACKEND_AUTOLOAD'] = '0'
 import torch
 
 
