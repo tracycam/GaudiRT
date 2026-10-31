@@ -35,11 +35,14 @@ float widen(uint16_t value) {
 }
 
 int main(int argc, char** argv) {
-  if (argc != 5) { std::cerr << "usage: TEST WEIGHTS RANK_FIXTURE MODULE HCCL_ID_FILE\n"; return 2; }
+  if (argc != 5 && argc != 6) { std::cerr << "usage: TEST WEIGHTS RANK_FIXTURE MODULE HCCL_ID_FILE [--empty]\n"; return 2; }
   try {
     using namespace gaudirt::runtime;
     const std::filesystem::path fixture(argv[2]), layer = fixture / "layer2";
-    const auto initial_key = read(layer / "key_cache.bin"), initial_value = read(layer / "value_cache.bin");
+    auto initial_key = read(layer / "key_cache.bin"), initial_value = read(layer / "value_cache.bin");
+    const bool empty = argc == 6;
+    if (empty && std::string(argv[5]) != "--empty") throw std::invalid_argument("invalid mode");
+    if (empty) { std::fill(initial_key.begin(),initial_key.end(),0); std::fill(initial_value.begin(),initial_value.end(),0); }
     if (initial_key.size() % (192*2) || initial_value.size() % (128*2) ||
         initial_key.size() / (192*2) != initial_value.size() / (128*2))
       throw std::runtime_error("invalid cache geometry");
@@ -83,18 +86,21 @@ int main(int argc, char** argv) {
       std::memcpy(&cos[r*64+i], rope.data()+(r*64+i%32)*2,2);
       std::memcpy(&sin[r*64+i], rope.data()+(r*64+32+i%32)*2,2);
     }
+    if(empty) { std::fill(cos.begin(),cos.end(),0x3f80); std::fill(sin.begin(),sin.end(),0); }
     const auto slot_bytes = read(layer / "slot_mapping.bin");
     const auto page_bytes = read(layer / "window_pages.bin");
     if (slot_bytes.size()!=4 || page_bytes.size()!=8) throw std::runtime_error("invalid page fixture");
     int32_t first; std::array<int32_t,2> pages1{},groups1{0,0};
     std::memcpy(&first,slot_bytes.data(),4); std::memcpy(pages1.data(),page_bytes.data(),8);
-    if (first<0 || unsigned(first)+kRows>cache_slots || first%128 || pages1[1]*128!=first)
+    if (empty) { first=0; pages1={0,-1}; groups1={0,-1}; }
+    if (first<0 || unsigned(first)+kRows>cache_slots || first%128 || (!empty && pages1[1]*128!=first))
       throw std::runtime_error("invalid starting decode page");
     std::array<int32_t,kRows> slots{},positions{};
     std::array<int32_t,kRows*2> pages{},groups{};
     for (unsigned r=0;r<kRows;++r) {
-      slots[r]=first+r; positions[r]=4096+r;
-      pages[2*r]=pages1[0]; pages[2*r+1]=pages1[1]; groups[2*r]=groups[2*r+1]=r;
+      slots[r]=first+r; positions[r]=(empty?0:4096)+r;
+      pages[2*r]=pages1[0]; pages[2*r+1]=pages1[1];
+      groups[2*r]=r; groups[2*r+1]=empty ? -1 : static_cast<int32_t>(r);
     }
     std::vector<float> gathered_hidden(8*kRows*6144);
     for(unsigned rank=0;rank<8;++rank) for(unsigned r=0;r<kRows;++r) for(unsigned c=0;c<6144;++c) {
@@ -177,7 +183,7 @@ int main(int argc, char** argv) {
     verify_kv(batched.key_cache,serial.key_cache,initial_key,192*2);
     verify_kv(batched.value_cache,serial.value_cache,initial_value,128*2);
     std::cout << "M32 TP8 real-weight SWA layer vs sequential M1: max_abs=" << max_abs
-              << " max_row_relative_l2=" << max_row_relative_l2 << " KV=bitwise\n";
+              << " max_row_relative_l2=" << max_row_relative_l2 << " KV=bitwise empty=" << empty << "\n";
     if (max_row_relative_l2>0.003) throw std::runtime_error("attention row exceeds quick-screen tolerance");
     float marker=1.0f; const auto barrier=upload(&marker,sizeof(marker));
     if(hcclAllReduce(reinterpret_cast<const void*>(barrier),reinterpret_cast<void*>(barrier),1,hcclFloat32,hcclSum,runtime.comm(),runtime.compute_stream())!=hcclSuccess) throw std::runtime_error("barrier failed");
