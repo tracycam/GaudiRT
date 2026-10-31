@@ -305,3 +305,17 @@ relative errors were `0.0205696` and `0.0236053`, respectively. The QKV
 layer receipt is `5b5802ea844dd0e571c30d186f9e89471ca9991ca19d228fcad70a158f2dcf77`;
 the one-card mechanism receipt is
 `71f0ba11114e98ebfcb35d281b85ea4ba2469b26afb4c1d042c2b67b2094b3c3`.
+
+An untimed audit of the restored candidate reproduced the unprofiled run's
+first logits and first 128 tokens on all eight ranks. For every step, rank,
+and layer, the expected key and value slot was written and remained unchanged
+later; all untouched KV bytes remained bitwise identical. This does not
+change the failed first-step accuracy gate. The audit receipt SHA256 is
+`ff968f35a54adb5742e29136899ac17fcedc647c7d3314be2a65af62209572dc`.
+
+An independent CPU head calculation used that candidate's actual first-step
+final normalized input and checkpoint weights. Its FP32 output had relative
+L2 `0.0204918` against the FP32 full-model reference and `0.0235504` against
+the FP64 reference. Both exceed the unchanged `0.02` gate. This is a CPU
+same-input calculation, not a measurement of an FP32 device head. Its receipt
+SHA256 is `9fac64529bf150dbf505265eaa7f563216d2a660e011d4e2c16d258d9d8daf36`.
