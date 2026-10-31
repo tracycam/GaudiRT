@@ -331,8 +331,14 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     } else {
       throw std::invalid_argument("PrivateUse1: unknown model weight");
     }
-    const uint64_t address = arena_.allocate(tensor.nbytes());
-    arena_.copy_h2d_sync(runtime_.h2d_stream(), tensor.data_ptr(), address, tensor.nbytes());
+    uint64_t bytes = tensor.nbytes();
+    const auto* data = static_cast<const uint8_t*>(tensor.data_ptr());
+    if (name == "lm_head") {
+      bytes = static_cast<uint64_t>(ModelHead::kLocalVocabSize) * 6144 * sizeof(uint16_t);
+      data += rank_ * bytes;
+    }
+    const uint64_t address = arena_.allocate(bytes);
+    arena_.copy_h2d_sync(runtime_.h2d_stream(), data, address, bytes);
     model_weights_.emplace(name, address);
   }
 
@@ -424,13 +430,15 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     embedding_device_ = arena_.allocate(6144 * sizeof(uint16_t));
     embedding_status_ = arena_.allocate(sizeof(int32_t));
     normalized_device_ = arena_.allocate(6144 * sizeof(uint16_t));
-    logits_device_ = arena_.allocate(152576 * sizeof(uint16_t));
+    local_logits_device_ = arena_.allocate(ModelHead::kLocalVocabSize * sizeof(uint16_t));
+    logits_device_ = arena_.allocate(ModelHead::kVocabSize * sizeof(uint16_t));
     const int32_t trigger_value = 0;
     arena_.copy_h2d_sync(runtime_.h2d_stream(), &trigger_value, trigger_device_, sizeof(trigger_value));
     arena_.copy_h2d_sync(runtime_.h2d_stream(), &initial_token, token_device_, sizeof(initial_token));
     embedding_ = std::make_unique<ModelEmbedding>(arena_, model_weights_.at("embedding"), &recipe_cache_);
     head_ = std::make_unique<ModelHead>(arena_, model_weights_.at("final_norm"),
-                                        model_weights_.at("lm_head"), &recipe_cache_, fused_model_);
+                                        model_weights_.at("lm_head"), &recipe_cache_, fused_model_,
+                                        ModelHead::kLocalVocabSize);
     argmax_ = std::make_unique<ModelArgmax>(arena_, &recipe_cache_);
     const uint64_t workspace = arena_.workspace_addr();
     model_embedding_launch_ = embedding_->prepare(token_device_, embedding_device_,
@@ -455,7 +463,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       model_layers_.push_back(std::move(prepared));
       residual = entries_.at(layer).residual_output;
     }
-    model_head_launch_ = head_->prepare(hidden, residual, normalized_device_, logits_device_);
+    model_head_launch_ = head_->prepare(hidden, residual, normalized_device_, local_logits_device_);
     model_argmax_launch_ = argmax_->prepare(logits_device_, embedding_status_, token_device_);
     if (arena_.workspace_addr() != workspace)
       throw std::runtime_error("PrivateUse1: workspace changed during model binding");
@@ -487,6 +495,10 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       for (const auto& layer : model_layers_) layer.execute(stream);
     }
     model_head_launch_.execute(stream);
+    if (hcclAllGather(reinterpret_cast<const void*>(local_logits_device_),
+                      reinterpret_cast<void*>(logits_device_), ModelHead::kLocalVocabSize,
+                      hcclBfloat16, runtime_.comm(), stream) != hcclSuccess)
+      throw std::runtime_error("PrivateUse1: model logits AllGather failed");
     model_argmax_launch_.execute(stream);
     check_syn(synEventRecord(compute_done_, runtime_.compute_stream()), "compute event record");
     check_syn(synStreamWaitEvent(runtime_.d2h_stream(), compute_done_, 0), "output wait");
@@ -772,6 +784,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   uint64_t embedding_device_ = 0;
   uint64_t embedding_status_ = 0;
   uint64_t normalized_device_ = 0;
+  uint64_t local_logits_device_ = 0;
   uint64_t logits_device_ = 0;
   std::unique_ptr<ModelEmbedding> embedding_;
   std::unique_ptr<ModelHead> head_;
