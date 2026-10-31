@@ -28,7 +28,7 @@ class Layer0 final {
          const runtime::WeightManifest& attention_weights,
          const runtime::WeightManifest& dense_weights, uint32_t cache_slots,
          uint32_t page_count = 64, runtime::RecipeCache* cache = nullptr,
-         bool fused_model = false);
+         bool fused_model = false, uint32_t rows = 1);
 
   Layer0(const Layer0&) = delete;
   Layer0& operator=(const Layer0&) = delete;
@@ -50,6 +50,7 @@ class Layer0 final {
   hcclComm_t comm_;
   uint64_t post_attention_gamma_ = 0;
   bool fused_model_ = false;
+  uint32_t rows_ = 1;
 };
 
 }  // namespace gaudirt::mimo
