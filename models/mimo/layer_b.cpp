@@ -56,14 +56,19 @@ LayerB::LayerB(runtime::HbmArena& arena, runtime::DeviceRuntime& runtime,
   if (rows_ != 1 && ((rows_ != 32 && rows_ != 512 && rows_ != 1024 && rows_ != 2048) || !fused_model_))
     throw std::invalid_argument("MiMo layer: prefill requires fused execution");
   if (!comm_) throw std::invalid_argument("MiMo Type B: missing HCCL");
+  if (rows_ > 1 && page_count == 32)
+    short_attention_ = std::make_unique<runtime::MimoFullAttention>(
+        arena, weights, cache_slots, false, 16, cache, fused_model, rows);
   arena.ensure_workspace(std::max(
-      {attention_.workspace_bytes(), attention_reduce_ ? attention_reduce_->workspace_bytes() : 0,
+      {attention_.workspace_bytes(), short_attention_ ? short_attention_->workspace_bytes() : 0,
+       attention_reduce_ ? attention_reduce_->workspace_bytes() : 0,
        moe_.workspace_bytes(), moe_reduce_ ? moe_reduce_->workspace_bytes() : 0}));
 }
 
-PreparedLayer LayerB::prepare(const Io& io) {
+PreparedLayer LayerB::prepare(const Io& io, bool short_prefix) {
   PreparedLayer result;
-  result.attention.push_back(attention_.prepare(io.attention));
+  if (short_prefix && !short_attention_) throw std::invalid_argument("MiMo Type B: no short attention graph");
+  result.attention.push_back((short_prefix ? *short_attention_ : attention_).prepare(io.attention));
   if (!fused_model_)
     result.attention_reduce = attention_reduce_->prepare(io.attention_gathered_fp32,
                                                           io.attention_output_bf16);
@@ -114,6 +119,7 @@ void LayerB::execute(const Io& io, synStreamHandle stream) {
 
 void LayerB::rebind_weights(const runtime::WeightManifest& weights) {
   attention_.rebind_weights(weights);
+  if (short_attention_) short_attention_->rebind_weights(weights);
   moe_weights_.post_attention_gamma_bf16 =
       weights.get("post_attention_layernorm").device_address;
   moe_weights_.router_weight_bf16 = weights.get("router_weight").device_address;

@@ -34,7 +34,7 @@ class LayerB final {
   LayerB& operator=(const LayerB&) = delete;
 
   void execute(const Io& io, synStreamHandle stream);
-  PreparedLayer prepare(const Io& io);
+  PreparedLayer prepare(const Io& io, bool short_prefix = false);
   void rebind_weights(const runtime::WeightManifest& weights);
   uint64_t moe_lut() const { return moe_weights_.mxfp4_lut_bf16; }
   uint64_t moe_directions() const { return moe_weights_.down_combine_directions_u8; }
@@ -45,6 +45,7 @@ class LayerB final {
  private:
   runtime::HbmArena& arena_;
   runtime::MimoFullAttention attention_;
+  std::unique_ptr<runtime::MimoFullAttention> short_attention_;
   std::unique_ptr<runtime::TpReduce> attention_reduce_;
   runtime::MimoMoeLayer1::Weights moe_weights_{};
   runtime::MimoMoeLayer1 moe_;

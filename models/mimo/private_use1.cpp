@@ -352,7 +352,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
                                                *entry_it->second.attention_weights,
                                                entry_it->second.dense_weights.get()));
       if (prefill_enabled_)
-        prefill_instances_.emplace(kind, create_instance(kind, cache_slots, page_count,
+        prefill_instances_.emplace(kind, create_instance(kind, cache_slots, kind == Kind::C ? page_count : 32,
             *entry_it->second.attention_weights, entry_it->second.dense_weights.get(), 32));
       if (prefill_enabled_)
         large_prefill_instances_.emplace(kind, create_instance(kind, cache_slots,
@@ -552,6 +552,8 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       auto bind = [&]<typename Metadata>(ModelEmbedding& embedding, runtime::TpReduce& reduce,
                                        uint64_t base, std::vector<PreparedLayer>& layers,
                                        std::vector<std::pair<uint64_t*, uint64_t>>& metadata_bindings,
+                                       std::vector<PreparedLayer>& short_layers,
+                                       std::vector<std::pair<uint64_t*, uint64_t>>& short_bindings,
                                        runtime::PreparedLaunch& embedding_launch, uint64_t*& token_binding,
                                        runtime::PreparedLaunch& reduce_launch, runtime::PreparedLaunch& head_launch) {
         embedding_launch = embedding.prepare(prefill_tokens_device_, prefill_embedding_device_, prefill_status_device_);
@@ -561,6 +563,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
         }
         if (!token_binding) throw std::runtime_error("PrivateUse1: missing prefill token binding");
         layers.reserve(70);
+        short_layers.reserve(70);
         uint64_t hidden = prefill_embedding_device_, residual = prefill_embedding_device_;
         for (uint32_t layer = 0; layer < 70; ++layer) {
           const bool full = is_full_layer(layer);
@@ -574,11 +577,13 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
               base + (full ? offsetof(Metadata, full_groups) : offsetof(Metadata, window_groups)),
               base + offsetof(Metadata, positions)};
           layers.push_back(prepare_layer(layer, addresses, Metadata::kRows));
+          short_layers.push_back(prepare_layer(layer, addresses, Metadata::kRows, full));
           hidden = layers.back().feed_forward_gathered;
           residual = Metadata::kRows == 32 ? entries_.at(layer).prefill_residual_output
                                            : entries_.at(layer).large_prefill_residual_output;
         }
         metadata_bindings = prefill_metadata_bindings(layers, base, sizeof(Metadata));
+        short_bindings = prefill_metadata_bindings(short_layers, base, sizeof(Metadata));
         const uint64_t last = (Metadata::kRows - 1) * 6144 * sizeof(uint16_t);
         const uint64_t rank_stride = Metadata::kRows * 6144 * sizeof(float);
         reduce_launch = reduce.prepare_strided(hidden + (Metadata::kRows - 1) * 6144 * sizeof(float),
@@ -587,13 +592,13 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
                                             normalized_device_, local_logits_device_);
       };
       bind.template operator()<PrefillMetadata>(*prefill_embedding_, *prefill_reduce_, prefill_metadata_device_,
-          prefill_layers_, prefill_metadata_bindings_, prefill_embedding_launch_, prefill_token_binding_,
+          prefill_layers_, prefill_metadata_bindings_, short_prefill_layers_, short_prefill_metadata_bindings_, prefill_embedding_launch_, prefill_token_binding_,
           prefill_reduce_launch_, prefill_head_launch_);
       bind.template operator()<LargePrefillMetadata>(*large_prefill_embedding_, *prefill_reduce_, large_prefill_metadata_device_,
-          large_prefill_layers_, large_prefill_metadata_bindings_, large_prefill_embedding_launch_, large_prefill_token_binding_,
+          large_prefill_layers_, large_prefill_metadata_bindings_, short_large_prefill_layers_, short_large_prefill_metadata_bindings_, large_prefill_embedding_launch_, large_prefill_token_binding_,
           large_prefill_reduce_launch_, large_prefill_head_launch_);
       bind.template operator()<XLargePrefillMetadata>(*xlarge_prefill_embedding_, *prefill_reduce_, xlarge_prefill_metadata_device_,
-          xlarge_prefill_layers_, xlarge_prefill_metadata_bindings_, xlarge_prefill_embedding_launch_, xlarge_prefill_token_binding_,
+          xlarge_prefill_layers_, xlarge_prefill_metadata_bindings_, short_xlarge_prefill_layers_, short_xlarge_prefill_metadata_bindings_, xlarge_prefill_embedding_launch_, xlarge_prefill_token_binding_,
           xlarge_prefill_reduce_launch_, xlarge_prefill_head_launch_);
       prefill_argmax_launch_ = argmax_->prepare(logits_device_, prefill_status_device_, token_device_);
     }
@@ -704,8 +709,13 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       const bool large = chunk.rows == 512, xlarge = chunk.rows == 2048;
       auto& token_binding = xlarge ? xlarge_prefill_token_binding_ : large ? large_prefill_token_binding_ : prefill_token_binding_;
       auto& embedding = xlarge ? xlarge_prefill_embedding_launch_ : large ? large_prefill_embedding_launch_ : prefill_embedding_launch_;
-      auto& bindings = xlarge ? xlarge_prefill_metadata_bindings_ : large ? large_prefill_metadata_bindings_ : prefill_metadata_bindings_;
-      auto& layers = xlarge ? xlarge_prefill_layers_ : large ? large_prefill_layers_ : prefill_layers_;
+      const bool short_prefix = prefill_rows_ + chunk.offset + chunk.rows <= 2048;
+      auto& bindings = short_prefix
+          ? (xlarge ? short_xlarge_prefill_metadata_bindings_ : large ? short_large_prefill_metadata_bindings_ : short_prefill_metadata_bindings_)
+          : (xlarge ? xlarge_prefill_metadata_bindings_ : large ? large_prefill_metadata_bindings_ : prefill_metadata_bindings_);
+      auto& layers = short_prefix
+          ? (xlarge ? short_xlarge_prefill_layers_ : large ? short_large_prefill_layers_ : short_prefill_layers_)
+          : (xlarge ? xlarge_prefill_layers_ : large ? large_prefill_layers_ : prefill_layers_);
       *token_binding = prefill_tokens_device_ + chunk.offset * sizeof(int32_t);
       embedding.execute(stream);
       const uint64_t base = xlarge ? xlarge_prefill_metadata_device_ + chunk.index * sizeof(XLargePrefillMetadata)
@@ -829,7 +839,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
 
   PreparedLayer prepare_layer(uint32_t layer_id,
                               const std::array<uint64_t, 11>& addresses,
-                              uint32_t prefill = 0) {
+                              uint32_t prefill = 0, bool short_prefix = false) {
     auto& entry = entries_.at(layer_id);
     auto& map = prefill == 2048 ? xlarge_prefill_instances_ : prefill == 512 ? large_prefill_instances_ : prefill == 32 ? prefill_instances_ : instances_;
     auto& instance = *map.at(entry.kind);
@@ -842,7 +852,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       io.attention.residual = addresses[0];
       io.dense_outputs.residual_out_bf16 = residual_output;
       io.layer_output_bf16 = entry.layer_output;
-      return instance.a->prepare(io);
+      return instance.a->prepare(io, short_prefix);
     }
     if (entry.kind == Kind::B) {
       instance.b->rebind_weights(*entry.attention_weights);
@@ -850,7 +860,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       set_common_attention(io.attention, addresses);
       io.moe_outputs.residual_out_bf16 = residual_output;
       io.layer_output_bf16 = entry.layer_output;
-      return instance.b->prepare(io);
+      return instance.b->prepare(io, short_prefix);
     }
     instance.c->rebind_weights(*entry.attention_weights);
     auto io = instance.c_io;
@@ -1068,9 +1078,15 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   std::vector<PreparedLayer> prefill_layers_;
   std::vector<PreparedLayer> large_prefill_layers_;
   std::vector<PreparedLayer> xlarge_prefill_layers_;
+  std::vector<PreparedLayer> short_prefill_layers_;
+  std::vector<PreparedLayer> short_large_prefill_layers_;
+  std::vector<PreparedLayer> short_xlarge_prefill_layers_;
   std::vector<std::pair<uint64_t*, uint64_t>> prefill_metadata_bindings_;
   std::vector<std::pair<uint64_t*, uint64_t>> large_prefill_metadata_bindings_;
   std::vector<std::pair<uint64_t*, uint64_t>> xlarge_prefill_metadata_bindings_;
+  std::vector<std::pair<uint64_t*, uint64_t>> short_prefill_metadata_bindings_;
+  std::vector<std::pair<uint64_t*, uint64_t>> short_large_prefill_metadata_bindings_;
+  std::vector<std::pair<uint64_t*, uint64_t>> short_xlarge_prefill_metadata_bindings_;
   uint64_t* prefill_token_binding_ = nullptr;
   uint64_t* large_prefill_token_binding_ = nullptr;
   uint64_t* xlarge_prefill_token_binding_ = nullptr;

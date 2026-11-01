@@ -177,7 +177,8 @@ struct MimoFullAttention::Impl {
                          synDataType dtype,
                          std::initializer_list<uint64_t> sizes) {
     const std::string full_name = (pure_rmsnorm ? "pure_" : "residual_") +
-                                  (rows == 1 ? "" : "m" + std::to_string(rows) + "_") +
+                                  (rows == 1 ? "" : "m" + std::to_string(rows) +
+                                                        "_p" + std::to_string(page_count) + "_") +
                                   std::string(name);
     synTensorDescriptor descriptor = {};
     descriptor.m_name = full_name.c_str();
