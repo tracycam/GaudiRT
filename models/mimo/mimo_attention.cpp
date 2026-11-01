@@ -206,8 +206,8 @@ struct MimoAttention::Impl {
   }
 
   void build() {
-    if (rows != 1 && rows != 32)
-      throw std::invalid_argument("MimoAttention: rows must be 1 or 32");
+    if (rows != 1 && rows != 32 && rows != 512)
+      throw std::invalid_argument("MimoAttention: unsupported rows");
     if (cache_slots < 2 * MimoAttention::kKvBlockSize ||
         cache_slots % MimoAttention::kKvBlockSize != 0 ||
         cache_slots > static_cast<uint32_t>(INT_MAX) /
@@ -312,9 +312,9 @@ struct MimoAttention::Impl {
          "write_new_value");
 
     synTensor window_pages = external("window_pages", Binding::kWindowPages,
-                                      syn_type_int32, {rows == 1 ? 2U : 64U});
+                                      syn_type_int32, {2U * rows});
     synTensor window_groups = external("window_groups", Binding::kWindowGroups,
-                                       syn_type_int32, {rows == 1 ? 2U : 64U});
+                                       syn_type_int32, {2U * rows});
     synTensor position = external("position", Binding::kPosition,
                                   syn_type_int32, {rows});
     synTensor sink = external("attention_sink", Binding::kAttentionSink,
@@ -338,10 +338,10 @@ struct MimoAttention::Impl {
          sizeof(oproj_gemm_params), "gemm", "oproj_bf16_mme_local");
 
     recipe = compile_cached(graph, rows == 1 ? "mimo_layer1_attention_b1_m1_tp8"
-                                             : "mimo_swa_prefill_b1_m32_tp8",
+                                             : "mimo_swa_prefill_b1_m" + std::to_string(rows) + "_tp8",
                             "swa_grid24_fp32_v7_c" + std::to_string(cache_slots) +
                                 (gathered_input ? "_gathered_tp1" : "_direct") +
-                                (rows == 1 ? "" : "_m32"), cache);
+                                (rows == 1 ? "" : "_m" + std::to_string(rows)), cache);
     check(synWorkspaceGetSize(&workspace_size, recipe), "get workspace size");
     arena.ensure_workspace(workspace_size);
     if (graph) {
