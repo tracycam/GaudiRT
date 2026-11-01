@@ -194,6 +194,51 @@ struct MimoDenseMlp::Impl {
           std::string("create node ") + name);
   }
 
+  void linear_large_mme(synGraphHandle graph, synTensor x, synTensor weight,
+                        synTensor scales, synTensor bias, synTensor output,
+                        uint64_t groups, uint64_t width, const char* prefix) {
+    // Three BF16 products approximate FP32 x*w as high*high + low*high +
+    // high*low. The second-order low*low product is omitted.
+    const auto name = [&](const char* suffix) { return std::string(prefix) + suffix; };
+    synTensor activation = intermediate(graph, name("_mme_activation_bf16").c_str(), syn_type_bf16,
+                                         {groups * 128, rows});
+    synTensor decoded = intermediate(graph, name("_mme_decoded_weight").c_str(), syn_type_bf16,
+                                      {groups * 128, width});
+    synTensor partial = intermediate(graph, name("_mme_output_fp32").c_str(), syn_type_float,
+                                      {width, rows});
+    ns_CastKernel::ParamsV3 cast{};
+    cast.round_mode = CAST_ROUND_HALF_NE;
+    node(graph, {x}, {activation}, &cast, sizeof(cast), "cast_f32_to_bf16", "mme_activation_cast");
+    synTensor decoded_low = intermediate(graph, name("_mme_decoded_weight_low").c_str(), syn_type_bf16,
+                                          {groups * 128, width});
+    node(graph, {weight, scales}, {decoded, decoded_low}, nullptr, 0,
+         "gk_dense_block128_decode_split_v1", "mme_weight_decode_split");
+    synTensor reconstructed = intermediate(graph, name("_mme_activation_reconstructed").c_str(), syn_type_float,
+                                            {groups * 128, rows});
+    synTensor residual = intermediate(graph, name("_mme_activation_residual").c_str(), syn_type_float,
+                                       {groups * 128, rows});
+    synTensor correction = intermediate(graph, name("_mme_activation_correction").c_str(), syn_type_bf16,
+                                         {groups * 128, rows});
+    synTensor extra = intermediate(graph, name("_mme_output_correction").c_str(), syn_type_float,
+                                    {width, rows});
+    synTensor combined = intermediate(graph, name("_mme_output_combined").c_str(), syn_type_float,
+                                       {width, rows});
+    node(graph, {activation}, {reconstructed}, &cast, sizeof(cast), "cast_bf16_to_f32", "mme_activation_widen");
+    node(graph, {x, reconstructed}, {residual}, nullptr, 0, "sub_fwd_f32", "mme_activation_residual");
+    node(graph, {residual}, {correction}, &cast, sizeof(cast), "cast_f32_to_bf16", "mme_activation_correction");
+    const synGEMMParams params{false, true};
+    node(graph, {activation, decoded}, {partial}, &params, sizeof(params), "gemm", "mme_dense");
+    node(graph, {correction, decoded}, {extra}, &params, sizeof(params), "gemm", "mme_dense_correction");
+    synTensor weight_extra = intermediate(graph, name("_mme_weight_correction").c_str(), syn_type_float,
+                                           {width, rows});
+    synTensor combined_all = intermediate(graph, name("_mme_output_combined_all").c_str(), syn_type_float,
+                                           {width, rows});
+    node(graph, {activation, decoded_low}, {weight_extra}, &params, sizeof(params), "gemm", "mme_weight_correction");
+    node(graph, {partial, extra}, {combined}, nullptr, 0, "add_fwd_f32", "mme_combine");
+    node(graph, {combined, weight_extra}, {combined_all}, nullptr, 0, "add_fwd_f32", "mme_combine_weight");
+    node(graph, {combined_all, bias}, {output}, nullptr, 0, "add_fwd_f32", "mme_bias");
+  }
+
   void build() {
     if (rows != 1 && rows != 32 && rows != 512 && rows != 1024 && rows != 2048)
       throw std::invalid_argument("MimoDenseMlp: unsupported rows");
@@ -263,8 +308,9 @@ struct MimoDenseMlp::Impl {
                               Binding::kGateUpBias, syn_type_float, {gate_up_n});
     synTensor gate_up = intermediate(gate_up_graph, "gate_up_fp32",
                                      syn_type_float, {gate_up_n, rows});
-    node(gate_up_graph, {normalized, weight, weight_scale, bias}, {gate_up}, nullptr, 0,
-         rows == 1 ? "gk_dense_linear_fp32_v1" : "gk_dense_linear_prefill_fp32_v1", "gate_up_fp32_linear");
+    if (rows >= 512) linear_large_mme(gate_up_graph, normalized, weight, weight_scale, bias, gate_up, groups, gate_up_n, "gate_up");
+    else node(gate_up_graph, {normalized, weight, weight_scale, bias}, {gate_up}, nullptr, 0,
+              rows == 1 ? "gk_dense_linear_fp32_v1" : "gk_dense_linear_prefill_fp32_v1", "gate_up_fp32_linear");
     synTensor activation_wide = external(gate_up_graph, gate_up_externals,
                                          "activation_fp32", Binding::kActivationFp32,
                                          syn_type_float, {down_k, rows});
@@ -274,7 +320,8 @@ struct MimoDenseMlp::Impl {
         gate_up_graph, rows == 1 ? "mimo_dense_gate_up_b1_m1_tp8" : "mimo_dense_gate_up_b1_m" + std::to_string(rows) + "_tp8",
         "dense_gate_up_n" + std::to_string(gate_up_n) + "_g" +
             std::to_string(groups) + (gathered_attention ? "_gathered_tp1" : "_direct") +
-            (rows == 1 ? "" : "_m" + std::to_string(rows)), cache);
+            (rows == 1 ? "" : "_m" + std::to_string(rows)) +
+            (rows >= 512 ? "_mme_split_v1" : ""), cache);
     check(synWorkspaceGetSize(&gate_up_workspace_size, gate_up_recipe),
           "get gate_up workspace size");
     arena.ensure_workspace(gate_up_workspace_size);
@@ -307,11 +354,13 @@ struct MimoDenseMlp::Impl {
     synTensor output_local = external(down_graph, down_externals, "output_local",
                                       Binding::kOutputLocal, syn_type_float,
                                       {6144, rows});
-    node(down_graph, {activation, weight, weight_scale, bias}, {output_local},
-         nullptr, 0, rows == 1 ? "gk_dense_linear_fp32_v1" : "gk_dense_linear_prefill_fp32_v1", "down_fp32_linear");
+    if (rows >= 512) linear_large_mme(down_graph, activation, weight, weight_scale, bias, output_local, groups, 6144, "down");
+    else node(down_graph, {activation, weight, weight_scale, bias}, {output_local},
+              nullptr, 0, rows == 1 ? "gk_dense_linear_fp32_v1" : "gk_dense_linear_prefill_fp32_v1", "down_fp32_linear");
     down_recipe = compile_cached(
         down_graph, rows == 1 ? "mimo_dense_down_b1_m1_tp8" : "mimo_dense_down_b1_m" + std::to_string(rows) + "_tp8",
-        "dense_down_k" + std::to_string(down_k) + "_g" + std::to_string(groups) + (rows == 1 ? "" : "_m" + std::to_string(rows)),
+        "dense_down_k" + std::to_string(down_k) + "_g" + std::to_string(groups) +
+            (rows == 1 ? "" : "_m" + std::to_string(rows)) + (rows >= 512 ? "_mme_split_v1" : ""),
         cache);
     check(synWorkspaceGetSize(&down_workspace_size, down_recipe),
           "get down workspace size");
