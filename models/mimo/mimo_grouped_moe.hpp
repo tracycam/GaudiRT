@@ -21,7 +21,7 @@ inline void append_grouped_prefill_moe(synGraphHandle graph, uint32_t rows,
                                        synTensor gate_scale, synTensor down_weight,
                                        synTensor down_scale, synTensor lut,
                                        synTensor output) {
-  if (rows != 256 && rows != 512 && rows != 1024) throw std::invalid_argument("grouped MoE rows");
+  if (rows != 256 && rows != 512 && rows != 1024 && rows != 2048) throw std::invalid_argument("grouped MoE rows");
   const std::string prefix = std::string(graph_variant) + "_m" + std::to_string(rows) + "_";
   auto check = [](synStatus status, const char* where) {
     if (status != synSuccess) throw std::runtime_error(std::string(where) + ": " + std::to_string(status));
