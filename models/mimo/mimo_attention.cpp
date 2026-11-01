@@ -323,7 +323,9 @@ struct MimoAttention::Impl {
     node({query, key_cache_after, value_cache_after, window_pages,
           window_groups, position, sink},
          {context}, &kAttentionScale, sizeof(kAttentionScale),
-         rows == 1 ? "gk_swa128_avgroup_group_v0" : "gk_swa128_batch_window_quad_fp32_v2",
+         rows == 1 ? "gk_swa128_avgroup_group_v0"
+                   : (rows == 512 ? "gk_swa128_batch_window_direct_fp32_v3"
+                                  : "gk_swa128_batch_window_quad_fp32_v2"),
          "swa128_fp32_attention");
 
     synTensor context_flat = intermediate("context_flat", syn_type_bf16,
@@ -339,7 +341,9 @@ struct MimoAttention::Impl {
 
     recipe = compile_cached(graph, rows == 1 ? "mimo_layer1_attention_b1_m1_tp8"
                                              : "mimo_swa_prefill_b1_m" + std::to_string(rows) + "_tp8",
-                            "swa_grid24_fp32_v7_c" + std::to_string(cache_slots) +
+                            std::string(rows == 512 ? "swa_grid24_direct_fp32_v8_c"
+                                                    : "swa_grid24_fp32_v7_c") +
+                                std::to_string(cache_slots) +
                                 (gathered_input ? "_gathered_tp1" : "_direct") +
                                 (rows == 1 ? "" : "_m" + std::to_string(rows)), cache);
     check(synWorkspaceGetSize(&workspace_size, recipe), "get workspace size");
