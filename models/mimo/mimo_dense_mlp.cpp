@@ -197,8 +197,6 @@ struct MimoDenseMlp::Impl {
   void linear_large_mme(synGraphHandle graph, synTensor x, synTensor weight,
                         synTensor scales, synTensor bias, synTensor output,
                         uint64_t groups, uint64_t width, const char* prefix) {
-    // Three BF16 products approximate FP32 x*w as high*high + low*high +
-    // high*low. The second-order low*low product is omitted.
     const auto name = [&](const char* suffix) { return std::string(prefix) + suffix; };
     synTensor activation = intermediate(graph, name("_mme_activation_bf16").c_str(), syn_type_bf16,
                                          {groups * 128, rows});
@@ -320,8 +318,7 @@ struct MimoDenseMlp::Impl {
         gate_up_graph, rows == 1 ? "mimo_dense_gate_up_b1_m1_tp8" : "mimo_dense_gate_up_b1_m" + std::to_string(rows) + "_tp8",
         "dense_gate_up_n" + std::to_string(gate_up_n) + "_g" +
             std::to_string(groups) + (gathered_attention ? "_gathered_tp1" : "_direct") +
-            (rows == 1 ? "" : "_m" + std::to_string(rows)) +
-            (rows >= 512 ? "_mme_split_v1" : ""), cache);
+            (rows == 1 ? "" : "_m" + std::to_string(rows)), cache);
     check(synWorkspaceGetSize(&gate_up_workspace_size, gate_up_recipe),
           "get gate_up workspace size");
     arena.ensure_workspace(gate_up_workspace_size);
@@ -359,8 +356,7 @@ struct MimoDenseMlp::Impl {
               nullptr, 0, rows == 1 ? "gk_dense_linear_fp32_v1" : "gk_dense_linear_prefill_fp32_v1", "down_fp32_linear");
     down_recipe = compile_cached(
         down_graph, rows == 1 ? "mimo_dense_down_b1_m1_tp8" : "mimo_dense_down_b1_m" + std::to_string(rows) + "_tp8",
-        "dense_down_k" + std::to_string(down_k) + "_g" + std::to_string(groups) +
-            (rows == 1 ? "" : "_m" + std::to_string(rows)) + (rows >= 512 ? "_mme_split_v1" : ""),
+        "dense_down_k" + std::to_string(down_k) + "_g" + std::to_string(groups) + (rows == 1 ? "" : "_m" + std::to_string(rows)),
         cache);
     check(synWorkspaceGetSize(&down_workspace_size, down_recipe),
           "get down workspace size");
