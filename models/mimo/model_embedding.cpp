@@ -25,7 +25,7 @@ void check(synStatus status, const char* operation) {
 ModelEmbedding::ModelEmbedding(runtime::HbmArena& arena, uint64_t table,
                                runtime::RecipeCache* cache, uint32_t rows)
     : arena_(arena) {
-  if (rows != 1 && rows != 32 && rows != 256 && rows != 512)
+  if (rows != 1 && rows != 32 && rows != 256 && rows != 512 && rows != 1024)
     throw std::invalid_argument("MiMo embedding: invalid rows");
   if (!table) throw std::invalid_argument("MiMo embedding: null table");
   synGraphHandle graph = nullptr;
