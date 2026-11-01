@@ -239,7 +239,7 @@ MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
          &router_post_params, sizeof(router_post_params));
 
     if (rows_ == 256 || rows_ == 512) {
-      append_grouped_prefill_moe(graph, rows_, normalized, route_ids, route_weights,
+      append_grouped_prefill_moe(graph, rows_, graph_variant, normalized, route_ids, route_weights,
                                  gate_up_weight, gate_up_scale, down_weight,
                                  down_scale, lut, moe_out);
     } else {
