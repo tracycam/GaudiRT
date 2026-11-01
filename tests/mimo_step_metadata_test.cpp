@@ -88,6 +88,23 @@ int main() {
   }
   require(rejected);
 
+  // Serving registers RoPE from position zero so shorter prompts decode at
+  // their real end rather than at the maximum supported prompt length.
+  std::array<uint16_t, 4224 * 64> serving_rope{};
+  for (size_t i = 0; i < serving_rope.size(); ++i)
+    serving_rope[i] = static_cast<uint16_t>(i);
+  for (uint32_t prompt : {1536u, 2080u, 4096u}) {
+    for (uint32_t offset : {0u, 127u}) {
+      const uint32_t position = prompt + offset;
+      fill_step_metadata(step, position, 0, 4224, serving_rope.data(),
+                         serving_rope.data(), pages, 205184);
+      require(step.position == static_cast<int32_t>(position));
+      require(step.slot == pages[position / 128] * 128 + static_cast<int32_t>(position % 128));
+      require(step.full_cos[0] == serving_rope[position * 64]);
+      require(step.full_sin[63] == serving_rope[position * 64 + 63]);
+    }
+  }
+
   std::array<int32_t, 64> updated{};
   for (size_t i = 0; i < updated.size(); ++i) updated[i] = static_cast<int32_t>(i + 34);
   auto original = updated;
