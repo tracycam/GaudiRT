@@ -502,12 +502,11 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       large_prefill_metadata_device_ = arena_.allocate(8 * sizeof(LargePrefillMetadata));
       prefill_embedding_device_ = arena_.allocate(512 * 6144 * sizeof(uint16_t));
       prefill_status_device_ = arena_.allocate(512 * sizeof(int32_t));
-      prefill_reduced_device_ = arena_.allocate(512 * 6144 * sizeof(uint16_t));
+      prefill_reduced_device_ = arena_.allocate(6144 * sizeof(uint16_t));
       prefill_embedding_ = std::make_unique<ModelEmbedding>(arena_, model_weights_.at("embedding"), &recipe_cache_, 32);
       large_prefill_embedding_ = std::make_unique<ModelEmbedding>(arena_, model_weights_.at("embedding"), &recipe_cache_, 512);
       prefill_head_ = std::make_unique<ModelHead>(arena_, model_weights_.at("final_norm"), model_weights_.at("lm_head"), &recipe_cache_, false, ModelHead::kLocalVocabSize);
-      prefill_reduce_ = std::make_unique<runtime::TpReduce>(arena_, 32 * 6144, syn_type_float, &recipe_cache_);
-      large_prefill_reduce_ = std::make_unique<runtime::TpReduce>(arena_, 512 * 6144, syn_type_float, &recipe_cache_);
+      prefill_reduce_ = std::make_unique<runtime::TpReduce>(arena_, 6144, syn_type_float, &recipe_cache_);
     }
     const uint64_t workspace = arena_.workspace_addr();
     model_embedding_launch_ = embedding_->prepare(token_device_, embedding_device_,
@@ -565,15 +564,17 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
                                            : entries_.at(layer).large_prefill_residual_output;
         }
         metadata_bindings = prefill_metadata_bindings(layers, base, sizeof(Metadata));
-        reduce_launch = reduce.prepare(hidden, prefill_reduced_device_);
         const uint64_t last = (Metadata::kRows - 1) * 6144 * sizeof(uint16_t);
-        head_launch = prefill_head_->prepare(prefill_reduced_device_ + last, residual + last,
+        const uint64_t rank_stride = Metadata::kRows * 6144 * sizeof(float);
+        reduce_launch = reduce.prepare_strided(hidden + (Metadata::kRows - 1) * 6144 * sizeof(float),
+                                               prefill_reduced_device_, rank_stride);
+        head_launch = prefill_head_->prepare(prefill_reduced_device_, residual + last,
                                             normalized_device_, local_logits_device_);
       };
       bind.template operator()<PrefillMetadata>(*prefill_embedding_, *prefill_reduce_, prefill_metadata_device_,
           prefill_layers_, prefill_metadata_bindings_, prefill_embedding_launch_, prefill_token_binding_,
           prefill_reduce_launch_, prefill_head_launch_);
-      bind.template operator()<LargePrefillMetadata>(*large_prefill_embedding_, *large_prefill_reduce_, large_prefill_metadata_device_,
+      bind.template operator()<LargePrefillMetadata>(*large_prefill_embedding_, *prefill_reduce_, large_prefill_metadata_device_,
           large_prefill_layers_, large_prefill_metadata_bindings_, large_prefill_embedding_launch_, large_prefill_token_binding_,
           large_prefill_reduce_launch_, large_prefill_head_launch_);
       prefill_argmax_launch_ = argmax_->prepare(logits_device_, prefill_status_device_, token_device_);
@@ -1084,7 +1085,6 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   std::unique_ptr<ModelEmbedding> large_prefill_embedding_;
   std::unique_ptr<ModelHead> prefill_head_;
   std::unique_ptr<runtime::TpReduce> prefill_reduce_;
-  std::unique_ptr<runtime::TpReduce> large_prefill_reduce_;
   std::unique_ptr<ModelEmbedding> embedding_;
   std::unique_ptr<ModelHead> head_;
   std::unique_ptr<ModelArgmax> argmax_;

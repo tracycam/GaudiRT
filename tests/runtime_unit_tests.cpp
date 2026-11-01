@@ -434,6 +434,22 @@ void test_foundation_on_hardware() {
   arena.copy_d2h_sync(rt.d2h_stream(), prepared_addr, prepared_result.data(),
                       prepared_result.size() * sizeof(uint16_t));
   assert(prepared_result == reduced);
+  // The last row of each rank's multirow gather is separated by a rank stride.
+  constexpr size_t kRows = 512;
+  std::vector<float> strided(8 * kRows * kElems, -17.0f);
+  for (size_t rank = 0; rank < 8; ++rank)
+    std::fill_n(strided.begin() + (rank * kRows + kRows - 1) * kElems,
+                kElems, static_cast<float>(rank + 1));
+  const uint64_t strided_addr = arena.allocate(strided.size() * sizeof(float));
+  arena.copy_h2d_sync(rt.h2d_stream(), strided.data(), strided_addr,
+                      strided.size() * sizeof(float));
+  auto last_row = reduce.prepare_strided(strided_addr + (kRows - 1) * kBytes,
+                                         prepared_addr, kRows * kBytes);
+  last_row.execute(rt.compute_stream());
+  assert(synStreamSynchronize(rt.compute_stream()) == synSuccess);
+  arena.copy_d2h_sync(rt.d2h_stream(), prepared_addr, prepared_result.data(),
+                      prepared_result.size() * sizeof(uint16_t));
+  assert(prepared_result == reduced);
   bool overlap_rejected = false;
   try {
     static_cast<void>(reduce.prepare(gathered_addr, gathered_addr));
