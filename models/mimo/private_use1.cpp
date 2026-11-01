@@ -332,10 +332,17 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     if ((kind == Kind::A) != static_cast<bool>(dense)) {
       throw std::invalid_argument("PrivateUse1: dense weights are only valid for Type A");
     }
+    // A layer consumes the preceding residual before its own output is
+    // written on the same stream. Two buffers therefore serve all layers and
+    // all prefill buckets; model weights and KV remain separately resident.
+    if (prefill_enabled_ && !prefill_residual_slots_[0]) {
+      prefill_residual_slots_[0] = arena_.allocate(12288 * 1024);
+      prefill_residual_slots_[1] = arena_.allocate(12288 * 1024);
+    }
+    const uint64_t prefill_residual = prefill_enabled_ ? prefill_residual_slots_[layer_id % 2] : 0;
     LayerEntry entry{kind, std::move(attention), std::move(dense),
                      arena_.allocate(12288), arena_.allocate(12288),
-                     prefill_enabled_ ? arena_.allocate(12288 * 32) : 0,
-                     prefill_enabled_ ? arena_.allocate(12288 * 1024) : 0};
+                     prefill_residual, prefill_residual};
     auto [entry_it, inserted] = entries_.emplace(layer_id, std::move(entry));
     if (!inserted) {
       throw std::invalid_argument("PrivateUse1: duplicate layer_id");
@@ -1073,6 +1080,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   runtime::PreparedLaunch model_embedding_launch_;
   runtime::PreparedLaunch model_head_launch_;
   runtime::PreparedLaunch model_argmax_launch_;
+  std::array<uint64_t, 2> prefill_residual_slots_{};
   std::array<uint64_t, 70> model_keys_{};
   std::array<uint64_t, 70> model_values_{};
   std::array<int32_t, 64> model_pages_{};
