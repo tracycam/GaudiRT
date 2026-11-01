@@ -178,7 +178,7 @@ struct MimoAttention::Impl {
 
   synTensor intermediate(const char* name, synDataType dtype,
                          std::initializer_list<uint64_t> sizes) {
-    const std::string full_name = (rows == 1 ? "swa_" : "swa_m32_") +
+    const std::string full_name = (rows == 1 ? "swa_" : "swa_m" + std::to_string(rows) + "_") +
                                   std::string(name);
     synTensorDescriptor descriptor = {};
     descriptor.m_name = full_name.c_str();
