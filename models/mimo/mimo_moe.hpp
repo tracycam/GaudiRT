@@ -111,9 +111,9 @@ class MimoMoeLayer1 final {
     kDownWeight,
     kDownScale,
     kLut,
-    kDirections,
     kResidualOut,
     kMoeOut,
+    kDirections,
     kSlotCount
   };
 
