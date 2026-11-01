@@ -61,21 +61,19 @@ inline void append_grouped_prefill_moe(synGraphHandle graph, uint32_t rows,
   auto offsets = tensor("grouped_offsets", syn_type_int32, {length / 64 + 1, experts});
   const int32_t count_params[] = {experts};
   node("grouped_count", "gk_expert_count", {ids, flat}, {counts, flags, offsets}, count_params, sizeof(count_params));
-  const uint32_t small = rows / 8;
-  const std::array<uint32_t, 2> capacities{small, rows};
-  const std::array<uint32_t, 2> slots{experts, std::min(experts, length / (small + 1))};
-  std::array<std::array<synTensor, 3>, 2> outputs{};
-  for (unsigned band = 0; band < 2; ++band) {
-    const uint32_t c = capacities[band], nslots = slots[band];
-    const std::string tag = "grouped_b" + std::to_string(band);
+  const uint32_t c = rows / 8;
+  // ceil(count/c) summed over experts is bounded by E + ceil(total_routes/c).
+  const uint32_t nslots = experts + (length + c - 1) / c;
+  std::array<synTensor, 3> outputs{};
+  {
+    const std::string tag = "grouped_split";
     auto prefix = tensor(tag + "_prefix", syn_type_int32, {experts + 1});
     auto selected = tensor(tag + "_experts", syn_type_int32, {nslots});
     auto base = tensor(tag + "_base", syn_type_int32, {nslots});
     auto valid = tensor(tag + "_valid", syn_type_int32, {nslots});
     auto status = tensor(tag + "_status", syn_type_int32, {1});
-    const int32_t pp[] = {routes, static_cast<int32_t>(c), static_cast<int32_t>(nslots),
-                          static_cast<int32_t>(band ? small + 1 : 1), static_cast<int32_t>(c), 0};
-    node(tag + "_prefix_node", "gk_expert_prefix", {counts, flags}, {prefix, selected, base, valid, status}, pp, sizeof(pp));
+    const int32_t pp[] = {routes, static_cast<int32_t>(c), static_cast<int32_t>(nslots)};
+    node(tag + "_prefix_node", "gk_expert_prefix_split", {counts, flags}, {prefix, selected, base, valid, status}, pp, sizeof(pp));
     auto inverse = tensor(tag + "_inverse", syn_type_int32, {length});
     const int32_t ip[] = {static_cast<int32_t>(c), static_cast<int32_t>(nslots)};
     node(tag + "_inverse_node", "gk_expert_inverse", {ids, flat, prefix, status, offsets}, {inverse}, ip, sizeof(ip));
@@ -128,17 +126,12 @@ inline void append_grouped_prefill_moe(synGraphHandle graph, uint32_t rows,
       }
       auto partial = tensor(tag + "_partial" + std::to_string(tile), syn_type_float, {2048, c * nslots});
       join(tag + "_join" + std::to_string(tile), parts, partial, 1);
-      outputs[band][tile] = tensor(tag + "_output" + std::to_string(tile), syn_type_float, {2048, rows});
+      outputs[tile] = tensor(tag + "_output" + std::to_string(tile), syn_type_float, {2048, rows});
       node(tag + "_combine" + std::to_string(tile), "gk_expert_combine",
-           {partial, routing, inverse, status}, {outputs[band][tile]});
+           {partial, routing, inverse, status}, {outputs[tile]});
     }
   }
-  std::vector<synTensor> tiles;
-  for (unsigned tile = 0; tile < 3; ++tile) {
-    auto sum = tensor("grouped_sum" + std::to_string(tile), syn_type_float, {2048, rows});
-    node("grouped_add" + std::to_string(tile), "add_fwd_f32", {outputs[0][tile], outputs[1][tile]}, {sum});
-    tiles.push_back(sum);
-  }
+  std::vector<synTensor> tiles(outputs.begin(), outputs.end());
   join("grouped_output", tiles, output, 0);
 }
 
