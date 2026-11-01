@@ -170,7 +170,7 @@ struct MimoDenseMlp::Impl {
   synTensor intermediate(synGraphHandle, const char* name, synDataType dtype,
                          std::initializer_list<uint64_t> sizes) {
     synTensorDescriptor descriptor = {};
-    const std::string tensor_name = rows == 1 ? name : "dense_m32_" + std::string(name);
+    const std::string tensor_name = rows == 1 ? name : "dense_m" + std::to_string(rows) + "_" + name;
     descriptor.m_name = tensor_name.c_str();
     descriptor.m_dataType = dtype;
     descriptor.m_dims = sizes.size();
