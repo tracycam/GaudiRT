@@ -1,0 +1,14 @@
+build/
+evidence/
+*.log
+*.recipe
+*.o
+*.so
+*.a
+__pycache__/
+*.pyc
+.DS_Store
+habana-logs/
+*-habana/
+habana-logs-*/
+*_reference.bin
