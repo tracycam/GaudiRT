@@ -52,8 +52,8 @@ class ServingModel:
             extension.register_empty_model_kv(rank, layer)
         for name in ('embedding', 'final_norm', 'lm_head'):
             extension.upload_model_weight(rank, name, load_model_weight(model_path, name))
-        trigger = extension.finalize_model(rank, self.full_rope[4096:].contiguous(),
-                                           self.swa_rope[4096:].contiguous(),
+        trigger = extension.finalize_model(rank, self.full_rope,
+                                           self.swa_rope,
                                            torch.arange(64, dtype=torch.int32), 0)
 
         def capture(graph, inputs):
@@ -77,7 +77,7 @@ class ServingModel:
         self.finished = False
         self.pages = None
 
-    def prefill(self, tokens, pages):
+    def prefill(self, tokens, pages, prompt_length):
         if self.finished:
             raise ValueError('reset is required before a new request')
         self.update_pages(pages)
@@ -85,7 +85,7 @@ class ServingModel:
             return -1
         result = self.extension.prefill_chunk(self.rank, torch.tensor(tokens, dtype=torch.int32),
                                               self.full_rope[:4096].contiguous(),
-                                              self.swa_rope[:4096].contiguous())
+                                              self.swa_rope[:4096].contiguous(), prompt_length)
         if result >= 0:
             self.finished = True
         return result

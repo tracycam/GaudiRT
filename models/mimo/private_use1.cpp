@@ -464,7 +464,8 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     if (!cpu(full_rope, at::kBFloat16) || !cpu(swa_rope, at::kBFloat16) ||
         !cpu(pages, at::kInt) || full_rope.dim() != 2 || swa_rope.dim() != 2 ||
         full_rope.size(1) != 64 || full_rope.sizes() != swa_rope.sizes() ||
-        full_rope.size(0) < 128 || full_rope.size(0) > 4096 || pages.numel() != 64)
+        full_rope.size(0) < 128 || full_rope.size(0) > (prefill_enabled_ ? 4224 : 4096) ||
+        (prefill_enabled_ && full_rope.size(0) != 4224) || pages.numel() != 64)
       throw std::invalid_argument("PrivateUse1: invalid shared decode metadata");
     const auto slots = instances_.at(Kind::A)->cache_slots;
     if (instances_.at(Kind::B)->cache_slots != slots ||
@@ -473,12 +474,13 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       throw std::invalid_argument("PrivateUse1: model layers must share KV page geometry");
     cache_slots_ = slots;
     rope_rows_ = static_cast<uint32_t>(full_rope.size(0));
+    rope_first_position_ = prefill_enabled_ ? 0 : 4096;
     full_rope_.resize(static_cast<size_t>(full_rope.numel()));
     swa_rope_.resize(static_cast<size_t>(swa_rope.numel()));
     std::memcpy(full_rope_.data(), full_rope.data_ptr(), full_rope.nbytes());
     std::memcpy(swa_rope_.data(), swa_rope.data_ptr(), swa_rope.nbytes());
     std::memcpy(model_pages_.data(), pages.data_ptr(), pages.nbytes());
-    validate_step_metadata(4096 + rope_rows_ - 1, 4096, rope_rows_,
+    validate_step_metadata(rope_first_position_ + rope_rows_ - 1, rope_first_position_, rope_rows_,
                            full_rope_.data(), swa_rope_.data(), model_pages_,
                            cache_slots_);
     check_syn(synHostMalloc(runtime_.device_id(), sizeof(StepMetadata), 0, &metadata_host_),
@@ -597,7 +599,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     }
     if (arena_.workspace_addr() != workspace)
       throw std::runtime_error("PrivateUse1: workspace changed during model binding");
-    model_position_ = 4096;
+    model_position_ = prefill_enabled_ ? 0 : 4096;
     model_finalized_ = true;
     return wrap(trigger_device_, {1}, at::kInt);
   }
@@ -632,32 +634,36 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       }
       first = end;
     }
-    model_position_ = 4096;
+    model_position_ = 0;
     prefill_rows_ = 0;
+    prompt_length_ = 0;
     prefill_complete_ = false;
   }
 
   int32_t prefill(const at::Tensor& tokens, const at::Tensor& full_rope,
                   const at::Tensor& swa_rope) {
-    if (tokens.numel() != 4096 || prefill_rows_ != 0)
-      throw std::invalid_argument("PrivateUse1: full prefill requires 4096 new tokens");
-    return prefill_chunk(tokens, full_rope, swa_rope);
+    if (prefill_rows_ != 0)
+      throw std::invalid_argument("PrivateUse1: full prefill requires a fresh request");
+    return prefill_chunk(tokens, full_rope, swa_rope, static_cast<uint32_t>(tokens.numel()));
   }
 
   int32_t prefill_chunk(const at::Tensor& tokens, const at::Tensor& full_rope,
-                        const at::Tensor& swa_rope) {
+                        const at::Tensor& swa_rope, uint32_t prompt_length) {
     if (!prefill_enabled_ || !model_finalized_ || model_pending_ || prefill_complete_ ||
-        model_position_ != 4096)
+        model_position_ != 0)
       throw std::invalid_argument("PrivateUse1: prefill is not ready");
     const auto cpu = [](const at::Tensor& t, at::ScalarType type) {
       return t.device().type() == c10::kCPU && t.is_contiguous() && t.scalar_type() == type;
     };
-    if (!cpu(tokens, at::kInt) || tokens.numel() <= 0 || tokens.numel() % 32 != 0 ||
-        tokens.numel() > 4096 - prefill_rows_ ||
+    if (prompt_length < 32 || prompt_length > 4096 || prompt_length % 32 ||
+        (prompt_length_ && prompt_length_ != prompt_length) || prefill_rows_ >= prompt_length ||
+        !cpu(tokens, at::kInt) || tokens.numel() <= 0 || tokens.numel() % 32 != 0 ||
+        tokens.numel() > prompt_length - prefill_rows_ ||
         !cpu(full_rope, at::kBFloat16) || !cpu(swa_rope, at::kBFloat16) ||
         full_rope.dim() != 2 || full_rope.size(0) != 4096 || full_rope.size(1) != 64 ||
         full_rope.sizes() != swa_rope.sizes())
       throw std::invalid_argument("PrivateUse1: invalid prompt or prefill RoPE");
+    prompt_length_ = prompt_length;
     const auto* token_data = tokens.data_ptr<int32_t>();
     for (int64_t i = 0; i < tokens.numel(); ++i)
       if (token_data[i] < 0 || token_data[i] >= 152576)
@@ -708,7 +714,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       for (auto [address, offset] : bindings) *address = base + offset;
       for (const auto& layer : layers) layer.execute_fused(stream);
     }
-    if (prefill_rows_ + tokens.numel() != 4096) {
+    if (prefill_rows_ + tokens.numel() != prompt_length_) {
       runtime_.synchronize_compute();
       prefill_rows_ += static_cast<uint32_t>(tokens.numel());
       return -1;
@@ -728,7 +734,8 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     check_syn(synStreamSynchronize(runtime_.d2h_stream()), "prefill token completion");
     const int32_t token = *static_cast<int32_t*>(token_host_);
     if (token < 0 || token >= 152576) throw std::runtime_error("PrivateUse1: invalid prefill token or logits");
-    prefill_rows_ = 4096;
+    prefill_rows_ = prompt_length_;
+    model_position_ = prompt_length_;
     prefill_complete_ = true;
     return token;
   }
@@ -738,10 +745,10 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
         trigger.scalar_type() != at::kInt ||
         trigger.numel() != 1 || address_of(trigger) != trigger_device_)
       throw std::invalid_argument("PrivateUse1: invalid model step or unfinished previous step");
-    if (model_position_ - 4096 >= rope_rows_)
+    if (model_position_ < rope_first_position_ || model_position_ - rope_first_position_ >= rope_rows_)
       throw std::invalid_argument("PrivateUse1: model position exceeds registered RoPE rows");
     auto& metadata = *static_cast<StepMetadata*>(metadata_host_);
-    fill_step_metadata_prevalidated(metadata, model_position_, 4096, full_rope_.data(),
+    fill_step_metadata_prevalidated(metadata, model_position_, rope_first_position_, full_rope_.data(),
                                     swa_rope_.data(), model_pages_);
     model_pending_ = true;
     check_syn(synMemCopyAsync(runtime_.h2d_stream(), reinterpret_cast<uint64_t>(metadata_host_),
@@ -785,13 +792,13 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   }
 
   at::Tensor model_logits() {
-    if (!model_finalized_ || model_pending_ || (model_position_ == 4096 && !prefill_complete_))
+    if (!model_finalized_ || model_pending_ || (prefill_enabled_ && !prefill_complete_))
       throw std::invalid_argument("PrivateUse1: model logits are not ready");
     return wrap(logits_device_, {1, 152576}, at::kBFloat16);
   }
 
   std::vector<at::Tensor> model_kv(uint32_t layer) {
-    if (!model_finalized_ || model_pending_ || (model_position_ == 4096 && !prefill_complete_) || layer >= 70)
+    if (!model_finalized_ || model_pending_ || (prefill_enabled_ && !prefill_complete_) || layer >= 70)
       throw std::invalid_argument("PrivateUse1: model KV is not ready");
     return {wrap(model_keys_[layer], {cache_slots_, 192}, at::kBFloat16),
             wrap(model_values_[layer], {cache_slots_, 128}, at::kBFloat16)};
@@ -799,7 +806,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
 
   std::vector<at::Tensor> model_kv_slots(uint32_t layer, uint32_t first,
                                          uint32_t count) {
-    if (!model_finalized_ || model_pending_ || (model_position_ == 4096 && !prefill_complete_) ||
+    if (!model_finalized_ || model_pending_ || (prefill_enabled_ && !prefill_complete_) ||
         layer >= 70 || count == 0 || first >= cache_slots_ || count > cache_slots_ - first)
       throw std::invalid_argument("PrivateUse1: invalid model KV slot range");
     return {wrap(model_keys_[layer] + static_cast<uint64_t>(first) * 192 * sizeof(uint16_t),
@@ -1088,6 +1095,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   std::vector<uint16_t> swa_rope_;
   uint32_t cache_slots_ = 0;
   uint32_t rope_rows_ = 0;
+  uint32_t rope_first_position_ = 0;
   uint32_t model_position_ = 0;
   bool model_finalized_ = false;
   bool model_pending_ = false;
@@ -1095,6 +1103,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   bool prefill_enabled_ = false;
   bool prefill_complete_ = false;
   uint32_t prefill_rows_ = 0;
+  uint32_t prompt_length_ = 0;
   void* metadata_host_ = nullptr;
   void* token_host_ = nullptr;
   synEventHandle metadata_ready_ = nullptr;
@@ -1356,8 +1365,8 @@ int32_t prefill(uint32_t rank, const at::Tensor& tokens, const at::Tensor& full_
   return get(rank)->prefill(tokens, full_rope, swa_rope);
 }
 int32_t prefill_chunk(uint32_t rank, const at::Tensor& tokens, const at::Tensor& full_rope,
-                      const at::Tensor& swa_rope) {
-  return get(rank)->prefill_chunk(tokens, full_rope, swa_rope);
+                      const at::Tensor& swa_rope, uint32_t prompt_length) {
+  return get(rank)->prefill_chunk(tokens, full_rope, swa_rope, prompt_length);
 }
 void update_model_pages(uint32_t rank, const at::Tensor& pages) {
   get(rank)->update_model_pages(pages);
