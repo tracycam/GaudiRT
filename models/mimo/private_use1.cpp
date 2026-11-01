@@ -521,35 +521,55 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     return wrap(trigger_device_, {1}, at::kInt);
   }
 
+  void update_model_pages(const at::Tensor& pages) {
+    if (!model_finalized_ || model_pending_ || pages.device().type() != c10::kCPU ||
+        !pages.is_contiguous() || pages.scalar_type() != at::kInt || pages.numel() != 64)
+      throw std::invalid_argument("PrivateUse1: invalid scheduled page table");
+    std::array<int32_t, 64> next{};
+    std::memcpy(next.data(), pages.data_ptr(), pages.nbytes());
+    const uint32_t written = prefill_enabled_ && !prefill_complete_ ? prefill_rows_ : model_position_;
+    validate_page_update(model_pages_, next, written, cache_slots_);
+    model_pages_ = next;
+  }
+
   int32_t prefill(const at::Tensor& tokens, const at::Tensor& full_rope,
                   const at::Tensor& swa_rope) {
-    if (!prefill_enabled_ || !model_finalized_ || model_pending_ || prefill_started_ ||
+    if (tokens.numel() != 4096 || prefill_rows_ != 0)
+      throw std::invalid_argument("PrivateUse1: full prefill requires 4096 new tokens");
+    return prefill_chunk(tokens, full_rope, swa_rope);
+  }
+
+  int32_t prefill_chunk(const at::Tensor& tokens, const at::Tensor& full_rope,
+                        const at::Tensor& swa_rope) {
+    if (!prefill_enabled_ || !model_finalized_ || model_pending_ || prefill_complete_ ||
         model_position_ != 4096)
       throw std::invalid_argument("PrivateUse1: prefill is not ready");
     const auto cpu = [](const at::Tensor& t, at::ScalarType type) {
       return t.device().type() == c10::kCPU && t.is_contiguous() && t.scalar_type() == type;
     };
-    if (!cpu(tokens, at::kInt) || tokens.numel() != 4096 ||
+    if (!cpu(tokens, at::kInt) || tokens.numel() <= 0 || tokens.numel() % 32 != 0 ||
+        tokens.numel() > 4096 - prefill_rows_ ||
         !cpu(full_rope, at::kBFloat16) || !cpu(swa_rope, at::kBFloat16) ||
         full_rope.dim() != 2 || full_rope.size(0) != 4096 || full_rope.size(1) != 64 ||
         full_rope.sizes() != swa_rope.sizes())
       throw std::invalid_argument("PrivateUse1: invalid prompt or prefill RoPE");
     const auto* token_data = tokens.data_ptr<int32_t>();
-    for (int i = 0; i < 4096; ++i)
+    for (int64_t i = 0; i < tokens.numel(); ++i)
       if (token_data[i] < 0 || token_data[i] >= 152576)
         throw std::invalid_argument("PrivateUse1: prompt token out of range");
     const auto* full = reinterpret_cast<const uint16_t*>(full_rope.data_ptr());
     const auto* swa = reinterpret_cast<const uint16_t*>(swa_rope.data_ptr());
-    std::vector<PrefillMetadata> metadata(128);
-    for (uint32_t chunk = 0; chunk < 128; ++chunk)
-      fill_prefill_metadata(metadata[chunk], chunk * 32, 4096, full, swa, model_pages_, cache_slots_);
-    prefill_started_ = true;
+    const uint32_t chunks = static_cast<uint32_t>(tokens.numel() / 32);
+    std::vector<PrefillMetadata> metadata(chunks);
+    for (uint32_t chunk = 0; chunk < chunks; ++chunk)
+      fill_prefill_metadata(metadata[chunk], prefill_rows_ + chunk * 32, 4096, full, swa,
+                            model_pages_, cache_slots_);
     arena_.copy_h2d_sync(runtime_.h2d_stream(), token_data, prefill_tokens_device_, tokens.nbytes());
     arena_.copy_h2d_sync(runtime_.h2d_stream(), metadata.data(), prefill_metadata_device_,
                          metadata.size() * sizeof(PrefillMetadata));
     const auto stream = runtime_.compute_stream();
     uint64_t last_hidden = 0, last_residual = 0;
-    for (uint32_t chunk = 0; chunk < 128; ++chunk) {
+    for (uint32_t chunk = 0; chunk < chunks; ++chunk) {
       prefill_embedding_->prepare(prefill_tokens_device_ + chunk * 32 * sizeof(int32_t),
                                   prefill_embedding_device_, prefill_status_device_).execute(stream);
       uint64_t hidden = prefill_embedding_device_, residual = prefill_embedding_device_;
@@ -573,6 +593,11 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       last_hidden = hidden;
       last_residual = residual;
     }
+    if (prefill_rows_ + tokens.numel() != 4096) {
+      runtime_.synchronize_compute();
+      prefill_rows_ += static_cast<uint32_t>(tokens.numel());
+      return -1;
+    }
     prefill_reduce_->prepare(last_hidden, prefill_reduced_device_).execute(stream);
     prefill_head_->prepare(prefill_reduced_device_ + 31 * 6144 * sizeof(uint16_t),
                            last_residual + 31 * 6144 * sizeof(uint16_t),
@@ -589,6 +614,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     check_syn(synStreamSynchronize(runtime_.d2h_stream()), "prefill token completion");
     const int32_t token = *static_cast<int32_t*>(token_host_);
     if (token < 0 || token >= 152576) throw std::runtime_error("PrivateUse1: invalid prefill token or logits");
+    prefill_rows_ = 4096;
     prefill_complete_ = true;
     return token;
   }
@@ -924,7 +950,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   bool fused_model_ = false;
   bool prefill_enabled_ = false;
   bool prefill_complete_ = false;
-  bool prefill_started_ = false;
+  uint32_t prefill_rows_ = 0;
   void* metadata_host_ = nullptr;
   void* token_host_ = nullptr;
   synEventHandle metadata_ready_ = nullptr;
@@ -1181,6 +1207,13 @@ int32_t prefill(uint32_t rank, const at::Tensor& tokens, const at::Tensor& full_
                 const at::Tensor& swa_rope) {
   return get(rank)->prefill(tokens, full_rope, swa_rope);
 }
+int32_t prefill_chunk(uint32_t rank, const at::Tensor& tokens, const at::Tensor& full_rope,
+                      const at::Tensor& swa_rope) {
+  return get(rank)->prefill_chunk(tokens, full_rope, swa_rope);
+}
+void update_model_pages(uint32_t rank, const at::Tensor& pages) {
+  get(rank)->update_model_pages(pages);
+}
 
 at::Tensor finalize_model(uint32_t rank, const at::Tensor& full_rope,
                           const at::Tensor& swa_rope, const at::Tensor& pages,
@@ -1295,6 +1328,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("register_model_kv", &gaudirt::mimo::register_model_kv);
   m.def("register_empty_model_kv", &gaudirt::mimo::register_empty_model_kv);
   m.def("prefill", &gaudirt::mimo::prefill);
+  m.def("prefill_chunk", &gaudirt::mimo::prefill_chunk);
+  m.def("update_model_pages", &gaudirt::mimo::update_model_pages);
   m.def("finalize_model", &gaudirt::mimo::finalize_model);
   m.def("finish_model_step", &gaudirt::mimo::finish_model_step);
   m.def("model_logits", &gaudirt::mimo::model_logits);

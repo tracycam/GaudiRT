@@ -29,6 +29,21 @@ struct alignas(256) StepMetadata {
 static_assert(std::is_trivially_copyable_v<StepMetadata>);
 static_assert(sizeof(StepMetadata) <= 4096);
 
+// The scheduler may add pages, but already-written logical pages cannot move.
+inline void validate_page_update(const std::array<int32_t, 64>& previous,
+                                 const std::array<int32_t, 64>& next,
+                                 uint32_t written_tokens, uint32_t cache_slots) {
+  if (written_tokens > 8192 || cache_slots == 0 || cache_slots % 128 != 0)
+    throw std::invalid_argument("MiMo pages: invalid geometry");
+  const uint32_t written_pages = (written_tokens + 127) / 128;
+  for (size_t i = 0; i < next.size(); ++i) {
+    if (next[i] < 0 || static_cast<uint32_t>(next[i]) >= cache_slots / 128 ||
+        std::find(next.begin(), next.begin() + i, next[i]) != next.begin() + i ||
+        (i < written_pages && next[i] != previous[i]))
+      throw std::invalid_argument("MiMo pages: invalid, aliased, or moved page");
+  }
+}
+
 // Validate the complete page range once when the fixed mapping is registered.
 inline void validate_step_metadata(uint32_t position, uint32_t first_position,
                                    uint32_t rope_rows, const uint16_t* full_rope,

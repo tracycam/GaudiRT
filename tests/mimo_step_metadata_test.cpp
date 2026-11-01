@@ -86,4 +86,26 @@ int main() {
     rejected = true;
   }
   require(rejected);
+
+  std::array<int32_t, 64> updated{};
+  for (size_t i = 0; i < updated.size(); ++i) updated[i] = static_cast<int32_t>(i + 34);
+  auto original = updated;
+  std::swap(updated[33], updated[63]);
+  gaudirt::mimo::validate_page_update(original, updated, 4096, 205184);
+  rejected = false;
+  try {
+    gaudirt::mimo::validate_page_update(original, updated, 4225, 205184);
+  } catch (const std::invalid_argument&) {
+    rejected = true;
+  }
+  require(rejected);
+  updated = original;
+  updated[63] = updated[1];
+  rejected = false;
+  try {
+    gaudirt::mimo::validate_page_update(original, updated, 0, 205184);
+  } catch (const std::invalid_argument&) {
+    rejected = true;
+  }
+  require(rejected);
 }
