@@ -332,9 +332,8 @@ struct MimoAttention::Impl {
       node({query_matrix, gathered_key}, {scores}, &qk, sizeof(qk), "batch_gemm", "swa_mme_qk");
       synTensor probability = intermediate("swa_mme_probability", syn_type_bf16, {384, 2048, rows / 128});
       synTensor correction = intermediate("swa_mme_correction", syn_type_bf16, {384, 2048, rows / 128});
-      synTensor tail = intermediate("swa_mme_tail", syn_type_bf16, {384, 2048, rows / 128});
-      node({scores, position, sink}, {probability, correction, tail}, &kAttentionScale,
-           sizeof(kAttentionScale), "gk_swa_mme_softmax_three_v2", "swa_mme_softmax");
+      node({scores, position, sink}, {probability, correction}, &kAttentionScale,
+           sizeof(kAttentionScale), "gk_swa_mme_softmax_v1", "swa_mme_softmax");
       synTensor main = intermediate("swa_mme_pv_main", syn_type_float, {128, 2048, rows / 128});
       synTensor extra = intermediate("swa_mme_pv_extra", syn_type_float, {128, 2048, rows / 128});
       synTensor total = intermediate("swa_mme_pv_total", syn_type_float, {128, 2048, rows / 128});
@@ -342,11 +341,7 @@ struct MimoAttention::Impl {
       const synGEMMParams pv{false, false};
       node({probability, gathered_value}, {main}, &pv, sizeof(pv), "batch_gemm", "swa_mme_pv");
       node({correction, gathered_value}, {extra}, &pv, sizeof(pv), "batch_gemm", "swa_mme_pv_correction");
-      synTensor third = intermediate("swa_mme_pv_tail", syn_type_float, {128, 2048, rows / 128});
-      synTensor partial = intermediate("swa_mme_pv_partial", syn_type_float, {128, 2048, rows / 128});
-      node({tail, gathered_value}, {third}, &pv, sizeof(pv), "batch_gemm", "swa_mme_pv_tail");
-      node({main, extra}, {partial}, nullptr, 0, "add_fwd_f32", "swa_mme_pv_first_sum");
-      node({partial, third}, {total}, nullptr, 0, "add_fwd_f32", "swa_mme_pv_combine");
+      node({main, extra}, {total}, nullptr, 0, "add_fwd_f32", "swa_mme_pv_combine");
       ns_CastKernel::ParamsV3 cast{}; cast.round_mode = CAST_ROUND_HALF_NE;
       node({total}, {rounded}, &cast, sizeof(cast), "cast_f32_to_bf16", "swa_mme_pv_round");
       node({rounded}, {context}, nullptr, 0, "reshape", "swa_mme_context_reshape");
