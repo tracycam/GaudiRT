@@ -195,8 +195,8 @@ struct MimoDenseMlp::Impl {
   }
 
   void build() {
-    if (rows != 1 && rows != 32)
-      throw std::invalid_argument("MimoDenseMlp: rows must be 1 or 32");
+    if (rows != 1 && rows != 32 && rows != 512)
+      throw std::invalid_argument("MimoDenseMlp: unsupported rows");
     const auto& gate_up_weight =
         expect_dynamic_weight(*weights, "gate_up_weight", syn_type_fp8_143, 3);
     gate_up_n = gate_up_weight.shape[1];
@@ -271,10 +271,10 @@ struct MimoDenseMlp::Impl {
     node(gate_up_graph, {gate_up}, {activation_wide}, nullptr, 0,
          rows == 1 ? "gk_dense_swiglu_fp32_v1" : "gk_dense_swiglu_prefill_fp32_v1", "swiglu_fp32");
     gate_up_recipe = compile_cached(
-        gate_up_graph, rows == 1 ? "mimo_dense_gate_up_b1_m1_tp8" : "mimo_dense_gate_up_b1_m32_tp8",
+        gate_up_graph, rows == 1 ? "mimo_dense_gate_up_b1_m1_tp8" : "mimo_dense_gate_up_b1_m" + std::to_string(rows) + "_tp8",
         "dense_gate_up_n" + std::to_string(gate_up_n) + "_g" +
             std::to_string(groups) + (gathered_attention ? "_gathered_tp1" : "_direct") +
-            (rows == 1 ? "" : "_m32"), cache);
+            (rows == 1 ? "" : "_m" + std::to_string(rows)), cache);
     check(synWorkspaceGetSize(&gate_up_workspace_size, gate_up_recipe),
           "get gate_up workspace size");
     arena.ensure_workspace(gate_up_workspace_size);
@@ -310,8 +310,8 @@ struct MimoDenseMlp::Impl {
     node(down_graph, {activation, weight, weight_scale, bias}, {output_local},
          nullptr, 0, rows == 1 ? "gk_dense_linear_fp32_v1" : "gk_dense_linear_prefill_fp32_v1", "down_fp32_linear");
     down_recipe = compile_cached(
-        down_graph, rows == 1 ? "mimo_dense_down_b1_m1_tp8" : "mimo_dense_down_b1_m32_tp8",
-        "dense_down_k" + std::to_string(down_k) + "_g" + std::to_string(groups) + (rows == 1 ? "" : "_m32"),
+        down_graph, rows == 1 ? "mimo_dense_down_b1_m1_tp8" : "mimo_dense_down_b1_m" + std::to_string(rows) + "_tp8",
+        "dense_down_k" + std::to_string(down_k) + "_g" + std::to_string(groups) + (rows == 1 ? "" : "_m" + std::to_string(rows)),
         cache);
     check(synWorkspaceGetSize(&down_workspace_size, down_recipe),
           "get down workspace size");
