@@ -122,6 +122,9 @@ target_include_directories(prefill_metadata_test PRIVATE models/mimo)
 add_executable(mimo_step_metadata_test tests/mimo_step_metadata_test.cpp)
 target_include_directories(mimo_step_metadata_test PRIVATE models/mimo)
 
+add_executable(host_policy_inherit_test tests/host_policy_inherit_test.cpp)
+target_include_directories(host_policy_inherit_test PRIVATE include)
+
 add_executable(mimo_layer1 models/mimo/layer1_main.cpp)
 target_link_libraries(mimo_layer1 PRIVATE mimo_layer_vertical)
 
