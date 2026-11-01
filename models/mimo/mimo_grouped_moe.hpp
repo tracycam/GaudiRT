@@ -61,7 +61,7 @@ inline void append_grouped_prefill_moe(synGraphHandle graph, uint32_t rows,
   auto offsets = tensor("grouped_offsets", syn_type_int32, {length / 64 + 1, experts});
   const int32_t count_params[] = {experts};
   node("grouped_count", "gk_expert_count", {ids, flat}, {counts, flags, offsets}, count_params, sizeof(count_params));
-  const uint32_t c = rows / 8;
+  const uint32_t c = rows == 2048 ? rows / 16 : rows / 8;
   // ceil(count/c) summed over experts is bounded by E + ceil(total_routes/c).
   const uint32_t nslots = experts + (length + c - 1) / c;
   std::array<synTensor, 3> outputs{};
