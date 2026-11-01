@@ -137,7 +137,14 @@ TpReduce::~TpReduce() {
 }
 
 PreparedLaunch TpReduce::prepare(uint64_t gathered, uint64_t output) {
-  const uint64_t gathered_bytes = 8 * rank_bytes_;
+  return prepare_strided(gathered, output, rank_bytes_);
+}
+
+PreparedLaunch TpReduce::prepare_strided(uint64_t gathered, uint64_t output,
+                                         uint64_t rank_stride_bytes) {
+  if (rank_stride_bytes < rank_bytes_ || rank_stride_bytes > (UINT64_MAX - rank_bytes_) / 7)
+    throw std::invalid_argument("TpReduce: invalid rank stride");
+  const uint64_t gathered_bytes = 7 * rank_stride_bytes + rank_bytes_;
   const uint64_t output_bytes = static_cast<uint64_t>(elements_) * 2;
   if (!gathered || !output || gathered + gathered_bytes < gathered ||
       output + output_bytes < output ||
@@ -145,7 +152,7 @@ PreparedLaunch TpReduce::prepare(uint64_t gathered, uint64_t output) {
     throw std::invalid_argument("TpReduce: invalid or overlapping bindings");
   auto tensors = prepared_template_;
   for (unsigned rank = 0; rank < 8; ++rank)
-    tensors[rank].pTensorAddress = gathered + rank * rank_bytes_;
+    tensors[rank].pTensorAddress = gathered + rank * rank_stride_bytes;
   tensors[8].pTensorAddress = output;
   PreparedLaunch result{recipe_, arena_.ensure_workspace(workspace_bytes_),
                         {tensors.begin(), tensors.end()}, 0};

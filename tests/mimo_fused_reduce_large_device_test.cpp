@@ -4,6 +4,7 @@
 #include "gaudirt/runtime/hbm_arena.hpp"
 #include "gaudirt/runtime/prepared_launch.hpp"
 #include "gaudirt/runtime/recipe_registry.hpp"
+#include "gaudirt/runtime/tp_reduce.hpp"
 #include "tp_reduce_graph.hpp"
 
 #include <array>
@@ -64,6 +65,18 @@ int main() {
       float sum=0; for(unsigned rank=0;rank<ranks;++rank) sum+=wide[(static_cast<size_t>(rank)*rows+row)*hidden+c];
       if(actual[static_cast<size_t>(row)*hidden+c]!=bf16(sum)) throw std::runtime_error("TP8 row/rank reduction mismatch");
     }
+    const uint64_t element_bytes = dtype == syn_type_float ? 4 : 2;
+    const uint64_t rank_stride = static_cast<uint64_t>(rows) * hidden * element_bytes;
+    const uint64_t last_input = binding[0].pTensorAddress + (rows - 1) * hidden * element_bytes;
+    const uint64_t last_output = arena.allocate(hidden * 2);
+    TpReduce last_reduce(arena, hidden, dtype);
+    auto last = last_reduce.prepare_strided(last_input, last_output, rank_stride);
+    last.execute(runtime.compute_stream()); runtime.synchronize_compute();
+    std::vector<uint16_t> final_row(hidden);
+    arena.copy_d2h_sync(runtime.d2h_stream(), last_output, final_row.data(), hidden * 2);
+    for (unsigned c=0; c<hidden; ++c)
+      if (final_row[c] != actual[(rows - 1) * hidden + c])
+        throw std::runtime_error("strided last-row TP8 reduction mismatch");
     check(synRecipeDestroy(recipe));
   }
   std::printf("M512 BF16 and FP32 TP8 reductions match CPU bitwise\n");

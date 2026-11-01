@@ -22,6 +22,8 @@ class TpReduce {
 
   void execute(uint64_t gathered, uint64_t output, synStreamHandle stream);
   PreparedLaunch prepare(uint64_t gathered, uint64_t output);
+  PreparedLaunch prepare_strided(uint64_t gathered, uint64_t output,
+                                 uint64_t rank_stride_bytes);
   uint64_t workspace_bytes() const noexcept { return workspace_bytes_; }
 
  private:
