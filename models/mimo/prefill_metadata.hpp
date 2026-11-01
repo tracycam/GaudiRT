@@ -8,8 +8,10 @@ namespace gaudirt::mimo {
 // Shared by the 70 same-position graphs. Every Synapse tensor begins on a
 // separate aligned boundary; Full Attention gathers up to the final row and
 // applies an additional per-row causal mask inside its softmax.
-struct alignas(256) PrefillMetadata {
-  static constexpr uint32_t kRows = 32;
+template <uint32_t Rows>
+struct alignas(256) PrefillMetadataT {
+  static_assert(Rows == 32 || Rows == 512);
+  static constexpr uint32_t kRows = Rows;
   alignas(256) std::array<uint16_t, kRows * 64> full_cos{};
   alignas(256) std::array<uint16_t, kRows * 64> full_sin{};
   alignas(256) std::array<uint16_t, kRows * 64> swa_cos{};
@@ -22,20 +24,23 @@ struct alignas(256) PrefillMetadata {
   alignas(256) std::array<int32_t, kRows * 2> window_pages{};
   alignas(256) std::array<int32_t, kRows * 2> window_groups{};
 };
+using PrefillMetadata = PrefillMetadataT<32>;
+using LargePrefillMetadata = PrefillMetadataT<512>;
 static_assert(std::is_trivially_copyable_v<PrefillMetadata>);
+static_assert(std::is_trivially_copyable_v<LargePrefillMetadata>);
 
-inline void fill_prefill_metadata(PrefillMetadata& result, uint32_t first_position,
+template <uint32_t Rows>
+inline void fill_prefill_metadata(PrefillMetadataT<Rows>& result, uint32_t first_position,
                                   uint32_t rope_rows, const uint16_t* full_rope,
                                   const uint16_t* swa_rope,
                                   const std::array<int32_t, 64>& pages,
                                   uint32_t cache_slots) {
-  if (first_position % PrefillMetadata::kRows ||
-      first_position > UINT32_MAX - PrefillMetadata::kRows + 1)
+  if (first_position % 32 || first_position > UINT32_MAX - Rows + 1)
     throw std::invalid_argument("MiMo prefill: invalid chunk position");
-  const uint32_t last = first_position + PrefillMetadata::kRows - 1;
+  const uint32_t last = first_position + Rows - 1;
   validate_step_metadata(last, 0, rope_rows, full_rope, swa_rope, pages, cache_slots);
   StepMetadata step{};
-  for (uint32_t row = 0; row < PrefillMetadata::kRows; ++row) {
+  for (uint32_t row = 0; row < Rows; ++row) {
     fill_step_metadata_prevalidated(step, first_position + row, 0,
                                     full_rope, swa_rope, pages);
     std::copy(step.full_cos.begin(), step.full_cos.end(), result.full_cos.begin() + row * 64);
