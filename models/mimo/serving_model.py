@@ -70,9 +70,16 @@ class ServingModel:
             self.extension.update_model_pages(self.rank, torch.tensor(pages, dtype=torch.int32))
             self.pages = list(pages)
 
+    def reset(self):
+        if not self.finished:
+            raise ValueError('reset requires a complete previous prefill')
+        self.extension.reset_prefill(self.rank)
+        self.finished = False
+        self.pages = None
+
     def prefill(self, tokens, pages):
         if self.finished:
-            raise ValueError('this runner has already served a request')
+            raise ValueError('reset is required before a new request')
         self.update_pages(pages)
         if not tokens:
             return -1
