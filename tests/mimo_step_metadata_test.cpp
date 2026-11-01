@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "step_metadata.hpp"
+#include "prefill_metadata.hpp"
 
 #include <array>
 #include <cstdint>
@@ -108,4 +109,32 @@ int main() {
     rejected = true;
   }
   require(rejected);
+
+  // The M512 SWA kernel consumes exactly two adjacent metadata entries per
+  // row. Compare that layout with both the step contract and a full scan.
+  std::array<uint16_t, 4096 * 64> prefill_rope{};
+  std::array<int32_t, 64> permuted{};
+  for (size_t i = 0; i < permuted.size(); ++i) permuted[i] = (i * 17) % 64;
+  gaudirt::mimo::LargePrefillMetadata batch{};
+  for (uint32_t first = 0; first < 4096; first += 512) {
+    gaudirt::mimo::fill_prefill_metadata(batch, first, 4096, prefill_rope.data(),
+                                        prefill_rope.data(), permuted, 8192);
+    for (uint32_t row = 0; row < 512; ++row) {
+      fill_step_metadata(step, first + row, 0, 4096, prefill_rope.data(),
+                         prefill_rope.data(), permuted, 8192);
+      int32_t scanned[2]{-1, -1};
+      unsigned found = 0;
+      for (size_t i = 0; i < batch.window_groups.size(); ++i) {
+        if (batch.window_groups[i] == static_cast<int32_t>(row)) {
+          require(found < 2);
+          scanned[found++] = batch.window_pages[i];
+        }
+      }
+      require(batch.window_groups[row * 2] == static_cast<int32_t>(row));
+      require(batch.window_pages[row * 2] == step.window_pages[0] &&
+              batch.window_pages[row * 2 + 1] == step.window_pages[1]);
+      require(scanned[0] == step.window_pages[0] && scanned[1] == step.window_pages[1]);
+      require(found == (step.window_pages[1] < 0 ? 1u : 2u));
+    }
+  }
 }
