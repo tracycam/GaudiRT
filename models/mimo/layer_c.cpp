@@ -19,7 +19,8 @@ void check(hcclResult_t status, const char* operation) {
 
 LayerC::LayerC(runtime::HbmArena& arena, runtime::DeviceRuntime& runtime,
                const runtime::WeightManifest& weights, uint32_t cache_slots,
-               runtime::RecipeCache* cache, bool fused_model, uint32_t rows)
+               runtime::RecipeCache* cache, bool fused_model, uint32_t rows,
+               uint64_t shared_lut, uint64_t shared_directions)
     : arena_(arena),
       attention_(arena, weights, cache_slots, cache, fused_model, rows),
       attention_reduce_(fused_model ? nullptr :
@@ -33,14 +34,20 @@ LayerC::LayerC(runtime::HbmArena& arena, runtime::DeviceRuntime& runtime,
         moe_weights_.gate_up_scales_u8 = weights.get("moe_gs").device_address;
         moe_weights_.down_packed_u8 = weights.get("moe_dp").device_address;
         moe_weights_.down_scales_u8 = weights.get("moe_ds").device_address;
-        const auto lut = runtime::MimoMoeLayer1::make_mxfp4_lut_bf16();
-        moe_weights_.mxfp4_lut_bf16 = arena.allocate(lut.size() * sizeof(lut[0]));
-        arena.copy_h2d_sync(runtime.h2d_stream(), lut.data(), moe_weights_.mxfp4_lut_bf16,
-                            lut.size() * sizeof(lut[0]));
-        const auto directions = runtime::MimoMoeLayer1::make_down_combine_directions();
-        moe_weights_.down_combine_directions_u8 = arena.allocate(directions.size());
-        arena.copy_h2d_sync(runtime.h2d_stream(), directions.data(),
-                            moe_weights_.down_combine_directions_u8, directions.size());
+        if (bool(shared_lut) != bool(shared_directions)) throw std::invalid_argument("MiMo Type C: incomplete shared LUT");
+        if (shared_lut) {
+          moe_weights_.mxfp4_lut_bf16 = shared_lut;
+          moe_weights_.down_combine_directions_u8 = shared_directions;
+        } else {
+          const auto lut = runtime::MimoMoeLayer1::make_mxfp4_lut_bf16();
+          moe_weights_.mxfp4_lut_bf16 = arena.allocate(lut.size() * sizeof(lut[0]));
+          arena.copy_h2d_sync(runtime.h2d_stream(), lut.data(), moe_weights_.mxfp4_lut_bf16,
+                              lut.size() * sizeof(lut[0]));
+          const auto directions = runtime::MimoMoeLayer1::make_down_combine_directions();
+          moe_weights_.down_combine_directions_u8 = arena.allocate(directions.size());
+          arena.copy_h2d_sync(runtime.h2d_stream(), directions.data(),
+                              moe_weights_.down_combine_directions_u8, directions.size());
+        }
         return moe_weights_;
       }(), "swa", cache, fused_model, syn_type_bf16, rows),
       moe_reduce_(fused_model ? nullptr :
