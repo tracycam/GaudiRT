@@ -4,15 +4,15 @@
 
 int main() {
   using gaudirt::mimo::prefill_chunks;
-  for (unsigned count : {32, 480, 512, 544, 1024, 4096}) {
+  for (unsigned count : {32, 480, 512, 544, 992, 1024, 1056, 1536, 4064, 4096}) {
     auto chunks = prefill_chunks(count);
-    unsigned offset=0, small=0, large=0;
+    unsigned offset=0, small=0, large=0, xlarge=0;
     for (auto chunk : chunks) {
-      if (chunk.offset!=offset || (chunk.rows!=32 && chunk.rows!=512) ||
-          chunk.index!=(chunk.rows==512?large++:small++)) throw std::runtime_error("invalid prefill chunk plan");
+      if (chunk.offset!=offset || (chunk.rows!=32 && chunk.rows!=512 && chunk.rows!=1024) ||
+          chunk.index!=(chunk.rows==1024?xlarge++:chunk.rows==512?large++:small++)) throw std::runtime_error("invalid prefill chunk plan");
       offset+=chunk.rows;
     }
-    if (offset!=count || large!=count/512 || small!=(count%512)/32)
+    if (offset!=count || xlarge!=count/1024 || large!=(count%1024)/512 || small!=(count%512)/32)
       throw std::runtime_error("prefill chunk plan lost tokens");
   }
   for(unsigned bad : {0,31,33,4097}) {

@@ -36,5 +36,6 @@ int main() {
   };
   verify.template operator()<32>();
   verify.template operator()<512>();
+  verify.template operator()<1024>();
   std::cout << "4096-token chunk metadata, permutations, windows, and RoPE verified\n";
 }

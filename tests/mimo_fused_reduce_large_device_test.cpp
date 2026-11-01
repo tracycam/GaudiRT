@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Check the TP8 rank/row layout consumed by the M512 fused graphs.
+// Check the TP8 rank/row layout consumed by large prefill graphs.
 #include "gaudirt/runtime/device_runtime.hpp"
 #include "gaudirt/runtime/hbm_arena.hpp"
 #include "gaudirt/runtime/prepared_launch.hpp"
@@ -20,9 +20,12 @@ uint16_t bf16(float x) { uint32_t b; std::memcpy(&b, &x, 4); b += 0x7fff + ((b >
 }
 int main() {
   using namespace gaudirt::runtime;
-  constexpr unsigned hidden = 6144, rows = 512, ranks = 8;
+#ifndef GAUDIRT_TEST_ROWS
+#define GAUDIRT_TEST_ROWS 512
+#endif
+  constexpr unsigned hidden = 6144, rows = GAUDIRT_TEST_ROWS, ranks = 8;
   DeviceRuntime::Config config{}; DeviceRuntime runtime(config);
-  HbmArena arena(runtime.device_id(), 256ULL * 1024 * 1024);
+  HbmArena arena(runtime.device_id(), 512ULL * 1024 * 1024);
   for (auto dtype : {syn_type_float, syn_type_bf16}) {
     synGraphHandle graph = nullptr; synRecipeHandle recipe = nullptr;
     std::array<synSectionHandle, 2> sections{};
@@ -79,5 +82,5 @@ int main() {
         throw std::runtime_error("strided last-row TP8 reduction mismatch");
     check(synRecipeDestroy(recipe));
   }
-  std::printf("M512 BF16 and FP32 TP8 reductions match CPU bitwise\n");
+  std::printf("M%u BF16 and FP32 TP8 reductions match CPU bitwise\n", rows);
 }

@@ -10,7 +10,7 @@ namespace gaudirt::mimo {
 // applies an additional per-row causal mask inside its softmax.
 template <uint32_t Rows>
 struct alignas(256) PrefillMetadataT {
-  static_assert(Rows == 32 || Rows == 512);
+  static_assert(Rows == 32 || Rows == 512 || Rows == 1024);
   static constexpr uint32_t kRows = Rows;
   alignas(256) std::array<uint16_t, kRows * 64> full_cos{};
   alignas(256) std::array<uint16_t, kRows * 64> full_sin{};
@@ -26,8 +26,10 @@ struct alignas(256) PrefillMetadataT {
 };
 using PrefillMetadata = PrefillMetadataT<32>;
 using LargePrefillMetadata = PrefillMetadataT<512>;
+using XLargePrefillMetadata = PrefillMetadataT<1024>;
 static_assert(std::is_trivially_copyable_v<PrefillMetadata>);
 static_assert(std::is_trivially_copyable_v<LargePrefillMetadata>);
+static_assert(std::is_trivially_copyable_v<XLargePrefillMetadata>);
 
 template <uint32_t Rows>
 inline void fill_prefill_metadata(PrefillMetadataT<Rows>& result, uint32_t first_position,
