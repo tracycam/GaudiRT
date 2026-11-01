@@ -36,18 +36,23 @@ Layer0::Layer0(runtime::HbmArena& arena, runtime::DeviceRuntime& runtime,
   if (!comm_ || !post_attention_gamma_) {
     throw std::invalid_argument("MiMo layer0: missing HCCL or post-attention gamma");
   }
+  if (rows_ > 1 && page_count == 32)
+    short_attention_ = std::make_unique<runtime::MimoFullAttention>(
+        arena, attention_weights, cache_slots, true, 16, cache, false, rows);
   arena.ensure_workspace(std::max({attention_.workspace_bytes(),
+                                   short_attention_ ? short_attention_->workspace_bytes() : 0,
                                    attention_reduce_ ? attention_reduce_->workspace_bytes() : 0,
                                    dense_.workspace_bytes(),
                                    dense_reduce_ ? dense_reduce_->workspace_bytes() : 0}));
 }
 
-PreparedLayer Layer0::prepare(const Io& io) {
+PreparedLayer Layer0::prepare(const Io& io, bool short_prefix) {
   auto dense = dense_.prepare({fused_model_ ? io.attention_gathered_fp32 : io.attention_output_bf16,
                                io.attention.hidden_states,
                                post_attention_gamma_}, io.dense_outputs);
   PreparedLayer result;
-  result.attention.push_back(attention_.prepare(io.attention));
+  if (short_prefix && !short_attention_) throw std::invalid_argument("MiMo layer0: no short attention graph");
+  result.attention.push_back((short_prefix ? *short_attention_ : attention_).prepare(io.attention));
   if (!fused_model_)
     result.attention_reduce = attention_reduce_->prepare(io.attention_gathered_fp32,
                                                           io.attention_output_bf16);
@@ -94,6 +99,7 @@ void Layer0::execute(const Io& io, synStreamHandle stream) {
 void Layer0::rebind_weights(const runtime::WeightManifest& attention_weights,
                             const runtime::WeightManifest& dense_weights) {
   attention_.rebind_weights(attention_weights);
+  if (short_attention_) short_attention_->rebind_weights(attention_weights);
   dense_.rebind_weights(dense_weights);
   post_attention_gamma_ = dense_weights.get("post_attention_gamma").device_address;
   if (!post_attention_gamma_) {

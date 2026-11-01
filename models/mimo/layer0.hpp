@@ -34,7 +34,7 @@ class Layer0 final {
   Layer0& operator=(const Layer0&) = delete;
 
   void execute(const Io& io, synStreamHandle stream);
-  PreparedLayer prepare(const Io& io);
+  PreparedLayer prepare(const Io& io, bool short_prefix = false);
   void rebind_weights(const runtime::WeightManifest& attention_weights,
                       const runtime::WeightManifest& dense_weights);
   std::vector<uint64_t> recipe_identity() const {
@@ -44,6 +44,7 @@ class Layer0 final {
 
  private:
   runtime::MimoFullAttention attention_;
+  std::unique_ptr<runtime::MimoFullAttention> short_attention_;
   std::unique_ptr<runtime::TpReduce> attention_reduce_;
   runtime::MimoDenseMlp dense_;
   std::unique_ptr<runtime::TpReduce> dense_reduce_;
