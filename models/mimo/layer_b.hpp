@@ -27,7 +27,8 @@ class LayerB final {
   LayerB(runtime::HbmArena& arena, runtime::DeviceRuntime& runtime,
          const runtime::WeightManifest& weights, uint32_t cache_slots,
          uint32_t page_count = 64, runtime::RecipeCache* cache = nullptr,
-         bool fused_model = false, uint32_t rows = 1);
+         bool fused_model = false, uint32_t rows = 1,
+         uint64_t shared_lut = 0, uint64_t shared_directions = 0);
 
   LayerB(const LayerB&) = delete;
   LayerB& operator=(const LayerB&) = delete;
@@ -35,6 +36,8 @@ class LayerB final {
   void execute(const Io& io, synStreamHandle stream);
   PreparedLayer prepare(const Io& io);
   void rebind_weights(const runtime::WeightManifest& weights);
+  uint64_t moe_lut() const { return moe_weights_.mxfp4_lut_bf16; }
+  uint64_t moe_directions() const { return moe_weights_.down_combine_directions_u8; }
   std::vector<uint64_t> recipe_identity() const {
     return {attention_.recipe_identity(), moe_.recipe_identity()};
   }
