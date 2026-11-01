@@ -8,6 +8,7 @@
 #include "step_metadata.hpp"
 #include "prefill_metadata.hpp"
 #include "prefill_bindings.hpp"
+#include "prefill_chunks.hpp"
 
 #include "gaudirt/common/sha256.hpp"
 #include "gaudirt/runtime/weight_manifest.hpp"
@@ -135,6 +136,7 @@ struct LayerEntry {
   uint64_t residual_output = 0;
   uint64_t layer_output = 0;
   uint64_t prefill_residual_output = 0;
+  uint64_t large_prefill_residual_output = 0;
 };
 
 struct PendingWeights {
@@ -261,6 +263,13 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       default:
         throw std::invalid_argument("PrivateUse1: unsupported weight dtype");
     }
+    if (prefill_enabled_ && !dense && (name == "moe_gs" || name == "moe_ds")) {
+      if (tensor.scalar_type() != at::kByte)
+        throw std::invalid_argument("PrivateUse1: invalid MoE scale dtype");
+      const auto* scales = tensor.const_data_ptr<uint8_t>();
+      if (std::any_of(scales, scales + tensor.numel(), [](uint8_t x) { return x < 2 || x > 252; }))
+        throw std::invalid_argument("PrivateUse1: MoE scale outside grouped decoder contract");
+    }
     item.elements = static_cast<uint64_t>(tensor.numel());
     item.bytes = tensor.nbytes();
     if (!dense && (name == "qkv_scales" || name == "qkv_bias")) {
@@ -325,7 +334,8 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     }
     LayerEntry entry{kind, std::move(attention), std::move(dense),
                      arena_.allocate(12288), arena_.allocate(12288),
-                     prefill_enabled_ ? arena_.allocate(12288 * 32) : 0};
+                     prefill_enabled_ ? arena_.allocate(12288 * 32) : 0,
+                     prefill_enabled_ ? arena_.allocate(12288 * 512) : 0};
     auto [entry_it, inserted] = entries_.emplace(layer_id, std::move(entry));
     if (!inserted) {
       throw std::invalid_argument("PrivateUse1: duplicate layer_id");
@@ -337,6 +347,10 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       if (prefill_enabled_)
         prefill_instances_.emplace(kind, create_instance(kind, cache_slots, page_count,
             *entry_it->second.attention_weights, entry_it->second.dense_weights.get(), 32));
+      if (prefill_enabled_)
+        large_prefill_instances_.emplace(kind, create_instance(kind, cache_slots,
+            kind == Kind::C ? page_count : 32, *entry_it->second.attention_weights,
+            entry_it->second.dense_weights.get(), 512));
     } else {
       const auto& instance = instances_.at(kind);
       if (instance->cache_slots != cache_slots || instance->page_count != page_count) {
@@ -485,12 +499,15 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     if (prefill_enabled_) {
       prefill_tokens_device_ = arena_.allocate(4096 * sizeof(int32_t));
       prefill_metadata_device_ = arena_.allocate(128 * sizeof(PrefillMetadata));
-      prefill_embedding_device_ = arena_.allocate(32 * 6144 * sizeof(uint16_t));
-      prefill_status_device_ = arena_.allocate(32 * sizeof(int32_t));
-      prefill_reduced_device_ = arena_.allocate(32 * 6144 * sizeof(uint16_t));
+      large_prefill_metadata_device_ = arena_.allocate(8 * sizeof(LargePrefillMetadata));
+      prefill_embedding_device_ = arena_.allocate(512 * 6144 * sizeof(uint16_t));
+      prefill_status_device_ = arena_.allocate(512 * sizeof(int32_t));
+      prefill_reduced_device_ = arena_.allocate(512 * 6144 * sizeof(uint16_t));
       prefill_embedding_ = std::make_unique<ModelEmbedding>(arena_, model_weights_.at("embedding"), &recipe_cache_, 32);
+      large_prefill_embedding_ = std::make_unique<ModelEmbedding>(arena_, model_weights_.at("embedding"), &recipe_cache_, 512);
       prefill_head_ = std::make_unique<ModelHead>(arena_, model_weights_.at("final_norm"), model_weights_.at("lm_head"), &recipe_cache_, false, ModelHead::kLocalVocabSize);
       prefill_reduce_ = std::make_unique<runtime::TpReduce>(arena_, 32 * 6144, syn_type_float, &recipe_cache_);
+      large_prefill_reduce_ = std::make_unique<runtime::TpReduce>(arena_, 512 * 6144, syn_type_float, &recipe_cache_);
     }
     const uint64_t workspace = arena_.workspace_addr();
     model_embedding_launch_ = embedding_->prepare(token_device_, embedding_device_,
@@ -518,40 +535,47 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     model_head_launch_ = head_->prepare(hidden, residual, normalized_device_, local_logits_device_);
     model_argmax_launch_ = argmax_->prepare(logits_device_, embedding_status_, token_device_);
     if (prefill_enabled_) {
-      prefill_embedding_launch_ = prefill_embedding_->prepare(
-          prefill_tokens_device_, prefill_embedding_device_, prefill_status_device_);
-      for (auto& tensor : prefill_embedding_launch_.tensors) {
-        if (tensor.pTensorAddress == prefill_tokens_device_) {
-          if (prefill_token_binding_) throw std::runtime_error("PrivateUse1: ambiguous prefill token binding");
-          prefill_token_binding_ = &tensor.pTensorAddress;
+      auto bind = [&]<typename Metadata>(ModelEmbedding& embedding, runtime::TpReduce& reduce,
+                                       uint64_t base, std::vector<PreparedLayer>& layers,
+                                       std::vector<std::pair<uint64_t*, uint64_t>>& metadata_bindings,
+                                       runtime::PreparedLaunch& embedding_launch, uint64_t*& token_binding,
+                                       runtime::PreparedLaunch& reduce_launch, runtime::PreparedLaunch& head_launch) {
+        embedding_launch = embedding.prepare(prefill_tokens_device_, prefill_embedding_device_, prefill_status_device_);
+        for (auto& tensor : embedding_launch.tensors) if (tensor.pTensorAddress == prefill_tokens_device_) {
+          if (token_binding) throw std::runtime_error("PrivateUse1: ambiguous prefill token binding");
+          token_binding = &tensor.pTensorAddress;
         }
-      }
-      if (!prefill_token_binding_) throw std::runtime_error("PrivateUse1: missing prefill token binding");
-      prefill_layers_.reserve(70);
-      hidden = prefill_embedding_device_;
-      residual = prefill_embedding_device_;
-      for (uint32_t layer = 0; layer < 70; ++layer) {
-        const bool full = is_full_layer(layer);
-        const uint64_t base = prefill_metadata_device_;
-        std::array<uint64_t, 11> addresses{
-            hidden, residual,
-            base + (full ? offsetof(PrefillMetadata, full_cos) : offsetof(PrefillMetadata, swa_cos)),
-            base + (full ? offsetof(PrefillMetadata, full_sin) : offsetof(PrefillMetadata, swa_sin)),
-            model_keys_[layer], model_values_[layer], base + offsetof(PrefillMetadata, slots),
-            base + (full ? offsetof(PrefillMetadata, full_pages) : offsetof(PrefillMetadata, window_pages)),
-            base + offsetof(PrefillMetadata, full_usage),
-            base + (full ? offsetof(PrefillMetadata, full_groups) : offsetof(PrefillMetadata, window_groups)),
-            base + offsetof(PrefillMetadata, positions)};
-        prefill_layers_.push_back(prepare_layer(layer, addresses, true));
-        hidden = prefill_layers_.back().feed_forward_gathered;
-        residual = entries_.at(layer).prefill_residual_output;
-      }
-      prefill_metadata_bindings_ = prefill_metadata_bindings(
-          prefill_layers_, prefill_metadata_device_, sizeof(PrefillMetadata));
-      prefill_reduce_launch_ = prefill_reduce_->prepare(hidden, prefill_reduced_device_);
-      prefill_head_launch_ = prefill_head_->prepare(
-          prefill_reduced_device_ + 31 * 6144 * sizeof(uint16_t),
-          residual + 31 * 6144 * sizeof(uint16_t), normalized_device_, local_logits_device_);
+        if (!token_binding) throw std::runtime_error("PrivateUse1: missing prefill token binding");
+        layers.reserve(70);
+        uint64_t hidden = prefill_embedding_device_, residual = prefill_embedding_device_;
+        for (uint32_t layer = 0; layer < 70; ++layer) {
+          const bool full = is_full_layer(layer);
+          std::array<uint64_t, 11> addresses{
+              hidden, residual,
+              base + (full ? offsetof(Metadata, full_cos) : offsetof(Metadata, swa_cos)),
+              base + (full ? offsetof(Metadata, full_sin) : offsetof(Metadata, swa_sin)),
+              model_keys_[layer], model_values_[layer], base + offsetof(Metadata, slots),
+              base + (full ? offsetof(Metadata, full_pages) : offsetof(Metadata, window_pages)),
+              base + offsetof(Metadata, full_usage),
+              base + (full ? offsetof(Metadata, full_groups) : offsetof(Metadata, window_groups)),
+              base + offsetof(Metadata, positions)};
+          layers.push_back(prepare_layer(layer, addresses, Metadata::kRows));
+          hidden = layers.back().feed_forward_gathered;
+          residual = Metadata::kRows == 32 ? entries_.at(layer).prefill_residual_output
+                                           : entries_.at(layer).large_prefill_residual_output;
+        }
+        metadata_bindings = prefill_metadata_bindings(layers, base, sizeof(Metadata));
+        reduce_launch = reduce.prepare(hidden, prefill_reduced_device_);
+        const uint64_t last = (Metadata::kRows - 1) * 6144 * sizeof(uint16_t);
+        head_launch = prefill_head_->prepare(prefill_reduced_device_ + last, residual + last,
+                                            normalized_device_, local_logits_device_);
+      };
+      bind.template operator()<PrefillMetadata>(*prefill_embedding_, *prefill_reduce_, prefill_metadata_device_,
+          prefill_layers_, prefill_metadata_bindings_, prefill_embedding_launch_, prefill_token_binding_,
+          prefill_reduce_launch_, prefill_head_launch_);
+      bind.template operator()<LargePrefillMetadata>(*large_prefill_embedding_, *large_prefill_reduce_, large_prefill_metadata_device_,
+          large_prefill_layers_, large_prefill_metadata_bindings_, large_prefill_embedding_launch_, large_prefill_token_binding_,
+          large_prefill_reduce_launch_, large_prefill_head_launch_);
       prefill_argmax_launch_ = argmax_->prepare(logits_device_, prefill_status_device_, token_device_);
     }
     if (arena_.workspace_addr() != workspace)
@@ -623,29 +647,49 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
         throw std::invalid_argument("PrivateUse1: prompt token out of range");
     const auto* full = reinterpret_cast<const uint16_t*>(full_rope.data_ptr());
     const auto* swa = reinterpret_cast<const uint16_t*>(swa_rope.data_ptr());
-    const uint32_t chunks = static_cast<uint32_t>(tokens.numel() / 32);
-    std::vector<PrefillMetadata> metadata(chunks);
-    for (uint32_t chunk = 0; chunk < chunks; ++chunk)
-      fill_prefill_metadata(metadata[chunk], prefill_rows_ + chunk * 32, 4096, full, swa,
-                            model_pages_, cache_slots_);
+    const auto chunks = prefill_chunks(static_cast<uint32_t>(tokens.numel()));
+    std::vector<PrefillMetadata> metadata;
+    std::vector<LargePrefillMetadata> large_metadata;
+    for (const auto& chunk : chunks) {
+      if (chunk.rows == 512) {
+        large_metadata.emplace_back();
+        fill_prefill_metadata(large_metadata.back(), prefill_rows_ + chunk.offset, 4096, full, swa,
+                              model_pages_, cache_slots_);
+      } else {
+        metadata.emplace_back();
+        fill_prefill_metadata(metadata.back(), prefill_rows_ + chunk.offset, 4096, full, swa,
+                              model_pages_, cache_slots_);
+      }
+    }
     arena_.copy_h2d_sync(runtime_.h2d_stream(), token_data, prefill_tokens_device_, tokens.nbytes());
-    arena_.copy_h2d_sync(runtime_.h2d_stream(), metadata.data(), prefill_metadata_device_,
-                         metadata.size() * sizeof(PrefillMetadata));
+    if (!metadata.empty())
+      arena_.copy_h2d_sync(runtime_.h2d_stream(), metadata.data(), prefill_metadata_device_,
+                           metadata.size() * sizeof(PrefillMetadata));
+    if (!large_metadata.empty())
+      arena_.copy_h2d_sync(runtime_.h2d_stream(), large_metadata.data(), large_prefill_metadata_device_,
+                           large_metadata.size() * sizeof(LargePrefillMetadata));
     const auto stream = runtime_.compute_stream();
-    for (uint32_t chunk = 0; chunk < chunks; ++chunk) {
-      *prefill_token_binding_ = prefill_tokens_device_ + chunk * 32 * sizeof(int32_t);
-      prefill_embedding_launch_.execute(stream);
-      const uint64_t base = prefill_metadata_device_ + chunk * sizeof(PrefillMetadata);
-      for (auto [address, offset] : prefill_metadata_bindings_) *address = base + offset;
-      for (const auto& layer : prefill_layers_) layer.execute_fused(stream);
+    for (const auto& chunk : chunks) {
+      const bool large = chunk.rows == 512;
+      auto& token_binding = large ? large_prefill_token_binding_ : prefill_token_binding_;
+      auto& embedding = large ? large_prefill_embedding_launch_ : prefill_embedding_launch_;
+      auto& bindings = large ? large_prefill_metadata_bindings_ : prefill_metadata_bindings_;
+      auto& layers = large ? large_prefill_layers_ : prefill_layers_;
+      *token_binding = prefill_tokens_device_ + chunk.offset * sizeof(int32_t);
+      embedding.execute(stream);
+      const uint64_t base = large ? large_prefill_metadata_device_ + chunk.index * sizeof(LargePrefillMetadata)
+                                  : prefill_metadata_device_ + chunk.index * sizeof(PrefillMetadata);
+      for (auto [address, offset] : bindings) *address = base + offset;
+      for (const auto& layer : layers) layer.execute_fused(stream);
     }
     if (prefill_rows_ + tokens.numel() != 4096) {
       runtime_.synchronize_compute();
       prefill_rows_ += static_cast<uint32_t>(tokens.numel());
       return -1;
     }
-    prefill_reduce_launch_.execute(stream);
-    prefill_head_launch_.execute(stream);
+    const bool last_large = chunks.back().rows == 512;
+    (last_large ? large_prefill_reduce_launch_ : prefill_reduce_launch_).execute(stream);
+    (last_large ? large_prefill_head_launch_ : prefill_head_launch_).execute(stream);
     if (hcclAllGather(reinterpret_cast<const void*>(local_logits_device_),
                       reinterpret_cast<void*>(logits_device_), ModelHead::kLocalVocabSize,
                       hcclBfloat16, runtime_.comm(), stream) != hcclSuccess)
@@ -752,10 +796,12 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
 
   PreparedLayer prepare_layer(uint32_t layer_id,
                               const std::array<uint64_t, 11>& addresses,
-                              bool prefill = false) {
+                              uint32_t prefill = 0) {
     auto& entry = entries_.at(layer_id);
-    auto& instance = *(prefill ? prefill_instances_ : instances_).at(entry.kind);
-    const uint64_t residual_output = prefill ? entry.prefill_residual_output : entry.residual_output;
+    auto& map = prefill == 512 ? large_prefill_instances_ : prefill == 32 ? prefill_instances_ : instances_;
+    auto& instance = *map.at(entry.kind);
+    const uint64_t residual_output = prefill == 512 ? entry.large_prefill_residual_output
+                                     : prefill == 32 ? entry.prefill_residual_output : entry.residual_output;
     if (entry.kind == Kind::A) {
       instance.a->rebind_weights(*entry.attention_weights, *entry.dense_weights);
       auto io = instance.a_io;
@@ -902,9 +948,12 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       io.attention_gathered_fp32 = arena_.allocate(rows * 8 * 6144 * 4);
       io.down_gathered_fp32 = arena_.allocate(rows * 8 * 6144 * 4);
     } else if (kind == Kind::B) {
+      const auto* decode = rows == 1 ? nullptr : instances_.at(kind)->b.get();
       instance->b = std::make_unique<LayerB>(arena_, runtime_, attention_weights,
                                              cache_slots, page_count, &recipe_cache_,
-                                             fused_model_, rows);
+                                             fused_model_, rows,
+                                             decode ? decode->moe_lut() : 0,
+                                             decode ? decode->moe_directions() : 0);
       auto& io = instance->b_io;
       io.attention.residual_out = arena_.allocate(rows * 12288);
       io.attention.output_local_fp32 = arena_.allocate(rows * 6144 * 4);
@@ -913,8 +962,11 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       io.attention_gathered_fp32 = arena_.allocate(rows * 8 * 6144 * 4);
       io.moe_gathered_fp32 = arena_.allocate(rows * 8 * 6144 * 4);
     } else {
+      const auto* decode = rows == 1 ? nullptr : instances_.at(kind)->c.get();
       instance->c = std::make_unique<LayerC>(arena_, runtime_, attention_weights,
-                                             cache_slots, &recipe_cache_, fused_model_, rows);
+                                             cache_slots, &recipe_cache_, fused_model_, rows,
+                                             decode ? decode->moe_lut() : 0,
+                                             decode ? decode->moe_directions() : 0);
       auto& io = instance->c_io;
       io.attention.residual_out = arena_.allocate(rows * 12288);
       io.attention.output_local = arena_.allocate(rows * 12288);
@@ -974,16 +1026,23 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   runtime::RecipeCache recipe_cache_;
   std::unordered_map<Kind, std::unique_ptr<Instance>> instances_;
   std::unordered_map<Kind, std::unique_ptr<Instance>> prefill_instances_;
+  std::unordered_map<Kind, std::unique_ptr<Instance>> large_prefill_instances_;
   std::unordered_map<uint32_t, LayerEntry> entries_;
   std::unordered_map<uint32_t, PendingWeights> pending_;
   std::unordered_map<std::string, uint64_t> model_weights_;
   std::vector<PreparedLayer> model_layers_;
   std::vector<PreparedLayer> prefill_layers_;
+  std::vector<PreparedLayer> large_prefill_layers_;
   std::vector<std::pair<uint64_t*, uint64_t>> prefill_metadata_bindings_;
+  std::vector<std::pair<uint64_t*, uint64_t>> large_prefill_metadata_bindings_;
   uint64_t* prefill_token_binding_ = nullptr;
+  uint64_t* large_prefill_token_binding_ = nullptr;
   runtime::PreparedLaunch prefill_embedding_launch_;
+  runtime::PreparedLaunch large_prefill_embedding_launch_;
   runtime::PreparedLaunch prefill_reduce_launch_;
+  runtime::PreparedLaunch large_prefill_reduce_launch_;
   runtime::PreparedLaunch prefill_head_launch_;
+  runtime::PreparedLaunch large_prefill_head_launch_;
   runtime::PreparedLaunch prefill_argmax_launch_;
   runtime::PreparedLaunch model_embedding_launch_;
   runtime::PreparedLaunch model_head_launch_;
@@ -1017,12 +1076,15 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   uint64_t logits_device_ = 0;
   uint64_t prefill_tokens_device_ = 0;
   uint64_t prefill_metadata_device_ = 0;
+  uint64_t large_prefill_metadata_device_ = 0;
   uint64_t prefill_embedding_device_ = 0;
   uint64_t prefill_status_device_ = 0;
   uint64_t prefill_reduced_device_ = 0;
   std::unique_ptr<ModelEmbedding> prefill_embedding_;
+  std::unique_ptr<ModelEmbedding> large_prefill_embedding_;
   std::unique_ptr<ModelHead> prefill_head_;
   std::unique_ptr<runtime::TpReduce> prefill_reduce_;
+  std::unique_ptr<runtime::TpReduce> large_prefill_reduce_;
   std::unique_ptr<ModelEmbedding> embedding_;
   std::unique_ptr<ModelHead> head_;
   std::unique_ptr<ModelArgmax> argmax_;

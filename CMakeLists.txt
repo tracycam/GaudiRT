@@ -149,6 +149,9 @@ target_link_libraries(mimo_swa_output_device_test PRIVATE mimo_layer_vertical)
 add_executable(prefill_metadata_test tests/prefill_metadata_test.cpp)
 target_include_directories(prefill_metadata_test PRIVATE models/mimo)
 
+add_executable(prefill_chunks_test tests/prefill_chunks_test.cpp)
+target_include_directories(prefill_chunks_test PRIVATE models/mimo)
+
 add_executable(prefill_bindings_test tests/prefill_bindings_test.cpp)
 target_include_directories(prefill_bindings_test PRIVATE models/mimo)
 
