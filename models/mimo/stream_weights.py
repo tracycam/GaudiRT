@@ -131,4 +131,3 @@ def load_model_weight(model, name):
     suffix = suffixes[name]
     with safe_open(str(model / weight_map[suffix]), framework='pt', device='cpu') as tensors:
         return tensors.get_tensor(suffix)
-
