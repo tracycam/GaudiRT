@@ -204,26 +204,18 @@ struct MimoDenseMlp::Impl {
                                       {groups * 128, width});
     synTensor partial = intermediate(graph, name("_mme_output_fp32").c_str(), syn_type_float,
                                       {width, rows});
-    ns_CastKernel::ParamsV3 cast{};
-    cast.round_mode = CAST_ROUND_HALF_NE;
-    node(graph, {x}, {activation}, &cast, sizeof(cast), "cast_f32_to_bf16", "mme_activation_cast");
+    synTensor correction = intermediate(graph, name("_mme_activation_correction").c_str(), syn_type_bf16,
+                                         {groups * 128, rows});
+    node(graph, {x}, {activation, correction}, nullptr, 0,
+         "gk_dense_activation_split_v1", "mme_activation_split");
     synTensor decoded_low = intermediate(graph, name("_mme_decoded_weight_low").c_str(), syn_type_bf16,
                                           {groups * 128, width});
     node(graph, {weight, scales}, {decoded, decoded_low}, nullptr, 0,
          "gk_dense_block128_decode_split_v1", "mme_weight_decode_split");
-    synTensor reconstructed = intermediate(graph, name("_mme_activation_reconstructed").c_str(), syn_type_float,
-                                            {groups * 128, rows});
-    synTensor residual = intermediate(graph, name("_mme_activation_residual").c_str(), syn_type_float,
-                                       {groups * 128, rows});
-    synTensor correction = intermediate(graph, name("_mme_activation_correction").c_str(), syn_type_bf16,
-                                         {groups * 128, rows});
     synTensor extra = intermediate(graph, name("_mme_output_correction").c_str(), syn_type_float,
                                     {width, rows});
     synTensor combined = intermediate(graph, name("_mme_output_combined").c_str(), syn_type_float,
                                        {width, rows});
-    node(graph, {activation}, {reconstructed}, &cast, sizeof(cast), "cast_bf16_to_f32", "mme_activation_widen");
-    node(graph, {x, reconstructed}, {residual}, nullptr, 0, "sub_fwd_f32", "mme_activation_residual");
-    node(graph, {residual}, {correction}, &cast, sizeof(cast), "cast_f32_to_bf16", "mme_activation_correction");
     const synGEMMParams params{false, true};
     node(graph, {activation, decoded}, {partial}, &params, sizeof(params), "gemm", "mme_dense");
     node(graph, {correction, decoded}, {extra}, &params, sizeof(params), "gemm", "mme_dense_correction");
