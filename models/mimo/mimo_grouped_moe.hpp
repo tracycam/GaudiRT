@@ -15,19 +15,22 @@ namespace gaudirt::runtime {
 // This graph consumes the same packed weights as decode. Decoded expert tiles
 // are graph temporaries and share the recipe workspace, not persistent weights.
 inline void append_grouped_prefill_moe(synGraphHandle graph, uint32_t rows,
+                                       const char* graph_variant,
                                        synTensor activation, synTensor ids,
                                        synTensor routing, synTensor gate_weight,
                                        synTensor gate_scale, synTensor down_weight,
                                        synTensor down_scale, synTensor lut,
                                        synTensor output) {
   if (rows != 256 && rows != 512) throw std::invalid_argument("grouped MoE rows");
+  const std::string prefix = std::string(graph_variant) + "_m" + std::to_string(rows) + "_";
   auto check = [](synStatus status, const char* where) {
     if (status != synSuccess) throw std::runtime_error(std::string(where) + ": " + std::to_string(status));
   };
   auto tensor = [&](const std::string& name, synDataType type,
                     std::initializer_list<uint64_t> shape) {
     synTensorDescriptor d{};
-    d.m_name = name.c_str(); d.m_dataType = type; d.m_dims = shape.size();
+    const std::string full_name = prefix + name;
+    d.m_name = full_name.c_str(); d.m_dataType = type; d.m_dims = shape.size();
     unsigned i = 0;
     for (auto size : shape) { d.m_sizes[i] = d.m_minSizes[i] = size; ++i; }
     synTensor result = nullptr;
@@ -37,8 +40,9 @@ inline void append_grouped_prefill_moe(synGraphHandle graph, uint32_t rows,
   auto node = [&](const std::string& name, const char* guid,
                   const std::vector<synTensor>& in, const std::vector<synTensor>& out,
                   const void* params = nullptr, unsigned bytes = 0) {
+    const std::string full_name = prefix + name;
     check(synNodeCreate(graph, in.data(), out.data(), in.size(), out.size(),
-                        params, bytes, guid, name.c_str(), nullptr, nullptr), name.c_str());
+                        params, bytes, guid, full_name.c_str(), nullptr, nullptr), name.c_str());
   };
   auto join = [&](const std::string& name, const std::vector<synTensor>& inputs,
                   synTensor result, unsigned axis) {
