@@ -320,13 +320,38 @@ struct MimoAttention::Impl {
     synTensor sink = external("attention_sink", Binding::kAttentionSink,
                               syn_type_bf16, {16});
     context = intermediate("context", syn_type_bf16, {128, 16, rows});
-    node({query, key_cache_after, value_cache_after, window_pages,
-          window_groups, position, sink},
-         {context}, &kAttentionScale, sizeof(kAttentionScale),
-         rows == 1 ? "gk_swa128_avgroup_group_v0"
-                   : (rows == 512 ? "gk_swa128_batch_window_direct_fp32_v3"
-                                  : "gk_swa128_batch_window_quad_fp32_v2"),
-         "swa128_fp32_attention");
+    if (rows == 512) {
+      synTensor gathered_key = intermediate("swa_mme_key", syn_type_bf16, {192, 384, 4});
+      synTensor gathered_value = intermediate("swa_mme_value", syn_type_bf16, {128, 384, 4});
+      node({key_cache_after, value_cache_after, window_pages, window_groups, position},
+           {gathered_key, gathered_value}, nullptr, 0, "gk_swa_mme_gather_v1", "swa_mme_gather");
+      synTensor query_matrix = intermediate("swa_mme_query", syn_type_bf16, {192, 2048, 4});
+      node({query}, {query_matrix}, nullptr, 0, "reshape", "swa_mme_query_reshape");
+      synTensor scores = intermediate("swa_mme_scores", syn_type_float, {384, 2048, 4});
+      const synGEMMParams qk{false, true};
+      node({query_matrix, gathered_key}, {scores}, &qk, sizeof(qk), "batch_gemm", "swa_mme_qk");
+      synTensor probability = intermediate("swa_mme_probability", syn_type_bf16, {384, 2048, 4});
+      synTensor correction = intermediate("swa_mme_correction", syn_type_bf16, {384, 2048, 4});
+      node({scores, position, sink}, {probability, correction}, &kAttentionScale,
+           sizeof(kAttentionScale), "gk_swa_mme_softmax_v1", "swa_mme_softmax");
+      synTensor main = intermediate("swa_mme_pv_main", syn_type_float, {128, 2048, 4});
+      synTensor extra = intermediate("swa_mme_pv_extra", syn_type_float, {128, 2048, 4});
+      synTensor total = intermediate("swa_mme_pv_total", syn_type_float, {128, 2048, 4});
+      synTensor rounded = intermediate("swa_mme_pv_rounded", syn_type_bf16, {128, 2048, 4});
+      const synGEMMParams pv{false, false};
+      node({probability, gathered_value}, {main}, &pv, sizeof(pv), "batch_gemm", "swa_mme_pv");
+      node({correction, gathered_value}, {extra}, &pv, sizeof(pv), "batch_gemm", "swa_mme_pv_correction");
+      node({main, extra}, {total}, nullptr, 0, "add_fwd_f32", "swa_mme_pv_combine");
+      ns_CastKernel::ParamsV3 cast{}; cast.round_mode = CAST_ROUND_HALF_NE;
+      node({total}, {rounded}, &cast, sizeof(cast), "cast_f32_to_bf16", "swa_mme_pv_round");
+      node({rounded}, {context}, nullptr, 0, "reshape", "swa_mme_context_reshape");
+    } else {
+      node({query, key_cache_after, value_cache_after, window_pages,
+            window_groups, position, sink},
+           {context}, &kAttentionScale, sizeof(kAttentionScale),
+           rows == 1 ? "gk_swa128_avgroup_group_v0" : "gk_swa128_batch_window_quad_fp32_v2",
+           "swa128_fp32_attention");
+    }
 
     synTensor context_flat = intermediate("context_flat", syn_type_bf16,
                                           {2048, rows});
@@ -341,7 +366,7 @@ struct MimoAttention::Impl {
 
     recipe = compile_cached(graph, rows == 1 ? "mimo_layer1_attention_b1_m1_tp8"
                                              : "mimo_swa_prefill_b1_m" + std::to_string(rows) + "_tp8",
-                            std::string(rows == 512 ? "swa_grid24_direct_fp32_v8_c"
+                            std::string(rows == 512 ? "swa_mme_prefill_v1_c"
                                                     : "swa_grid24_fp32_v7_c") +
                                 std::to_string(cache_slots) +
                                 (gathered_input ? "_gathered_tp1" : "_direct") +
