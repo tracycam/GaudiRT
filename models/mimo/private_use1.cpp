@@ -532,6 +532,30 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     model_pages_ = next;
   }
 
+  void reset_prefill() {
+    if (!prefill_enabled_ || !model_finalized_ || model_pending_ || !prefill_complete_)
+      throw std::invalid_argument("PrivateUse1: completed request required before reset");
+    auto pages = model_pages_;
+    std::sort(pages.begin(), pages.end());
+    const auto stream = runtime_.compute_stream();
+    for (size_t first = 0; first < pages.size();) {
+      size_t end = first + 1;
+      while (end < pages.size() && pages[end] == pages[end - 1] + 1) ++end;
+      const size_t slot = static_cast<size_t>(pages[first]) * 128;
+      const size_t slots = (end - first) * 128;
+      for (size_t layer = 0; layer < model_keys_.size(); ++layer) {
+        check_syn(synMemsetD8Async(model_keys_[layer] + slot * 192 * 2, 0,
+                                   slots * 192 * 2, stream), "reset model key pages");
+        check_syn(synMemsetD8Async(model_values_[layer] + slot * 128 * 2, 0,
+                                   slots * 128 * 2, stream), "reset model value pages");
+      }
+      first = end;
+    }
+    model_position_ = 4096;
+    prefill_rows_ = 0;
+    prefill_complete_ = false;
+  }
+
   int32_t prefill(const at::Tensor& tokens, const at::Tensor& full_rope,
                   const at::Tensor& swa_rope) {
     if (tokens.numel() != 4096 || prefill_rows_ != 0)
@@ -1214,6 +1238,7 @@ int32_t prefill_chunk(uint32_t rank, const at::Tensor& tokens, const at::Tensor&
 void update_model_pages(uint32_t rank, const at::Tensor& pages) {
   get(rank)->update_model_pages(pages);
 }
+void reset_prefill(uint32_t rank) { get(rank)->reset_prefill(); }
 
 at::Tensor finalize_model(uint32_t rank, const at::Tensor& full_rope,
                           const at::Tensor& swa_rope, const at::Tensor& pages,
@@ -1330,6 +1355,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("prefill", &gaudirt::mimo::prefill);
   m.def("prefill_chunk", &gaudirt::mimo::prefill_chunk);
   m.def("update_model_pages", &gaudirt::mimo::update_model_pages);
+  m.def("reset_prefill", &gaudirt::mimo::reset_prefill);
   m.def("finalize_model", &gaudirt::mimo::finalize_model);
   m.def("finish_model_step", &gaudirt::mimo::finish_model_step);
   m.def("model_logits", &gaudirt::mimo::model_logits);
