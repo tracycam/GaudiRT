@@ -56,7 +56,7 @@ MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
                              bool gathered_attention, synDataType gathered_type, uint32_t rows)
     : tp_rank_(tp_rank), rows_(rows), gathered_attention_(gathered_attention),
       gathered_type_(gathered_type) {
-  if (rows_ != 1 && rows_ != 32 && rows_ != 256 && rows_ != 512 && rows_ != 1024)
+  if (rows_ != 1 && rows_ != 32 && rows_ != 256 && rows_ != 512 && rows_ != 1024 && rows_ != 2048)
     throw std::invalid_argument("MimoMoeLayer1: unsupported rows");
   if (tp_rank_ >= kTpSize) {
     throw std::invalid_argument("MimoMoeLayer1: TP rank must be in [0,8)");
@@ -238,7 +238,7 @@ MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
          {scores, selected_ids}, {route_weights, route_ids, route_weight_sum},
          &router_post_params, sizeof(router_post_params));
 
-    if (rows_ == 256 || rows_ == 512 || rows_ == 1024) {
+    if (rows_ == 256 || rows_ == 512 || rows_ == 1024 || rows_ == 2048) {
       append_grouped_prefill_moe(graph, rows_, graph_variant, normalized, route_ids, route_weights,
                                  gate_up_weight, gate_up_scale, down_weight,
                                  down_scale, lut, moe_out);

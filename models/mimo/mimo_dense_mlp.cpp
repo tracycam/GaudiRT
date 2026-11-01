@@ -195,7 +195,7 @@ struct MimoDenseMlp::Impl {
   }
 
   void build() {
-    if (rows != 1 && rows != 32 && rows != 512 && rows != 1024)
+    if (rows != 1 && rows != 32 && rows != 512 && rows != 1024 && rows != 2048)
       throw std::invalid_argument("MimoDenseMlp: unsupported rows");
     const auto& gate_up_weight =
         expect_dynamic_weight(*weights, "gate_up_weight", syn_type_fp8_143, 3);

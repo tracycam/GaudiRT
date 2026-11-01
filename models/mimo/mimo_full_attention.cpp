@@ -204,7 +204,7 @@ struct MimoFullAttention::Impl {
   }
 
   void build() {
-    if (rows != 1 && rows != 32 && rows != 512 && rows != 1024)
+    if (rows != 1 && rows != 32 && rows != 512 && rows != 1024 && rows != 2048)
       throw std::invalid_argument("MimoFullAttention: unsupported rows");
     if (cache_slots < 2 * MimoAttention::kKvBlockSize ||
         cache_slots % MimoAttention::kKvBlockSize != 0 ||

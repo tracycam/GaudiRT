@@ -336,8 +336,8 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     // written on the same stream. Two buffers therefore serve all layers and
     // all prefill buckets; model weights and KV remain separately resident.
     if (prefill_enabled_ && !prefill_residual_slots_[0]) {
-      prefill_residual_slots_[0] = arena_.allocate(12288 * 1024);
-      prefill_residual_slots_[1] = arena_.allocate(12288 * 1024);
+      prefill_residual_slots_[0] = arena_.allocate(12288 * 2048);
+      prefill_residual_slots_[1] = arena_.allocate(12288 * 2048);
     }
     const uint64_t prefill_residual = prefill_enabled_ ? prefill_residual_slots_[layer_id % 2] : 0;
     LayerEntry entry{kind, std::move(attention), std::move(dense),
@@ -361,7 +361,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       if (prefill_enabled_)
         xlarge_prefill_instances_.emplace(kind, create_instance(kind, cache_slots,
             kind == Kind::C ? page_count : 32, *entry_it->second.attention_weights,
-            entry_it->second.dense_weights.get(), 1024));
+            entry_it->second.dense_weights.get(), 2048));
     } else {
       const auto& instance = instances_.at(kind);
       if (instance->cache_slots != cache_slots || instance->page_count != page_count) {
@@ -512,12 +512,12 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       prefill_metadata_device_ = arena_.allocate(128 * sizeof(PrefillMetadata));
       large_prefill_metadata_device_ = arena_.allocate(8 * sizeof(LargePrefillMetadata));
       xlarge_prefill_metadata_device_ = arena_.allocate(4 * sizeof(XLargePrefillMetadata));
-      prefill_embedding_device_ = arena_.allocate(1024 * 6144 * sizeof(uint16_t));
-      prefill_status_device_ = arena_.allocate(1024 * sizeof(int32_t));
+      prefill_embedding_device_ = arena_.allocate(2048 * 6144 * sizeof(uint16_t));
+      prefill_status_device_ = arena_.allocate(2048 * sizeof(int32_t));
       prefill_reduced_device_ = arena_.allocate(6144 * sizeof(uint16_t));
       prefill_embedding_ = std::make_unique<ModelEmbedding>(arena_, model_weights_.at("embedding"), &recipe_cache_, 32);
       large_prefill_embedding_ = std::make_unique<ModelEmbedding>(arena_, model_weights_.at("embedding"), &recipe_cache_, 512);
-      xlarge_prefill_embedding_ = std::make_unique<ModelEmbedding>(arena_, model_weights_.at("embedding"), &recipe_cache_, 1024);
+      xlarge_prefill_embedding_ = std::make_unique<ModelEmbedding>(arena_, model_weights_.at("embedding"), &recipe_cache_, 2048);
       prefill_head_ = std::make_unique<ModelHead>(arena_, model_weights_.at("final_norm"), model_weights_.at("lm_head"), &recipe_cache_, false, ModelHead::kLocalVocabSize);
       prefill_reduce_ = std::make_unique<runtime::TpReduce>(arena_, 6144, syn_type_float, &recipe_cache_);
     }
@@ -669,7 +669,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     std::vector<LargePrefillMetadata> large_metadata;
     std::vector<XLargePrefillMetadata> xlarge_metadata;
     for (const auto& chunk : chunks) {
-      if (chunk.rows == 1024) {
+      if (chunk.rows == 2048) {
         xlarge_metadata.emplace_back();
         fill_prefill_metadata(xlarge_metadata.back(), prefill_rows_ + chunk.offset, 4096, full, swa,
                               model_pages_, cache_slots_);
@@ -695,7 +695,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
                            xlarge_metadata.size() * sizeof(XLargePrefillMetadata));
     const auto stream = runtime_.compute_stream();
     for (const auto& chunk : chunks) {
-      const bool large = chunk.rows == 512, xlarge = chunk.rows == 1024;
+      const bool large = chunk.rows == 512, xlarge = chunk.rows == 2048;
       auto& token_binding = xlarge ? xlarge_prefill_token_binding_ : large ? large_prefill_token_binding_ : prefill_token_binding_;
       auto& embedding = xlarge ? xlarge_prefill_embedding_launch_ : large ? large_prefill_embedding_launch_ : prefill_embedding_launch_;
       auto& bindings = xlarge ? xlarge_prefill_metadata_bindings_ : large ? large_prefill_metadata_bindings_ : prefill_metadata_bindings_;
@@ -713,7 +713,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       prefill_rows_ += static_cast<uint32_t>(tokens.numel());
       return -1;
     }
-    const bool last_large = chunks.back().rows == 512, last_xlarge = chunks.back().rows == 1024;
+    const bool last_large = chunks.back().rows == 512, last_xlarge = chunks.back().rows == 2048;
     (last_xlarge ? xlarge_prefill_reduce_launch_ : last_large ? large_prefill_reduce_launch_ : prefill_reduce_launch_).execute(stream);
     (last_xlarge ? xlarge_prefill_head_launch_ : last_large ? large_prefill_head_launch_ : prefill_head_launch_).execute(stream);
     if (hcclAllGather(reinterpret_cast<const void*>(local_logits_device_),
@@ -824,7 +824,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
                               const std::array<uint64_t, 11>& addresses,
                               uint32_t prefill = 0) {
     auto& entry = entries_.at(layer_id);
-    auto& map = prefill == 1024 ? xlarge_prefill_instances_ : prefill == 512 ? large_prefill_instances_ : prefill == 32 ? prefill_instances_ : instances_;
+    auto& map = prefill == 2048 ? xlarge_prefill_instances_ : prefill == 512 ? large_prefill_instances_ : prefill == 32 ? prefill_instances_ : instances_;
     auto& instance = *map.at(entry.kind);
     const uint64_t residual_output = prefill >= 512 ? entry.large_prefill_residual_output
                                      : prefill == 32 ? entry.prefill_residual_output : entry.residual_output;
