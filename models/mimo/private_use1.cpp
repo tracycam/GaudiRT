@@ -7,6 +7,7 @@
 #include "model_head.hpp"
 #include "step_metadata.hpp"
 #include "prefill_metadata.hpp"
+#include "prefill_bindings.hpp"
 
 #include "gaudirt/common/sha256.hpp"
 #include "gaudirt/runtime/weight_manifest.hpp"
@@ -516,6 +517,43 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     }
     model_head_launch_ = head_->prepare(hidden, residual, normalized_device_, local_logits_device_);
     model_argmax_launch_ = argmax_->prepare(logits_device_, embedding_status_, token_device_);
+    if (prefill_enabled_) {
+      prefill_embedding_launch_ = prefill_embedding_->prepare(
+          prefill_tokens_device_, prefill_embedding_device_, prefill_status_device_);
+      for (auto& tensor : prefill_embedding_launch_.tensors) {
+        if (tensor.pTensorAddress == prefill_tokens_device_) {
+          if (prefill_token_binding_) throw std::runtime_error("PrivateUse1: ambiguous prefill token binding");
+          prefill_token_binding_ = &tensor.pTensorAddress;
+        }
+      }
+      if (!prefill_token_binding_) throw std::runtime_error("PrivateUse1: missing prefill token binding");
+      prefill_layers_.reserve(70);
+      hidden = prefill_embedding_device_;
+      residual = prefill_embedding_device_;
+      for (uint32_t layer = 0; layer < 70; ++layer) {
+        const bool full = is_full_layer(layer);
+        const uint64_t base = prefill_metadata_device_;
+        std::array<uint64_t, 11> addresses{
+            hidden, residual,
+            base + (full ? offsetof(PrefillMetadata, full_cos) : offsetof(PrefillMetadata, swa_cos)),
+            base + (full ? offsetof(PrefillMetadata, full_sin) : offsetof(PrefillMetadata, swa_sin)),
+            model_keys_[layer], model_values_[layer], base + offsetof(PrefillMetadata, slots),
+            base + (full ? offsetof(PrefillMetadata, full_pages) : offsetof(PrefillMetadata, window_pages)),
+            base + offsetof(PrefillMetadata, full_usage),
+            base + (full ? offsetof(PrefillMetadata, full_groups) : offsetof(PrefillMetadata, window_groups)),
+            base + offsetof(PrefillMetadata, positions)};
+        prefill_layers_.push_back(prepare_layer(layer, addresses, true));
+        hidden = prefill_layers_.back().feed_forward_gathered;
+        residual = entries_.at(layer).prefill_residual_output;
+      }
+      prefill_metadata_bindings_ = prefill_metadata_bindings(
+          prefill_layers_, prefill_metadata_device_, sizeof(PrefillMetadata));
+      prefill_reduce_launch_ = prefill_reduce_->prepare(hidden, prefill_reduced_device_);
+      prefill_head_launch_ = prefill_head_->prepare(
+          prefill_reduced_device_ + 31 * 6144 * sizeof(uint16_t),
+          residual + 31 * 6144 * sizeof(uint16_t), normalized_device_, local_logits_device_);
+      prefill_argmax_launch_ = argmax_->prepare(logits_device_, prefill_status_device_, token_device_);
+    }
     if (arena_.workspace_addr() != workspace)
       throw std::runtime_error("PrivateUse1: workspace changed during model binding");
     model_position_ = 4096;
@@ -594,45 +632,25 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     arena_.copy_h2d_sync(runtime_.h2d_stream(), metadata.data(), prefill_metadata_device_,
                          metadata.size() * sizeof(PrefillMetadata));
     const auto stream = runtime_.compute_stream();
-    uint64_t last_hidden = 0, last_residual = 0;
     for (uint32_t chunk = 0; chunk < chunks; ++chunk) {
-      prefill_embedding_->prepare(prefill_tokens_device_ + chunk * 32 * sizeof(int32_t),
-                                  prefill_embedding_device_, prefill_status_device_).execute(stream);
-      uint64_t hidden = prefill_embedding_device_, residual = prefill_embedding_device_;
+      *prefill_token_binding_ = prefill_tokens_device_ + chunk * 32 * sizeof(int32_t);
+      prefill_embedding_launch_.execute(stream);
       const uint64_t base = prefill_metadata_device_ + chunk * sizeof(PrefillMetadata);
-      for (uint32_t layer = 0; layer < 70; ++layer) {
-        const bool full_attention = is_full_layer(layer);
-        std::array<uint64_t, 11> addresses{
-          hidden, residual,
-          base + (full_attention ? offsetof(PrefillMetadata, full_cos) : offsetof(PrefillMetadata, swa_cos)),
-          base + (full_attention ? offsetof(PrefillMetadata, full_sin) : offsetof(PrefillMetadata, swa_sin)),
-          model_keys_[layer], model_values_[layer], base + offsetof(PrefillMetadata, slots),
-          base + (full_attention ? offsetof(PrefillMetadata, full_pages) : offsetof(PrefillMetadata, window_pages)),
-          base + offsetof(PrefillMetadata, full_usage),
-          base + (full_attention ? offsetof(PrefillMetadata, full_groups) : offsetof(PrefillMetadata, window_groups)),
-          base + offsetof(PrefillMetadata, positions)};
-        auto prepared = prepare_layer(layer, addresses, true);
-        prepared.execute_fused(stream);
-        hidden = prepared.feed_forward_gathered;
-        residual = entries_.at(layer).prefill_residual_output;
-      }
-      last_hidden = hidden;
-      last_residual = residual;
+      for (auto [address, offset] : prefill_metadata_bindings_) *address = base + offset;
+      for (const auto& layer : prefill_layers_) layer.execute_fused(stream);
     }
     if (prefill_rows_ + tokens.numel() != 4096) {
       runtime_.synchronize_compute();
       prefill_rows_ += static_cast<uint32_t>(tokens.numel());
       return -1;
     }
-    prefill_reduce_->prepare(last_hidden, prefill_reduced_device_).execute(stream);
-    prefill_head_->prepare(prefill_reduced_device_ + 31 * 6144 * sizeof(uint16_t),
-                           last_residual + 31 * 6144 * sizeof(uint16_t),
-                           normalized_device_, local_logits_device_).execute(stream);
+    prefill_reduce_launch_.execute(stream);
+    prefill_head_launch_.execute(stream);
     if (hcclAllGather(reinterpret_cast<const void*>(local_logits_device_),
                       reinterpret_cast<void*>(logits_device_), ModelHead::kLocalVocabSize,
                       hcclBfloat16, runtime_.comm(), stream) != hcclSuccess)
       throw std::runtime_error("PrivateUse1: prefill logits AllGather failed");
-    argmax_->prepare(logits_device_, prefill_status_device_, token_device_).execute(stream);
+    prefill_argmax_launch_.execute(stream);
     runtime_.synchronize_compute();
     check_syn(synMemCopyAsync(runtime_.d2h_stream(), token_device_, sizeof(int32_t),
                               reinterpret_cast<uint64_t>(token_host_), DRAM_TO_HOST),
@@ -960,6 +978,13 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   std::unordered_map<uint32_t, PendingWeights> pending_;
   std::unordered_map<std::string, uint64_t> model_weights_;
   std::vector<PreparedLayer> model_layers_;
+  std::vector<PreparedLayer> prefill_layers_;
+  std::vector<std::pair<uint64_t*, uint64_t>> prefill_metadata_bindings_;
+  uint64_t* prefill_token_binding_ = nullptr;
+  runtime::PreparedLaunch prefill_embedding_launch_;
+  runtime::PreparedLaunch prefill_reduce_launch_;
+  runtime::PreparedLaunch prefill_head_launch_;
+  runtime::PreparedLaunch prefill_argmax_launch_;
   runtime::PreparedLaunch model_embedding_launch_;
   runtime::PreparedLaunch model_head_launch_;
   runtime::PreparedLaunch model_argmax_launch_;
