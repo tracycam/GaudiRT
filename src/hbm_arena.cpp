@@ -50,7 +50,9 @@ uint64_t HbmArena::allocate(uint64_t bytes, uint64_t alignment) {
   const uint64_t aligned_offset =
       rem == 0 ? offset_ : (offset_ + (alignment - rem));
   if (aligned_offset + bytes > slab_capacity_) {
-    throw std::runtime_error("HbmArena: out of pre-allocated HBM slab memory");
+    throw std::runtime_error("HbmArena: out of pre-allocated HBM slab memory: requested=" +
+                             std::to_string(bytes) + ", used=" + std::to_string(aligned_offset) +
+                             ", capacity=" + std::to_string(slab_capacity_));
   }
   const uint64_t addr = slab_base_ + aligned_offset;
   offset_ = aligned_offset + bytes;
