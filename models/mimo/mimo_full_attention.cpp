@@ -204,8 +204,8 @@ struct MimoFullAttention::Impl {
   }
 
   void build() {
-    if (rows != 1 && rows != 32)
-      throw std::invalid_argument("MimoFullAttention: rows must be 1 or 32");
+    if (rows != 1 && rows != 32 && rows != 512)
+      throw std::invalid_argument("MimoFullAttention: unsupported rows");
     if (cache_slots < 2 * MimoAttention::kKvBlockSize ||
         cache_slots % MimoAttention::kKvBlockSize != 0 ||
         cache_slots > static_cast<uint32_t>(INT_MAX) /
@@ -401,13 +401,13 @@ struct MimoFullAttention::Impl {
          &oproj_gemm_params, sizeof(oproj_gemm_params), "gemm",
          "oproj_bf16_fp32_mme_local");
     const std::string recipe_name = pure_rmsnorm
-        ? (rows == 1 ? "mimo_full_attention_b1_m1_tp8_pure" : "mimo_full_prefill_b1_m32_tp8_pure")
-        : (rows == 1 ? "mimo_full_attention_b1_m1_tp8_residual" : "mimo_full_prefill_b1_m32_tp8_residual");
+        ? (rows == 1 ? "mimo_full_attention_b1_m1_tp8_pure" : "mimo_full_prefill_b1_m" + std::to_string(rows) + "_tp8_pure")
+        : (rows == 1 ? "mimo_full_attention_b1_m1_tp8_residual" : "mimo_full_prefill_b1_m" + std::to_string(rows) + "_tp8_residual");
     prepare_recipe = compile_cached(
         prepare_graph, recipe_name,
         std::string("full_mme_neumaier_v4_") + (pure_rmsnorm ? "pure" : "residual") +
             "_c" + std::to_string(cache_slots) + "_p" + std::to_string(page_count) +
-            (gathered_input ? "_gathered_tp1" : "_direct") + (rows == 1 ? "" : "_m32"),
+            (gathered_input ? "_gathered_tp1" : "_direct") + (rows == 1 ? "" : "_m" + std::to_string(rows)),
         cache);
     check(synWorkspaceGetSize(&prepare_workspace_size, prepare_recipe),
           "get prepare workspace size");
