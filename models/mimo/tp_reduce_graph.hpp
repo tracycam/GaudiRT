@@ -14,7 +14,7 @@ inline synTensor append_tp8_reduce(synGraphHandle graph, synTensor gathered,
                                    synDataType dtype,
                                    synSectionHandle& output_section,
                                    uint32_t rows = 1) {
-  if (!graph || !gathered || (rows != 1 && rows != 32) ||
+  if (!graph || !gathered || (rows != 1 && rows != 32 && rows != 512) ||
       (dtype != syn_type_bf16 && dtype != syn_type_float))
     throw std::invalid_argument("MiMo TP reduction: invalid graph, tensor or dtype");
   const auto check = [](synStatus status, const char* operation) {
@@ -26,7 +26,8 @@ inline synTensor append_tp8_reduce(synGraphHandle graph, synTensor gathered,
   check(synSectionCreate(&output_section, 0, graph), "create output section");
   check(synSectionSetPersistent(output_section, false), "set output section");
   synTensorDescriptor descriptor{};
-  descriptor.m_name = rows == 32 ? "tp_reduce_m32_bf16" : "tp_reduce_bf16";
+  const std::string output_name = rows == 1 ? "tp_reduce_bf16" : "tp_reduce_m" + std::to_string(rows) + "_bf16";
+  descriptor.m_name = output_name.c_str();
   descriptor.m_dataType = syn_type_bf16;
   descriptor.m_dims = 2;
   descriptor.m_sizes[0] = descriptor.m_minSizes[0] = 6144;

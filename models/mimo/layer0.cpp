@@ -31,8 +31,8 @@ Layer0::Layer0(runtime::HbmArena& arena, runtime::DeviceRuntime& runtime,
       post_attention_gamma_(
           dense_weights.get("post_attention_gamma").device_address),
       fused_model_(fused_model), rows_(rows) {
-  if (rows_ != 1 && (rows_ != 32 || !fused_model_))
-    throw std::invalid_argument("MiMo layer: M32 requires fused execution");
+  if (rows_ != 1 && ((rows_ != 32 && rows_ != 512) || !fused_model_))
+    throw std::invalid_argument("MiMo layer: prefill requires fused execution");
   if (!comm_ || !post_attention_gamma_) {
     throw std::invalid_argument("MiMo layer0: missing HCCL or post-attention gamma");
   }

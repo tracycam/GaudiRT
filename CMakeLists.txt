@@ -77,6 +77,9 @@ target_link_libraries(mimo_argmax_device_test PRIVATE mimo_layer_vertical)
 add_executable(mimo_fused_reduce_device_test tests/mimo_fused_reduce_device_test.cpp)
 target_link_libraries(mimo_fused_reduce_device_test PRIVATE mimo_layer_vertical)
 
+add_executable(mimo_fused_reduce_large_device_test tests/mimo_fused_reduce_large_device_test.cpp)
+target_link_libraries(mimo_fused_reduce_large_device_test PRIVATE mimo_layer_vertical)
+
 add_executable(mimo_vocab_head_device_test tests/mimo_vocab_head_device_test.cpp)
 target_link_libraries(mimo_vocab_head_device_test PRIVATE mimo_layer_vertical)
 
