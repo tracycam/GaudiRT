@@ -274,7 +274,8 @@ MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
         graph, recipe_name,
         std::string("moe_fp32_gate_v3_") + graph_variant + "_rank" + std::to_string(tp_rank_) +
             (gathered_attention_ ? "_gathered_tp1" : "_direct") +
-            (rows_ == 1 ? "" : "_m" + std::to_string(rows_)),
+            (rows_ == 1 ? "" : "_m" + std::to_string(rows_)) +
+            (rows_ > 32 ? "_split_tiles_v1" : ""),
         cache);
     check(synWorkspaceGetSize(&workspace_bytes_, recipe_),
           "synWorkspaceGetSize");
