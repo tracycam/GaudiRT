@@ -12,6 +12,8 @@
 
 namespace gaudirt::common {
 
+inline constexpr uint32_t kInheritHostPolicy = UINT32_MAX;
+
 struct SchedAttr {
   uint32_t size;
   uint32_t sched_policy;
@@ -34,6 +36,10 @@ struct HostPolicyStatus {
 
 inline HostPolicyStatus lock_host_policy(int target_cpu = -1, uint32_t util_min = 1024) {
   HostPolicyStatus st{};
+  if (util_min == kInheritHostPolicy) {
+    st.pinned_cpu = sched_getcpu();
+    return st;
+  }
   st.uclamp_min = util_min;
   st.uclamp_max = 1024;
 

@@ -184,7 +184,9 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
           config.module_id = rank;
           config.rank = rank;
           config.world_size = world;
-          config.pin_cpu = rank * 4;
+          // The service launcher owns CPU placement and scheduling policy.
+          config.pin_cpu = -1;
+          config.uclamp_min = common::kInheritHostPolicy;
           return config;
         }()),
         arena_(runtime_.device_id(), hbm_bytes),
