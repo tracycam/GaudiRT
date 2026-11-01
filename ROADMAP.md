@@ -78,11 +78,15 @@ Intel 将离线图编译器与在线发射运行时打包在同一个 `libSynaps
   - **算子打包、补偿舍入与三类层 TP8 / 长上下文 FP64 全过**：将自研 TPC provider 静态合并进单一打包库以满足 Synapse 15 库硬上限（`P-RT-14`），并修复 QKV 归约在 BF16 中点处的二次舍入偏差（`P-NUM-09`）。三类异构层（Type A/B/C）8 Rank 空 KV 首块 `M=32` 对 32 次串行 `M=1` 输出与 KV **100% 逐位一致**（收据 SHA256：`5602ae037ea82e48f39b37e53f7eb203a0df310ecf27edfe6c6d00f112f53318`、`f746d975cfc9f3d56f27ca8c7186d680b45ede9310e87fa7be3d9f2576031cf0`）；真实首块 32 行全行对独立 CPU FP64 最大行相对 L2 分别为 `3.15e-4 / 6.24e-4 / 2.75e-4`（512/512 个 MoE 路由集合全匹配，收据 SHA256：`0c1da8bac37b7394edcf526b531dda3496172e2604f4d1675ca487b42199fc30`、`9d847418e4bfa8ee78c0ca0c21ed55db99b1727f7ad17f1cfe998de01f09f446`）；真实 `pos=4095` 长上下文在线 KV（Layer 7 含 4095 行 Full KV、Layer 8 含 127 行 SWA KV）对 FP64 整层相对 L2 仅 **`2.41e-5 / 1.42e-5`** 且路由一致，33 行 `gk_norm_block128_grid24_fp32_v1` 融合编码与残差逐位匹配 FP64（收据 SHA256：`43d317abfaf2627ccd869cfe396637f6e8531855b075d18020d03d71a91d49ad`、`3b9051c41e2a68a87b4be92d6ec3985c3d7170ca3fd83f86f05b20fa3e08da9e`、`b06fc76c2dd8565f2b4a3fc9fc1f4d902d470cf1d809e43559c7dcdaa9438998`）。
   - **70 层全零空 KV 端到端冷/暖确定性与逐槽位 KV 审计全过**：不加载旧桥、不借离线 KV 快照，从全零空 KV 接收 4096-token 真实 Prompt 完成 `128 × M=32` Prefill + 128 步 Decode；冷编译每 Rank 保存 20 张自编译 Recipe，独立暖进程每 Rank 加载 20 张、重编 0 张，首步 logits、129 个生成 token 与 140 个终态 KV 缓冲区冷暖 **100% 逐位一致**（收据 SHA256：`9f7dd5b21605e082dcea06f4df9d855ff65c48e7afcfd5070271c2367248097f`、`424daa81971473fb224c1af27fc315f59b37a1811a42d5d88ec63c1b6497011a`）；8 Rank 逐步插桩审计全部 128 个 Prefill 分块 + 128 个 Decode 步，已写槽位零覆盖、未触碰槽位恒零（`max_abs = 0.0`），生成英文长段连贯可读，全进程 `exit 0` 释放八卡（收据 SHA256：`55654b029f2758db1b91fd4f405596ad6108284bef0dbc53b6797ef2e6924fec`）。
   - **空 KV 4096 长前缀 70 层全量 FP64 三角核验完成（候选精度优于纯 CPU FP32）**：① 固定候选在线前缀 KV 重算末 token 70 层，候选对 CPU FP64 的 **`max_kl = 0.00620 <= 0.01`**、Top-1 一致（同条件下 CPU FP32 对 FP64 为 `0.02178`，收据 SHA256：`0d10c115448317bec44c7320dc978e3937d6078555807b682bd9c0855703727a`、`269557b1fe256cc310d1f6f908f5b8de1a1037a7195aafec33ce8f6e98ac1a36`）；② 从空 KV 独立滚完 4096 token × 70 层（复合 `282,624` 次离散 Top-8 路由写入在线 KV），**零硬件参与的纯 CPU FP32 对纯 CPU FP64 自身**即达 **`max_kl = 0.043453`**（`relative_l2 = 0.122038`，翻转 32/69 层，第 8 层起翻），而 **Gaudi2 零旧桥候选对同一份纯 CPU FP64 真值**的 **`max_kl = 0.034032`**（`relative_l2 = 0.128379`，Top-1 与 Top-4 排序 `[576, 1096, 342, 151645]` 100% 一致，仅翻转 28/69 层且前 17 个 MoE 层全匹配），比纯 IEEE CPU FP32 贴近 FP64 达 **`21.7%`**（收据 SHA256：`96276b2a260b5640cb9c3a7f435a9976178a5afbcb3f05e8a30853a71265a839`、`a79278bd63dfe4967f5ec6c9e5db88085a610a1a8b5aad28e5a5699c4179ea53`、`a048ff3d98880ad4845162a43f8cd5dd27dedcfc51c07a1c31b911d0696e5bbd`、`c5c679d889776ea147099538bdf038b223fa2ca2fc6317dd5fe7af8b9867a236`）。
+- **Phase 4.3 单流服务路径与同口径 ABBA 已验证**（`vllm-gaudi` `ad7f4f0f`，实测 `GaudiRT` `66cd1a6`，算子包 `d23e585`）：
+  - **服务与状态**：真实 vLLM V1 调度、分页块表、8 Worker IPC 和 `OutputProcessor` 贯通；空 KV 4096-token Prompt 的首步 logits、129 个输出 token 与独立 Runner 逐位一致，暖运行 8 Rank 70 层最终 KV 逐位一致。冷、暖分别每 Rank 保存 20 张和加载 20 张自编译 Recipe，暖运行保存 0 张。收据 SHA256：`66fcf3c28741bf21444e89b094f5b55a556308f08a616286d4ac5879e59e2510`、`505f94136d141698fbf2dacba522d74afdb4dc6d034ec993b0cb4940458690d7`。
+  - **完整 `engine.step()` 服务 ABBA**：每臂 1 次预热、3 次正式请求；A1/B1/B2/A2 的 4096-token TTFT p50/mean 分别为 **`2570.86/2650.66`、`8436.30/8436.56`、`8435.89/8436.04`、`2567.78/2567.92 ms`**，128 步 TPOT p50/mean 分别为 **`11.522/11.520`、`11.016/11.103`、`10.952/11.069`、`11.384/11.407 ms`**。生产 A1→A2 的 p50/mean 漂移：TTFT `-0.12%/-3.12%`、TPOT `-1.20%/-0.99%`；候选 B1→B2：TTFT `-0.005%/-0.006%`、TPOT `-0.58%/-0.31%`。两次候选 token 逐位一致，候选与生产从第 13 个输出 token 起分叉。全部 Worker 与 EngineCore 退出码为 0、候选缓存未变、八卡释放；`same_complete_production_serving_path_proven = true`。汇总收据 SHA256：`7e4907c876dd8f38064fd47ef619df6cf41fdf08c85107c580e7cf905d2dc4a6`。
+  - **性能边界**：两臂 p50 的简单均值下，候选 TPOT 约快 `4.1%`，但 TTFT 约为生产的 **`3.28×`**、增加约 `5.87 s`；这是明确的 Prefill 退化，不能宣称端到端全面加速，瓶颈原因尚待诊断。生产空 KV 首步对同一 CPU FP64 的 `max_kl = 0.056061`、Top-1 一致，仅作长前缀横向参考（收据 SHA256：`e0e53f85a8b584b6c87cfd5468f3394502a2df15d2b381c92eeb6884a343cb0b`）。
 
 ### 尚未完成与严禁越界宣称的事项
-1. **严禁把 Phase 3 / Phase 4.2 独立 Runner 成绩冒充为“完整生产服务（第 4 层 `vllm-gaudi`）已收口”**：
-   - Phase 3 的 4 臂 ABBA（`10.5119 / 10.6084 ms` vs `11.4145 / 11.2448 ms`）未经过 `vLLM` 调度器与进程间 IPC（口径限定收据 SHA256：`3a1588c0e449fa8df2f3bacc2d860dced6de624322890e7c2308ed77df80d218`）；Phase 4.2 的空 KV `Prefill -> 128 步 Decode` 尚未做无插桩服务级测速，**当前尚无同 `vLLM engine.step()` 口径下的服务级 TTFT 与 TPOT 验收成绩**。
-   - **当前唯一主线阻塞项即 Phase 4.3**：接入 `vllm-gaudi` 原生零旧桥 Platform / Worker / ModelRunner，走通真实调度器、分页 KV 块表映射、进程间 IPC 与 `OutputProcessor` 的完整对称 `engine.step()` 闭环及 4 臂 ABBA。多并发 `Batch > 1` 分桶、非 `32` 整数倍变长尾块掩码与通用随机采样留待单流服务闭环达标后按需扩展。
+1. **服务验收范围与性能边界**：
+   - Phase 3 的独立 Runner 成绩未经过 `vLLM` 调度器与进程间 IPC，不能与上述 Phase 4.3 完整服务成绩混用。Phase 4.3 已验证单流 `4096` token、贪婪生成和 `128` 步 Decode；候选 TTFT 约为生产 `3.28×`，需先诊断并降低实际 Prefill 代价。
+   - 多并发 `Batch > 1`、非 `32` 整数倍变长尾块与通用随机采样不在当前已验证契约内，尚未完成。
 2. **待收敛的工程债与受限契约边界**：
    - 本地散落的 20 余个历史实验 worktree 尚未在 Phase 4 终验后归并清理；`models/mimo/private_use1.cpp` 仍耦合 MiMo 模型常量；
    - `P-NUM-09` 补偿 QKV 中点舍入内核受“零 bias 且准备后 scale 正常数下界”的模型契约约束（流式入口已强校，次正规数残差人工用例不适用，禁宣称通用算子）；
@@ -136,7 +140,7 @@ Intel 将离线图编译器与在线发射运行时打包在同一个 `libSynaps
 1. 通过独立薄 Bridge 驱动完整 70 层 TP8 模型，使用**不依赖 `habana_frameworks` 的纯 CPU `safetensors` 按 Rank 流式切片/打包加载器**直接灌入 `GaudiRT` `HbmArena`（遵守已证实字节等价的 FP8 / MXFP4 规则），严禁拉起旧桥进程借权重。初始化显式提供覆盖权重、10 层 Full KV、60 层 SWA KV 与 workspace 的单卡 HBM 预算；70 层及 Embedding、Final RMSNorm、TP8 词表切分 `lm_head` 的权重在 CPU 内存中切片/打包后直接 H2D，禁止生成全量 `.bin` 副本。
 2. 完成 70 层构建指纹 `RecipeCache` 冷编译/暖加载逐位等价验收（第四节第 1 条），按第四节第 2 条完成 70 层冻结同输入路由/算术与连续 128 步状态验收，并在无插桩同机器策略下与独立进程运行的旧桥生产基线完成 4 臂（A-B-B-A）独立解码 + 客户端输出处理 TPOT 验收（`10.5119 / 10.6084 ms` vs `11.4145 / 11.2448 ms`）。
 
-### Phase 4：底座防呆收敛、零旧桥 Prefill 与 `vllm-gaudi` 完整服务闭环（4.1、4.2 已完成；当前冲刺 4.3）
+### Phase 4：底座防呆收敛、零旧桥 Prefill 与 `vllm-gaudi` 单流服务闭环（4.1–4.3 已验证；4.4 攻坚 TTFT 退化）
 1. **里程碑 4.1：底座防呆与工程清理（已完成：`502c072` / `2f6a401`）**：
    - 将已在三类算子重复实现的 TPC `v_exp_f32` 分界点安全指数修正下沉为 `gaudi-kernels` 公共安全数学头文件 `tpc_math_safe.h`（750 点边界单测与逐位回归通过）；
    - 将多 Rank 退出栅栏、流同步、编译图与 `PrivateUse1` 设备张量先于 `DeviceRuntime` 销毁的顺序封装进 C++/Runner 生命周期方法，强制 `TORCH_DEVICE_BACKEND_AUTOLOAD=0` 物理隔离旧桥；
@@ -144,10 +148,13 @@ Intel 将离线图编译器与在线发射运行时打包在同一个 `libSynaps
 2. **里程碑 4.2：零旧桥最小 Prefill（`M=32` 静态分桶）与空 KV 端到端自洽闭环（已完成：`8fc3b3b` / `d23e585`）**：
    - 合并 15 库上限内的自研 TPC 算子包（`P-RT-14`），修复 QKV BF16 中点二次舍入（`P-NUM-09`），打通不加载旧桥、不借离线 KV 快照的 70 层 `M=32` 分块 Prefill 图与分页 KV 写入；
    - 验证从空 KV 接收 4096-token 真实 Prompt 跑通 `Prefill -> 128 步 Decode`，冷/暖 20 张 `RecipeCache` 逐位一致、128 块 + 128 步 KV 槽位零越界，条件化末步 `max_kl = 0.00620 <= 0.01`、全前缀相对独立 70 层 FP64 `max_kl = 0.034032 < 0.043453`（优于同契约纯 CPU FP32 参考）。
-3. **里程碑 4.3（当前执行）：接入第 4 层（`vllm-gaudi` 原生零旧桥 Platform / Worker / ModelRunner）与严格同 `engine.step()` 口径 4 臂 ABBA**：
-   - 在独立干净 worktree 上将零旧桥后端（`GaudiRT` + 自研算子包）接入真实 `vLLM` V1 引擎（`LLMEngine` / `EngineCore` 调度器、分页 KV 块表分配、`MultiprocExecutor` 进程间 IPC 与 `OutputProcessor`），主进程与全部 8 个 Worker 子进程彻底物理隔离 `habana_frameworks`（绕开旧 `vllm_gaudi/platform.py` 导入）；
-   - 验证通过 `vLLM` 服务入口跑出的 4096 Prompt 首步 logits、128 步解码 token 序列与终态 KV 与里程碑 4.2 独立 Runner **100% 逐位一致（`max_abs = 0.0`，第四节第 1 条）**，且主/子进程优雅关闭全 `exit 0`、无残留共享内存泄漏、八卡完全释放；
-   - 在完全对称的完整服务调用链（`vLLM` `engine.step()` / `LLM.generate` 同计时边界、同主机绑核策略、零插桩）下完成**单流 `4096-token TTFT` + `128-step 稳态 TPOT` 的 4 臂（A1-B1-B2-A2）ABBA 终验**，用实测数据把 `same_complete_production_serving_path_proven` 翻转为 `true`。单流服务闭环达标后，再按需扩展变长尾块 padding 与有限静态 `Batch > 1` 分桶。
+3. **里程碑 4.3：接入第 4 层（`vllm-gaudi` 原生零旧桥 Platform / Worker / ModelRunner）与同 `engine.step()` 口径 4 臂 ABBA（单流闭环已验证：`ad7f4f0f` / `c568284` / `d23e585`）**：
+   - 零旧桥后端已接入真实 `vLLM` V1 引擎（`EngineCore` 调度器、分页 KV 块表、8 Worker IPC 与 `OutputProcessor`），首步 logits、129 个输出 token 与终态 KV 与独立 Runner 100% 逐位一致，全进程 `exit 0` 释放八卡；
+   - 同口径 4 臂 ABBA 证实候选稳态 TPOT p50 均值净快 `4.1%`（`10.984 ms` vs `11.453 ms`），但 4096-token TTFT 退化至生产的 `3.28×`（`8436.1 ms` vs `2569.3 ms`，`+5.87 s`）。
+4. **里程碑 4.4（当前主攻）：Prefill TTFT 实测拆账、大静态桶（`M=256/512`）与按专家聚合 MME MoE 提速**：
+   - **先拆清真机毫秒账单再改图（禁盲改）**：源码核查已定位四项结构性代价候选（具体耗时占比待单跑拆账实测确认）：① `mimo_moe.cpp` 在 `M=32` 下仍调用 `M=1` 无分组逐槽位 TPC 查表 GEMV（`gk_moe_gp_scale_tail_v1` / `downact_direct_down_broadcast`，4096 token × 8 topk × 69 层累计读取与软解包 `5.67 TB` 权重）；② `128 × M=32` 碎块将 `hcclAllGather` 与 `synLaunch` 放大至 `17,920` 次、稠密权重重复读 128 遍；③ Full-Attention 每 32 token 全量 Gather `8,192` 行物理 KV 槽位并跑双倍 `PV` GEMM；④ `prefill_chunk` 热循环内重复执行 `8,960` 次 `rebind_weights` / `prepare` 构表与别名校验并在每调度片尾同步。
+   - **同驻留权重布局下升级大桶 Prefill + MME MoE**：严禁在 HBM 双份常驻 MoE 权重；主 Prefill 桶扩至 `M=256` 或 `M=512`（保留 `M=32` 处理尾块），复用 `gaudi-kernels` 同权重布局的按专家计数分桶 + MME `batch_gemm` 链路（`csrc/tpc/moe_partition/`，**必须同步把 `gate.c` 升级为 `tpc_math_safe.h` 安全指数与 FP32 SiLU 契约，并合入 15 库上限内的静态算子包**），同时将 Prefill 层发射改为初始化期预构建绑定表、消除无谓全表空页扫描与多余流同步。
+   - **验收门禁**：保持零旧桥、全进程 `exit 0`、第四节长前缀 `FP64` 精度与 128 步 KV 硬门禁不退化；单跑无插桩 `vLLM engine.step()` 确认 `4096` TTFT 追平或优于生产基线（`<= 2,570 ms`）且稳态 TPOT 不劣于 `11.05 ms` 后，再跑最终 4 臂 ABBA 收口单流服务里程碑；达标后再扩非 `32` 整数倍尾块 padding 与 `Batch > 1`。
 
 ### Phase 5：单步硬件效率深挖与受控的 ARC 固件 / `scal/` 队列增强
 1. **先拆清真机微秒账单，用尽公开接口空间再动底层**：对稳态单步耗时（当前 `~10.56 ms` vs 纯有效 HBM 带宽底线 `~2.7 ms`）拆出“MME/TPC 算子本体计算 vs `141` 次 `hcclAllGather` 通信 vs `140+` 次 `synLaunch` 跨图同步间隙”的实测账单；属算子利用率或公开合图可解的先在算子/图内解决，**仅针对公开 `synGraphCompile + synLaunch + hccl` 证实无法消除的设备端动态控制或队列提交瓶颈立项**。

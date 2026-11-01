@@ -234,6 +234,30 @@
 - **硬性铁律解法**：不得把 eager 重放结果当作整步图的数值结论；检查平票时必须用实际 `argmax`，不能把 `topk` 的平票返回顺序当作贪心选词。生产对照与服务验收必须保持图配置一致，并在同输入下单独核验图路径及其完整退出。上游问题修复前不宣称根因已查清。
 - **证据落点**：生产图同 KV 重放收据 SHA256：`bbd6fffeaabbfa9d9f76b92e5520503391fca0e780f734fc92d4dce541aebad3`；同 hidden 的 FP64 词表头与全模型参考对拍收据 SHA256：`bf244c58e2f3f87a23161a4eca1e9eab228c750a5276bf449a90ae2464d66bfa`；同 KV 前两名比较收据 SHA256：`b981ec9d6ec9530183385a2e6aeb815d17fd429534bebcbae9f2e57ee4e92c55`；生产 eager 收据 SHA256：`75ccef5c70ffffb6d80d05b8a44347e158e88959d8c3e74a998837df7a84f416`。生产诊断主进程退出码为 0，但框架日志有子进程 SIGTERM 和共享内存警告。
 
+### `P-RT-17`：生产 Prefill 调度分块不保证是自研静态桶整数倍 `[整模已验证]`
+- **现象与触发**：真实 vLLM 调度器对 4096-token 请求先下发 505 token，要求每次调度都可被 32 整除的候选 Worker 因此在首块报错。
+- **真实根因**：生产分块边界由调度策略和预留规则决定，`max_num_scheduled_tokens=512` 只是预算，不能推断实际分块长度或与算子桶对齐。
+- **硬性铁律解法**：保留生产调度与页分配，跨调度调用暂存不足 32 的尾部 token，按顺序拼成静态桶；仅在完整提示已处理时产生首 token，禁止用空结果冒充推理。整模须核对输出和状态等价。
+- **证据落点**：失败日志 SHA256：`0f5c70b9e9e33867915bf432019575fab0f28690442164dd879ec96116961e4c`；`vllm-gaudi` `ed5caaa9` 的 505-token 分块顺序单测通过。70 层服务冷、暖运行的首步 logits 与 129 个输出 token 均与独立 Runner 逐位一致；暖运行的 8 Rank、70 层终态 KV 也逐位一致。收据 SHA256：`66fcf3c28741bf21444e89b094f5b55a556308f08a616286d4ac5879e59e2510`、`505f94136d141698fbf2dacba522d74afdb4dc6d034ec993b0cb4940458690d7`。
+
+### `P-RT-18`：EngineCore 的外层关闭期限短于 TP8 Worker 清理 `[现象已证实]`
+- **现象与触发**：轻量服务请求已完成，默认关闭时主进程返回 0，但 5 秒后 EngineCore 被强杀，并报告 9 个共享内存对象待清理。
+- **真实根因**：Worker 退出预算与 EngineCore 进程管理器的关闭预算是两层独立期限；只设置前者不会延长后者，TP8 的设备同步和退出栅栏可能超过默认 5 秒。
+- **硬性铁律解法**：服务生命周期使用 vLLM 的正式关闭接口，同时为 EngineCore 和 Worker 设置足以完成同步及栅栏的期限；检查全部进程退出码和共享内存，而不只看主进程返回值。
+- **证据落点**：默认期限失败日志 SHA256：`e99341fbcfcb27f8bd07b1d1253ea6fba4fd5a1420ac3bde93bfed0c00fe10eb`；延长期限后仍需修复下述 EngineCore 清理问题。两项修复后的轻量运行 8 Worker、EngineCore 和主进程退出码均为 0，8 卡释放，无强杀及共享内存告警；日志 SHA256：`a0a434c75162c7dad879fa2fc862ce3448a21dd178c5fae000bad80de623a09a`。
+
+### `P-RT-19`：无设备的 EngineCore 调用通用加速器缓存清理失败 `[已证实]`
+- **现象与触发**：8 个 GaudiRT Worker 均以 0 退出后，EngineCore 在关闭期间调用 `torch.accelerator.empty_cache()` 抛出无可用加速器异常，EngineCore 退出码为 1。
+- **真实根因**：零旧桥 EngineCore 仅持有 CPU 调度及 IPC 状态，设备与分配器由 Worker 进程持有；当前 PyTorch 通用加速器查询不将该进程的 `PrivateUse1` 注册视作已选加速器。
+- **硬性铁律解法**：候选平台的 EngineCore 关闭路径仅清理其自身分布式环境；Worker 仍负责设备同步、跨 Rank 栅栏和资源释放。不得忽略异常或仅凭父进程退出码宣称通过。
+- **证据落点**：逐进程退出码和异常日志 SHA256：`3bfbcf40108a5ed5fc835c446261545b8e95ff16af56c3efc4eedf9906088152`；修复 `vllm-gaudi` `194a91ff` 后的 8 Rank 轻量服务和逐进程退出码日志 SHA256：`a0a434c75162c7dad879fa2fc862ce3448a21dd178c5fae000bad80de623a09a`。该轻量测试使用合成输出，不代表整模推理等价。
+
+### `P-RT-20`：Worker“gracefully”日志不证明数值退出码为零 `[已证实]`
+- **现象与触发**：完整服务计时的 EngineCore 以 0 退出，日志称所有 Worker 已正常退出，但没有提供各 Worker 的退出码。
+- **真实根因**：执行器的该日志仅判断 Worker 是否仍存活，并未检查每个子进程的 `exitcode`；非零退出同样可能使存活检查结束。
+- **硬性铁律解法**：验收要单独记录各 Worker 的实际退出状态，不得用该日志或父进程退出码代替。性能运行可在计时结束后的关闭阶段被动读取 `/proc` 僵尸进程等待状态；未捕获到状态时必须标为缺失。
+- **证据落点**：8 Rank 轻量测试中，被动观察的全部状态均为 0，与框架内部记录的 8 个退出码一致；观察收据 SHA256：`3cfa2c11f67468f67068e8ba1202471ca5e4a456ecb0871470b5ab6f4d3235e8`，日志 SHA256：`1a65460f60e56c8b8c92a968b2868b732128cbe2836725d22dcbc335287de83f`。
+
 ---
 
 ## 四、性能测量与评测防骗坑（`P-BENCH`）
@@ -267,6 +291,12 @@
 - **真实根因**：负向不等式判断对 `NaN` 天然漏网，且 Python `json.dumps` 默认可能写出非标准 `NaN` 或崩溃。
 - **硬性铁律解法**：所有数值门禁必须前置 `torch.isfinite(out).all()`，并采用正向断言 `assert finite and err <= tol`，失败强制非零退出。
 - **证据落点**：[`../ROADMAP.md`](../ROADMAP.md) 第四节。
+
+### `P-BENCH-06`：设备初始化覆盖 vLLM 的 NUMA 亲和与调度策略 `[已证实]`
+- **现象与触发**：候选 70 层冷启动使用生产 `vllm_kwargs(diagnostics=False)` 后，Worker 主线程仍分别被固定到 CPU 0、4、8、12、16、20、24、28；部分 Rank 不在 vLLM 选定的 NUMA CPU 集合内，Worker 的 `uclamp.min` 为 1024 而 EngineCore 为 0。
+- **真实根因**：`PrivateProgram` 初始化 `DeviceRuntime` 时自行设置 `rank × 4` 的 CPU 和默认利用率夹紧，覆盖了 Worker 继承的生产放置策略；之后创建的线程也可能继承该差异。
+- **硬性铁律解法**：服务 Worker 的设备初始化必须原样继承 vLLM 的 CPU 和调度策略；验证各 Rank 及相关线程的实际亲和和夹紧值。修复并实测前，此候选结果不得用于同口径 ABBA。
+- **证据落点**：冷启动时 `/proc` 与生产放置配置观察收据 SHA256：`7d62e1acda6b6b38e16ca6d437cf2254ec6dcf083e005ae31f63078daab6f9b2`；`GaudiRT` `66cd1a6` 修复后，8 Rank 主线程亲和均与 vLLM 放置一致，检查到的线程均在对应 NUMA 集合内且 `uclamp.min=0`，全部进程退出码为 0、8 卡释放，轻量日志 SHA256：`18981ff868b52e7f71a0427fbbea21f9c078aad2bffb65d11b4b0c8c08271ec9`。两次均为非计时运行，不是性能结论。
 
 ---
 
