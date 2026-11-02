@@ -28,8 +28,11 @@ float widen(uint16_t value) {
 
 int main(int argc, char** argv) {
   using namespace gaudirt::runtime;
-  const unsigned batch = argc == 2 ? std::strtoul(argv[1], nullptr, 10) : 4;
+  const unsigned batch = argc >= 2 ? std::strtoul(argv[1], nullptr, 10) : 4;
   if (batch != 4 && batch != 8) throw std::invalid_argument("batch must be 4 or 8");
+  if (argc > 3 || (argc == 3 && std::string(argv[2]) != "padded"))
+    throw std::invalid_argument("expected optional padded mode");
+  const unsigned active = argc == 3 ? 3 : batch;
   constexpr unsigned pages = 2, page_size = 128, slots = 4 * page_size, heads = 16;
   DeviceRuntime device(DeviceRuntime::Config{});
   HbmArena arena(device.device_id(), 64ULL * 1024 * 1024);
@@ -83,6 +86,11 @@ int main(int argc, char** argv) {
   table[0]=0;usage[0]=2;groups[0]=10;table[1]=1;usage[1]=3;groups[1]=20;
   table[2]=1;usage[2]=3;groups[2]=20;table[3]=0;usage[3]=2;groups[3]=10;
   table[4]=2;usage[4]=1;groups[4]=30;table[5]=3;usage[5]=1;groups[5]=30;
+  for (unsigned row=3;row<active;++row) {
+    row_groups[row]=40+row;
+    table[row*pages]=row%4;usage[row*pages]=1+row%3;groups[row*pages]=row_groups[row];
+    table[row*pages+1]=(row+1)%4;usage[row*pages+1]=2;groups[row*pages+1]=10;
+  }
   std::vector<float> scores(pages*page_size*heads*batch,8.0f);
   for(unsigned row=0;row<batch;++row)for(unsigned page=0;page<pages;++page)
     for(int t=0;t<usage[row*pages+page];++t) if(row_groups[row]>=0 && groups[row*pages+page]==row_groups[row])
@@ -124,5 +132,5 @@ int main(int argc, char** argv) {
   }
   check(synRecipeDestroy(recipe),"destroy recipe");
   if(max_error>5e-5)throw std::runtime_error("batch softmax error");
-  std::printf("B%u isolated gather and softmax max_abs=%.9g\n",batch,max_error);
+  std::printf("B%u active=%u isolated gather and softmax max_abs=%.9g\n",batch,active,max_error);
 }
