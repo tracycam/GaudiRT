@@ -38,5 +38,25 @@ int main() {
   verify.template operator()<512>();
   verify.template operator()<1024>();
   verify.template operator()<2048>();
+  for (unsigned valid : {1, 17, 31}) {
+    PrefillMetadata metadata{};
+    fill_prefill_metadata(metadata, 4096 - valid, 4096, full.data(), swa.data(),
+                          pages, 8320, valid, 8192);
+    for (unsigned row = 0; row < 32; ++row) {
+      const unsigned pos = 4096 - valid + std::min(row, valid - 1);
+      const int slot = row < valid ? pages[pos / 128] * 128 + int(pos % 128)
+                                   : 8192 + int(row - valid);
+      if (metadata.positions[row] != int(pos) || metadata.slots[row] != slot)
+        throw std::runtime_error("incorrect valid or isolated padding row");
+    }
+    if (metadata.full_usage[31] != 128 || metadata.full_groups[32] != -1)
+      throw std::runtime_error("padding extended the valid KV prefix");
+  }
+  bool rejected = false;
+  try {
+    PrefillMetadata metadata{};
+    fill_prefill_metadata(metadata, 0, 4096, full.data(), swa.data(), pages, 8320, 1, 0);
+  } catch (const std::invalid_argument&) { rejected = true; }
+  if (!rejected) throw std::runtime_error("padding aliases a scheduled page");
   std::cout << "4096-token chunk metadata, permutations, windows, and RoPE verified\n";
 }

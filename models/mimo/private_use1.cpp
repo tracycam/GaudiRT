@@ -325,10 +325,12 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       throw std::invalid_argument("PrivateUse1: invalid or duplicate layer_id");
     }
     if (cache_slots == 0 || cache_slots % 128 != 0 || page_count == 0 ||
+        (prefill_enabled_ && cache_slots > UINT32_MAX - 128) ||
         (kind == Kind::C && page_count != 2) ||
         (kind != Kind::C && page_count > 64)) {
       throw std::invalid_argument("PrivateUse1: invalid cache or page geometry");
     }
+    const uint32_t graph_cache_slots = cache_slots + (prefill_enabled_ ? 128 : 0);
     if ((kind == Kind::A) != static_cast<bool>(dense)) {
       throw std::invalid_argument("PrivateUse1: dense weights are only valid for Type A");
     }
@@ -348,23 +350,23 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       throw std::invalid_argument("PrivateUse1: duplicate layer_id");
     }
     if (!instances_.count(kind)) {
-      instances_.emplace(kind, create_instance(kind, cache_slots, page_count,
+      instances_.emplace(kind, create_instance(kind, graph_cache_slots, page_count,
                                                *entry_it->second.attention_weights,
                                                entry_it->second.dense_weights.get()));
       if (prefill_enabled_)
-        prefill_instances_.emplace(kind, create_instance(kind, cache_slots, kind == Kind::C ? page_count : 32,
+        prefill_instances_.emplace(kind, create_instance(kind, graph_cache_slots, kind == Kind::C ? page_count : 32,
             *entry_it->second.attention_weights, entry_it->second.dense_weights.get(), 32));
       if (prefill_enabled_)
-        large_prefill_instances_.emplace(kind, create_instance(kind, cache_slots,
+        large_prefill_instances_.emplace(kind, create_instance(kind, graph_cache_slots,
             kind == Kind::C ? page_count : 32, *entry_it->second.attention_weights,
             entry_it->second.dense_weights.get(), 512));
       if (prefill_enabled_)
-        xlarge_prefill_instances_.emplace(kind, create_instance(kind, cache_slots,
+        xlarge_prefill_instances_.emplace(kind, create_instance(kind, graph_cache_slots,
             kind == Kind::C ? page_count : 32, *entry_it->second.attention_weights,
             entry_it->second.dense_weights.get(), 2048));
     } else {
       const auto& instance = instances_.at(kind);
-      if (instance->cache_slots != cache_slots || instance->page_count != page_count) {
+      if (instance->cache_slots != graph_cache_slots || instance->page_count != page_count) {
         throw std::invalid_argument("PrivateUse1: isomorphic layers must share cache geometry");
       }
     }
@@ -473,6 +475,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
         instances_.at(Kind::A)->page_count != 64 || instances_.at(Kind::B)->page_count != 64)
       throw std::invalid_argument("PrivateUse1: model layers must share KV page geometry");
     cache_slots_ = slots;
+    physical_cache_slots_ = slots - (prefill_enabled_ ? 128 : 0);
     rope_rows_ = static_cast<uint32_t>(full_rope.size(0));
     rope_first_position_ = prefill_enabled_ ? 0 : 4096;
     full_rope_.resize(static_cast<size_t>(full_rope.numel()));
@@ -480,6 +483,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     std::memcpy(full_rope_.data(), full_rope.data_ptr(), full_rope.nbytes());
     std::memcpy(swa_rope_.data(), swa_rope.data_ptr(), swa_rope.nbytes());
     std::memcpy(model_pages_.data(), pages.data_ptr(), pages.nbytes());
+    validate_page_update(model_pages_, model_pages_, 0, physical_cache_slots_);
     validate_step_metadata(rope_first_position_ + rope_rows_ - 1, rope_first_position_, rope_rows_,
                            full_rope_.data(), swa_rope_.data(), model_pages_,
                            cache_slots_);
@@ -616,7 +620,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     std::array<int32_t, 64> next{};
     std::memcpy(next.data(), pages.data_ptr(), pages.nbytes());
     const uint32_t written = prefill_enabled_ && !prefill_complete_ ? prefill_rows_ : model_position_;
-    validate_page_update(model_pages_, next, written, cache_slots_);
+    validate_page_update(model_pages_, next, written, physical_cache_slots_);
     model_pages_ = next;
   }
 
@@ -660,9 +664,9 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     const auto cpu = [](const at::Tensor& t, at::ScalarType type) {
       return t.device().type() == c10::kCPU && t.is_contiguous() && t.scalar_type() == type;
     };
-    if (prompt_length < 32 || prompt_length > 4096 || prompt_length % 32 ||
+    if (prompt_length == 0 || prompt_length > 4096 ||
         (prompt_length_ && prompt_length_ != prompt_length) || prefill_rows_ >= prompt_length ||
-        !cpu(tokens, at::kInt) || tokens.numel() <= 0 || tokens.numel() % 32 != 0 ||
+        !cpu(tokens, at::kInt) || tokens.numel() <= 0 ||
         tokens.numel() > prompt_length - prefill_rows_ ||
         !cpu(full_rope, at::kBFloat16) || !cpu(swa_rope, at::kBFloat16) ||
         full_rope.dim() != 2 || full_rope.size(0) != 4096 || full_rope.size(1) != 64 ||
@@ -683,18 +687,21 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       if (chunk.rows == 2048) {
         xlarge_metadata.emplace_back();
         fill_prefill_metadata(xlarge_metadata.back(), prefill_rows_ + chunk.offset, 4096, full, swa,
-                              model_pages_, cache_slots_);
+                              model_pages_, cache_slots_, chunk.valid_rows, physical_cache_slots_);
       } else if (chunk.rows == 512) {
         large_metadata.emplace_back();
         fill_prefill_metadata(large_metadata.back(), prefill_rows_ + chunk.offset, 4096, full, swa,
-                              model_pages_, cache_slots_);
+                              model_pages_, cache_slots_, chunk.valid_rows, physical_cache_slots_);
       } else {
         metadata.emplace_back();
         fill_prefill_metadata(metadata.back(), prefill_rows_ + chunk.offset, 4096, full, swa,
-                              model_pages_, cache_slots_);
+                              model_pages_, cache_slots_, chunk.valid_rows, physical_cache_slots_);
       }
     }
-    arena_.copy_h2d_sync(runtime_.h2d_stream(), token_data, prefill_tokens_device_, tokens.nbytes());
+    std::vector<int32_t> padded_tokens(token_data, token_data + tokens.numel());
+    padded_tokens.resize(padded_tokens.size() + chunks.back().rows - chunks.back().valid_rows, 0);
+    arena_.copy_h2d_sync(runtime_.h2d_stream(), padded_tokens.data(), prefill_tokens_device_,
+                         padded_tokens.size() * sizeof(int32_t));
     if (!metadata.empty())
       arena_.copy_h2d_sync(runtime_.h2d_stream(), metadata.data(), prefill_metadata_device_,
                            metadata.size() * sizeof(PrefillMetadata));
@@ -709,7 +716,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       const bool large = chunk.rows == 512, xlarge = chunk.rows == 2048;
       auto& token_binding = xlarge ? xlarge_prefill_token_binding_ : large ? large_prefill_token_binding_ : prefill_token_binding_;
       auto& embedding = xlarge ? xlarge_prefill_embedding_launch_ : large ? large_prefill_embedding_launch_ : prefill_embedding_launch_;
-      const bool short_prefix = prefill_rows_ + chunk.offset + chunk.rows <= 2048;
+      const bool short_prefix = prefill_rows_ + chunk.offset + chunk.valid_rows <= 2048;
       auto& bindings = short_prefix
           ? (xlarge ? short_xlarge_prefill_metadata_bindings_ : large ? short_large_prefill_metadata_bindings_ : short_prefill_metadata_bindings_)
           : (xlarge ? xlarge_prefill_metadata_bindings_ : large ? large_prefill_metadata_bindings_ : prefill_metadata_bindings_);
@@ -730,8 +737,21 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       return -1;
     }
     const bool last_large = chunks.back().rows == 512, last_xlarge = chunks.back().rows == 2048;
-    (last_xlarge ? xlarge_prefill_reduce_launch_ : last_large ? large_prefill_reduce_launch_ : prefill_reduce_launch_).execute(stream);
-    (last_xlarge ? xlarge_prefill_head_launch_ : last_large ? large_prefill_head_launch_ : prefill_head_launch_).execute(stream);
+    auto& last_layers = last_xlarge ? xlarge_prefill_layers_ : last_large ? large_prefill_layers_ : prefill_layers_;
+    auto& last_reduce = last_xlarge ? xlarge_prefill_reduce_launch_ : last_large ? large_prefill_reduce_launch_ : prefill_reduce_launch_;
+    auto& last_head = last_xlarge ? xlarge_prefill_head_launch_ : last_large ? large_prefill_head_launch_ : prefill_head_launch_;
+    const auto& last_chunk = chunks.back();
+    const uint64_t final_hidden = last_layers.back().feed_forward_gathered +
+        static_cast<uint64_t>(last_chunk.valid_rows - 1) * 6144 * sizeof(float);
+    const uint64_t rank_stride = static_cast<uint64_t>(last_chunk.rows) * 6144 * sizeof(float);
+    for (unsigned rank = 0; rank < 8; ++rank)
+      last_reduce.tensors[rank].pTensorAddress = final_hidden + rank * rank_stride;
+    const uint64_t residual_base = last_chunk.rows == 32 ? entries_.at(69).prefill_residual_output
+                                                          : entries_.at(69).large_prefill_residual_output;
+    last_head.tensors[1].pTensorAddress = residual_base +
+        static_cast<uint64_t>(last_chunk.valid_rows - 1) * 6144 * sizeof(uint16_t);
+    last_reduce.execute(stream);
+    last_head.execute(stream);
     if (hcclAllGather(reinterpret_cast<const void*>(local_logits_device_),
                       reinterpret_cast<void*>(logits_device_), ModelHead::kLocalVocabSize,
                       hcclBfloat16, runtime_.comm(), stream) != hcclSuccess)
@@ -810,14 +830,14 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   std::vector<at::Tensor> model_kv(uint32_t layer) {
     if (!model_finalized_ || model_pending_ || (prefill_enabled_ && !prefill_complete_) || layer >= 70)
       throw std::invalid_argument("PrivateUse1: model KV is not ready");
-    return {wrap(model_keys_[layer], {cache_slots_, 192}, at::kBFloat16),
-            wrap(model_values_[layer], {cache_slots_, 128}, at::kBFloat16)};
+    return {wrap(model_keys_[layer], {physical_cache_slots_, 192}, at::kBFloat16),
+            wrap(model_values_[layer], {physical_cache_slots_, 128}, at::kBFloat16)};
   }
 
   std::vector<at::Tensor> model_kv_slots(uint32_t layer, uint32_t first,
                                          uint32_t count) {
     if (!model_finalized_ || model_pending_ || (prefill_enabled_ && !prefill_complete_) ||
-        layer >= 70 || count == 0 || first >= cache_slots_ || count > cache_slots_ - first)
+        layer >= 70 || count == 0 || first >= physical_cache_slots_ || count > physical_cache_slots_ - first)
       throw std::invalid_argument("PrivateUse1: invalid model KV slot range");
     return {wrap(model_keys_[layer] + static_cast<uint64_t>(first) * 192 * sizeof(uint16_t),
                  {count, 192}, at::kBFloat16),
@@ -1110,6 +1130,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   std::vector<uint16_t> full_rope_;
   std::vector<uint16_t> swa_rope_;
   uint32_t cache_slots_ = 0;
+  uint32_t physical_cache_slots_ = 0;
   uint32_t rope_rows_ = 0;
   uint32_t rope_first_position_ = 0;
   uint32_t model_position_ = 0;
