@@ -30,6 +30,7 @@ int main(int argc, char** argv) {
   }
   try {
     using namespace gaudirt::runtime;
+    using namespace gaudirt::mimo;
     const auto fixture = std::filesystem::path(argv[2]);
     const auto slots = std::filesystem::file_size(fixture / "key_cache_before.bin") / (192 * 2);
     const auto pages = std::filesystem::file_size(fixture / "block_list.bin") / 4;

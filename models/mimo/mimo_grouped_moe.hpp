@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-namespace gaudirt::runtime {
+namespace gaudirt::mimo {
 
 // This graph consumes the same packed weights as decode. Decoded expert tiles
 // are graph temporaries and share the recipe workspace, not persistent weights.
@@ -135,4 +135,4 @@ inline void append_grouped_prefill_moe(synGraphHandle graph, uint32_t rows,
   join("grouped_output", tiles, output, 0);
 }
 
-}  // namespace gaudirt::runtime
+}  // namespace gaudirt::mimo

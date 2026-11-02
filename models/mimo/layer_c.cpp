@@ -39,11 +39,11 @@ LayerC::LayerC(runtime::HbmArena& arena, runtime::DeviceRuntime& runtime,
           moe_weights_.mxfp4_lut_bf16 = shared_lut;
           moe_weights_.down_combine_directions_u8 = shared_directions;
         } else {
-          const auto lut = runtime::MimoMoeLayer1::make_mxfp4_lut_bf16();
+          const auto lut = MimoMoeLayer1::make_mxfp4_lut_bf16();
           moe_weights_.mxfp4_lut_bf16 = arena.allocate(lut.size() * sizeof(lut[0]));
           arena.copy_h2d_sync(runtime.h2d_stream(), lut.data(), moe_weights_.mxfp4_lut_bf16,
                               lut.size() * sizeof(lut[0]));
-          const auto directions = runtime::MimoMoeLayer1::make_down_combine_directions();
+          const auto directions = MimoMoeLayer1::make_down_combine_directions();
           moe_weights_.down_combine_directions_u8 = arena.allocate(directions.size());
           arena.copy_h2d_sync(runtime.h2d_stream(), directions.data(),
                               moe_weights_.down_combine_directions_u8, directions.size());

@@ -16,8 +16,8 @@ namespace gaudirt::mimo {
 class Layer0 final {
  public:
   struct Io {
-    runtime::MimoAttentionIo attention;
-    runtime::MimoDenseMlp::Outputs dense_outputs;
+    MimoAttentionIo attention;
+    MimoDenseMlp::Outputs dense_outputs;
     uint64_t attention_output_bf16 = 0;
     uint64_t attention_gathered_fp32 = 0;
     uint64_t down_gathered_fp32 = 0;
@@ -43,10 +43,10 @@ class Layer0 final {
   }
 
  private:
-  runtime::MimoFullAttention attention_;
-  std::unique_ptr<runtime::MimoFullAttention> short_attention_;
+  MimoFullAttention attention_;
+  std::unique_ptr<MimoFullAttention> short_attention_;
   std::unique_ptr<runtime::TpReduce> attention_reduce_;
-  runtime::MimoDenseMlp dense_;
+  MimoDenseMlp dense_;
   std::unique_ptr<runtime::TpReduce> dense_reduce_;
   hcclComm_t comm_;
   uint64_t post_attention_gamma_ = 0;

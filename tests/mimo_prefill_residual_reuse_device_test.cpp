@@ -18,6 +18,7 @@ int main(int argc, char** argv) {
   if (argc != 3) return 2;
   try {
     using namespace gaudirt::runtime;
+    using namespace gaudirt::mimo;
     DeviceRuntime runtime(DeviceRuntime::Config{});
     HbmArena arena(runtime.device_id(), 2ULL * 1024 * 1024 * 1024);
     WeightManifest weights(argv[1], runtime, arena);

@@ -29,6 +29,7 @@ int main(int argc,char** argv) {
   if(argc!=4) { std::cerr << "usage: TEST WEIGHTS RANK_FIXTURE MODULE\n"; return 2; }
   try {
     using namespace gaudirt::runtime;
+    using namespace gaudirt::mimo;
     const std::filesystem::path fixture(argv[2]),layer=fixture/"layer0";
     auto initial_key=read(layer/"key_cache.bin"),initial_value=read(layer/"value_cache.bin");
     std::fill(initial_key.begin(),initial_key.end(),0); std::fill(initial_value.begin(),initial_value.end(),0);

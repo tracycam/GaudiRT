@@ -26,6 +26,7 @@ int main(int argc,char** argv) {
   if(argc!=4) { std::cerr << "usage: TEST WEIGHTS RANK_FIXTURE MODULE\n"; return 2; }
   try {
     using namespace gaudirt::runtime;
+    using namespace gaudirt::mimo;
     const std::string module=argv[3]; if(module.size()!=1 || module[0]<'0' || module[0]>'7') throw std::invalid_argument("module must be 0..7");
     DeviceRuntime::Config cfg{}; cfg.module_id=module[0]-'0'; DeviceRuntime runtime(cfg);
     HbmArena arena(runtime.device_id(),4ULL*1024*1024*1024); WeightManifest weights(argv[1],runtime,arena);

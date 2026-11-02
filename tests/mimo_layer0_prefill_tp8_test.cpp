@@ -32,6 +32,7 @@ int main(int argc,char** argv) {
   if(argc!=6 && argc!=7) { std::cerr << "usage: TEST WEIGHTS DENSE_WEIGHTS RANK_FIXTURE MODULE HCCL_ID_FILE [--empty]\n"; return 2; }
   try {
     using namespace gaudirt::runtime;
+    using namespace gaudirt::mimo;
     const std::filesystem::path fixture(argv[3]),layer=fixture/"layer0";
     auto initial_key=read(layer/"key_cache.bin"),initial_value=read(layer/"value_cache.bin");
     const bool empty=argc==7; if(empty && std::string(argv[6])!="--empty") throw std::invalid_argument("invalid mode");

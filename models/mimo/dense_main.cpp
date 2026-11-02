@@ -156,17 +156,17 @@ int run(int argc, char** argv) {
   const gaudirt::runtime::WeightManifest weights(
       weights_root / ("rank" + std::to_string(rank)), runtime, arena);
 
-  gaudirt::runtime::MimoDenseMlp::Inputs inputs{};
+  gaudirt::mimo::MimoDenseMlp::Inputs inputs{};
   inputs.attention_bf16 = upload(arena, runtime, fixture_dir / "attention.bin");
   inputs.residual_in_bf16 = upload(arena, runtime, fixture_dir / "residual_in.bin");
   inputs.post_attention_gamma_bf16 =
       weights.get("post_attention_gamma").device_address;
-  gaudirt::runtime::MimoDenseMlp::Outputs outputs{};
+  gaudirt::mimo::MimoDenseMlp::Outputs outputs{};
   outputs.residual_out_bf16 = arena.allocate(12288);
   outputs.activation_fp32 = arena.allocate(2048 * 4);
   outputs.output_local_fp32 = arena.allocate(6144 * 4);
 
-  gaudirt::runtime::MimoDenseMlp dense(arena, weights);
+  gaudirt::mimo::MimoDenseMlp dense(arena, weights);
   gaudirt::runtime::TpReduce reduce(arena, 6144, syn_type_float);
   const uint64_t gathered = arena.allocate(world * 6144 * 4);
   const uint64_t layer_output = arena.allocate(12288);

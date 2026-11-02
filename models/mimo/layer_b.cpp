@@ -39,11 +39,11 @@ LayerB::LayerB(runtime::HbmArena& arena, runtime::DeviceRuntime& runtime,
           moe_weights_.mxfp4_lut_bf16 = shared_lut;
           moe_weights_.down_combine_directions_u8 = shared_directions;
         } else {
-          const auto lut = runtime::MimoMoeLayer1::make_mxfp4_lut_bf16();
+          const auto lut = MimoMoeLayer1::make_mxfp4_lut_bf16();
           moe_weights_.mxfp4_lut_bf16 = arena.allocate(lut.size() * sizeof(lut[0]));
           arena.copy_h2d_sync(runtime.h2d_stream(), lut.data(), moe_weights_.mxfp4_lut_bf16,
                               lut.size() * sizeof(lut[0]));
-          const auto directions = runtime::MimoMoeLayer1::make_down_combine_directions();
+          const auto directions = MimoMoeLayer1::make_down_combine_directions();
           moe_weights_.down_combine_directions_u8 = arena.allocate(directions.size());
           arena.copy_h2d_sync(runtime.h2d_stream(), directions.data(),
                               moe_weights_.down_combine_directions_u8, directions.size());
@@ -57,7 +57,7 @@ LayerB::LayerB(runtime::HbmArena& arena, runtime::DeviceRuntime& runtime,
     throw std::invalid_argument("MiMo layer: prefill requires fused execution");
   if (!comm_) throw std::invalid_argument("MiMo Type B: missing HCCL");
   if (rows_ > 1 && page_count == 32)
-    short_attention_ = std::make_unique<runtime::MimoFullAttention>(
+    short_attention_ = std::make_unique<MimoFullAttention>(
         arena, weights, cache_slots, false, 16, cache, fused_model, rows);
   arena.ensure_workspace(std::max(
       {attention_.workspace_bytes(), short_attention_ ? short_attention_->workspace_bytes() : 0,

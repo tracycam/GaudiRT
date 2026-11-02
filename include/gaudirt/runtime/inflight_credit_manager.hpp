@@ -25,7 +25,7 @@ namespace gaudirt::runtime {
 // consumes 1 patchable chunk until its completion copy finishes.
 //
 // For production70 (145 compute launches/step, 12 distinct recipes reused
-// across the 70 layers):
+// across model layers):
 //   L_max(12) = 575 - 2 * 12 = 551 launches (~3.80 steps).
 class InFlightCreditManager {
  public:
