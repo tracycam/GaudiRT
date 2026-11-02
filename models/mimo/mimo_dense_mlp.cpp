@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "mimo_dense_mlp.hpp"
-#include "block_fp8_mme.hpp"
 #include "tp_reduce_graph.hpp"
 
 #include "gaudirt/runtime/hbm_arena.hpp"
@@ -203,6 +202,8 @@ struct MimoDenseMlp::Impl {
                                          {groups * 128, rows});
     synTensor decoded = intermediate(graph, name("_mme_decoded_weight").c_str(), syn_type_bf16,
                                       {groups * 128, width});
+    synTensor partial = intermediate(graph, name("_mme_output_fp32").c_str(), syn_type_float,
+                                      {width, rows});
     synTensor correction = intermediate(graph, name("_mme_activation_correction").c_str(), syn_type_bf16,
                                          {groups * 128, rows});
     node(graph, {x}, {activation, correction}, nullptr, 0,
@@ -211,16 +212,21 @@ struct MimoDenseMlp::Impl {
                                           {groups * 128, width});
     node(graph, {weight, scales}, {decoded, decoded_low}, nullptr, 0,
          "gk_dense_block128_decode_split_v1", "mme_weight_decode_split");
-    auto make = [&](const char* n, synDataType t, std::initializer_list<uint64_t> s) {
-      return intermediate(graph, n, t, s);
-    };
-    auto add = [&](std::initializer_list<synTensor> i, std::initializer_list<synTensor> o,
-                   const void* p, unsigned z, const char* g, const char* n) {
-      node(graph, i, o, p, z, g, n);
-    };
-    gaudirt::mimo::append_block_fp8_mme(make, add, activation, correction, decoded,
-                                        decoded_low, bias, output, width, rows, false,
-                                        name("_mme").c_str());
+    synTensor extra = intermediate(graph, name("_mme_output_correction").c_str(), syn_type_float,
+                                    {width, rows});
+    synTensor combined = intermediate(graph, name("_mme_output_combined").c_str(), syn_type_float,
+                                       {width, rows});
+    const synGEMMParams params{false, true};
+    node(graph, {activation, decoded}, {partial}, &params, sizeof(params), "gemm", "mme_dense");
+    node(graph, {correction, decoded}, {extra}, &params, sizeof(params), "gemm", "mme_dense_correction");
+    synTensor weight_extra = intermediate(graph, name("_mme_weight_correction").c_str(), syn_type_float,
+                                           {width, rows});
+    synTensor combined_all = intermediate(graph, name("_mme_output_combined_all").c_str(), syn_type_float,
+                                           {width, rows});
+    node(graph, {activation, decoded_low}, {weight_extra}, &params, sizeof(params), "gemm", "mme_weight_correction");
+    node(graph, {partial, extra}, {combined}, nullptr, 0, "add_fwd_f32", "mme_combine");
+    node(graph, {combined, weight_extra}, {combined_all}, nullptr, 0, "add_fwd_f32", "mme_combine_weight");
+    node(graph, {combined_all, bias}, {output}, nullptr, 0, "add_fwd_f32", "mme_bias");
   }
 
   void build() {
@@ -304,7 +310,7 @@ struct MimoDenseMlp::Impl {
         gate_up_graph, rows == 1 ? "mimo_dense_gate_up_b1_m1_tp8" : "mimo_dense_gate_up_b1_m" + std::to_string(rows) + "_tp8",
         "dense_gate_up_n" + std::to_string(gate_up_n) + "_g" +
             std::to_string(groups) + (gathered_attention ? "_gathered_tp1" : "_direct") +
-            (rows == 1 ? "" : "_m" + std::to_string(rows)) + (rows >= 512 ? "_shared_v1" : ""), cache);
+            (rows == 1 ? "" : "_m" + std::to_string(rows)), cache);
     check(synWorkspaceGetSize(&gate_up_workspace_size, gate_up_recipe),
           "get gate_up workspace size");
     arena.ensure_workspace(gate_up_workspace_size);
@@ -342,7 +348,7 @@ struct MimoDenseMlp::Impl {
               nullptr, 0, rows == 1 ? "gk_dense_linear_fp32_v1" : "gk_dense_linear_prefill_fp32_v1", "down_fp32_linear");
     down_recipe = compile_cached(
         down_graph, rows == 1 ? "mimo_dense_down_b1_m1_tp8" : "mimo_dense_down_b1_m" + std::to_string(rows) + "_tp8",
-        "dense_down_k" + std::to_string(down_k) + "_g" + std::to_string(groups) + (rows == 1 ? "" : "_m" + std::to_string(rows)) + (rows >= 512 ? "_shared_v1" : ""),
+        "dense_down_k" + std::to_string(down_k) + "_g" + std::to_string(groups) + (rows == 1 ? "" : "_m" + std::to_string(rows)),
         cache);
     check(synWorkspaceGetSize(&down_workspace_size, down_recipe),
           "get down workspace size");
