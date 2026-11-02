@@ -12,7 +12,11 @@ int main() {
   std::vector<uint16_t> full(4096*64),swa(4096*64);
   for(size_t i=0;i<full.size();++i) { full[i]=i%65536; swa[i]=(i+13)%65536; }
   auto verify = [&]<uint32_t Rows>() {
-  for(unsigned base=0;base+Rows<=4096;base+=32) {
+  std::vector<unsigned> bases;
+  for(unsigned base=0;base+Rows<=4096;base+=32) bases.push_back(base);
+  for(unsigned base : {1U, 17U, 127U, 129U, 511U, 2047U})
+    if (base + Rows <= 4096) bases.push_back(base);
+  for(unsigned base : bases) {
     PrefillMetadataT<Rows> metadata{};
     fill_prefill_metadata(metadata,base,4096,full.data(),swa.data(),pages,8192);
     for(unsigned row=0;row<Rows;++row) {
