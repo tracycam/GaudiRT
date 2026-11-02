@@ -14,7 +14,7 @@ class RecipeCache;
 class TpReduce {
  public:
   TpReduce(HbmArena& arena, uint32_t elements, synDataType gathered_type,
-           RecipeCache* cache = nullptr, uint32_t ranks = 8);
+           RecipeCache* cache = nullptr);
   ~TpReduce();
 
   TpReduce(const TpReduce&) = delete;
@@ -29,7 +29,6 @@ class TpReduce {
  private:
   HbmArena& arena_;
   uint32_t elements_ = 0;
-  uint32_t ranks_ = 8;
   uint64_t rank_bytes_ = 0;
   synGraphHandle graph_ = nullptr;
   synRecipeHandle recipe_ = nullptr;

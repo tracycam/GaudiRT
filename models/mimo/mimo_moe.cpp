@@ -136,9 +136,8 @@ MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
 
     synTensor attention = nullptr;
     if (gathered_attention_) {
-      synTensor gathered = external(kAttention, "mimo1_attention_gathered",
-                                    rows_ >= 512 ? syn_type_float : gathered_type_,
-                                    {kHiddenSize, (rows_ >= 512 ? 1 : kTpSize) * rows_}, 0);
+      synTensor gathered = external(kAttention, "mimo1_attention_gathered", gathered_type_,
+                                    {kHiddenSize, kTpSize * rows_}, 0);
       sections.push_back(nullptr);
       attention = gaudirt::mimo::append_tp8_reduce(graph, gathered, gathered_type_, sections.back(), rows_);
     } else {
@@ -276,7 +275,7 @@ MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
         std::string("moe_fp32_gate_v3_") + graph_variant + "_rank" + std::to_string(tp_rank_) +
             (gathered_attention_ ? "_gathered_tp1" : "_direct") +
             (rows_ == 1 ? "" : "_m" + std::to_string(rows_)) +
-            (rows_ > 32 ? "_split_tiles_v1" : "") + (rows_ >= 512 ? "_allreduce_v1" : ""),
+            (rows_ > 32 ? "_split_tiles_v1" : ""),
         cache);
     check(synWorkspaceGetSize(&workspace_bytes_, recipe_),
           "synWorkspaceGetSize");

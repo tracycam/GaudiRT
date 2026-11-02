@@ -2,7 +2,6 @@
 #pragma once
 
 #include "gaudirt/runtime/prepared_launch.hpp"
-#include "gaudirt/runtime/tp_collective.hpp"
 
 #include <hccl.h>
 
@@ -29,25 +28,24 @@ struct PreparedLayer {
     if ((rows != 1 && rows != 32 && rows != 512 && rows != 1024 && rows != 2048) || !comm || attention.empty() || feed_forward.empty() ||
         !attention_local || !attention_gathered ||
         !feed_forward_local || !feed_forward_gathered ||
-        (rows < 512 && (attention_local == attention_gathered ||
-                        feed_forward_local == feed_forward_gathered)) ||
-        (rows >= 512 && (attention_local != attention_gathered ||
-                         feed_forward_local != feed_forward_gathered)))
+        attention_local == attention_gathered ||
+        feed_forward_local == feed_forward_gathered)
       throw std::invalid_argument("PreparedLayer: invalid collective bindings");
   }
 
   template <bool fused>
   void execute_graphs(synStreamHandle stream) const {
-    if constexpr (!fused) {
-      if (rows >= 512) throw std::invalid_argument("PreparedLayer: large prefill requires fused execution");
-    }
     for (const auto& launch : attention) launch.execute(stream);
-    runtime::enqueue_tp8_collective(attention_local, attention_gathered, rows, 6144,
-                                    attention_type, comm, stream);
+    if (hcclAllGather(reinterpret_cast<const void*>(attention_local),
+                      reinterpret_cast<void*>(attention_gathered), 6144 * rows,
+                      attention_type, comm, stream) != hcclSuccess)
+      throw std::runtime_error("PreparedLayer: attention AllGather failed");
     if constexpr (!fused) attention_reduce.execute(stream);
     for (const auto& launch : feed_forward) launch.execute(stream);
-    runtime::enqueue_tp8_collective(feed_forward_local, feed_forward_gathered, rows, 6144,
-                                    hcclFloat32, comm, stream);
+    if (hcclAllGather(reinterpret_cast<const void*>(feed_forward_local),
+                      reinterpret_cast<void*>(feed_forward_gathered), 6144 * rows,
+                      hcclFloat32, comm, stream) != hcclSuccess)
+      throw std::runtime_error("PreparedLayer: feed-forward AllGather failed");
     if constexpr (!fused) output_reduce.execute(stream);
   }
 

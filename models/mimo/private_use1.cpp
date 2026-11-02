@@ -526,7 +526,6 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       xlarge_prefill_embedding_ = std::make_unique<ModelEmbedding>(arena_, model_weights_.at("embedding"), &recipe_cache_, 2048);
       prefill_head_ = std::make_unique<ModelHead>(arena_, model_weights_.at("final_norm"), model_weights_.at("lm_head"), &recipe_cache_, false, ModelHead::kLocalVocabSize);
       prefill_reduce_ = std::make_unique<runtime::TpReduce>(arena_, 6144, syn_type_float, &recipe_cache_);
-      prefill_allreduce_cast_ = std::make_unique<runtime::TpReduce>(arena_, 6144, syn_type_float, &recipe_cache_, 1);
     }
     const uint64_t workspace = arena_.workspace_addr();
     model_embedding_launch_ = embedding_->prepare(token_device_, embedding_device_,
@@ -591,12 +590,8 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
         short_bindings = prefill_metadata_bindings(short_layers, base, sizeof(Metadata));
         const uint64_t last = (Metadata::kRows - 1) * 6144 * sizeof(uint16_t);
         const uint64_t rank_stride = Metadata::kRows * 6144 * sizeof(float);
-        if constexpr (Metadata::kRows >= 512)
-          reduce_launch = prefill_allreduce_cast_->prepare(hidden + (Metadata::kRows - 1) * 6144 * sizeof(float),
-                                                            prefill_reduced_device_);
-        else
-          reduce_launch = reduce.prepare_strided(hidden + (Metadata::kRows - 1) * 6144 * sizeof(float),
-                                                 prefill_reduced_device_, rank_stride);
+        reduce_launch = reduce.prepare_strided(hidden + (Metadata::kRows - 1) * 6144 * sizeof(float),
+                                               prefill_reduced_device_, rank_stride);
         head_launch = prefill_head_->prepare(prefill_reduced_device_, residual + last,
                                             normalized_device_, local_logits_device_);
       };
@@ -749,7 +744,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     const uint64_t final_hidden = last_layers.back().feed_forward_gathered +
         static_cast<uint64_t>(last_chunk.valid_rows - 1) * 6144 * sizeof(float);
     const uint64_t rank_stride = static_cast<uint64_t>(last_chunk.rows) * 6144 * sizeof(float);
-    for (unsigned rank = 0; rank < (last_chunk.rows >= 512 ? 1U : 8U); ++rank)
+    for (unsigned rank = 0; rank < 8; ++rank)
       last_reduce.tensors[rank].pTensorAddress = final_hidden + rank * rank_stride;
     const uint64_t residual_base = last_chunk.rows == 32 ? entries_.at(69).prefill_residual_output
                                                           : entries_.at(69).large_prefill_residual_output;
@@ -1013,8 +1008,8 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       io.dense_outputs.activation_fp32 = arena_.allocate(rows * 2048 * 4);
       io.dense_outputs.output_local_fp32 = arena_.allocate(rows * 6144 * 4);
       io.attention_output_bf16 = arena_.allocate(rows * 12288);
-      io.attention_gathered_fp32 = rows >= 512 ? io.attention.output_local_fp32 : arena_.allocate(rows * 8 * 6144 * 4);
-      io.down_gathered_fp32 = rows >= 512 ? io.dense_outputs.output_local_fp32 : arena_.allocate(rows * 8 * 6144 * 4);
+      io.attention_gathered_fp32 = arena_.allocate(rows * 8 * 6144 * 4);
+      io.down_gathered_fp32 = arena_.allocate(rows * 8 * 6144 * 4);
     } else if (kind == Kind::B) {
       const auto* decode = rows == 1 ? nullptr : instances_.at(kind)->b.get();
       instance->b = std::make_unique<LayerB>(arena_, runtime_, attention_weights,
@@ -1027,8 +1022,8 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       io.attention.output_local_fp32 = arena_.allocate(rows * 6144 * 4);
       io.moe_outputs.moe_local_fp32 = arena_.allocate(rows * 6144 * 4);
       io.attention_output_bf16 = arena_.allocate(rows * 12288);
-      io.attention_gathered_fp32 = rows >= 512 ? io.attention.output_local_fp32 : arena_.allocate(rows * 8 * 6144 * 4);
-      io.moe_gathered_fp32 = rows >= 512 ? io.moe_outputs.moe_local_fp32 : arena_.allocate(rows * 8 * 6144 * 4);
+      io.attention_gathered_fp32 = arena_.allocate(rows * 8 * 6144 * 4);
+      io.moe_gathered_fp32 = arena_.allocate(rows * 8 * 6144 * 4);
     } else {
       const auto* decode = rows == 1 ? nullptr : instances_.at(kind)->c.get();
       instance->c = std::make_unique<LayerC>(arena_, runtime_, attention_weights,
@@ -1037,11 +1032,11 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
                                              decode ? decode->moe_directions() : 0);
       auto& io = instance->c_io;
       io.attention.residual_out = arena_.allocate(rows * 12288);
-      io.attention.output_local = arena_.allocate(rows * 6144 * (rows >= 512 ? 4 : 2));
+      io.attention.output_local = arena_.allocate(rows * 12288);
       io.moe_outputs.moe_local_fp32 = arena_.allocate(rows * 6144 * 4);
       io.attention_output_bf16 = arena_.allocate(rows * 12288);
-      io.attention_gathered_bf16 = rows >= 512 ? io.attention.output_local : arena_.allocate(rows * 8 * 6144 * 2);
-      io.moe_gathered_fp32 = rows >= 512 ? io.moe_outputs.moe_local_fp32 : arena_.allocate(rows * 8 * 6144 * 4);
+      io.attention_gathered_bf16 = arena_.allocate(rows * 8 * 6144 * 2);
+      io.moe_gathered_fp32 = arena_.allocate(rows * 8 * 6144 * 4);
     }
     return instance;
   }
@@ -1171,7 +1166,6 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   std::unique_ptr<ModelEmbedding> xlarge_prefill_embedding_;
   std::unique_ptr<ModelHead> prefill_head_;
   std::unique_ptr<runtime::TpReduce> prefill_reduce_;
-  std::unique_ptr<runtime::TpReduce> prefill_allreduce_cast_;
   std::unique_ptr<ModelEmbedding> embedding_;
   std::unique_ptr<ModelHead> head_;
   std::unique_ptr<ModelArgmax> argmax_;

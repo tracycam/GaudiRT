@@ -68,16 +68,16 @@ PreparedLayer LayerC::prepare(const Io& io) {
     result.attention_reduce = attention_reduce_->prepare(io.attention_gathered_bf16,
                                                           io.attention_output_bf16);
   result.feed_forward.push_back(moe_.prepare(
-      {fused_model_ ? (rows_ >= 512 ? io.attention.output_local : io.attention_gathered_bf16) : io.attention_output_bf16,
+      {fused_model_ ? io.attention_gathered_bf16 : io.attention_output_bf16,
        io.attention.residual_out}, io.moe_outputs,
       arena_.workspace_addr()));
   if (!fused_model_)
     result.output_reduce = moe_reduce_->prepare(io.moe_gathered_fp32,
                                                  io.layer_output_bf16);
   result.attention_local = io.attention.output_local;
-  result.attention_gathered = rows_ >= 512 ? result.attention_local : io.attention_gathered_bf16;
+  result.attention_gathered = io.attention_gathered_bf16;
   result.feed_forward_local = io.moe_outputs.moe_local_fp32;
-  result.feed_forward_gathered = rows_ >= 512 ? result.feed_forward_local : io.moe_gathered_fp32;
+  result.feed_forward_gathered = io.moe_gathered_fp32;
   result.attention_type = hcclBfloat16;
   result.comm = comm_;
   result.rows = rows_;
