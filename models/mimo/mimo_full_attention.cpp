@@ -230,7 +230,7 @@ struct MimoFullAttention::Impl {
     synTensor hidden_states = nullptr;
     if (gathered_input) {
       synTensor gathered = external(prepare_graph, prepare_externals, "hidden_gathered",
-                                   Binding::kHiddenStates, syn_type_float, {6144, 8 * rows});
+                                   Binding::kHiddenStates, syn_type_float, {6144, (rows >= 512 ? 1 : 8) * rows});
       hidden_states = gaudirt::mimo::append_tp8_reduce(prepare_graph, gathered, syn_type_float,
                                                        reduction_section, rows);
     } else {
@@ -406,7 +406,7 @@ struct MimoFullAttention::Impl {
         : (rows == 1 ? "mimo_full_attention_b1_m1_tp8_residual" : "mimo_full_prefill_b1_m" + std::to_string(rows) + "_tp8_residual");
     prepare_recipe = compile_cached(
         prepare_graph, recipe_name,
-        std::string("full_mme_neumaier_v4_") + (pure_rmsnorm ? "pure" : "residual") +
+        std::string(rows >= 512 ? "full_mme_qkv_allreduce_v2_" : "full_mme_neumaier_v4_") + (pure_rmsnorm ? "pure" : "residual") +
             "_c" + std::to_string(cache_slots) + "_p" + std::to_string(page_count) +
             (gathered_input ? "_gathered_tp1" : "_direct") + (rows == 1 ? "" : "_m" + std::to_string(rows)),
         cache);
