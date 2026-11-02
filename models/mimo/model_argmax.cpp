@@ -21,8 +21,10 @@ void check(synStatus status, const char* operation) {
 }
 }  // namespace
 
-ModelArgmax::ModelArgmax(runtime::HbmArena& arena, runtime::RecipeCache* cache)
+ModelArgmax::ModelArgmax(runtime::HbmArena& arena, runtime::RecipeCache* cache, uint32_t rows)
     : arena_(arena) {
+  if (rows != 1 && rows != 4 && rows != 8)
+    throw std::invalid_argument("MiMo argmax: unsupported batch size");
   synGraphHandle graph = nullptr;
   std::vector<synSectionHandle> sections;
   sections.reserve(kSlotCount);
@@ -57,21 +59,30 @@ ModelArgmax::ModelArgmax(runtime::HbmArena& arena, runtime::RecipeCache* cache)
       }
       return value;
     };
-    synTensor logits = tensor("argmax_logits", syn_type_bf16, {152576, 1}, true, kLogits);
-    synTensor status = tensor("argmax_embedding_status", syn_type_int32, {1}, true, kEmbeddingStatus);
-    synTensor output = tensor("argmax_next_token", syn_type_int32, {1}, true, kNextToken);
-    synTensor maxima = tensor("argmax_partial_max", syn_type_float, {24}, false, kSlotCount);
-    synTensor ids = tensor("argmax_partial_id", syn_type_int32, {24}, false, kSlotCount);
-    synTensor bad = tensor("argmax_partial_bad", syn_type_int32, {24}, false, kSlotCount);
+    synTensor logits = rows == 1
+        ? tensor("argmax_logits", syn_type_bf16, {152576, 1}, true, kLogits)
+        : tensor("argmax_logits", syn_type_bf16, {19072, rows, 8}, true, kLogits);
+    synTensor status = tensor("argmax_embedding_status", syn_type_int32, {rows}, true, kEmbeddingStatus);
+    synTensor output = tensor("argmax_next_token", syn_type_int32, {rows}, true, kNextToken);
+    synTensor maxima = rows == 1 ? tensor("argmax_partial_max", syn_type_float, {24}, false, kSlotCount)
+                                 : tensor("argmax_partial_max", syn_type_float, {24, rows}, false, kSlotCount);
+    synTensor ids = rows == 1 ? tensor("argmax_partial_id", syn_type_int32, {24}, false, kSlotCount)
+                              : tensor("argmax_partial_id", syn_type_int32, {24, rows}, false, kSlotCount);
+    synTensor bad = rows == 1 ? tensor("argmax_partial_bad", syn_type_int32, {24}, false, kSlotCount)
+                              : tensor("argmax_partial_bad", syn_type_int32, {24, rows}, false, kSlotCount);
     synTensor parts_outputs[] = {maxima, ids, bad};
     check(synNodeCreate(graph, &logits, parts_outputs, 1, 3, nullptr, 0,
-                        "gk_mimo_argmax_parts_bf16_v1", "mimo_argmax_parts", nullptr, nullptr),
+                        rows == 1 ? "gk_mimo_argmax_parts_bf16_v1" : "gk_mimo_argmax_batch_parts_bf16_v1",
+                        "mimo_argmax_parts", nullptr, nullptr),
           "argmax parts");
     synTensor finish_inputs[] = {maxima, ids, bad, status};
     check(synNodeCreate(graph, finish_inputs, &output, 4, 1, nullptr, 0,
-                        "gk_mimo_argmax_finish_v1", "mimo_argmax_finish", nullptr, nullptr),
+                        rows == 1 ? "gk_mimo_argmax_finish_v1" : "gk_mimo_argmax_batch_finish_v1",
+                        "mimo_argmax_finish", nullptr, nullptr),
           "argmax finish");
-    recipe_ = runtime::compile_cached(graph, "mimo_argmax_b1_m1", "model_argmax_v1", cache);
+    const std::string recipe_name = rows == 1 ? "mimo_argmax_b1_m1" : "mimo_argmax_b" + std::to_string(rows);
+    const std::string cache_key = rows == 1 ? "model_argmax_v1" : "model_argmax_batch_v1_b" + std::to_string(rows);
+    recipe_ = runtime::compile_cached(graph, recipe_name, cache_key, cache);
     check(synWorkspaceGetSize(&workspace_bytes_, recipe_), "synWorkspaceGetSize");
     arena_.ensure_workspace(workspace_bytes_);
     runtime::initialize_launch_tensor_ids(recipe_, launch_tensors_.data(), launch_tensors_.size());

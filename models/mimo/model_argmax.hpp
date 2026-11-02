@@ -19,7 +19,8 @@ namespace gaudirt::mimo {
 // embedding status is nonzero. All inputs and the result reside on device.
 class ModelArgmax final {
  public:
-  explicit ModelArgmax(runtime::HbmArena& arena, runtime::RecipeCache* cache = nullptr);
+  explicit ModelArgmax(runtime::HbmArena& arena, runtime::RecipeCache* cache = nullptr,
+                       uint32_t rows = 1);
   ~ModelArgmax();
   ModelArgmax(const ModelArgmax&) = delete;
   ModelArgmax& operator=(const ModelArgmax&) = delete;
