@@ -39,7 +39,9 @@ ModelArgmax::ModelArgmax(runtime::HbmArena& arena, runtime::RecipeCache* cache, 
         check(synSectionSetPersistent(section, true), name);
       }
       synTensorDescriptor descriptor{};
-      descriptor.m_name = name;
+      const std::string scoped_name = rows == 1 ? name : std::string(name) + "_b" + std::to_string(rows);
+      if (persistent) tensor_names_[slot] = scoped_name;
+      descriptor.m_name = persistent ? tensor_names_[slot].c_str() : scoped_name.c_str();
       descriptor.m_dataType = dtype;
       descriptor.m_dims = static_cast<unsigned>(sizes.size());
       unsigned dim = 0;
@@ -51,7 +53,7 @@ ModelArgmax::ModelArgmax(runtime::HbmArena& arena, runtime::RecipeCache* cache, 
       check(synTensorCreate(&value, &descriptor, section, 0), name);
       if (persistent) {
         synLaunchTensorInfo info{};
-        info.tensorName = name;
+        info.tensorName = tensor_names_[slot].c_str();
         info.tensorType = DATA_TENSOR;
         dim = 0;
         for (uint64_t size : sizes) info.tensorSize[dim++] = static_cast<uint32_t>(size);
@@ -71,14 +73,16 @@ ModelArgmax::ModelArgmax(runtime::HbmArena& arena, runtime::RecipeCache* cache, 
     synTensor bad = rows == 1 ? tensor("argmax_partial_bad", syn_type_int32, {24}, false, kSlotCount)
                               : tensor("argmax_partial_bad", syn_type_int32, {24, rows}, false, kSlotCount);
     synTensor parts_outputs[] = {maxima, ids, bad};
+    const std::string parts_name = rows == 1 ? "mimo_argmax_parts" : "mimo_argmax_parts_b" + std::to_string(rows);
     check(synNodeCreate(graph, &logits, parts_outputs, 1, 3, nullptr, 0,
                         rows == 1 ? "gk_mimo_argmax_parts_bf16_v1" : "gk_mimo_argmax_batch_parts_bf16_v1",
-                        "mimo_argmax_parts", nullptr, nullptr),
+                        parts_name.c_str(), nullptr, nullptr),
           "argmax parts");
     synTensor finish_inputs[] = {maxima, ids, bad, status};
+    const std::string finish_name = rows == 1 ? "mimo_argmax_finish" : "mimo_argmax_finish_b" + std::to_string(rows);
     check(synNodeCreate(graph, finish_inputs, &output, 4, 1, nullptr, 0,
                         rows == 1 ? "gk_mimo_argmax_finish_v1" : "gk_mimo_argmax_batch_finish_v1",
-                        "mimo_argmax_finish", nullptr, nullptr),
+                        finish_name.c_str(), nullptr, nullptr),
           "argmax finish");
     const std::string recipe_name = rows == 1 ? "mimo_argmax_b1_m1" : "mimo_argmax_b" + std::to_string(rows);
     const std::string cache_key = rows == 1 ? "model_argmax_v1" : "model_argmax_batch_v1_b" + std::to_string(rows);
