@@ -264,7 +264,7 @@ struct MimoDenseMlp::Impl {
     synTensor attention = nullptr;
     if (gathered_attention) {
       synTensor gathered = external(gate_up_graph, gate_up_externals, "attention_gathered",
-                                     Binding::kAttention, syn_type_float, {6144, 8 * rows});
+                                     Binding::kAttention, syn_type_float, {6144, (rows >= 512 ? 1 : 8) * rows});
       attention = gaudirt::mimo::append_tp8_reduce(gate_up_graph, gathered, syn_type_float,
                                                    reduction_section, rows);
     } else {
@@ -310,7 +310,7 @@ struct MimoDenseMlp::Impl {
         gate_up_graph, rows == 1 ? "mimo_dense_gate_up_b1_m1_tp8" : "mimo_dense_gate_up_b1_m" + std::to_string(rows) + "_tp8",
         "dense_gate_up_n" + std::to_string(gate_up_n) + "_g" +
             std::to_string(groups) + (gathered_attention ? "_gathered_tp1" : "_direct") +
-            (rows == 1 ? "" : "_m" + std::to_string(rows)), cache);
+            (rows == 1 ? "" : "_m" + std::to_string(rows)) + (rows >= 512 ? "_allreduce_v1" : ""), cache);
     check(synWorkspaceGetSize(&gate_up_workspace_size, gate_up_recipe),
           "get gate_up workspace size");
     arena.ensure_workspace(gate_up_workspace_size);

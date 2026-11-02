@@ -47,7 +47,7 @@ Layer0::Layer0(runtime::HbmArena& arena, runtime::DeviceRuntime& runtime,
 }
 
 PreparedLayer Layer0::prepare(const Io& io, bool short_prefix) {
-  auto dense = dense_.prepare({fused_model_ ? io.attention_gathered_fp32 : io.attention_output_bf16,
+  auto dense = dense_.prepare({fused_model_ ? (rows_ >= 512 ? io.attention.output_local_fp32 : io.attention_gathered_fp32) : io.attention_output_bf16,
                                io.attention.hidden_states,
                                post_attention_gamma_}, io.dense_outputs);
   PreparedLayer result;
@@ -61,9 +61,9 @@ PreparedLayer Layer0::prepare(const Io& io, bool short_prefix) {
     result.output_reduce = dense_reduce_->prepare(io.down_gathered_fp32,
                                                   io.layer_output_bf16);
   result.attention_local = io.attention.output_local_fp32;
-  result.attention_gathered = io.attention_gathered_fp32;
+  result.attention_gathered = rows_ >= 512 ? result.attention_local : io.attention_gathered_fp32;
   result.feed_forward_local = io.dense_outputs.output_local_fp32;
-  result.feed_forward_gathered = io.down_gathered_fp32;
+  result.feed_forward_gathered = rows_ >= 512 ? result.feed_forward_local : io.down_gathered_fp32;
   result.attention_type = hcclFloat32;
   result.comm = comm_;
   result.rows = rows_;
