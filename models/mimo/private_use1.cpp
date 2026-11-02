@@ -10,6 +10,7 @@
 #include "prefill_bindings.hpp"
 #include "prefill_chunks.hpp"
 
+#include "gaudirt/bridge/rank_lifecycle.hpp"
 #include "gaudirt/common/sha256.hpp"
 #include "gaudirt/runtime/weight_manifest.hpp"
 
@@ -21,20 +22,17 @@
 
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
 #include <filesystem>
-#include <fstream>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -73,51 +71,6 @@ std::filesystem::path recipe_cache_directory(const std::filesystem::path& root,
   const auto digest = common::sha256_bytes(
       reinterpret_cast<const uint8_t*>(inputs.data()), inputs.size());
   return root / digest / ("rank" + std::to_string(rank));
-}
-
-std::vector<uint8_t> read_file(const std::filesystem::path& path) {
-  const uint64_t bytes = std::filesystem::file_size(path);
-  std::vector<uint8_t> data(bytes);
-  std::ifstream input(path, std::ios::binary);
-  if (!input.read(reinterpret_cast<char*>(data.data()), bytes)) {
-    throw std::runtime_error("PrivateUse1: cannot read HCCL unique ID");
-  }
-  return data;
-}
-
-void write_file(const std::filesystem::path& path,
-                const std::vector<uint8_t>& data) {
-  std::ofstream output(path, std::ios::binary);
-  if (!output.write(reinterpret_cast<const char*>(data.data()), data.size())) {
-    throw std::runtime_error("PrivateUse1: cannot write HCCL unique ID");
-  }
-}
-
-hcclUniqueId exchange_unique_id(uint32_t rank,
-                                const std::filesystem::path& path) {
-  hcclUniqueId id;
-  if (rank == 0) {
-    if (hcclGetUniqueId(&id) != hcclSuccess) {
-      throw std::runtime_error("PrivateUse1: hcclGetUniqueId failed");
-    }
-    auto temporary = path;
-    temporary += ".tmp";
-    write_file(temporary,
-               std::vector<uint8_t>(reinterpret_cast<uint8_t*>(&id),
-                                    reinterpret_cast<uint8_t*>(&id) + sizeof(id)));
-    std::filesystem::rename(temporary, path);
-    return id;
-  }
-  for (unsigned attempt = 0; attempt < 2400; ++attempt) {
-    if (std::filesystem::is_regular_file(path) &&
-        std::filesystem::file_size(path) == sizeof(id)) {
-      const auto data = read_file(path);
-      std::copy(data.begin(), data.end(), reinterpret_cast<uint8_t*>(&id));
-      return id;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
-  throw std::runtime_error("PrivateUse1: HCCL unique ID timeout");
 }
 
 enum class Kind : int { A = 0, B = 1, C = 2 };
@@ -197,7 +150,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     if (world != 8 || rank >= world) {
       throw std::invalid_argument("PrivateUse1: only TP8 is supported");
     }
-    runtime_.init_comm(exchange_unique_id(rank, unique_id));
+    runtime_.init_comm(bridge::exchange_unique_id(rank, unique_id));
     shutdown_buffer_ = arena_.allocate(sizeof(float));
     const float ready = 1.0f;
     arena_.copy_h2d_sync(runtime_.h2d_stream(), &ready, shutdown_buffer_, sizeof(ready));
@@ -986,12 +939,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   void synchronize_shutdown() {
     if (model_pending_)
       throw std::runtime_error("PrivateUse1: finish the pending model step before shutdown");
-    runtime_.synchronize_all();
-    auto* buffer = reinterpret_cast<void*>(shutdown_buffer_);
-    if (hcclAllReduce(buffer, buffer, 1, hcclFloat32, hcclSum,
-                      runtime_.comm(), runtime_.compute_stream()) != hcclSuccess)
-      throw std::runtime_error("PrivateUse1: shutdown rank barrier failed");
-    runtime_.synchronize_compute();
+    bridge::synchronize_shutdown(runtime_, shutdown_buffer_);
   }
 
  private:

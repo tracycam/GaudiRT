@@ -19,6 +19,7 @@ link_directories(${HABANA_LIB_DIR})
 add_link_options(-Wl,-rpath,${HABANA_LIB_DIR})
 
 add_library(gaudirt STATIC
+    src/bridge/rank_lifecycle.cpp
     src/device_runtime.cpp
     src/hbm_arena.cpp
     src/recipe_registry.cpp
