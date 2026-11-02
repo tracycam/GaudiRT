@@ -2,6 +2,7 @@
 #pragma once
 
 #include <synapse_api.h>
+#include <perf_lib_layer_params.h>
 
 #include <cstdint>
 #include <stdexcept>
@@ -34,10 +35,17 @@ inline synTensor append_tp8_reduce(synGraphHandle graph, synTensor gathered,
   descriptor.m_sizes[1] = descriptor.m_minSizes[1] = rows;
   synTensor output = nullptr;
   check(synTensorCreate(&output, &descriptor, output_section, 0), "create output");
-  const int32_t ranks = 8;
-  const char* guid = dtype == syn_type_float ? "pf_sum_f32_bf16" : "pf_sum_bf16_bf16";
-  check(synNodeCreate(graph, &gathered, &output, 1, 1, &ranks, sizeof(ranks),
-                      guid, "tp_reduce", nullptr, nullptr), "reduce ranks");
+  if (rows >= 512) {
+    ns_CastKernel::ParamsV3 cast{};
+    cast.round_mode = CAST_ROUND_HALF_NE;
+    check(synNodeCreate(graph, &gathered, &output, 1, 1, &cast, sizeof(cast),
+                        "cast_f32_to_bf16", "tp_reduce_cast", nullptr, nullptr), "round reduced input");
+  } else {
+    const int32_t ranks = 8;
+    const char* guid = dtype == syn_type_float ? "pf_sum_f32_bf16" : "pf_sum_bf16_bf16";
+    check(synNodeCreate(graph, &gathered, &output, 1, 1, &ranks, sizeof(ranks),
+                        guid, "tp_reduce", nullptr, nullptr), "reduce ranks");
+  }
   return output;
 }
 
