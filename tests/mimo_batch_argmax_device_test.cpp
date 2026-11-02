@@ -27,6 +27,9 @@ int main(int argc, char** argv) {
   constexpr unsigned shard=19072,ranks=8,vocab=shard*ranks;
   DeviceRuntime device(DeviceRuntime::Config{});
   HbmArena arena(device.device_id(),64ULL*1024*1024);
+  gaudirt::mimo::ModelArgmax model_one(arena, nullptr, 1);
+  gaudirt::mimo::ModelArgmax model_four(arena, nullptr, 4);
+  gaudirt::mimo::ModelArgmax model_eight(arena, nullptr, 8);
   synGraphHandle graph=nullptr;synRecipeHandle recipe=nullptr;
   std::array<synSectionHandle,3> sections{};
   std::array<synTensor,3> external{};std::array<synLaunchTensorInfo,3> binding{};
@@ -84,7 +87,7 @@ int main(int argc, char** argv) {
       throw std::runtime_error("batch argmax mismatch");
     }
   }
-  gaudirt::mimo::ModelArgmax model_argmax(arena, nullptr, rows);
+  auto& model_argmax=rows==4?model_four:model_eight;
   auto model_launch=model_argmax.prepare(binding[0].pTensorAddress,binding[1].pTensorAddress,binding[2].pTensorAddress);
   model_launch.execute(device.compute_stream());device.synchronize_compute();
   arena.copy_d2h_sync(device.d2h_stream(),binding[2].pTensorAddress,actual.data(),bytes[2]);
