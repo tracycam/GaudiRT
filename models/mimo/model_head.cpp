@@ -27,13 +27,15 @@ void check(synStatus status, const char* operation) {
 
 ModelHead::ModelHead(runtime::HbmArena& arena, uint64_t final_norm_gamma,
                      uint64_t lm_head_weight, runtime::RecipeCache* cache,
-                     bool gathered_input, uint32_t vocab_size)
+                     bool gathered_input, uint32_t vocab_size, uint32_t rows)
     : arena_(arena), gathered_input_(gathered_input) {
   if (final_norm_gamma == 0 || lm_head_weight == 0) {
     throw std::invalid_argument("MiMo model head: null weight address");
   }
   if (vocab_size != kVocabSize && vocab_size != kLocalVocabSize)
     throw std::invalid_argument("MiMo model head: unsupported vocabulary size");
+  if (rows != 1 && rows != 4 && rows != 8)
+    throw std::invalid_argument("MiMo model head: unsupported batch size");
   synGraphHandle graph = nullptr;
   std::vector<synSectionHandle> sections;
   sections.reserve(kSlotCount);
@@ -46,7 +48,8 @@ ModelHead::ModelHead(runtime::HbmArena& arena, uint64_t final_norm_gamma,
       sections.push_back(section);
       check(synSectionSetPersistent(section, true), name);
       synTensorDescriptor descriptor{};
-      descriptor.m_name = name;
+      tensor_names_[slot] = rows == 1 ? name : std::string(name) + "_b" + std::to_string(rows);
+      descriptor.m_name = tensor_names_[slot].c_str();
       descriptor.m_dataType = dtype;
       descriptor.m_dims = static_cast<unsigned>(sizes.size());
       unsigned dim = 0;
@@ -57,7 +60,7 @@ ModelHead::ModelHead(runtime::HbmArena& arena, uint64_t final_norm_gamma,
       synTensor tensor = nullptr;
       check(synTensorCreate(&tensor, &descriptor, section, 0), name);
       synLaunchTensorInfo info{};
-      info.tensorName = name;
+      info.tensorName = tensor_names_[slot].c_str();
       info.pTensorAddress = address;
       info.tensorType = DATA_TENSOR;
       dim = 0;
@@ -86,43 +89,47 @@ ModelHead::ModelHead(runtime::HbmArena& arena, uint64_t final_norm_gamma,
     synTensor hidden = nullptr;
     if (gathered_input_) {
       synTensor gathered = external(kHidden, "model_hidden_gathered", syn_type_float,
-                                    {6144, 8}, 0);
+                                    {6144, 8 * rows}, 0);
       sections.push_back(nullptr);
-      hidden = append_tp8_reduce(graph, gathered, syn_type_float, sections.back());
+      hidden = append_tp8_reduce(graph, gathered, syn_type_float, sections.back(), rows);
     } else {
       hidden = external(kHidden, "model_final_hidden", syn_type_bf16,
-                        {6144, 1}, 0);
+                        {6144, rows}, 0);
     }
     synTensor residual = external(kResidual, "model_final_residual", syn_type_bf16,
-                                  {6144, 1}, 0);
+                                  {6144, rows}, 0);
     synTensor gamma = external(kGamma, "model_final_gamma", syn_type_bf16,
                                {6144}, final_norm_gamma);
     synTensor weight = external(kLmHeadWeight, "model_lm_head_weight", syn_type_bf16,
                                 {6144, vocab_size}, lm_head_weight);
     synTensor logits = external(kLogits, "model_logits", syn_type_bf16,
-                                {vocab_size, 1}, 0);
+                                {vocab_size, rows}, 0);
     synTensor normalized = external(kNormalized, "model_final_normalized",
-                                    syn_type_bf16, {6144, 1}, 0);
+                                    syn_type_bf16, {6144, rows}, 0);
     const char* residual_name = vocab_size == kVocabSize
         ? (gathered_input_ ? "model_final_residual_out_full_gathered" : "model_final_residual_out_full_direct")
         : (gathered_input_ ? "model_final_residual_out_shard_gathered" : "model_final_residual_out_shard_direct");
-    synTensor residual_out = temporary(residual_name, syn_type_bf16, {6144, 1});
+    const std::string residual_scoped = rows == 1 ? residual_name : std::string(residual_name) + "_b" + std::to_string(rows);
+    synTensor residual_out = temporary(residual_scoped.c_str(), syn_type_bf16, {6144, rows});
     const float epsilon = 1e-5F;
     synTensor norm_inputs[] = {hidden, residual, gamma};
     synTensor norm_outputs[] = {residual_out, normalized};
+    const std::string norm_name = rows == 1 ? "model_final_rmsnorm" : "model_final_rmsnorm_b" + std::to_string(rows);
     check(synNodeCreate(graph, norm_inputs, norm_outputs, 3, 2, &epsilon,
                         sizeof(epsilon), "gk_residual_rmsnorm_bf16_v1",
-                        "model_final_rmsnorm", nullptr, nullptr),
+                        norm_name.c_str(), nullptr, nullptr),
           "final RMSNorm");
     const synGEMMParams gemm_params{false, true};
     synTensor gemm_inputs[] = {normalized, weight};
+    const std::string gemm_name = rows == 1 ? "model_lm_head" : "model_lm_head_b" + std::to_string(rows);
     check(synNodeCreate(graph, gemm_inputs, &logits, 2, 1, &gemm_params,
-                        sizeof(gemm_params), "gemm", "model_lm_head", nullptr,
+                        sizeof(gemm_params), "gemm", gemm_name.c_str(), nullptr,
                         nullptr),
           "lm_head GEMM");
+    const std::string batch_suffix = rows == 1 ? "" : "_b" + std::to_string(rows);
     const std::string cache_key = std::string(gathered_input_ ? "model_head_gathered_tp1_v2_" : "model_head_v1_") +
-                                  std::to_string(vocab_size);
-    recipe_ = runtime::compile_cached(graph, "mimo_final_rmsnorm_lm_head_b1_m1", cache_key, cache);
+                                  std::to_string(vocab_size) + batch_suffix;
+    recipe_ = runtime::compile_cached(graph, "mimo_final_rmsnorm_lm_head_b1_m1" + batch_suffix, cache_key, cache);
     check(synWorkspaceGetSize(&workspace_bytes_, recipe_), "synWorkspaceGetSize");
     arena_.ensure_workspace(workspace_bytes_);
     runtime::initialize_launch_tensor_ids(recipe_, launch_tensors_.data(),
