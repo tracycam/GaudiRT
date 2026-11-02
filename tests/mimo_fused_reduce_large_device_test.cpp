@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Check the TP8 rank/row layout consumed by large prefill graphs.
+// Check large-prefill AllReduce output conversion and strided TP8 reduction.
 #include "gaudirt/runtime/device_runtime.hpp"
 #include "gaudirt/runtime/hbm_arena.hpp"
 #include "gaudirt/runtime/prepared_launch.hpp"
@@ -40,9 +40,10 @@ int main() {
       binding[i].tensorName=name; binding[i].tensorType=DATA_TENSOR;
       binding[i].tensorSize[0]=hidden; binding[i].tensorSize[1]=count;
     };
-    external(0,"input",dtype,rows*ranks); external(1,"output",syn_type_bf16,rows);
+    // Large prefill graphs consume the already reduced FP32 tensor.
+    external(0,"input",syn_type_float,rows); external(1,"output",syn_type_bf16,rows);
     synSectionHandle intermediate_section = nullptr;
-    auto reduced=gaudirt::mimo::append_tp8_reduce(graph,tensor[0],dtype,intermediate_section,rows);
+    auto reduced=gaudirt::mimo::append_tp8_reduce(graph,tensor[0],syn_type_float,intermediate_section,rows);
     check(synNodeCreate(graph,&reduced,&tensor[1],1,1,nullptr,0,"reshape","output_copy",nullptr,nullptr));
     check(synGraphCompile(&recipe,graph,"tp8_m512_test",nullptr));
     uint64_t ws=0; check(synWorkspaceGetSize(&ws,recipe));
@@ -57,9 +58,16 @@ int main() {
         const size_t i=(static_cast<size_t>(rank)*rows+row)*hidden+c;
         wide[i]=x; narrow[i]=bf16(x);
       }
+    std::vector<float> sums(static_cast<size_t>(rows)*hidden, 0);
+    for(unsigned rank=0;rank<ranks;++rank) for(unsigned row=0;row<rows;++row)
+      for(unsigned c=0;c<hidden;++c)
+        sums[static_cast<size_t>(row)*hidden+c]+=wide[(static_cast<size_t>(rank)*rows+row)*hidden+c];
     const auto bytes=values*(dtype==syn_type_float?4:2);
-    binding[0].pTensorAddress=arena.allocate(bytes); binding[1].pTensorAddress=arena.allocate(rows*hidden*2);
-    arena.copy_h2d_sync(runtime.h2d_stream(),dtype==syn_type_float?static_cast<void*>(wide.data()):static_cast<void*>(narrow.data()),binding[0].pTensorAddress,bytes);
+    binding[0].pTensorAddress=arena.allocate(sums.size()*sizeof(float));
+    binding[1].pTensorAddress=arena.allocate(rows*hidden*2);
+    const auto gathered=arena.allocate(bytes);
+    arena.copy_h2d_sync(runtime.h2d_stream(),sums.data(),binding[0].pTensorAddress,sums.size()*sizeof(float));
+    arena.copy_h2d_sync(runtime.h2d_stream(),dtype==syn_type_float?static_cast<void*>(wide.data()):static_cast<void*>(narrow.data()),gathered,bytes);
     PreparedLaunch launch{recipe,arena.ensure_workspace(ws),{binding.begin(),binding.end()},0};
     launch.validate(); launch.execute(runtime.compute_stream()); runtime.synchronize_compute();
     std::vector<uint16_t> actual(static_cast<size_t>(rows)*hidden);
@@ -70,7 +78,7 @@ int main() {
     }
     const uint64_t element_bytes = dtype == syn_type_float ? 4 : 2;
     const uint64_t rank_stride = static_cast<uint64_t>(rows) * hidden * element_bytes;
-    const uint64_t last_input = binding[0].pTensorAddress + (rows - 1) * hidden * element_bytes;
+    const uint64_t last_input = gathered + (rows - 1) * hidden * element_bytes;
     const uint64_t last_output = arena.allocate(hidden * 2);
     TpReduce last_reduce(arena, hidden, dtype);
     auto last = last_reduce.prepare_strided(last_input, last_output, rank_stride);
