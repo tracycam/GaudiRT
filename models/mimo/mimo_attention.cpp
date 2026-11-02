@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "mimo_attention.hpp"
+#include "block_fp8_mme.hpp"
 #include "tp_reduce_graph.hpp"
 
 #include "gaudirt/runtime/hbm_arena.hpp"
@@ -268,14 +269,34 @@ struct MimoAttention::Impl {
          &kRmsNormEpsilon, sizeof(kRmsNormEpsilon),
          "gk_norm_block128_grid24_fp32_v1", "input_residual_norm_block128_quant");
 
-    synTensor qkv_accumulator = intermediate("qkv_accumulator_fp32",
-                                             syn_type_float, {3392, rows, 48});
-    synGEMMParams qkv_gemm_params{false, true};
     qkv = intermediate("qkv", syn_type_bf16, {3392, rows});
-    node({activation_q, qkv_packed}, {qkv_accumulator}, &qkv_gemm_params,
-         sizeof(qkv_gemm_params), "batch_gemm", "qkv_block128_fp8_batch_gemm");
-    node({qkv_accumulator, activation_scale, qkv_scale, qkv_zero_bias}, {qkv},
-         nullptr, 0, "gk_block128_neumaier_bf16_compensated_v1", "qkv_block128_scale_finish");
+    if (rows >= 512) {
+      synTensor x_hi = intermediate("qkv_mme_x_hi", syn_type_bf16, {6144, rows});
+      synTensor x_lo = intermediate("qkv_mme_x_lo", syn_type_bf16, {6144, rows});
+      synTensor w_hi = intermediate("qkv_mme_w_hi", syn_type_bf16, {6144, 3392});
+      synTensor w_lo = intermediate("qkv_mme_w_lo", syn_type_bf16, {6144, 3392});
+      node({activation_q, activation_scale}, {x_hi, x_lo}, nullptr, 0,
+           "gk_qkv_activation_split_v1", "qkv_mme_activation_split");
+      node({qkv_packed, qkv_scale}, {w_hi, w_lo}, nullptr, 0,
+           "gk_dense_block128_decode_split_v1", "qkv_mme_weight_split");
+      auto make = [&](const char* n, synDataType t, std::initializer_list<uint64_t> s) {
+        return intermediate(n, t, s);
+      };
+      auto add = [&](std::initializer_list<synTensor> i, std::initializer_list<synTensor> o,
+                     const void* p, unsigned z, const char* g, const char* n) {
+        node(i, o, p, z, g, n);
+      };
+      gaudirt::mimo::append_block_fp8_mme(make, add, x_hi, x_lo, w_hi, w_lo,
+                                          qkv_zero_bias, qkv, 3392, rows, true, "qkv_mme");
+    } else {
+      synTensor qkv_accumulator = intermediate("qkv_accumulator_fp32",
+                                               syn_type_float, {3392, rows, 48});
+      synGEMMParams qkv_gemm_params{false, true};
+      node({activation_q, qkv_packed}, {qkv_accumulator}, &qkv_gemm_params,
+           sizeof(qkv_gemm_params), "batch_gemm", "qkv_block128_fp8_batch_gemm");
+      node({qkv_accumulator, activation_scale, qkv_scale, qkv_zero_bias}, {qkv},
+           nullptr, 0, "gk_block128_neumaier_bf16_compensated_v1", "qkv_block128_scale_finish");
+    }
 
     synTensor rope_cos = external("rope_cos", Binding::kRopeCos, syn_type_bf16,
                                   {64, 1, rows});
@@ -366,7 +387,7 @@ struct MimoAttention::Impl {
 
     recipe = compile_cached(graph, rows == 1 ? "mimo_layer1_attention_b1_m1_tp8"
                                              : "mimo_swa_prefill_b1_m" + std::to_string(rows) + "_tp8",
-                            std::string(rows >= 512 ? "swa_mme_prefill_v1_c"
+                            std::string(rows >= 512 ? "swa_mme_prefill_qkv_mme_v2_c"
                                                     : "swa_grid24_fp32_v7_c") +
                                 std::to_string(cache_slots) +
                                 (gathered_input ? "_gathered_tp1" : "_direct") +
