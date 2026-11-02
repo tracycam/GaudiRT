@@ -29,6 +29,7 @@ int main(int argc, char** argv) {
   }
   try {
     using namespace gaudirt::runtime;
+    using namespace gaudirt::mimo;
     DeviceRuntime::Config config{};
     config.module_id = 0;
     DeviceRuntime runtime(config);

@@ -16,8 +16,8 @@ namespace gaudirt::mimo {
 class LayerC final {
  public:
   struct Io {
-    runtime::MimoAttentionIo attention;
-    runtime::MimoMoeLayer1::Outputs moe_outputs;
+    MimoAttentionIo attention;
+    MimoMoeLayer1::Outputs moe_outputs;
     uint64_t attention_output_bf16 = 0;
     uint64_t attention_gathered_bf16 = 0;
     uint64_t moe_gathered_fp32 = 0;
@@ -43,10 +43,10 @@ class LayerC final {
 
  private:
   runtime::HbmArena& arena_;
-  runtime::MimoAttention attention_;
+  MimoAttention attention_;
   std::unique_ptr<runtime::TpReduce> attention_reduce_;
-  runtime::MimoMoeLayer1::Weights moe_weights_{};
-  runtime::MimoMoeLayer1 moe_;
+  MimoMoeLayer1::Weights moe_weights_{};
+  MimoMoeLayer1 moe_;
   std::unique_ptr<runtime::TpReduce> moe_reduce_;
   hcclComm_t comm_;
   bool fused_model_ = false;

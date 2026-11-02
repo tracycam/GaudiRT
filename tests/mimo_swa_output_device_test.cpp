@@ -32,6 +32,7 @@ int main(int argc, char** argv) {
   }
   try {
     using namespace gaudirt::runtime;
+    using namespace gaudirt::mimo;
     const auto fixture = std::filesystem::path(argv[2]);
     const auto layer = fixture / "layer1";
     const auto slots = std::filesystem::file_size(layer / "key_cache.bin") / (192 * 2);

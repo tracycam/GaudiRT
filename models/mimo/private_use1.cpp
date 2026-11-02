@@ -1072,7 +1072,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     return addresses;
   }
 
-  static void set_common_attention(runtime::MimoAttentionIo& io,
+  static void set_common_attention(MimoAttentionIo& io,
                                    const std::array<uint64_t, 11>& addresses) {
     io.hidden_states = addresses[0];
     io.residual = addresses[1];

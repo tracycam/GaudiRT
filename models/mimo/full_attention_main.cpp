@@ -183,7 +183,7 @@ int run(int argc, char** argv) {
   gaudirt::runtime::HbmArena arena(runtime.device_id(), 256 * 1024 * 1024ULL);
   const gaudirt::runtime::WeightManifest weights(
       weights_root / ("rank" + std::to_string(rank)), runtime, arena);
-  gaudirt::runtime::MimoAttentionIo io{};
+  gaudirt::mimo::MimoAttentionIo io{};
   io.hidden_states = upload(arena, runtime, fixture_dir / "residual_in.bin");
   io.residual = io.hidden_states;
   io.residual_out = arena.allocate(12288);
@@ -197,7 +197,7 @@ int run(int argc, char** argv) {
   io.full_block_groups = upload(arena, runtime, fixture_dir / "block_groups.bin");
   io.output_local_fp32 = arena.allocate(6144 * 4);
 
-  gaudirt::runtime::MimoFullAttention attention(arena, weights, cache_slots, true,
+  gaudirt::mimo::MimoFullAttention attention(arena, weights, cache_slots, true,
                                                 page_count);
   gaudirt::runtime::TpReduce reduce(arena, 6144, syn_type_float);
   const uint64_t gathered = arena.allocate(world * 6144 * 4);

@@ -37,7 +37,7 @@ Layer0::Layer0(runtime::HbmArena& arena, runtime::DeviceRuntime& runtime,
     throw std::invalid_argument("MiMo layer0: missing HCCL or post-attention gamma");
   }
   if (rows_ > 1 && page_count == 32)
-    short_attention_ = std::make_unique<runtime::MimoFullAttention>(
+    short_attention_ = std::make_unique<MimoFullAttention>(
         arena, attention_weights, cache_slots, true, 16, cache, false, rows);
   arena.ensure_workspace(std::max({attention_.workspace_bytes(),
                                    short_attention_ ? short_attention_->workspace_bytes() : 0,

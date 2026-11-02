@@ -16,7 +16,8 @@
 #include <string>
 #include <vector>
 
-namespace gaudirt::runtime {
+namespace gaudirt::mimo {
+using namespace gaudirt::runtime;
 namespace {
 
 constexpr float kRmsNormEpsilon = 1e-5F;
@@ -486,4 +487,4 @@ std::pair<uint64_t, uint64_t> MimoDenseMlp::recipe_identity() const noexcept {
           reinterpret_cast<uint64_t>(impl_->down_recipe)};
 }
 
-}  // namespace gaudirt::runtime
+}  // namespace gaudirt::mimo

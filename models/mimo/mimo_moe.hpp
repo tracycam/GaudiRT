@@ -9,9 +9,11 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace gaudirt::runtime {
+namespace gaudirt::runtime { class RecipeCache; }
 
-class RecipeCache;
+namespace gaudirt::mimo {
+using runtime::RecipeCache;
+using runtime::PreparedLaunch;
 
 // Fixed MiMo layer1 decode MoE: B1/M1, TP8/EP1, H6144, E384, top8.
 // All tensors use Synapse FCD-first geometry. HBM addresses refer to contiguous
@@ -128,4 +130,4 @@ class MimoMoeLayer1 final {
   std::array<synLaunchTensorInfo, kSlotCount> launch_tensors_{};
 };
 
-}  // namespace gaudirt::runtime
+}  // namespace gaudirt::mimo

@@ -13,6 +13,7 @@
 
 int main() {
   using namespace gaudirt::runtime;
+    using namespace gaudirt::mimo;
   constexpr uint32_t rows = 512, hidden = 6144;
   DeviceRuntime::Config config{};
   DeviceRuntime runtime(config);

@@ -11,10 +11,16 @@
 #include <utility>
 
 namespace gaudirt::runtime {
-
 class HbmArena;
 class WeightManifest;
 class RecipeCache;
+}
+
+namespace gaudirt::mimo {
+using runtime::HbmArena;
+using runtime::WeightManifest;
+using runtime::RecipeCache;
+using runtime::PreparedLaunch;
 
 class MimoDenseMlp final {
  public:
@@ -52,4 +58,4 @@ class MimoDenseMlp final {
   std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace gaudirt::runtime
+}  // namespace gaudirt::mimo

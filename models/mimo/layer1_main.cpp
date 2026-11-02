@@ -147,7 +147,7 @@ int run(int argc, char** argv) {
   const auto residual_dir = residual_root / ("rank" + std::to_string(rank));
   gaudirt::runtime::WeightManifest weights(weight_dir, runtime, arena);
 
-  gaudirt::runtime::MimoAttentionIo attention_io;
+  gaudirt::mimo::MimoAttentionIo attention_io;
   attention_io.hidden_states = upload(arena, runtime, attention_dir / "hidden.bin");
   attention_io.residual = upload(arena, runtime, attention_dir / "residual.bin");
   attention_io.residual_out = arena.allocate(12288);
@@ -161,7 +161,7 @@ int run(int argc, char** argv) {
   attention_io.position = upload(arena, runtime, attention_dir / "position.bin");
   attention_io.output_local = arena.allocate(12288);
 
-  gaudirt::runtime::MimoAttention attention(arena, weights, kCacheSlots);
+  gaudirt::mimo::MimoAttention attention(arena, weights, kCacheSlots);
   auto attention_reduce =
       std::make_unique<gaudirt::runtime::TpReduce>(arena, 6144, syn_type_bf16);
   auto moe_reduce =
@@ -169,7 +169,7 @@ int run(int argc, char** argv) {
   const uint64_t attention_output = arena.allocate(12288);
   const uint64_t attention_gathered = arena.allocate(world * 12288);
 
-  gaudirt::runtime::MimoMoeLayer1::Weights moe_weights{};
+  gaudirt::mimo::MimoMoeLayer1::Weights moe_weights{};
   moe_weights.post_attention_gamma_bf16 =
       weights.get("post_attention_layernorm").device_address;
   moe_weights.router_weight_bf16 = weights.get("router_weight").device_address;
@@ -178,22 +178,22 @@ int run(int argc, char** argv) {
   moe_weights.gate_up_scales_u8 = weights.get("moe_gs").device_address;
   moe_weights.down_packed_u8 = weights.get("moe_dp").device_address;
   moe_weights.down_scales_u8 = weights.get("moe_ds").device_address;
-  auto lut = gaudirt::runtime::MimoMoeLayer1::make_mxfp4_lut_bf16();
+  auto lut = gaudirt::mimo::MimoMoeLayer1::make_mxfp4_lut_bf16();
   moe_weights.mxfp4_lut_bf16 = arena.allocate(lut.size() * sizeof(lut[0]));
   arena.copy_h2d_sync(runtime.h2d_stream(), lut.data(), moe_weights.mxfp4_lut_bf16,
                       lut.size() * sizeof(lut[0]));
-  auto directions = gaudirt::runtime::MimoMoeLayer1::make_down_combine_directions();
+  auto directions = gaudirt::mimo::MimoMoeLayer1::make_down_combine_directions();
   moe_weights.down_combine_directions_u8 = arena.allocate(directions.size());
   arena.copy_h2d_sync(runtime.h2d_stream(), directions.data(),
                       moe_weights.down_combine_directions_u8, directions.size());
 
-  gaudirt::runtime::MimoMoeLayer1 moe(rank, moe_weights, "swa");
+  gaudirt::mimo::MimoMoeLayer1 moe(rank, moe_weights, "swa");
   const uint64_t moe_workspace = arena.ensure_workspace(moe.workspace_bytes());
-  gaudirt::runtime::MimoMoeLayer1::Inputs moe_inputs{};
+  gaudirt::mimo::MimoMoeLayer1::Inputs moe_inputs{};
   moe_inputs.attention_bf16 = attention_output;
   moe_inputs.residual_in_bf16 = upload(
       arena, runtime, residual_dir / "layer1.post_attention_residual_in.bf16");
-  gaudirt::runtime::MimoMoeLayer1::Outputs moe_outputs{};
+  gaudirt::mimo::MimoMoeLayer1::Outputs moe_outputs{};
   moe_outputs.residual_out_bf16 = arena.allocate(12288);
   moe_outputs.moe_local_fp32 = arena.allocate(24576);
   const uint64_t layer_output = arena.allocate(12288);

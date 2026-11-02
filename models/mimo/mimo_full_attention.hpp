@@ -8,7 +8,7 @@
 #include <memory>
 #include <utility>
 
-namespace gaudirt::runtime {
+namespace gaudirt::mimo {
 
 class MimoFullAttention final {
  public:
@@ -33,4 +33,4 @@ class MimoFullAttention final {
   std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace gaudirt::runtime
+}  // namespace gaudirt::mimo

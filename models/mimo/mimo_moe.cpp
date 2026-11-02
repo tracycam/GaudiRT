@@ -12,7 +12,8 @@
 #include <string>
 #include <vector>
 
-namespace gaudirt::runtime {
+namespace gaudirt::mimo {
+using namespace gaudirt::runtime;
 namespace {
 
 using Sizes = std::initializer_list<uint64_t>;
@@ -425,4 +426,4 @@ std::array<uint8_t, 512> MimoMoeLayer1::make_down_combine_directions() {
   return directions;
 }
 
-}  // namespace gaudirt::runtime
+}  // namespace gaudirt::mimo

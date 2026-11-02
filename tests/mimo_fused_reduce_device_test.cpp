@@ -215,13 +215,13 @@ int main() {
   gaudirt::runtime::WeightManifest dense_manifest(std::move(dense_weights));
   constexpr uint32_t cache_slots = 205184;
   std::fprintf(stderr, "compiling fused SWA attention\n");
-  gaudirt::runtime::MimoAttention swa(arena, attention_manifest, cache_slots, nullptr, true);
+  gaudirt::mimo::MimoAttention swa(arena, attention_manifest, cache_slots, nullptr, true);
   std::fprintf(stderr, "compiling fused full attention\n");
-  gaudirt::runtime::MimoFullAttention full(arena, attention_manifest, cache_slots,
+  gaudirt::mimo::MimoFullAttention full(arena, attention_manifest, cache_slots,
                                           false, 64, nullptr, true);
   std::fprintf(stderr, "compiling fused dense\n");
-  gaudirt::runtime::MimoDenseMlp dense(arena, dense_manifest, nullptr, true);
-  gaudirt::runtime::MimoMoeLayer1::Weights moe{};
+  gaudirt::mimo::MimoDenseMlp dense(arena, dense_manifest, nullptr, true);
+  gaudirt::mimo::MimoMoeLayer1::Weights moe{};
   moe.post_attention_gamma_bf16 = arena.allocate(256);
   moe.router_weight_bf16 = arena.allocate(256);
   moe.router_correction_bias_fp32 = arena.allocate(256);
@@ -232,9 +232,9 @@ int main() {
   moe.mxfp4_lut_bf16 = arena.allocate(256);
   moe.down_combine_directions_u8 = arena.allocate(256);
   std::fprintf(stderr, "compiling fused SWA MoE\n");
-  gaudirt::runtime::MimoMoeLayer1 swa_moe(0, moe, "swa", nullptr, true, syn_type_bf16);
+  gaudirt::mimo::MimoMoeLayer1 swa_moe(0, moe, "swa", nullptr, true, syn_type_bf16);
   std::fprintf(stderr, "compiling fused full MoE\n");
-  gaudirt::runtime::MimoMoeLayer1 full_moe(0, moe, "full_attention", nullptr, true, syn_type_float);
+  gaudirt::mimo::MimoMoeLayer1 full_moe(0, moe, "full_attention", nullptr, true, syn_type_float);
   std::fprintf(stderr, "compiling fused model head\n");
   gaudirt::mimo::ModelHead head(arena, arena.allocate(256), arena.allocate(256), nullptr, true);
   std::printf("All fused model consumer graphs compiled.\n");

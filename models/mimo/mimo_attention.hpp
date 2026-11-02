@@ -9,10 +9,16 @@
 #include <memory>
 
 namespace gaudirt::runtime {
-
 class HbmArena;
 class WeightManifest;
 class RecipeCache;
+}
+
+namespace gaudirt::mimo {
+using runtime::HbmArena;
+using runtime::WeightManifest;
+using runtime::RecipeCache;
+using runtime::PreparedLaunch;
 
 // BF16 shapes are fastest-first: hidden_states/residual/residual_out and
 // output_local [6144,M]. rope_cos/rope_sin are [64,1,M], with each 32-value
@@ -81,4 +87,4 @@ class MimoAttention {
   std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace gaudirt::runtime
+}  // namespace gaudirt::mimo

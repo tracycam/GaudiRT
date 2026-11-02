@@ -39,6 +39,7 @@ int main(int argc, char** argv) {
   if (argc != 5 && argc != 6) { std::cerr << "usage: TEST WEIGHTS RANK_FIXTURE MODULE HCCL_ID_FILE [--empty]\n"; return 2; }
   try {
     using namespace gaudirt::runtime;
+    using namespace gaudirt::mimo;
     const std::filesystem::path fixture(argv[2]), layer = fixture / "layer2";
     auto initial_key = read(layer / "key_cache.bin"), initial_value = read(layer / "value_cache.bin");
     const bool empty = argc == 6;
