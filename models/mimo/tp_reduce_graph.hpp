@@ -15,7 +15,7 @@ inline synTensor append_tp8_reduce(synGraphHandle graph, synTensor gathered,
                                    synDataType dtype,
                                    synSectionHandle& output_section,
                                    uint32_t rows = 1) {
-  if (!graph || !gathered || (rows != 1 && rows != 32 && rows != 512 && rows != 1024 && rows != 2048) ||
+  if (!graph || !gathered || (rows != 1 && rows != 4 && rows != 8 && rows != 32 && rows != 512 && rows != 1024 && rows != 2048) ||
       (dtype != syn_type_bf16 && dtype != syn_type_float) ||
       (rows >= 512 && dtype != syn_type_float))
     throw std::invalid_argument("MiMo TP reduction: invalid graph, tensor or dtype");

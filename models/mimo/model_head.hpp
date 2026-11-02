@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cstdint>
+#include <string>
 
 namespace gaudirt::runtime {
 class HbmArena;
@@ -22,7 +23,8 @@ class ModelHead final {
 
   ModelHead(runtime::HbmArena& arena, uint64_t final_norm_gamma,
             uint64_t lm_head_weight, runtime::RecipeCache* cache = nullptr,
-            bool gathered_input = false, uint32_t vocab_size = kVocabSize);
+            bool gathered_input = false, uint32_t vocab_size = kVocabSize,
+            uint32_t rows = 1);
   ~ModelHead();
 
   ModelHead(const ModelHead&) = delete;
@@ -52,6 +54,7 @@ class ModelHead final {
   bool gathered_input_ = false;
   synRecipeHandle recipe_ = nullptr;
   uint64_t workspace_bytes_ = 0;
+  std::array<std::string, kSlotCount> tensor_names_{};
   std::array<synLaunchTensorInfo, kSlotCount> launch_tensors_{};
 };
 
