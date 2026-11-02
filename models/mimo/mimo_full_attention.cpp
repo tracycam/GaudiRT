@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "mimo_full_attention.hpp"
-#include "block_fp8_mme.hpp"
 #include "tp_reduce_graph.hpp"
 
 #include "gaudirt/runtime/hbm_arena.hpp"
@@ -274,37 +273,17 @@ struct MimoFullAttention::Impl {
     node(prepare_graph, {normalized}, {activation_q, activation_scale}, nullptr,
          0, "gk_block128_quant_v1", "qkv_block128_activation_quant");
 
+    synTensor qkv_accumulator = intermediate(prepare_graph,
+                                             "qkv_accumulator_fp32",
+                                             syn_type_float, {3392, rows, 48});
+    synGEMMParams qkv_gemm_params{false, true};
     synTensor qkv = intermediate(prepare_graph, "qkv", syn_type_bf16, {3392, rows});
-    if (rows >= 512) {
-      synTensor x_hi = intermediate(prepare_graph, "qkv_mme_x_hi", syn_type_bf16, {6144, rows});
-      synTensor x_lo = intermediate(prepare_graph, "qkv_mme_x_lo", syn_type_bf16, {6144, rows});
-      synTensor w_hi = intermediate(prepare_graph, "qkv_mme_w_hi", syn_type_bf16, {6144, 3392});
-      synTensor w_lo = intermediate(prepare_graph, "qkv_mme_w_lo", syn_type_bf16, {6144, 3392});
-      node(prepare_graph, {activation_q, activation_scale}, {x_hi, x_lo}, nullptr, 0,
-           "gk_qkv_activation_split_v1", "qkv_mme_activation_split");
-      node(prepare_graph, {qkv_packed, qkv_scale}, {w_hi, w_lo}, nullptr, 0,
-           "gk_dense_block128_decode_split_v1", "qkv_mme_weight_split");
-      auto make = [&](const char* n, synDataType t, std::initializer_list<uint64_t> s) {
-        return intermediate(prepare_graph, n, t, s);
-      };
-      auto add = [&](std::initializer_list<synTensor> i, std::initializer_list<synTensor> o,
-                     const void* p, unsigned z, const char* g, const char* n) {
-        node(prepare_graph, i, o, p, z, g, n);
-      };
-      gaudirt::mimo::append_block_fp8_mme(make, add, x_hi, x_lo, w_hi, w_lo,
-                                          qkv_zero_bias, qkv, 3392, rows, true, "qkv_mme");
-    } else {
-      synTensor qkv_accumulator = intermediate(prepare_graph,
-                                               "qkv_accumulator_fp32",
-                                               syn_type_float, {3392, rows, 48});
-      synGEMMParams qkv_gemm_params{false, true};
-      node(prepare_graph, {activation_q, qkv_packed}, {qkv_accumulator},
-           &qkv_gemm_params, sizeof(qkv_gemm_params), "batch_gemm",
-           "qkv_block128_fp8_batch_gemm");
-      node(prepare_graph,
-           {qkv_accumulator, activation_scale, qkv_scale, qkv_zero_bias}, {qkv},
-           nullptr, 0, "gk_block128_neumaier_bf16_compensated_v1", "qkv_block128_scale_finish");
-    }
+    node(prepare_graph, {activation_q, qkv_packed}, {qkv_accumulator},
+         &qkv_gemm_params, sizeof(qkv_gemm_params), "batch_gemm",
+         "qkv_block128_fp8_batch_gemm");
+    node(prepare_graph,
+         {qkv_accumulator, activation_scale, qkv_scale, qkv_zero_bias}, {qkv},
+         nullptr, 0, "gk_block128_neumaier_bf16_compensated_v1", "qkv_block128_scale_finish");
 
     synTensor rope_cos = external(prepare_graph, prepare_externals, "rope_cos",
                                   Binding::kRopeCos, syn_type_bf16, {64, 1, rows});
@@ -427,7 +406,7 @@ struct MimoFullAttention::Impl {
         : (rows == 1 ? "mimo_full_attention_b1_m1_tp8_residual" : "mimo_full_prefill_b1_m" + std::to_string(rows) + "_tp8_residual");
     prepare_recipe = compile_cached(
         prepare_graph, recipe_name,
-        std::string(rows >= 512 ? "full_mme_qkv_mme_v1_" : "full_mme_neumaier_v4_") + (pure_rmsnorm ? "pure" : "residual") +
+        std::string("full_mme_neumaier_v4_") + (pure_rmsnorm ? "pure" : "residual") +
             "_c" + std::to_string(cache_slots) + "_p" + std::to_string(page_count) +
             (gathered_input ? "_gathered_tp1" : "_direct") + (rows == 1 ? "" : "_m" + std::to_string(rows)),
         cache);
