@@ -43,6 +43,13 @@ int main() {
     // Large prefill graphs consume the already reduced FP32 tensor.
     external(0,"input",syn_type_float,rows); external(1,"output",syn_type_bf16,rows);
     synSectionHandle intermediate_section = nullptr;
+    bool rejected_bf16 = false;
+    try {
+      gaudirt::mimo::append_tp8_reduce(graph,tensor[0],syn_type_bf16,intermediate_section,rows);
+    } catch (const std::invalid_argument&) {
+      rejected_bf16 = true;
+    }
+    if (!rejected_bf16) throw std::runtime_error("large reduction accepted non-FP32 input");
     auto reduced=gaudirt::mimo::append_tp8_reduce(graph,tensor[0],syn_type_float,intermediate_section,rows);
     check(synNodeCreate(graph,&reduced,&tensor[1],1,1,nullptr,0,"reshape","output_copy",nullptr,nullptr));
     check(synGraphCompile(&recipe,graph,"tp8_m512_test",nullptr));
