@@ -2,6 +2,7 @@
 #pragma once
 
 #include <synapse_api.h>
+#include <perf_lib_layer_params.h>
 #include <synapse_common_types.hpp>
 
 #include <cstdint>
@@ -34,8 +35,11 @@ void append_block_fp8_mme(Intermediate tensor, Node node, synTensor x_hi,
   node({combined, weight_extra}, {combined_all}, nullptr, 0, "add_fwd_f32", name("_combine_weight").c_str());
   synTensor biased = round_bf16 ? make("_biased") : output;
   node({combined_all, bias}, {biased}, nullptr, 0, "add_fwd_f32", name("_bias").c_str());
-  if (round_bf16)
-    node({biased}, {output}, nullptr, 0, "cast_f32_to_bf16", name("_round").c_str());
+  if (round_bf16) {
+    ns_CastKernel::ParamsV3 cast{};
+    cast.round_mode = CAST_ROUND_HALF_NE;
+    node({biased}, {output}, &cast, sizeof(cast), "cast_f32_to_bf16", name("_round").c_str());
+  }
 }
 
 }  // namespace gaudirt::mimo
