@@ -239,7 +239,7 @@ struct MimoAttention::Impl {
 
     if (gathered_input) {
       synTensor gathered = external("hidden_gathered", Binding::kHiddenStates,
-                                    syn_type_float, {6144, (rows >= 512 ? 1 : 8) * rows});
+                                    syn_type_float, {6144, 8 * rows});
       hidden_states = gaudirt::mimo::append_tp8_reduce(graph, gathered, syn_type_float,
                                                        reduction_section, rows);
     } else {
@@ -359,23 +359,14 @@ struct MimoAttention::Impl {
     synTensor oproj = external("oproj_weight", Binding::kOprojWeight,
                                syn_type_bf16, {2048, 6144});
     output_local = external("output_local", Binding::kOutputLocal,
-                            rows >= 512 ? syn_type_float : syn_type_bf16, {6144, rows});
-    synTensor projected = rows >= 512
-        ? intermediate("oproj_local_fp32", syn_type_float, {6144, rows}) : output_local;
+                            syn_type_bf16, {6144, rows});
     synGEMMParams oproj_gemm_params{false, true};
-    node({context_flat, oproj}, {projected}, &oproj_gemm_params,
+    node({context_flat, oproj}, {output_local}, &oproj_gemm_params,
          sizeof(oproj_gemm_params), "gemm", "oproj_bf16_mme_local");
-    if (rows >= 512) {
-      synTensor rounded = intermediate("oproj_rounded_bf16", syn_type_bf16, {6144, rows});
-      synTensor unused = intermediate("oproj_round_residual_bf16", syn_type_bf16, {6144, rows});
-      node({projected}, {rounded, unused}, nullptr, 0,
-           "gk_dense_activation_split_v1", "oproj_round_bf16_boundary");
-      node({rounded}, {output_local}, nullptr, 0, "cast_bf16_to_f32", "oproj_widen_for_reduce");
-    }
 
     recipe = compile_cached(graph, rows == 1 ? "mimo_layer1_attention_b1_m1_tp8"
                                              : "mimo_swa_prefill_b1_m" + std::to_string(rows) + "_tp8",
-                            std::string(rows >= 512 ? "swa_mme_prefill_allreduce_bf16_v1_c"
+                            std::string(rows >= 512 ? "swa_mme_prefill_v1_c"
                                                     : "swa_grid24_fp32_v7_c") +
                                 std::to_string(cache_slots) +
                                 (gathered_input ? "_gathered_tp1" : "_direct") +

@@ -44,10 +44,9 @@ void node(synGraphHandle graph, const std::vector<synTensor>& inputs,
 }  // namespace
 
 TpReduce::TpReduce(HbmArena& arena, uint32_t elements,
-                   synDataType gathered_type, RecipeCache* cache, uint32_t ranks)
-    : arena_(arena), elements_(elements), ranks_(ranks) {
+                   synDataType gathered_type, RecipeCache* cache)
+    : arena_(arena), elements_(elements) {
   if (elements == 0 ||
-      (ranks_ != 1 && ranks_ != 8) || (ranks_ == 1 && gathered_type != syn_type_float) ||
       (gathered_type != syn_type_bf16 && gathered_type != syn_type_float)) {
     throw std::invalid_argument("TpReduce: invalid elements or gathered dtype");
   }
@@ -61,8 +60,8 @@ TpReduce::TpReduce(HbmArena& arena, uint32_t elements,
     synTensor output = tensor("output", syn_type_bf16, elements, 1,
                               output_section_);
 
-    std::vector<synTensor> ranks(ranks_);
-    for (unsigned rank = 0; rank < ranks_; ++rank) {
+    std::vector<synTensor> ranks(8);
+    for (unsigned rank = 0; rank < 8; ++rank) {
       check(synSectionCreate(&rank_sections_[rank], 0, graph_),
             "create rank section");
       check(synSectionSetPersistent(rank_sections_[rank], true),
@@ -73,8 +72,8 @@ TpReduce::TpReduce(HbmArena& arena, uint32_t elements,
 
     ns_CastKernel::ParamsV3 cast_params = {};
     cast_params.round_mode = CAST_ROUND_HALF_NE;
-    std::vector<synTensor> wide(ranks_);
-    for (unsigned rank = 0; rank < ranks_; ++rank) {
+    std::vector<synTensor> wide(8);
+    for (unsigned rank = 0; rank < 8; ++rank) {
       if (gathered_type == syn_type_bf16) {
         wide[rank] = tensor(("wide" + std::to_string(rank)).c_str(),
                             syn_type_float, elements, 1);
@@ -85,7 +84,7 @@ TpReduce::TpReduce(HbmArena& arena, uint32_t elements,
       }
     }
     synTensor sum = wide[0];
-    for (unsigned rank = 1; rank < ranks_; ++rank) {
+    for (unsigned rank = 1; rank < 8; ++rank) {
       synTensor next = tensor(("sum" + std::to_string(rank)).c_str(),
                               syn_type_float, elements, 1);
       node(graph_, {sum, wide[rank]}, {next}, nullptr, 0, "add_fwd_f32",
@@ -94,25 +93,25 @@ TpReduce::TpReduce(HbmArena& arena, uint32_t elements,
     }
     node(graph_, {sum}, {output}, &cast_params, sizeof(cast_params),
          "cast_f32_to_bf16", "round_final_bf16");
-    const std::string key = (ranks_ == 1 ? "tp_single_cast_v1_" : "tp8_gather_sum_v1_") + std::to_string(elements) + "_" +
+    const std::string key = "tp8_gather_sum_v1_" + std::to_string(elements) + "_" +
                             std::to_string(static_cast<int>(gathered_type));
     recipe_ = compile_cached(graph_, key, key, cache);
     check(synWorkspaceGetSize(&workspace_bytes_, recipe_), "workspace size");
     arena_.ensure_workspace(workspace_bytes_);
     const char* names[] = {"rank0", "rank1", "rank2", "rank3",
                            "rank4", "rank5", "rank6", "rank7"};
-    for (unsigned rank = 0; rank < ranks_; ++rank) {
+    for (unsigned rank = 0; rank < 8; ++rank) {
       prepared_template_[rank].tensorName = names[rank];
       prepared_template_[rank].tensorType = DATA_TENSOR;
       prepared_template_[rank].tensorSize[0] = elements_;
       prepared_template_[rank].tensorSize[1] = 1;
     }
-    prepared_template_[ranks_].tensorName = "output";
-    prepared_template_[ranks_].tensorType = DATA_TENSOR;
-    prepared_template_[ranks_].tensorSize[0] = elements_;
-    prepared_template_[ranks_].tensorSize[1] = 1;
+    prepared_template_[8].tensorName = "output";
+    prepared_template_[8].tensorType = DATA_TENSOR;
+    prepared_template_[8].tensorSize[0] = elements_;
+    prepared_template_[8].tensorSize[1] = 1;
     initialize_launch_tensor_ids(recipe_, prepared_template_.data(),
-                                 ranks_ + 1);
+                                 prepared_template_.size());
   } catch (...) {
     if (recipe_) synRecipeDestroy(recipe_);
     if (graph_) synGraphDestroy(graph_);
@@ -143,20 +142,20 @@ PreparedLaunch TpReduce::prepare(uint64_t gathered, uint64_t output) {
 
 PreparedLaunch TpReduce::prepare_strided(uint64_t gathered, uint64_t output,
                                          uint64_t rank_stride_bytes) {
-  if (rank_stride_bytes < rank_bytes_ || (ranks_ > 1 && rank_stride_bytes > (UINT64_MAX - rank_bytes_) / (ranks_ - 1)))
+  if (rank_stride_bytes < rank_bytes_ || rank_stride_bytes > (UINT64_MAX - rank_bytes_) / 7)
     throw std::invalid_argument("TpReduce: invalid rank stride");
-  const uint64_t gathered_bytes = (ranks_ - 1) * rank_stride_bytes + rank_bytes_;
+  const uint64_t gathered_bytes = 7 * rank_stride_bytes + rank_bytes_;
   const uint64_t output_bytes = static_cast<uint64_t>(elements_) * 2;
   if (!gathered || !output || gathered + gathered_bytes < gathered ||
       output + output_bytes < output ||
       (gathered < output + output_bytes && output < gathered + gathered_bytes))
     throw std::invalid_argument("TpReduce: invalid or overlapping bindings");
   auto tensors = prepared_template_;
-  for (unsigned rank = 0; rank < ranks_; ++rank)
+  for (unsigned rank = 0; rank < 8; ++rank)
     tensors[rank].pTensorAddress = gathered + rank * rank_stride_bytes;
-  tensors[ranks_].pTensorAddress = output;
+  tensors[8].pTensorAddress = output;
   PreparedLaunch result{recipe_, arena_.ensure_workspace(workspace_bytes_),
-                        {tensors.begin(), tensors.begin() + ranks_ + 1}, 0};
+                        {tensors.begin(), tensors.end()}, 0};
   result.validate();
   return result;
 }
@@ -166,7 +165,25 @@ void TpReduce::execute(uint64_t gathered, uint64_t output,
   if (!gathered || !output || !stream || !recipe_) {
     throw std::runtime_error("TpReduce: invalid launch argument");
   }
-  prepare(gathered, output).execute(stream);
+  std::vector<synLaunchTensorInfo> tensors(9);
+  const char* names[] = {"rank0", "rank1", "rank2", "rank3",
+                         "rank4", "rank5", "rank6", "rank7"};
+  for (unsigned rank = 0; rank < 8; ++rank) {
+    tensors[rank].tensorName = names[rank];
+    tensors[rank].tensorType = DATA_TENSOR;
+    tensors[rank].pTensorAddress = gathered + rank * rank_bytes_;
+    tensors[rank].tensorSize[0] = elements_;
+    tensors[rank].tensorSize[1] = 1;
+  }
+  tensors[8].tensorName = "output";
+  tensors[8].tensorType = DATA_TENSOR;
+  tensors[8].pTensorAddress = output;
+  tensors[8].tensorSize[0] = elements_;
+  tensors[8].tensorSize[1] = 1;
+  const uint64_t workspace = arena_.ensure_workspace(workspace_bytes_);
+  check(synLaunch(stream, tensors.data(), tensors.size(), workspace, recipe_,
+                  SYN_FLAGS_TENSOR_NAME),
+        "launch");
 }
 
 }  // namespace gaudirt::runtime
