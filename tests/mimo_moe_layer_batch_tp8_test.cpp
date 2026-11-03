@@ -34,9 +34,10 @@ int main(int argc, char** argv) {
 #else
   using Layer = LayerB;
 #endif
-  if (argc != 4) throw std::invalid_argument("usage: test rank rows shared_id_file");
+  if (argc != 4 && argc != 5) throw std::invalid_argument("usage: test rank rows shared_id_file [active]");
   unsigned rank = std::strtoul(argv[1], nullptr, 10), rows = std::strtoul(argv[2], nullptr, 10);
-  if (rank >= 8 || (rows != 4 && rows != 8)) throw std::invalid_argument("invalid rank or rows");
+  const unsigned active=argc==5?std::strtoul(argv[4],nullptr,10):rows;
+  if (rank >= 8 || (rows != 4 && rows != 8) || !active || active > rows) throw std::invalid_argument("invalid rank, rows or active count");
   constexpr unsigned hidden = 6144, slots = 9 * 128, pages = 64;
   DeviceRuntime::Config cfg{}; cfg.module_id = rank; cfg.rank = rank; cfg.world_size = 8;
   DeviceRuntime device(cfg);
@@ -101,16 +102,16 @@ int main(int argc, char** argv) {
   for(unsigned r=0;r<rows;++r){std::fill_n(keys.begin()+r*128*192,192,bf16(0));std::fill_n(values.begin()+r*128*128,128,bf16(float(r+1)));}
   const auto original_keys=keys,original_values=values;
   std::array<BatchRequestStep,8> requests{};
-  for(unsigned r=0;r<rows;++r){requests[r].position=1;requests[r].pages[0]=r;requests[r].page_count=1;}
+  for(unsigned r=0;r<active;++r){requests[r].position=1;requests[r].pages[0]=r;requests[r].page_count=1;}
   std::vector<uint16_t> rope(2*64,0);
   for(unsigned i=0;i<32;++i)rope[64+i]=bf16(1);
-  validate_batch_step<8>(requests.data(),rows,2,rope.data(),rope.data(),8,8*128);
+  validate_batch_step<8>(requests.data(),active,2,rope.data(),rope.data(),8,8*128);
   BatchStepMetadata<8> metadata{};
-  fill_batch_step_metadata_prevalidated(metadata,requests.data(),rows,rope.data(),rope.data(),8*128);
+  fill_batch_step_metadata_prevalidated(metadata,requests.data(),active,rope.data(),rope.data(),8*128);
   // A foreign page exists in the table but must not enter the request's attention.
-  for(unsigned r=0;r<rows;++r){metadata.full_pages[r*pages+1]=(r+1)%rows;
+  for(unsigned r=0;r<active;++r){metadata.full_pages[r*pages+1]=(r+1)%active;
     metadata.full_usage[r*pages+1]=2;metadata.full_groups[r*pages+1]=999;
-    metadata.window_pages[r*2+1]=(r+1)%rows;metadata.window_groups[r*2+1]=999;}
+    metadata.window_pages[r*2+1]=(r+1)%active;metadata.window_groups[r*2+1]=999;}
   const auto& slot=metadata.slots;
   std::vector<float> gathered_hidden(8*rows*hidden);
   for(unsigned t=0;t<8;++t)for(unsigned r=0;r<rows;++r)for(unsigned i=0;i<hidden;++i)
@@ -153,15 +154,15 @@ int main(int argc, char** argv) {
   reference.attention.output_local_fp32=arena.allocate(hidden*4);
 #endif
   std::vector<float> expected(8*rows*hidden), actual(expected.size()), one(8*hidden);
-  for(unsigned r=0;r<rows;++r){
+  for(unsigned r=0;r<active;++r){
     std::array<int32_t,pages> p{},u{},g{};p.fill(-1);g.fill(-1);
-    p[0]=r;p[1]=(r+1)%rows;u[0]=2;g[0]=0;
+    p[0]=r;p[1]=(r+1)%active;u[0]=2;g[0]=0;
     reference.attention.hidden_states=single_hidden[r];reference.attention.residual=residual+r*hidden*2;reference.attention.rope_cos=c+r*64*2;reference.attention.rope_sin=s+r*64*2;
     reference.attention.slot_mapping=upload(&slot[r],4);reference.attention.full_block_list=upload(p.data(),sizeof(p));
     reference.attention.full_block_usage=upload(u.data(),sizeof(u));reference.attention.full_block_groups=upload(g.data(),sizeof(g));
 #ifdef TEST_SWA
     int32_t pos=1;reference.attention.position=upload(&pos,4);
-    std::array<int32_t,2> wp{int32_t(r),int32_t((r+1)%rows)},wg{0,-1};
+    std::array<int32_t,2> wp{int32_t(r),int32_t((r+1)%active)},wg{0,-1};
     reference.attention.window_pages=upload(wp.data(),sizeof(wp));reference.attention.window_groups=upload(wg.data(),sizeof(wg));
 #endif
     single.prepare(reference).execute_fused(device.compute_stream());device.synchronize_compute();
@@ -171,19 +172,19 @@ int main(int argc, char** argv) {
   batch.prepare(batched).execute_fused(device.compute_stream());device.synchronize_compute();
   arena.copy_d2h_sync(device.d2h_stream(),batched.moe_gathered_fp32,actual.data(),actual.size()*4);
   double max_abs=0,max_rel=0;
-  for(unsigned r=0;r<8*rows;++r){double diff=0,norm=0;for(unsigned i=0;i<hidden;++i){
+  for(unsigned r=0;r<8*rows;++r){if(r%rows>=active)continue;double diff=0,norm=0;for(unsigned i=0;i<hidden;++i){
     const double x=actual[r*hidden+i],y=expected[r*hidden+i];if(!std::isfinite(x)||!std::isfinite(y))throw std::runtime_error("non-finite output");
     diff+=(x-y)*(x-y);norm+=y*y;max_abs=std::max(max_abs,std::abs(x-y));}
     max_rel=std::max(max_rel,std::sqrt(diff/std::max(norm,1e-30)));}
   if(max_rel>0.003)throw std::runtime_error("layer output mismatch");
   auto verify_kv=[&](uint64_t x,uint64_t y,const std::vector<uint16_t>& orig,unsigned width){
     std::vector<uint16_t> a(orig.size()),b(orig.size());arena.copy_d2h_sync(device.d2h_stream(),x,a.data(),a.size()*2);arena.copy_d2h_sync(device.d2h_stream(),y,b.data(),b.size()*2);
-    if(a!=b)throw std::runtime_error("batch and single KV differ");
+    if(!std::equal(a.begin(),a.begin()+8*128*width,b.begin()))throw std::runtime_error("batch and single real KV differ");
     for(unsigned pos=0;pos<slots;++pos){bool touched=false;for(unsigned r=0;r<rows;++r)if(pos==unsigned(slot[r]))touched=true;
       if(!touched&&!std::equal(a.begin()+pos*width,a.begin()+(pos+1)*width,orig.begin()+pos*width))throw std::runtime_error("untouched KV changed");}
   };
   verify_kv(bk,rk,original_keys,192);verify_kv(bv,rv,original_values,128);
-  std::printf("rank=%u B%u MoE layer max_abs=%.9g max_row_relative_l2=%.9g KV=bitwise\n",rank,rows,max_abs,max_rel);
+  std::printf("rank=%u B%u active=%u MoE layer max_abs=%.9g max_row_relative_l2=%.9g real KV=bitwise\n",rank,rows,active,max_abs,max_rel);
   float marker=1;auto barrier=upload(&marker,sizeof(marker));
   if(hcclAllReduce((void*)barrier,(void*)barrier,1,hcclFloat32,hcclSum,device.comm(),device.compute_stream())!=hcclSuccess)throw std::runtime_error("exit barrier failed");
   device.synchronize_compute();
