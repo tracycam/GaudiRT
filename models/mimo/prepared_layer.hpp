@@ -26,7 +26,7 @@ struct PreparedLayer {
   uint32_t rows = 1;
 
   void validate() const {
-    if ((rows != 1 && rows != 32 && rows != 512 && rows != 1024 && rows != 2048) || !comm || attention.empty() || feed_forward.empty() ||
+    if ((rows != 1 && rows != 4 && rows != 8 && rows != 32 && rows != 512 && rows != 1024 && rows != 2048) || !comm || attention.empty() || feed_forward.empty() ||
         !attention_local || !attention_gathered ||
         !feed_forward_local || !feed_forward_gathered ||
         (rows < 512 && (attention_local == attention_gathered ||
