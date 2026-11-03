@@ -46,6 +46,8 @@ struct MimoAttentionIo {
 
   uint64_t output_local = 0;
   uint64_t output_local_fp32 = 0;
+  // Required by batched Full Attention; one group id per request row.
+  uint64_t full_row_groups = 0;
 };
 
 // One decode row of MiMo layer1 on one TP8 rank. Every address is mandatory.
