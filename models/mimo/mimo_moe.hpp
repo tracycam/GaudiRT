@@ -8,6 +8,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 namespace gaudirt::runtime { class RecipeCache; }
 
@@ -127,6 +128,7 @@ class MimoMoeLayer1 final {
   synDataType gathered_type_ = syn_type_float;
   synRecipeHandle recipe_ = nullptr;
   uint64_t workspace_bytes_ = 0;
+  std::array<std::string, kSlotCount> tensor_names_{};
   std::array<synLaunchTensorInfo, kSlotCount> launch_tensors_{};
 };
 
