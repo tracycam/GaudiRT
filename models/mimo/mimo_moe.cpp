@@ -57,7 +57,7 @@ MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
                              bool gathered_attention, synDataType gathered_type, uint32_t rows)
     : tp_rank_(tp_rank), rows_(rows), gathered_attention_(gathered_attention),
       gathered_type_(gathered_type) {
-  if (rows_ != 1 && rows_ != 32 && rows_ != 256 && rows_ != 512 && rows_ != 1024 && rows_ != 2048)
+  if (rows_ != 1 && rows_ != 4 && rows_ != 8 && rows_ != 32 && rows_ != 256 && rows_ != 512 && rows_ != 1024 && rows_ != 2048)
     throw std::invalid_argument("MimoMoeLayer1: unsupported rows");
   if (tp_rank_ >= kTpSize) {
     throw std::invalid_argument("MimoMoeLayer1: TP rank must be in [0,8)");
@@ -93,7 +93,9 @@ MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
       sections.push_back(section);
       check(synSectionSetPersistent(section, true), name);
       synTensorDescriptor descriptor{};
-      descriptor.m_name = name;
+      tensor_names_[slot] = (rows_ == 4 || rows_ == 8)
+          ? std::string(name) + "_b" + std::to_string(rows_) : name;
+      descriptor.m_name = tensor_names_[slot].c_str();
       descriptor.m_dataType = dtype;
       descriptor.m_dims = static_cast<unsigned>(sizes.size());
       unsigned dim = 0;
@@ -105,7 +107,7 @@ MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
       check(synTensorCreate(&tensor, &descriptor, section, 0), name);
 
       synLaunchTensorInfo info{};
-      info.tensorName = name;
+      info.tensorName = tensor_names_[slot].c_str();
       info.pTensorAddress = address;
       info.tensorType = DATA_TENSOR;
       dim = 0;
@@ -205,10 +207,12 @@ MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
                     std::initializer_list<synTensor> inputs,
                     std::initializer_list<synTensor> outputs,
                     const void* params, unsigned params_size) {
+      const std::string scoped_name = (rows_ == 4 || rows_ == 8)
+          ? std::string(name) + "_b" + std::to_string(rows_) : name;
       check(synNodeCreate(graph, inputs.begin(), outputs.begin(),
                           static_cast<uint32_t>(inputs.size()),
                           static_cast<uint32_t>(outputs.size()), params,
-                          params_size, guid, name, nullptr, nullptr),
+                          params_size, guid, scoped_name.c_str(), nullptr, nullptr),
             name);
     };
 
@@ -256,7 +260,7 @@ MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
          {gate_up_partial}, nullptr, 0);
 
     const int32_t gate_splits = 3;
-    node(rows_ == 32 ? "gk_mimo_moe_gate_prefill_fp32_v1" : "gk_mimo_moe_gate_fp32_v1", "mimo1_gate_silu", {gate_up_partial, route_ids},
+    node(rows_ != 1 ? "gk_mimo_moe_gate_prefill_fp32_v1" : "gk_mimo_moe_gate_fp32_v1", "mimo1_gate_silu", {gate_up_partial, route_ids},
          {gate_activation}, &gate_splits, sizeof(gate_splits));
 
     node("downact_direct_down_broadcast", "mimo1_down_mxfp4",
@@ -264,7 +268,7 @@ MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
          {down_partial}, nullptr, 0);
 
     const int32_t combine_topk = kTopK;
-    node(rows_ == 32 ? "gk_mimo_moe_combine_prefill_fp32_v1" : "pf_combine_f32", "mimo1_fp32_combine",
+    node(rows_ != 1 ? "gk_mimo_moe_combine_prefill_fp32_v1" : "pf_combine_f32", "mimo1_fp32_combine",
          {down_partial, route_weights, directions}, {moe_out}, &combine_topk,
          sizeof(combine_topk));
     }
