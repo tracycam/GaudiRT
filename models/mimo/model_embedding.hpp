@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cstdint>
+#include <string>
 
 namespace gaudirt::runtime {
 class HbmArena;
@@ -35,6 +36,7 @@ class ModelEmbedding final {
   runtime::HbmArena& arena_;
   synRecipeHandle recipe_ = nullptr;
   uint64_t workspace_bytes_ = 0;
+  std::array<std::string, kSlotCount> tensor_names_{};
   std::array<synLaunchTensorInfo, kSlotCount> launch_tensors_{};
 };
 

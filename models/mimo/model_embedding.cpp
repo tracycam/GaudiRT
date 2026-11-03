@@ -25,7 +25,7 @@ void check(synStatus status, const char* operation) {
 ModelEmbedding::ModelEmbedding(runtime::HbmArena& arena, uint64_t table,
                                runtime::RecipeCache* cache, uint32_t rows)
     : arena_(arena) {
-  if (rows != 1 && rows != 32 && rows != 256 && rows != 512 && rows != 1024 && rows != 2048)
+  if (rows != 1 && rows != 4 && rows != 8 && rows != 32 && rows != 256 && rows != 512 && rows != 1024 && rows != 2048)
     throw std::invalid_argument("MiMo embedding: invalid rows");
   if (!table) throw std::invalid_argument("MiMo embedding: null table");
   synGraphHandle graph = nullptr;
@@ -40,7 +40,9 @@ ModelEmbedding::ModelEmbedding(runtime::HbmArena& arena, uint64_t table,
       sections.push_back(section);
       check(synSectionSetPersistent(section, true), name);
       synTensorDescriptor descriptor{};
-      descriptor.m_name = name;
+      tensor_names_[slot] = (rows == 4 || rows == 8)
+          ? std::string(name) + "_b" + std::to_string(rows) : name;
+      descriptor.m_name = tensor_names_[slot].c_str();
       descriptor.m_dataType = dtype;
       descriptor.m_dims = static_cast<unsigned>(sizes.size());
       unsigned dim = 0;
@@ -51,7 +53,7 @@ ModelEmbedding::ModelEmbedding(runtime::HbmArena& arena, uint64_t table,
       synTensor tensor = nullptr;
       check(synTensorCreate(&tensor, &descriptor, section, 0), name);
       synLaunchTensorInfo info{};
-      info.tensorName = name;
+      info.tensorName = tensor_names_[slot].c_str();
       info.pTensorAddress = address;
       info.tensorType = DATA_TENSOR;
       dim = 0;
@@ -66,8 +68,10 @@ ModelEmbedding::ModelEmbedding(runtime::HbmArena& arena, uint64_t table,
     synTensor status_tensor = external(kStatus, "embedding_status", syn_type_int32, {rows}, 0);
     synTensor inputs[] = {table_tensor, token_tensor};
     synTensor outputs[] = {value_tensor, status_tensor};
+    const std::string node_name = (rows == 4 || rows == 8)
+        ? "mimo_embedding_b" + std::to_string(rows) : "mimo_embedding";
     check(synNodeCreate(graph, inputs, outputs, 2, 2, nullptr, 0,
-                        "gk_mimo_embedding_bf16_v1", "mimo_embedding", nullptr, nullptr),
+                        "gk_mimo_embedding_bf16_v1", node_name.c_str(), nullptr, nullptr),
           "synNodeCreate");
     recipe_ = runtime::compile_cached(graph, "mimo_embedding_b1_m" + std::to_string(rows),
                                       rows == 1 ? "model_embedding_v1" : "model_embedding_m" + std::to_string(rows) + "_v1", cache);
