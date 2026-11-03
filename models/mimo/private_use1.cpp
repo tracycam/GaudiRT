@@ -1025,6 +1025,39 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     return result;
   }
 
+  void stage_batch_requests(const std::vector<std::string>& request_ids,
+                            const std::vector<int32_t>& tokens,
+                            const std::vector<uint32_t>& positions,
+                            const std::vector<std::vector<int32_t>>& pages) {
+    if (batch_staged_ || batch_result_ready_ || model_pending_ || !model_finalized_ ||
+        !batch_decode_enabled_ || request_ids.empty() || request_ids.size() > 8 ||
+        tokens.size() != request_ids.size() || positions.size() != request_ids.size() ||
+        pages.size() != request_ids.size())
+      throw std::invalid_argument("PrivateUse1: cannot stage batch requests");
+    batch_request_ids_ = request_ids;
+    batch_tokens_ = tokens;
+    batch_positions_ = positions;
+    batch_pages_ = pages;
+    batch_staged_ = true;
+  }
+
+  at::Tensor forward_batch_model(const at::Tensor& trigger) {
+    if (!batch_staged_ || batch_result_ready_ || trigger.scalar_type() != at::kInt ||
+        trigger.numel() != 1 || address_of(trigger) != trigger_device_)
+      throw std::invalid_argument("PrivateUse1: batch request was not staged");
+    batch_result_ = decode_requests(batch_request_ids_, batch_tokens_, batch_positions_, batch_pages_);
+    batch_staged_ = false;
+    batch_result_ready_ = true;
+    const auto& plan = batch_decode_[batch_result_.size() <= 4 ? 0 : 1];
+    return wrap(plan.output_device, {1}, at::kInt);
+  }
+
+  std::vector<int32_t> finish_batch_model_step() {
+    if (!batch_result_ready_) throw std::invalid_argument("PrivateUse1: no completed batch step");
+    batch_result_ready_ = false;
+    return std::move(batch_result_);
+  }
+
   at::Tensor model_logits() {
     if (!model_finalized_ || model_pending_ || (prefill_enabled_ && !prefill_complete_))
       throw std::invalid_argument("PrivateUse1: model logits are not ready");
@@ -1318,9 +1351,16 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   bool fused_model_ = false;
   bool prefill_enabled_ = false;
   bool batch_decode_enabled_ = false;
+  bool batch_staged_ = false;
+  bool batch_result_ready_ = false;
   bool prefill_complete_ = false;
   uint32_t prefill_rows_ = 0;
   uint32_t prompt_length_ = 0;
+  std::vector<std::string> batch_request_ids_;
+  std::vector<int32_t> batch_tokens_;
+  std::vector<uint32_t> batch_positions_;
+  std::vector<std::vector<int32_t>> batch_pages_;
+  std::vector<int32_t> batch_result_;
   void* metadata_host_ = nullptr;
   void* token_host_ = nullptr;
   synEventHandle metadata_ready_ = nullptr;
@@ -1429,6 +1469,12 @@ std::vector<int32_t> decode_requests(uint32_t rank, const std::vector<std::strin
                                      const std::vector<std::vector<int32_t>>& pages) {
   return get(rank)->decode_requests(ids, tokens, positions, pages);
 }
+void stage_batch_requests(uint32_t rank, const std::vector<std::string>& ids,
+                          const std::vector<int32_t>& tokens, const std::vector<uint32_t>& positions,
+                          const std::vector<std::vector<int32_t>>& pages) {
+  get(rank)->stage_batch_requests(ids, tokens, positions, pages);
+}
+std::vector<int32_t> finish_batch_model_step(uint32_t rank) { return get(rank)->finish_batch_model_step(); }
 
 at::Tensor model_logits(uint32_t rank) { return get(rank)->model_logits(); }
 
@@ -1496,22 +1542,35 @@ at::Tensor model_step_meta(const at::Tensor& trigger) {
   return at::empty({1}, at::TensorOptions().device(at::kMeta).dtype(at::kInt));
 }
 
+at::Tensor batch_model_step(const at::Tensor& trigger) {
+  return get_sole_model()->forward_batch_model(trigger);
+}
+
+at::Tensor batch_model_step_meta(const at::Tensor& trigger) {
+  if (trigger.scalar_type() != at::kInt || trigger.numel() != 1)
+    throw std::invalid_argument("PrivateUse1: invalid meta batch trigger");
+  return at::empty({1}, at::TensorOptions().device(at::kMeta).dtype(at::kInt));
+}
+
 }  // namespace
 }  // namespace gaudirt::mimo
 
 TORCH_LIBRARY(gaudirt, m) {
   m.def("layer(int layer_id, Tensor[] inputs) -> Tensor[]");
   m.def("model_step(Tensor trigger) -> Tensor");
+  m.def("batch_model_step(Tensor trigger) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(gaudirt, PrivateUse1, m) {
   m.impl("layer", &gaudirt::mimo::forward);
   m.impl("model_step", &gaudirt::mimo::model_step);
+  m.impl("batch_model_step", &gaudirt::mimo::batch_model_step);
 }
 
 TORCH_LIBRARY_IMPL(gaudirt, Meta, m) {
   m.impl("layer", &gaudirt::mimo::forward_meta);
   m.impl("model_step", &gaudirt::mimo::model_step_meta);
+  m.impl("batch_model_step", &gaudirt::mimo::batch_model_step_meta);
 }
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
@@ -1542,6 +1601,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("finish_model_step", &gaudirt::mimo::finish_model_step);
   m.def("decode_batch", &gaudirt::mimo::decode_batch);
   m.def("decode_requests", &gaudirt::mimo::decode_requests);
+  m.def("stage_batch_requests", &gaudirt::mimo::stage_batch_requests);
+  m.def("finish_batch_model_step", &gaudirt::mimo::finish_batch_model_step);
   m.def("model_logits", &gaudirt::mimo::model_logits);
   m.def("model_kv", &gaudirt::mimo::model_kv);
   m.def("model_kv_slots", &gaudirt::mimo::model_kv_slots);

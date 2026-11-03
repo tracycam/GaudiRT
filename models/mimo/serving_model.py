@@ -18,6 +18,11 @@ class _ModelStep(torch.nn.Module):
         return torch.ops.gaudirt.model_step(trigger)
 
 
+class _BatchModelStep(torch.nn.Module):
+    def forward(self, trigger):
+        return torch.ops.gaudirt.batch_model_step(trigger)
+
+
 def _rope(theta):
     inverse = 1.0 / (float(theta) ** (torch.arange(0, 64, 2, dtype=torch.float64) / 64))
     angles = torch.arange(4224, dtype=torch.float64).unsqueeze(1) * inverse
@@ -31,6 +36,8 @@ class ServingModel:
         self.extension = extension
         self.rank = rank
         self.runner = None
+        self.batch_compiled = None
+        self.batch_trigger = None
         self.pages = None
         self.finished = False
         self.max_num_seqs = max_num_seqs
@@ -68,6 +75,14 @@ class ServingModel:
 
         compiled = torch.compile(_ModelStep(), fullgraph=True, backend=capture)
         self.runner = ModelRunner(extension, rank, compiled, trigger)
+        if max_num_seqs > 1:
+            def capture_batch(graph, inputs):
+                calls = [node for node in graph.graph.nodes if node.op == 'call_function']
+                if len(calls) != 1 or 'gaudirt.batch_model_step' not in str(calls[0].target):
+                    raise ValueError('compiled batch graph must contain one model step')
+                return graph.forward
+            self.batch_compiled = torch.compile(_BatchModelStep(), fullgraph=True, backend=capture_batch)
+            self.batch_trigger = trigger
 
     def update_pages(self, pages):
         if pages != self.pages:
@@ -116,9 +131,11 @@ class ServingModel:
             raise ValueError('multi-request decode requires scheduled requests')
         ids = [step.request_id for step in steps]
         tokens = [self.request_tokens[request_id] for request_id in ids]
-        result = self.extension.decode_requests(
+        self.extension.stage_batch_requests(
             self.rank, ids, tokens, [step.position for step in steps],
             [step.block_ids for step in steps])
+        self.batch_compiled(self.batch_trigger)
+        result = self.extension.finish_batch_model_step(self.rank)
         for request_id, token in zip(ids, result, strict=True):
             self.request_tokens[request_id] = token
         return result
@@ -128,5 +145,7 @@ class ServingModel:
         self.request_tokens.pop(request_id, None)
 
     def close(self):
+        self.batch_compiled = None
+        self.batch_trigger = None
         self.runner.close()
         self.runner = None

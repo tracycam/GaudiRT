@@ -28,8 +28,11 @@ class Extension:
         assert full_rope.shape == swa_rope.shape == (4096, 64)
         return 72
 
-    def decode_requests(self, rank, ids, tokens, positions, pages):
+    def stage_batch_requests(self, rank, ids, tokens, positions, pages):
         assert (rank, ids, tokens, positions, pages) == (2, ['a', 'b'], [72, 91], [2, 7], [[4], [5]])
+
+    def finish_batch_model_step(self, rank):
+        assert rank == 2
         return [81, 92]
 
     def release_request(self, rank, request_id):
@@ -41,6 +44,8 @@ def test_batch_request_tokens_follow_request_ids():
     model.rank = 2
     model.max_num_seqs = 4
     model.extension = Extension()
+    model.batch_trigger = object()
+    model.batch_compiled = lambda trigger: trigger is model.batch_trigger
     model.request_tokens = {'b': 91}
     model.full_rope = model.swa_rope = torch.zeros((4224, 64), dtype=torch.bfloat16)
     assert model.prefill_request('a', [10, 20], [4], 2) == 72
