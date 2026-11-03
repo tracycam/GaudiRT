@@ -25,20 +25,24 @@ def _rope(theta):
 
 
 class ServingModel:
-    def __init__(self, extension, rank, model_path, physical_pages):
-        if physical_pages < 64:
-            raise ValueError('at least 64 physical KV pages are required')
+    def __init__(self, extension, rank, model_path, physical_pages, max_num_seqs=1):
+        if not 1 <= max_num_seqs <= 8 or physical_pages < (256 if max_num_seqs > 1 else 64):
+            raise ValueError('invalid request capacity or physical KV page count')
         self.extension = extension
         self.rank = rank
         self.runner = None
         self.pages = None
         self.finished = False
+        self.max_num_seqs = max_num_seqs
+        self.request_tokens = {}
         model_path = Path(model_path)
         config = json.loads((model_path / 'config.json').read_text())
         self.full_rope = _rope(config['rope_theta'])
         self.swa_rope = _rope(config['swa_rope_theta'])
         extension.enable_model_fusion(rank)
         extension.enable_prefill(rank)
+        if max_num_seqs > 1:
+            extension.enable_batch_decode(rank)
         for layer in range(70):
             for name, tensor in iter_layer_weights(model_path, layer, rank):
                 value = tensor.contiguous() if isinstance(tensor, torch.Tensor) else torch.from_numpy(tensor).contiguous()
@@ -95,6 +99,33 @@ class ServingModel:
             raise ValueError('decode requires a complete prefill')
         self.update_pages(pages)
         return self.runner.step()
+
+    def prefill_request(self, request_id, tokens, pages, prompt_length):
+        if self.max_num_seqs <= 1 or not tokens:
+            raise ValueError('multi-request prefill requires a nonempty token fragment')
+        token = self.extension.prefill_request(
+            self.rank, request_id, torch.tensor(tokens, dtype=torch.int32),
+            self.full_rope[:4096].contiguous(), self.swa_rope[:4096].contiguous(),
+            prompt_length, pages)
+        if token >= 0:
+            self.request_tokens[request_id] = token
+        return token
+
+    def decode_requests(self, steps):
+        if self.max_num_seqs <= 1 or not steps:
+            raise ValueError('multi-request decode requires scheduled requests')
+        ids = [step.request_id for step in steps]
+        tokens = [self.request_tokens[request_id] for request_id in ids]
+        result = self.extension.decode_requests(
+            self.rank, ids, tokens, [step.position for step in steps],
+            [step.block_ids for step in steps])
+        for request_id, token in zip(ids, result, strict=True):
+            self.request_tokens[request_id] = token
+        return result
+
+    def release_request(self, request_id):
+        self.extension.release_request(self.rank, request_id)
+        self.request_tokens.pop(request_id, None)
 
     def close(self):
         self.runner.close()
