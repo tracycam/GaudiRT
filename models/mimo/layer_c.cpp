@@ -53,8 +53,8 @@ LayerC::LayerC(runtime::HbmArena& arena, runtime::DeviceRuntime& runtime,
       moe_reduce_(fused_model ? nullptr :
                   std::make_unique<runtime::TpReduce>(arena, 6144, syn_type_float)),
       comm_(runtime.comm()), fused_model_(fused_model), rows_(rows) {
-  if (rows_ != 1 && ((rows_ != 32 && rows_ != 512 && rows_ != 1024 && rows_ != 2048) || !fused_model_))
-    throw std::invalid_argument("MiMo layer: prefill requires fused execution");
+  if (rows_ != 1 && ((rows_ != 4 && rows_ != 8 && rows_ != 32 && rows_ != 512 && rows_ != 1024 && rows_ != 2048) || !fused_model_))
+    throw std::invalid_argument("MiMo layer: multirow execution requires a supported fused graph");
   if (!comm_) throw std::invalid_argument("MiMo Type C: missing HCCL");
   arena.ensure_workspace(std::max(
       {attention_.workspace_bytes(), attention_reduce_ ? attention_reduce_->workspace_bytes() : 0,
