@@ -29,6 +29,12 @@ struct alignas(256) BatchStepMetadata {
   alignas(256) std::array<int32_t, Rows * 2> window_groups{};
 };
 
+template <uint32_t Rows>
+struct alignas(256) BatchDecodeInput {
+  BatchStepMetadata<Rows> metadata{};
+  alignas(256) std::array<int32_t, Rows> tokens{};
+};
+
 struct BatchRequestStep {
   uint32_t position;
   // Only the allocated prefix is used. An allocation includes the slot to

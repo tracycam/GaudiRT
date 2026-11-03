@@ -6,6 +6,7 @@
 #include "model_embedding.hpp"
 #include "model_head.hpp"
 #include "step_metadata.hpp"
+#include "batch_step_metadata.hpp"
 #include "prefill_metadata.hpp"
 #include "prefill_bindings.hpp"
 #include "prefill_chunks.hpp"
@@ -140,6 +141,24 @@ struct BucketExecutionPlan {
   runtime::PreparedLaunch head_launch;
 };
 
+struct BatchDecodePlan {
+  BucketExecutionPlan execution;
+  std::unique_ptr<ModelHead> head;
+  std::unique_ptr<ModelArgmax> argmax;
+  runtime::PreparedLaunch head_launch;
+  runtime::PreparedLaunch argmax_launch;
+  void* input_host = nullptr;
+  void* output_host = nullptr;
+  uint64_t input_device = 0;
+  uint64_t output_device = 0;
+  uint64_t embedding_device = 0;
+  uint64_t status_device = 0;
+  uint64_t normalized_device = 0;
+  uint64_t local_logits = 0;
+  uint64_t logits = 0;
+  uint32_t rows = 0;
+};
+
 class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram> {
  public:
   PrivateProgram(uint32_t rank, uint32_t world,
@@ -176,6 +195,10 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     if (token_ready_) synEventDestroy(token_ready_);
     if (metadata_host_) synHostFree(runtime_.device_id(), metadata_host_, 0);
     if (token_host_) synHostFree(runtime_.device_id(), token_host_, 0);
+    for (auto& plan : batch_decode_) {
+      if (plan.input_host) synHostFree(runtime_.device_id(), plan.input_host, 0);
+      if (plan.output_host) synHostFree(runtime_.device_id(), plan.output_host, 0);
+    }
   }
 
   void enable_model_fusion() {
@@ -188,6 +211,12 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     if (!fused_model_ || prefill_enabled_ || !entries_.empty() || !pending_.empty())
       throw std::invalid_argument("PrivateUse1: enable prefill after fusion and before weights");
     prefill_enabled_ = true;
+  }
+
+  void enable_batch_decode() {
+    if (!prefill_enabled_ || batch_decode_enabled_ || !entries_.empty() || !pending_.empty())
+      throw std::invalid_argument("PrivateUse1: enable batch decode before registering weights");
+    batch_decode_enabled_ = true;
   }
 
   void register_layer(uint32_t layer_id, int64_t kind_value,
@@ -317,6 +346,15 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       instances_.emplace(kind, create_instance(kind, graph_cache_slots, page_count,
                                                *entry_it->second.attention_weights,
                                                entry_it->second.dense_weights.get()));
+      if (batch_decode_enabled_) {
+        for (size_t i = 0; i < batch_decode_.size(); ++i) {
+          const uint32_t rows = i == 0 ? 4 : 8;
+          batch_decode_[i].rows = rows;
+          batch_decode_[i].execution.instances.emplace(kind, create_instance(
+              kind, graph_cache_slots, page_count, *entry_it->second.attention_weights,
+              entry_it->second.dense_weights.get(), rows));
+        }
+      }
       if (prefill_enabled_)
         prefill_buckets_[0].instances.emplace(kind, create_instance(kind, graph_cache_slots, kind == Kind::C ? page_count : 32,
             *entry_it->second.attention_weights, entry_it->second.dense_weights.get(), 32));
@@ -495,6 +533,27 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       prefill_reduce_ = std::make_unique<runtime::TpReduce>(arena_, 6144, syn_type_float, &recipe_cache_);
       prefill_allreduce_cast_ = std::make_unique<runtime::TpReduce>(arena_, 6144, syn_type_float, &recipe_cache_, 1);
     }
+    if (batch_decode_enabled_) {
+      batch_residual_slots_[0] = arena_.allocate(8 * 6144 * sizeof(uint16_t));
+      batch_residual_slots_[1] = arena_.allocate(8 * 6144 * sizeof(uint16_t));
+      for (auto& plan : batch_decode_) {
+        const auto rows = plan.rows;
+        const size_t bytes = rows == 4 ? sizeof(BatchDecodeInput<4>) : sizeof(BatchDecodeInput<8>);
+        check_syn(synHostMalloc(runtime_.device_id(), bytes, 0, &plan.input_host), "batch metadata pinned allocation");
+        check_syn(synHostMalloc(runtime_.device_id(), rows * sizeof(int32_t), 0, &plan.output_host), "batch output pinned allocation");
+        plan.input_device = arena_.allocate(bytes);
+        plan.output_device = arena_.allocate(rows * sizeof(int32_t));
+        plan.embedding_device = arena_.allocate(rows * 6144 * sizeof(uint16_t));
+        plan.status_device = arena_.allocate(rows * sizeof(int32_t));
+        plan.normalized_device = arena_.allocate(rows * 6144 * sizeof(uint16_t));
+        plan.local_logits = arena_.allocate(rows * ModelHead::kLocalVocabSize * sizeof(uint16_t));
+        plan.logits = arena_.allocate(rows * ModelHead::kVocabSize * sizeof(uint16_t));
+        plan.execution.embedding = std::make_unique<ModelEmbedding>(arena_, model_weights_.at("embedding"), &recipe_cache_, rows);
+        plan.head = std::make_unique<ModelHead>(arena_, model_weights_.at("final_norm"), model_weights_.at("lm_head"),
+                                                &recipe_cache_, true, ModelHead::kLocalVocabSize, rows);
+        plan.argmax = std::make_unique<ModelArgmax>(arena_, &recipe_cache_, rows);
+      }
+    }
     const uint64_t workspace = arena_.workspace_addr();
     model_embedding_launch_ = embedding_->prepare(token_device_, embedding_device_,
                                                    embedding_status_);
@@ -576,6 +635,41 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       bind.template operator()<LargePrefillMetadata>(prefill_buckets_[1]);
       bind.template operator()<XLargePrefillMetadata>(prefill_buckets_[2]);
       prefill_argmax_launch_ = argmax_->prepare(logits_device_, prefill_status_device_, token_device_);
+    }
+    if (batch_decode_enabled_) {
+      auto bind = [&]<uint32_t Rows>(BatchDecodePlan& plan) {
+        using Input = BatchDecodeInput<Rows>;
+        using Metadata = BatchStepMetadata<Rows>;
+        if (reinterpret_cast<uintptr_t>(plan.input_host) % alignof(Input))
+          throw std::runtime_error("PrivateUse1: batch metadata is not aligned");
+        new (plan.input_host) Input{};
+        const uint64_t base = plan.input_device + offsetof(Input, metadata);
+        plan.execution.embedding_launch = plan.execution.embedding->prepare(
+            plan.input_device + offsetof(Input, tokens), plan.embedding_device, plan.status_device);
+        plan.execution.layers.reserve(70);
+        uint64_t hidden = plan.embedding_device, residual = plan.embedding_device;
+        for (uint32_t layer = 0; layer < 70; ++layer) {
+          const bool full = is_full_layer(layer);
+          std::array<uint64_t, 11> addresses{
+              hidden, residual,
+              base + (full ? offsetof(Metadata, full_cos) : offsetof(Metadata, swa_cos)),
+              base + (full ? offsetof(Metadata, full_sin) : offsetof(Metadata, swa_sin)),
+              model_keys_[layer], model_values_[layer], base + offsetof(Metadata, slots),
+              base + (full ? offsetof(Metadata, full_pages) : offsetof(Metadata, window_pages)),
+              base + offsetof(Metadata, full_usage),
+              base + (full ? offsetof(Metadata, full_groups) : offsetof(Metadata, window_groups)),
+              base + offsetof(Metadata, positions)};
+          auto prepared = prepare_layer(layer, addresses, Rows, false,
+                                        base + offsetof(Metadata, full_row_groups));
+          hidden = prepared.feed_forward_gathered;
+          residual = batch_residual_slots_[layer % 2];
+          plan.execution.layers.push_back(std::move(prepared));
+        }
+        plan.head_launch = plan.head->prepare(hidden, residual, plan.normalized_device, plan.local_logits);
+        plan.argmax_launch = plan.argmax->prepare(plan.logits, plan.status_device, plan.output_device);
+      };
+      bind.template operator()<4>(batch_decode_[0]);
+      bind.template operator()<8>(batch_decode_[1]);
     }
     if (arena_.workspace_addr() != workspace)
       throw std::runtime_error("PrivateUse1: workspace changed during model binding");
@@ -784,6 +878,60 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     return token;
   }
 
+  std::vector<int32_t> decode_batch(const std::vector<int32_t>& tokens,
+                                    const std::vector<uint32_t>& positions,
+                                    const std::vector<std::vector<int32_t>>& page_lists) {
+    const size_t active = tokens.size();
+    if (!batch_decode_enabled_ || !model_finalized_ || model_pending_ ||
+        !active || active > 8 || positions.size() != active || page_lists.size() != active)
+      throw std::invalid_argument("PrivateUse1: invalid batch decode inputs");
+    std::array<BatchRequestStep, 8> requests{};
+    for (size_t row = 0; row < active; ++row) {
+      if (tokens[row] < 0 || tokens[row] >= static_cast<int32_t>(ModelHead::kVocabSize) ||
+          page_lists[row].size() > requests[row].pages.size())
+        throw std::invalid_argument("PrivateUse1: invalid batch token or page table");
+      requests[row].position = positions[row];
+      requests[row].page_count = static_cast<uint32_t>(page_lists[row].size());
+      std::copy(page_lists[row].begin(), page_lists[row].end(), requests[row].pages.begin());
+    }
+    auto& plan = batch_decode_[active <= 4 ? 0 : 1];
+    auto stage = [&]<uint32_t Rows>() {
+      auto& input = *static_cast<BatchDecodeInput<Rows>*>(plan.input_host);
+      validate_batch_step<Rows>(requests.data(), active, rope_rows_, full_rope_.data(), swa_rope_.data(),
+                                physical_cache_slots_ / 128, physical_cache_slots_);
+      fill_batch_step_metadata_prevalidated(input.metadata, requests.data(), active,
+                                             full_rope_.data(), swa_rope_.data(), physical_cache_slots_);
+      input.tokens.fill(0);
+      std::copy(tokens.begin(), tokens.end(), input.tokens.begin());
+      check_syn(synMemCopyAsync(runtime_.h2d_stream(), reinterpret_cast<uint64_t>(plan.input_host),
+                                sizeof(input), plan.input_device, HOST_TO_DRAM), "batch metadata H2D");
+    };
+    if (plan.rows == 4) stage.template operator()<4>(); else stage.template operator()<8>();
+    check_syn(synEventRecord(metadata_ready_, runtime_.h2d_stream()), "batch metadata event");
+    check_syn(synStreamWaitEvent(runtime_.compute_stream(), metadata_ready_, 0), "batch metadata wait");
+    const auto stream = runtime_.compute_stream();
+    plan.execution.embedding_launch.execute(stream);
+    for (const auto& layer : plan.execution.layers) layer.execute_fused(stream);
+    plan.head_launch.execute(stream);
+    if (hcclAllGather(reinterpret_cast<const void*>(plan.local_logits), reinterpret_cast<void*>(plan.logits),
+                      static_cast<uint64_t>(ModelHead::kLocalVocabSize) * plan.rows,
+                      hcclBfloat16, runtime_.comm(), stream) != hcclSuccess)
+      throw std::runtime_error("PrivateUse1: batch logits AllGather failed");
+    plan.argmax_launch.execute(stream);
+    check_syn(synEventRecord(compute_done_, stream), "batch compute event");
+    check_syn(synStreamWaitEvent(runtime_.d2h_stream(), compute_done_, 0), "batch output wait");
+    check_syn(synMemCopyAsync(runtime_.d2h_stream(), plan.output_device, plan.rows * sizeof(int32_t),
+                              reinterpret_cast<uint64_t>(plan.output_host), DRAM_TO_HOST), "batch token D2H");
+    check_syn(synStreamSynchronize(runtime_.d2h_stream()), "batch token completion");
+    const auto* output = static_cast<const int32_t*>(plan.output_host);
+    std::vector<int32_t> result(output, output + active);
+    if (std::any_of(result.begin(), result.end(), [](int32_t token) {
+          return token < 0 || token >= static_cast<int32_t>(ModelHead::kVocabSize);
+        }))
+      throw std::runtime_error("PrivateUse1: invalid batch token or nonfinite logits");
+    return result;
+  }
+
   at::Tensor model_logits() {
     if (!model_finalized_ || model_pending_ || (prefill_enabled_ && !prefill_complete_))
       throw std::invalid_argument("PrivateUse1: model logits are not ready");
@@ -822,16 +970,19 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
 
   PreparedLayer prepare_layer(uint32_t layer_id,
                               const std::array<uint64_t, 11>& addresses,
-                              uint32_t prefill = 0, bool short_prefix = false) {
+                              uint32_t prefill = 0, bool short_prefix = false,
+                              uint64_t full_row_groups = 0) {
     auto& entry = entries_.at(layer_id);
     auto& map = prefill ? bucket_for_rows(prefill).instances : instances_;
     auto& instance = *map.at(entry.kind);
-    const uint64_t residual_output = prefill >= 512 ? entry.large_prefill_residual_output
+    const uint64_t residual_output = (prefill == 4 || prefill == 8) ? batch_residual_slots_[layer_id % 2]
+                                     : prefill >= 512 ? entry.large_prefill_residual_output
                                      : prefill == 32 ? entry.prefill_residual_output : entry.residual_output;
     if (entry.kind == Kind::A) {
       instance.a->rebind_weights(*entry.attention_weights, *entry.dense_weights);
       auto io = instance.a_io;
       set_common_attention(io.attention, addresses);
+      io.attention.full_row_groups = full_row_groups;
       io.attention.residual = addresses[0];
       io.dense_outputs.residual_out_bf16 = residual_output;
       io.layer_output_bf16 = entry.layer_output;
@@ -841,6 +992,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
       instance.b->rebind_weights(*entry.attention_weights);
       auto io = instance.b_io;
       set_common_attention(io.attention, addresses);
+      io.attention.full_row_groups = full_row_groups;
       io.moe_outputs.residual_out_bf16 = residual_output;
       io.layer_output_bf16 = entry.layer_output;
       return instance.b->prepare(io, short_prefix);
@@ -938,6 +1090,8 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
  private:
   BucketExecutionPlan& bucket_for_rows(uint32_t rows) {
     switch (rows) {
+      case 4: return batch_decode_[0].execution;
+      case 8: return batch_decode_[1].execution;
       case 32: return prefill_buckets_[0];
       case 512: return prefill_buckets_[1];
       case 2048: return prefill_buckets_[2];
@@ -1044,6 +1198,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   runtime::RecipeCache recipe_cache_;
   std::unordered_map<Kind, std::unique_ptr<Instance>> instances_;
   std::array<BucketExecutionPlan, 3> prefill_buckets_;
+  std::array<BatchDecodePlan, 2> batch_decode_;
   std::unordered_map<uint32_t, LayerEntry> entries_;
   std::unordered_map<uint32_t, PendingWeights> pending_;
   std::unordered_map<std::string, uint64_t> model_weights_;
@@ -1053,6 +1208,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   runtime::PreparedLaunch model_head_launch_;
   runtime::PreparedLaunch model_argmax_launch_;
   std::array<uint64_t, 2> prefill_residual_slots_{};
+  std::array<uint64_t, 2> batch_residual_slots_{};
   std::array<uint64_t, 70> model_keys_{};
   std::array<uint64_t, 70> model_values_{};
   std::array<int32_t, 64> model_pages_{};
@@ -1067,6 +1223,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   bool model_pending_ = false;
   bool fused_model_ = false;
   bool prefill_enabled_ = false;
+  bool batch_decode_enabled_ = false;
   bool prefill_complete_ = false;
   uint32_t prefill_rows_ = 0;
   uint32_t prompt_length_ = 0;
@@ -1123,6 +1280,7 @@ void upload_weight(uint32_t rank, uint32_t layer_id, bool dense,
 
 void enable_model_fusion(uint32_t rank) { get(rank)->enable_model_fusion(); }
 void enable_prefill(uint32_t rank) { get(rank)->enable_prefill(); }
+void enable_batch_decode(uint32_t rank) { get(rank)->enable_batch_decode(); }
 
 void register_streamed_layer(uint32_t rank, uint32_t layer_id, int64_t kind,
                              uint32_t cache_slots, uint32_t page_count) {
@@ -1160,6 +1318,11 @@ at::Tensor finalize_model(uint32_t rank, const at::Tensor& full_rope,
 }
 
 int32_t finish_model_step(uint32_t rank) { return get(rank)->finish_model_step(); }
+std::vector<int32_t> decode_batch(uint32_t rank, const std::vector<int32_t>& tokens,
+                                  const std::vector<uint32_t>& positions,
+                                  const std::vector<std::vector<int32_t>>& pages) {
+  return get(rank)->decode_batch(tokens, positions, pages);
+}
 
 at::Tensor model_logits(uint32_t rank) { return get(rank)->model_logits(); }
 
@@ -1256,6 +1419,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("initialize", &gaudirt::mimo::initialize);
   m.def("enable_model_fusion", &gaudirt::mimo::enable_model_fusion);
   m.def("enable_prefill", &gaudirt::mimo::enable_prefill);
+  m.def("enable_batch_decode", &gaudirt::mimo::enable_batch_decode);
   m.def("register_layer", &gaudirt::mimo::register_layer);
   m.def("upload_weight", &gaudirt::mimo::upload_weight);
   m.def("register_streamed_layer", &gaudirt::mimo::register_streamed_layer);
@@ -1268,6 +1432,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("reset_prefill", &gaudirt::mimo::reset_prefill);
   m.def("finalize_model", &gaudirt::mimo::finalize_model);
   m.def("finish_model_step", &gaudirt::mimo::finish_model_step);
+  m.def("decode_batch", &gaudirt::mimo::decode_batch);
   m.def("model_logits", &gaudirt::mimo::model_logits);
   m.def("model_kv", &gaudirt::mimo::model_kv);
   m.def("model_kv_slots", &gaudirt::mimo::model_kv_slots);
