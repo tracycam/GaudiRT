@@ -203,6 +203,9 @@ target_include_directories(prefill_bindings_test PRIVATE models/mimo)
 add_executable(mimo_step_metadata_test tests/mimo_step_metadata_test.cpp)
 target_include_directories(mimo_step_metadata_test PRIVATE models/mimo)
 
+add_executable(mimo_batch_step_metadata_test tests/mimo_batch_step_metadata_test.cpp)
+target_include_directories(mimo_batch_step_metadata_test PRIVATE models/mimo)
+
 add_executable(host_policy_inherit_test tests/host_policy_inherit_test.cpp)
 target_include_directories(host_policy_inherit_test PRIVATE include)
 

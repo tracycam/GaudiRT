@@ -3,6 +3,7 @@
 #include "gaudirt/runtime/device_runtime.hpp"
 #include "gaudirt/runtime/hbm_arena.hpp"
 #include "gaudirt/runtime/weight_manifest.hpp"
+#include "batch_step_metadata.hpp"
 #ifdef TEST_SWA
 #include "layer_c.hpp"
 #else
@@ -36,7 +37,7 @@ int main(int argc, char** argv) {
   if (argc != 4) throw std::invalid_argument("usage: test rank rows shared_id_file");
   unsigned rank = std::strtoul(argv[1], nullptr, 10), rows = std::strtoul(argv[2], nullptr, 10);
   if (rank >= 8 || (rows != 4 && rows != 8)) throw std::invalid_argument("invalid rank or rows");
-  constexpr unsigned hidden = 6144, slots = 9 * 128, pages = 2;
+  constexpr unsigned hidden = 6144, slots = 9 * 128, pages = 64;
   DeviceRuntime::Config cfg{}; cfg.module_id = rank; cfg.rank = rank; cfg.world_size = 8;
   DeviceRuntime device(cfg);
   hcclUniqueId id{}; std::filesystem::path path(argv[3]);
@@ -99,8 +100,18 @@ int main(int argc, char** argv) {
   std::vector<uint16_t> keys(slots*192,bf16(-8)),values(slots*128,bf16(-8));
   for(unsigned r=0;r<rows;++r){std::fill_n(keys.begin()+r*128*192,192,bf16(0));std::fill_n(values.begin()+r*128*128,128,bf16(float(r+1)));}
   const auto original_keys=keys,original_values=values;
-  std::vector<int32_t> slot(rows),table(rows*pages),usage(rows*pages,2),groups(rows*pages),row_groups(rows);
-  for(unsigned r=0;r<rows;++r){slot[r]=r*128+1;row_groups[r]=100+r;table[r*pages]=r;groups[r*pages]=row_groups[r];table[r*pages+1]=(r+1)%rows;groups[r*pages+1]=999;}
+  std::array<BatchRequestStep,8> requests{};
+  for(unsigned r=0;r<rows;++r){requests[r].position=1;requests[r].pages[0]=r;requests[r].page_count=1;}
+  std::vector<uint16_t> rope(2*64,0);
+  for(unsigned i=0;i<32;++i)rope[64+i]=bf16(1);
+  validate_batch_step<8>(requests.data(),rows,2,rope.data(),rope.data(),8,8*128);
+  BatchStepMetadata<8> metadata{};
+  fill_batch_step_metadata_prevalidated(metadata,requests.data(),rows,rope.data(),rope.data(),8*128);
+  // A foreign page exists in the table but must not enter the request's attention.
+  for(unsigned r=0;r<rows;++r){metadata.full_pages[r*pages+1]=(r+1)%rows;
+    metadata.full_usage[r*pages+1]=2;metadata.full_groups[r*pages+1]=999;
+    metadata.window_pages[r*2+1]=(r+1)%rows;metadata.window_groups[r*2+1]=999;}
+  const auto& slot=metadata.slots;
   std::vector<float> gathered_hidden(8*rows*hidden);
   for(unsigned t=0;t<8;++t)for(unsigned r=0;r<rows;++r)for(unsigned i=0;i<hidden;++i)
     gathered_hidden[(t*rows+r)*hidden+i]=0.015625f+r*0.00390625f+(i%3)*0.0009765625f;
@@ -113,15 +124,14 @@ int main(int argc, char** argv) {
   const auto bk=upload(keys.data(),keys.size()*2), bv=upload(values.data(),values.size()*2);
   const auto rk=upload(keys.data(),keys.size()*2), rv=upload(values.data(),values.size()*2);
   MimoAttentionIo ai{}; ai.hidden_states=h; ai.rope_cos=c; ai.rope_sin=s; ai.key_cache=bk; ai.value_cache=bv;
-  ai.slot_mapping=upload(slot.data(),slot.size()*4); ai.full_block_list=upload(table.data(),table.size()*4);
-  ai.full_block_usage=upload(usage.data(),usage.size()*4); ai.full_block_groups=upload(groups.data(),groups.size()*4);
-  ai.full_row_groups=upload(row_groups.data(),row_groups.size()*4);
+  ai.slot_mapping=upload(slot.data(),rows*4); ai.full_block_list=upload(metadata.full_pages.data(),rows*pages*4);
+  ai.full_block_usage=upload(metadata.full_usage.data(),rows*pages*4); ai.full_block_groups=upload(metadata.full_groups.data(),rows*pages*4);
+  ai.full_row_groups=upload(metadata.full_row_groups.data(),rows*4);
   ai.residual=residual;ai.residual_out=arena.allocate(rows*hidden*2);
 #ifdef TEST_SWA
-  std::vector<int32_t> swgroups(rows*pages),positions(rows,1);
-  for(unsigned r=0;r<rows;++r){swgroups[r*pages]=r;swgroups[r*pages+1]=999;}
-  ai.window_pages=ai.full_block_list;ai.window_groups=upload(swgroups.data(),swgroups.size()*4);
-  ai.position=upload(positions.data(),positions.size()*4);ai.output_local=arena.allocate(rows*hidden*2);
+  ai.window_pages=upload(metadata.window_pages.data(),rows*2*4);
+  ai.window_groups=upload(metadata.window_groups.data(),rows*2*4);
+  ai.position=upload(metadata.positions.data(),rows*4);ai.output_local=arena.allocate(rows*hidden*2);
 #else
   ai.output_local_fp32=arena.allocate(rows*hidden*4);
 #endif
@@ -144,13 +154,15 @@ int main(int argc, char** argv) {
 #endif
   std::vector<float> expected(8*rows*hidden), actual(expected.size()), one(8*hidden);
   for(unsigned r=0;r<rows;++r){
-    std::array<int32_t,pages> p{int32_t(r),int32_t((r+1)%rows)},u{2,0},g{0,-1};
+    std::array<int32_t,pages> p{},u{},g{};p.fill(-1);g.fill(-1);
+    p[0]=r;p[1]=(r+1)%rows;u[0]=2;g[0]=0;
     reference.attention.hidden_states=single_hidden[r];reference.attention.residual=residual+r*hidden*2;reference.attention.rope_cos=c+r*64*2;reference.attention.rope_sin=s+r*64*2;
     reference.attention.slot_mapping=upload(&slot[r],4);reference.attention.full_block_list=upload(p.data(),sizeof(p));
     reference.attention.full_block_usage=upload(u.data(),sizeof(u));reference.attention.full_block_groups=upload(g.data(),sizeof(g));
 #ifdef TEST_SWA
     int32_t pos=1;reference.attention.position=upload(&pos,4);
-    reference.attention.window_pages=reference.attention.full_block_list;reference.attention.window_groups=reference.attention.full_block_groups;
+    std::array<int32_t,2> wp{int32_t(r),int32_t((r+1)%rows)},wg{0,-1};
+    reference.attention.window_pages=upload(wp.data(),sizeof(wp));reference.attention.window_groups=upload(wg.data(),sizeof(wg));
 #endif
     single.prepare(reference).execute_fused(device.compute_stream());device.synchronize_compute();
     arena.copy_d2h_sync(device.d2h_stream(),reference.moe_gathered_fp32,one.data(),one.size()*4);
@@ -167,7 +179,7 @@ int main(int argc, char** argv) {
   auto verify_kv=[&](uint64_t x,uint64_t y,const std::vector<uint16_t>& orig,unsigned width){
     std::vector<uint16_t> a(orig.size()),b(orig.size());arena.copy_d2h_sync(device.d2h_stream(),x,a.data(),a.size()*2);arena.copy_d2h_sync(device.d2h_stream(),y,b.data(),b.size()*2);
     if(a!=b)throw std::runtime_error("batch and single KV differ");
-    for(unsigned pos=0;pos<slots;++pos){bool touched=false;for(auto v:slot)if(pos==unsigned(v))touched=true;
+    for(unsigned pos=0;pos<slots;++pos){bool touched=false;for(unsigned r=0;r<rows;++r)if(pos==unsigned(slot[r]))touched=true;
       if(!touched&&!std::equal(a.begin()+pos*width,a.begin()+(pos+1)*width,orig.begin()+pos*width))throw std::runtime_error("untouched KV changed");}
   };
   verify_kv(bk,rk,original_keys,192);verify_kv(bv,rv,original_values,128);
