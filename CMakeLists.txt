@@ -160,6 +160,9 @@ target_link_libraries(mimo_layer_b_prefill_large_tp8_test PRIVATE mimo_layer_b_v
 add_executable(mimo_layer0_prefill_tp8_test tests/mimo_layer0_prefill_tp8_test.cpp)
 target_link_libraries(mimo_layer0_prefill_tp8_test PRIVATE mimo_layer0_vertical)
 
+add_executable(mimo_layer0_batch_tp8_test tests/mimo_layer0_batch_tp8_test.cpp)
+target_link_libraries(mimo_layer0_batch_tp8_test PRIVATE mimo_layer0_vertical)
+
 add_executable(mimo_swa_prefill_tp8_test tests/mimo_swa_prefill_tp8_test.cpp)
 target_link_libraries(mimo_swa_prefill_tp8_test PRIVATE mimo_layer_c_vertical)
 
