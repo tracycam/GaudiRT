@@ -53,7 +53,7 @@ enum class Binding {
 };
 
 struct ExternalTensor {
-  const char* name;
+  std::string name;
   synTensor tensor = nullptr;
   synSectionHandle section = nullptr;
   Binding binding;
@@ -133,7 +133,9 @@ struct MimoAttention::Impl {
                      std::initializer_list<uint64_t> sizes,
                      synSectionHandle shared_section = nullptr) {
     synTensorDescriptor descriptor = {};
-    descriptor.m_name = name;
+    const std::string scoped_name = (rows == 4 || rows == 8)
+        ? std::string(name) + "_b" + std::to_string(rows) : name;
+    descriptor.m_name = scoped_name.c_str();
     descriptor.m_dataType = dtype;
     descriptor.m_dims = sizes.size();
     unsigned dim = 0;
@@ -152,7 +154,7 @@ struct MimoAttention::Impl {
             std::string("create section for ") + name);
     }
     externals.push_back(
-        {name, nullptr, owns_section ? section : nullptr, binding, sizes});
+        {scoped_name, nullptr, owns_section ? section : nullptr, binding, sizes});
     try {
       if (owns_section) {
         check(synSectionSetPersistent(section, true),
@@ -200,14 +202,16 @@ struct MimoAttention::Impl {
   void node(std::initializer_list<synTensor> inputs,
             std::initializer_list<synTensor> outputs, const void* params,
             unsigned params_size, const char* guid, const char* name) {
+    const std::string scoped_name = (rows == 4 || rows == 8)
+        ? std::string(name) + "_b" + std::to_string(rows) : name;
     check(synNodeCreate(graph, inputs.begin(), outputs.begin(), inputs.size(),
-                        outputs.size(), params, params_size, guid, name, nullptr,
+                        outputs.size(), params, params_size, guid, scoped_name.c_str(), nullptr,
                         nullptr),
           std::string("create node ") + name);
   }
 
   void build() {
-    if (rows != 1 && rows != 32 && rows != 512 && rows != 1024 && rows != 2048)
+    if (rows != 1 && rows != 4 && rows != 8 && rows != 32 && rows != 512 && rows != 1024 && rows != 2048)
       throw std::invalid_argument("MimoAttention: unsupported rows");
     if (cache_slots < 2 * MimoAttention::kKvBlockSize ||
         cache_slots % MimoAttention::kKvBlockSize != 0 ||
@@ -374,8 +378,10 @@ struct MimoAttention::Impl {
       node({rounded}, {output_local}, nullptr, 0, "cast_bf16_to_f32", "oproj_widen_for_reduce");
     }
 
-    recipe = compile_cached(graph, rows == 1 ? "mimo_layer1_attention_b1_m1_tp8"
-                                             : "mimo_swa_prefill_b1_m" + std::to_string(rows) + "_tp8",
+    const std::string recipe_name = rows == 1 ? "mimo_layer1_attention_b1_m1_tp8"
+        : (rows == 4 || rows == 8) ? "mimo_swa_decode_b" + std::to_string(rows) + "_tp8"
+                                    : "mimo_swa_prefill_b1_m" + std::to_string(rows) + "_tp8";
+    recipe = compile_cached(graph, recipe_name,
                             std::string(rows >= 512 ? "swa_mme_prefill_allreduce_only_v1_c"
                                                     : "swa_grid24_fp32_v7_c") +
                                 std::to_string(cache_slots) +
@@ -396,7 +402,7 @@ struct MimoAttention::Impl {
     launch.resize(externals.size());
     for (size_t i = 0; i < externals.size(); ++i) {
       launch[i] = {};
-      launch[i].tensorName = externals[i].name;
+      launch[i].tensorName = externals[i].name.c_str();
       launch[i].tensorType = DATA_TENSOR;
       for (size_t dim = 0; dim < externals[i].shape.size(); ++dim) {
         launch[i].tensorSize[dim] = externals[i].shape[dim];
