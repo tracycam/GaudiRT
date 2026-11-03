@@ -700,22 +700,8 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   void reset_prefill() {
     if (!prefill_enabled_ || !model_finalized_ || model_pending_ || !prefill_complete_)
       throw std::invalid_argument("PrivateUse1: completed request required before reset");
-    auto pages = model_pages_;
-    std::sort(pages.begin(), pages.end());
-    const auto stream = runtime_.compute_stream();
-    for (size_t first = 0; first < pages.size();) {
-      size_t end = first + 1;
-      while (end < pages.size() && pages[end] == pages[end - 1] + 1) ++end;
-      const size_t slot = static_cast<size_t>(pages[first]) * 128;
-      const size_t slots = (end - first) * 128;
-      for (size_t layer = 0; layer < model_keys_.size(); ++layer) {
-        check_syn(synMemsetD8Async(model_keys_[layer] + slot * 192 * 2, 0,
-                                   slots * 192 * 2, stream), "reset model key pages");
-        check_syn(synMemsetD8Async(model_values_[layer] + slot * 128 * 2, 0,
-                                   slots * 128 * 2, stream), "reset model value pages");
-      }
-      first = end;
-    }
+    const size_t written_pages = (static_cast<size_t>(model_position_) + 127) / 128;
+    clear_model_pages({model_pages_.begin(), model_pages_.begin() + written_pages});
     model_position_ = 0;
     prefill_rows_ = 0;
     prompt_length_ = 0;
@@ -767,8 +753,11 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   }
 
   void release_request(const std::string& request_id) {
-    if (!batch_decode_enabled_ || model_pending_ || request_prefills_.erase(request_id) != 1)
+    const auto request = request_prefills_.find(request_id);
+    if (!batch_decode_enabled_ || model_pending_ || request == request_prefills_.end())
       throw std::invalid_argument("PrivateUse1: invalid request release");
+    clear_model_pages(request->second.pages);
+    request_prefills_.erase(request);
   }
 
   int32_t prefill(const at::Tensor& tokens, const at::Tensor& full_rope,
@@ -1214,6 +1203,26 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   }
 
  private:
+  // Only release the request's own physical pages; operations are ordered on
+  // the same stream as subsequent prefill and decode work.
+  void clear_model_pages(std::vector<int32_t> pages) {
+    std::sort(pages.begin(), pages.end());
+    const auto stream = runtime_.compute_stream();
+    for (size_t first = 0; first < pages.size();) {
+      size_t end = first + 1;
+      while (end < pages.size() && pages[end] == pages[end - 1] + 1) ++end;
+      const size_t slot = static_cast<size_t>(pages[first]) * 128;
+      const size_t slots = (end - first) * 128;
+      for (size_t layer = 0; layer < model_keys_.size(); ++layer) {
+        check_syn(synMemsetD8Async(model_keys_[layer] + slot * 192 * 2, 0,
+                                   slots * 192 * 2, stream), "reset model key pages");
+        check_syn(synMemsetD8Async(model_values_[layer] + slot * 128 * 2, 0,
+                                   slots * 128 * 2, stream), "reset model value pages");
+      }
+      first = end;
+    }
+  }
+
   BucketExecutionPlan& bucket_for_rows(uint32_t rows) {
     switch (rows) {
       case 4: return batch_decode_[0].execution;
