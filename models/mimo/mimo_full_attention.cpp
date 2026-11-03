@@ -51,6 +51,7 @@ enum class Binding {
   kFullBlockList,
   kFullBlockUsage,
   kFullBlockGroups,
+  kFullRowGroups,
   kPosition,
   kOutputLocal,
   kInputLayernorm,
@@ -61,7 +62,7 @@ enum class Binding {
 };
 
 struct ExternalTensor {
-  const char* name;
+  std::string name;
   synSectionHandle section = nullptr;
   Binding binding;
   std::vector<uint64_t> shape;
@@ -134,7 +135,9 @@ struct MimoFullAttention::Impl {
                      std::initializer_list<uint64_t> sizes,
                      synSectionHandle shared_section = nullptr) {
     synTensorDescriptor descriptor = {};
-    descriptor.m_name = name;
+    const std::string scoped_name = (rows == 4 || rows == 8)
+        ? std::string(name) + "_b" + std::to_string(rows) : name;
+    descriptor.m_name = scoped_name.c_str();
     descriptor.m_dataType = dtype;
     descriptor.m_dims = sizes.size();
     unsigned dim = 0;
@@ -151,7 +154,7 @@ struct MimoFullAttention::Impl {
       check(synSectionCreate(&section, 0, graph),
             std::string("create section for ") + name);
     }
-    externals.push_back({name, owns_section ? section : nullptr, binding, sizes});
+    externals.push_back({scoped_name, owns_section ? section : nullptr, binding, sizes});
     try {
       if (owns_section) {
         check(synSectionSetPersistent(section, true),
@@ -200,14 +203,16 @@ struct MimoFullAttention::Impl {
   void node(synGraphHandle graph, std::initializer_list<synTensor> inputs,
             std::initializer_list<synTensor> outputs, const void* params,
             unsigned params_size, const char* guid, const char* name) {
+    const std::string scoped_name = (rows == 4 || rows == 8)
+        ? std::string(name) + "_b" + std::to_string(rows) : name;
     check(synNodeCreate(graph, inputs.begin(), outputs.begin(), inputs.size(),
-                        outputs.size(), params, params_size, guid, name, nullptr,
+                        outputs.size(), params, params_size, guid, scoped_name.c_str(), nullptr,
                         nullptr),
           std::string("create node ") + name);
   }
 
   void build() {
-    if (rows != 1 && rows != 32 && rows != 512 && rows != 1024 && rows != 2048)
+    if (rows != 1 && rows != 4 && rows != 8 && rows != 32 && rows != 512 && rows != 1024 && rows != 2048)
       throw std::invalid_argument("MimoFullAttention: unsupported rows");
     if (cache_slots < 2 * MimoAttention::kKvBlockSize ||
         cache_slots % MimoAttention::kKvBlockSize != 0 ||
@@ -345,70 +350,84 @@ struct MimoFullAttention::Impl {
          {value_cache_after}, &index_copy_params, sizeof(index_copy_params),
          "index_copy_fwd_bf16", "write_new_value");
 
-    synTensor block_list = external(prepare_graph, prepare_externals, "block_list",
-                                    Binding::kFullBlockList, syn_type_int32,
-                                    {page_count});
-    synTensor block_usage = external(prepare_graph, prepare_externals, "block_usage",
-                                     Binding::kFullBlockUsage, syn_type_int32,
-                                     {page_count});
-    synTensor block_groups = external(prepare_graph, prepare_externals, "block_groups",
-                                      Binding::kFullBlockGroups, syn_type_int32,
-                                      {page_count});
+    const bool batch_decode = rows == 4 || rows == 8;
+    const auto page_tensor = [&](const char* name, Binding binding) {
+      return batch_decode
+          ? external(prepare_graph, prepare_externals, name, binding, syn_type_int32, {page_count, rows})
+          : external(prepare_graph, prepare_externals, name, binding, syn_type_int32, {page_count});
+    };
+    synTensor block_list = page_tensor("block_list", Binding::kFullBlockList);
+    synTensor block_usage = page_tensor("block_usage", Binding::kFullBlockUsage);
+    synTensor block_groups = page_tensor("block_groups", Binding::kFullBlockGroups);
+    synTensor row_groups = batch_decode
+        ? external(prepare_graph, prepare_externals, "row_groups", Binding::kFullRowGroups, syn_type_int32, {rows})
+        : nullptr;
     const uint64_t tokens = static_cast<uint64_t>(page_count) * 128;
-    synTensor gathered_key = intermediate(prepare_graph, "full_gathered_key",
-                                          syn_type_bf16, {192, tokens});
-    synTensor gathered_value = intermediate(prepare_graph, "full_gathered_value",
-                                            syn_type_bf16, {128, tokens});
-    node(prepare_graph,
-         {key_cache_after, value_cache_after, block_list, block_usage, block_groups},
-         {gathered_key, gathered_value}, nullptr, 0,
-         "gk_full_mme_gather_v1", "full_gather_shared_kv");
-    synTensor query_matrix = intermediate(prepare_graph, "full_query_matrix",
-                                           syn_type_bf16, {192, 16 * rows});
-    node(prepare_graph, {query}, {query_matrix}, nullptr, 0, "reshape", "full_query_reshape");
-    synTensor scores = intermediate(prepare_graph, "full_attention_scores",
-                                     syn_type_float, {tokens, 16 * rows});
+    synTensor gathered_key = batch_decode
+        ? intermediate(prepare_graph, "full_gathered_key", syn_type_bf16, {192, tokens, rows})
+        : intermediate(prepare_graph, "full_gathered_key", syn_type_bf16, {192, tokens});
+    synTensor gathered_value = batch_decode
+        ? intermediate(prepare_graph, "full_gathered_value", syn_type_bf16, {128, tokens, rows})
+        : intermediate(prepare_graph, "full_gathered_value", syn_type_bf16, {128, tokens});
+    if (batch_decode)
+      node(prepare_graph, {key_cache_after, value_cache_after, block_list, block_usage, block_groups, row_groups},
+           {gathered_key, gathered_value}, nullptr, 0, "gk_full_mme_batch_gather_v1", "full_gather_shared_kv");
+    else
+      node(prepare_graph, {key_cache_after, value_cache_after, block_list, block_usage, block_groups},
+           {gathered_key, gathered_value}, nullptr, 0, "gk_full_mme_gather_v1", "full_gather_shared_kv");
+    synTensor query_matrix = query;
+    if (!batch_decode) {
+      query_matrix = intermediate(prepare_graph, "full_query_matrix", syn_type_bf16, {192, 16 * rows});
+      node(prepare_graph, {query}, {query_matrix}, nullptr, 0, "reshape", "full_query_reshape");
+    }
+    synTensor scores = batch_decode
+        ? intermediate(prepare_graph, "full_attention_scores", syn_type_float, {tokens, 16, rows})
+        : intermediate(prepare_graph, "full_attention_scores", syn_type_float, {tokens, 16 * rows});
     const synGEMMParams scores_params{false, true};
     node(prepare_graph, {query_matrix, gathered_key}, {scores}, &scores_params,
-         sizeof(scores_params), "gemm", "full_qk_mme");
-    synTensor probabilities = intermediate(prepare_graph, "full_attention_probabilities",
-                                            syn_type_bf16, {tokens, 16 * rows});
-    synTensor corrections = intermediate(prepare_graph, "full_attention_probabilities_correction",
-                                        syn_type_bf16, {tokens, 16 * rows});
-    const FullMmaSoftmaxParams softmax_params{kAttentionScale,
-                                               static_cast<int32_t>(cache_slots / 128)};
-    if (rows == 1) {
+         sizeof(scores_params), batch_decode ? "batch_gemm" : "gemm", "full_qk_mme");
+    synTensor probabilities = batch_decode
+        ? intermediate(prepare_graph, "full_attention_probabilities", syn_type_bf16, {tokens, 16, rows})
+        : intermediate(prepare_graph, "full_attention_probabilities", syn_type_bf16, {tokens, 16 * rows});
+    synTensor corrections = batch_decode
+        ? intermediate(prepare_graph, "full_attention_probabilities_correction", syn_type_bf16, {tokens, 16, rows})
+        : intermediate(prepare_graph, "full_attention_probabilities_correction", syn_type_bf16, {tokens, 16 * rows});
+    const FullMmaSoftmaxParams softmax_params{kAttentionScale, static_cast<int32_t>(cache_slots / 128)};
+    if (batch_decode) {
+      node(prepare_graph, {scores, block_list, block_usage, block_groups, row_groups}, {probabilities, corrections},
+           &softmax_params, sizeof(softmax_params), "gk_full_mme_batch_softmax_v1", "full_masked_softmax");
+    } else if (rows == 1) {
       node(prepare_graph, {scores, block_list, block_usage, block_groups}, {probabilities, corrections},
-           &softmax_params, sizeof(softmax_params), "gk_full_mme_softmax_v2",
-           "full_masked_softmax");
+           &softmax_params, sizeof(softmax_params), "gk_full_mme_softmax_v2", "full_masked_softmax");
     } else {
-      synTensor position = external(prepare_graph, prepare_externals, "position",
-                                    Binding::kPosition, syn_type_int32, {rows});
-      node(prepare_graph, {scores, block_list, block_usage, block_groups, position},
-           {probabilities, corrections}, &softmax_params, sizeof(softmax_params),
-           "gk_full_mme_prefill_softmax_v1", "full_causal_prefill_softmax");
+      synTensor position = external(prepare_graph, prepare_externals, "position", Binding::kPosition, syn_type_int32, {rows});
+      node(prepare_graph, {scores, block_list, block_usage, block_groups, position}, {probabilities, corrections},
+           &softmax_params, sizeof(softmax_params), "gk_full_mme_prefill_softmax_v1", "full_causal_prefill_softmax");
     }
-    synTensor context_main = intermediate(prepare_graph, "full_context_main",
-                                          syn_type_float, {128, 16 * rows});
-    synTensor context_correction = intermediate(prepare_graph, "full_context_correction",
-                                                syn_type_float, {128, 16 * rows});
-    synTensor context_float = intermediate(prepare_graph, "full_context_float",
-                                           syn_type_float, {128, 16 * rows});
-    synTensor context_matrix = intermediate(prepare_graph, "full_context_matrix",
-                                            syn_type_bf16, {128, 16 * rows});
+    const auto context_tensor = [&](const char* name, synDataType type) {
+      return batch_decode ? intermediate(prepare_graph, name, type, {128, 16, rows})
+                          : intermediate(prepare_graph, name, type, {128, 16 * rows});
+    };
+    synTensor context_main = context_tensor("full_context_main", syn_type_float);
+    synTensor context_correction = context_tensor("full_context_correction", syn_type_float);
+    synTensor context_float = context_tensor("full_context_float", syn_type_float);
+    synTensor context_matrix = context_tensor("full_context_matrix", syn_type_bf16);
     const synGEMMParams context_params{false, false};
     node(prepare_graph, {probabilities, gathered_value}, {context_main}, &context_params,
-         sizeof(context_params), "gemm", "full_pv_mme");
+         sizeof(context_params), batch_decode ? "batch_gemm" : "gemm", "full_pv_mme");
     node(prepare_graph, {corrections, gathered_value}, {context_correction}, &context_params,
-         sizeof(context_params), "gemm", "full_pv_correction_mme");
+         sizeof(context_params), batch_decode ? "batch_gemm" : "gemm", "full_pv_correction_mme");
     node(prepare_graph, {context_main, context_correction}, {context_float}, nullptr, 0,
          "add_fwd_f32", "full_pv_combine");
     ns_CastKernel::ParamsV3 context_cast{};
     context_cast.round_mode = CAST_ROUND_HALF_NE;
     node(prepare_graph, {context_float}, {context_matrix}, &context_cast, sizeof(context_cast),
          "cast_f32_to_bf16", "full_context_round");
-    synTensor context = intermediate(prepare_graph, "context", syn_type_bf16, {128, 16, rows});
-    node(prepare_graph, {context_matrix}, {context}, nullptr, 0, "reshape", "full_context_reshape");
+    synTensor context = context_matrix;
+    if (!batch_decode) {
+      context = intermediate(prepare_graph, "context", syn_type_bf16, {128, 16, rows});
+      node(prepare_graph, {context_matrix}, {context}, nullptr, 0, "reshape", "full_context_reshape");
+    }
 
     synTensor context_flat = intermediate(prepare_graph, "context_flat",
                                           syn_type_bf16, {2048, rows});
@@ -423,9 +442,11 @@ struct MimoFullAttention::Impl {
     node(prepare_graph, {context_flat, oproj}, {output_local},
          &oproj_gemm_params, sizeof(oproj_gemm_params), "gemm",
          "oproj_bf16_fp32_mme_local");
-    const std::string recipe_name = pure_rmsnorm
-        ? (rows == 1 ? "mimo_full_attention_b1_m1_tp8_pure" : "mimo_full_prefill_b1_m" + std::to_string(rows) + "_tp8_pure")
-        : (rows == 1 ? "mimo_full_attention_b1_m1_tp8_residual" : "mimo_full_prefill_b1_m" + std::to_string(rows) + "_tp8_residual");
+    const std::string recipe_name = batch_decode
+        ? "mimo_full_decode_b" + std::to_string(rows) + (pure_rmsnorm ? "_tp8_pure" : "_tp8_residual")
+        : (pure_rmsnorm
+            ? (rows == 1 ? "mimo_full_attention_b1_m1_tp8_pure" : "mimo_full_prefill_b1_m" + std::to_string(rows) + "_tp8_pure")
+            : (rows == 1 ? "mimo_full_attention_b1_m1_tp8_residual" : "mimo_full_prefill_b1_m" + std::to_string(rows) + "_tp8_residual"));
     prepare_recipe = compile_cached(
         prepare_graph, recipe_name,
         std::string(rows >= 512 ? "full_mme_qkv_allreduce_round_v1_" : "full_mme_neumaier_v4_") + (pure_rmsnorm ? "pure" : "residual") +
@@ -438,7 +459,7 @@ struct MimoFullAttention::Impl {
     prepare_launch.resize(prepare_externals.size());
     for (size_t i = 0; i < prepare_externals.size(); ++i) {
       prepare_launch[i] = {};
-      prepare_launch[i].tensorName = prepare_externals[i].name;
+      prepare_launch[i].tensorName = prepare_externals[i].name.c_str();
       prepare_launch[i].tensorType = DATA_TENSOR;
       for (size_t dim = 0; dim < prepare_externals[i].shape.size(); ++dim) {
         prepare_launch[i].tensorSize[dim] = prepare_externals[i].shape[dim];
@@ -461,6 +482,7 @@ struct MimoFullAttention::Impl {
       case Binding::kFullBlockList: return io.full_block_list;
       case Binding::kFullBlockUsage: return io.full_block_usage;
       case Binding::kFullBlockGroups: return io.full_block_groups;
+      case Binding::kFullRowGroups: return io.full_row_groups;
       case Binding::kPosition: return io.position;
       case Binding::kOutputLocal: return io.output_local_fp32;
       case Binding::kInputLayernorm:
