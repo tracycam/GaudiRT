@@ -91,6 +91,9 @@ target_link_libraries(mimo_fused_reduce_m1024_device_test PRIVATE mimo_layer_ver
 add_executable(mimo_batch_argmax_device_test tests/mimo_batch_argmax_device_test.cpp)
 target_link_libraries(mimo_batch_argmax_device_test PRIVATE mimo_layer_vertical)
 
+add_executable(mimo_dense_batch_device_test tests/mimo_dense_batch_device_test.cpp)
+target_link_libraries(mimo_dense_batch_device_test PRIVATE mimo_layer_vertical)
+
 add_executable(mimo_moe_batch_device_test tests/mimo_moe_batch_device_test.cpp)
 target_link_libraries(mimo_moe_batch_device_test PRIVATE mimo_layer_vertical)
 

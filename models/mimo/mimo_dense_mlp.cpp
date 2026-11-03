@@ -47,7 +47,7 @@ enum class Binding {
 };
 
 struct ExternalTensor {
-  const char* name;
+  std::string name;
   synSectionHandle section = nullptr;
   Binding binding;
   std::vector<uint64_t> shape;
@@ -133,7 +133,9 @@ struct MimoDenseMlp::Impl {
                      const char* name, Binding binding, synDataType dtype,
                      std::initializer_list<uint64_t> sizes) {
     synTensorDescriptor descriptor = {};
-    descriptor.m_name = name;
+    const std::string scoped_name = (rows == 4 || rows == 8)
+        ? std::string(name) + "_b" + std::to_string(rows) : name;
+    descriptor.m_name = scoped_name.c_str();
     descriptor.m_dataType = dtype;
     descriptor.m_dims = sizes.size();
     unsigned dim = 0;
@@ -147,7 +149,7 @@ struct MimoDenseMlp::Impl {
     synSectionHandle section = nullptr;
     check(synSectionCreate(&section, 0, graph),
           std::string("create section for ") + name);
-    externals.push_back({name, section, binding, sizes});
+    externals.push_back({scoped_name, section, binding, sizes});
     try {
       check(synSectionSetPersistent(section, true),
             std::string("persist section for ") + name);
@@ -190,8 +192,10 @@ struct MimoDenseMlp::Impl {
   void node(synGraphHandle graph, std::initializer_list<synTensor> inputs,
             std::initializer_list<synTensor> outputs, const void* params,
             unsigned params_size, const char* guid, const char* name) {
+    const std::string scoped_name = (rows == 4 || rows == 8)
+        ? std::string(name) + "_b" + std::to_string(rows) : name;
     check(synNodeCreate(graph, inputs.begin(), outputs.begin(), inputs.size(),
-                        outputs.size(), params, params_size, guid, name, nullptr,
+                        outputs.size(), params, params_size, guid, scoped_name.c_str(), nullptr,
                         nullptr),
           std::string("create node ") + name);
   }
@@ -225,7 +229,7 @@ struct MimoDenseMlp::Impl {
   }
 
   void build() {
-    if (rows != 1 && rows != 32 && rows != 512 && rows != 1024 && rows != 2048)
+    if (rows != 1 && rows != 4 && rows != 8 && rows != 32 && rows != 512 && rows != 1024 && rows != 2048)
       throw std::invalid_argument("MimoDenseMlp: unsupported rows");
     const auto& gate_up_weight =
         expect_dynamic_weight(*weights, "gate_up_weight", syn_type_fp8_143, 3);
@@ -312,7 +316,7 @@ struct MimoDenseMlp::Impl {
     gate_up_launch.resize(gate_up_externals.size());
     for (size_t i = 0; i < gate_up_externals.size(); ++i) {
       gate_up_launch[i] = {};
-      gate_up_launch[i].tensorName = gate_up_externals[i].name;
+      gate_up_launch[i].tensorName = gate_up_externals[i].name.c_str();
       gate_up_launch[i].tensorType = DATA_TENSOR;
       for (size_t dim = 0; dim < gate_up_externals[i].shape.size(); ++dim) {
         gate_up_launch[i].tensorSize[dim] = gate_up_externals[i].shape[dim];
@@ -351,7 +355,7 @@ struct MimoDenseMlp::Impl {
     down_launch.resize(down_externals.size());
     for (size_t i = 0; i < down_externals.size(); ++i) {
       down_launch[i] = {};
-      down_launch[i].tensorName = down_externals[i].name;
+      down_launch[i].tensorName = down_externals[i].name.c_str();
       down_launch[i].tensorType = DATA_TENSOR;
       for (size_t dim = 0; dim < down_externals[i].shape.size(); ++dim) {
         down_launch[i].tensorSize[dim] = down_externals[i].shape[dim];
