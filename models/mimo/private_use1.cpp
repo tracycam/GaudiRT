@@ -159,6 +159,14 @@ struct BatchDecodePlan {
   uint32_t rows = 0;
 };
 
+struct PrefillRequestState {
+  uint32_t rows = 0;
+  uint32_t prompt_length = 0;
+  uint32_t position = 0;
+  bool complete = false;
+  std::vector<int32_t> pages;
+};
+
 class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram> {
  public:
   PrivateProgram(uint32_t rank, uint32_t world,
@@ -714,6 +722,55 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     prefill_complete_ = false;
   }
 
+  int32_t prefill_request(const std::string& request_id, const at::Tensor& tokens,
+                          const at::Tensor& full_rope, const at::Tensor& swa_rope,
+                          uint32_t prompt_length, const std::vector<int32_t>& pages) {
+    if (!batch_decode_enabled_ || !model_finalized_ || model_pending_ || request_id.empty() ||
+        pages.empty() || pages.size() > 64)
+      throw std::invalid_argument("PrivateUse1: invalid request prefill input");
+    auto previous = request_prefills_.find(request_id);
+    if (previous == request_prefills_.end() && request_prefills_.size() >= 8)
+      throw std::invalid_argument("PrivateUse1: too many live requests");
+    if (previous != request_prefills_.end()) {
+      const auto& state = previous->second;
+      if (state.complete || state.prompt_length != prompt_length || pages.size() < state.pages.size() ||
+          !std::equal(state.pages.begin(), state.pages.end(), pages.begin()))
+        throw std::invalid_argument("PrivateUse1: invalid request prefill continuation");
+    }
+    std::vector<bool> used(physical_cache_slots_ / 128, false);
+    for (const auto page : pages) {
+      if (page < 0 || static_cast<size_t>(page) >= used.size() || used[page])
+        throw std::invalid_argument("PrivateUse1: invalid request KV pages");
+      used[page] = true;
+    }
+    for (const auto& [other_id, state] : request_prefills_) {
+      if (other_id == request_id) continue;
+      for (const auto page : state.pages)
+        if (used[page]) throw std::invalid_argument("PrivateUse1: request KV pages overlap");
+    }
+    const uint32_t prior_rows = previous == request_prefills_.end() ? 0 : previous->second.rows;
+    if (tokens.numel() <= 0 || tokens.numel() > UINT32_MAX - prior_rows ||
+        pages.size() < (static_cast<uint64_t>(prior_rows) + tokens.numel() + 127) / 128)
+      throw std::invalid_argument("PrivateUse1: request lacks allocated prefill pages");
+    std::copy(pages.begin(), pages.end(), model_pages_.begin());
+    size_t count = pages.size();
+    for (size_t page = 0; count < model_pages_.size() && page < used.size(); ++page)
+      if (!used[page]) model_pages_[count++] = static_cast<int32_t>(page);
+    if (count != model_pages_.size()) throw std::invalid_argument("PrivateUse1: insufficient page geometry");
+    model_position_ = previous == request_prefills_.end() ? 0 : previous->second.position;
+    prefill_rows_ = prior_rows;
+    prompt_length_ = previous == request_prefills_.end() ? 0 : previous->second.prompt_length;
+    prefill_complete_ = false;
+    const int32_t next = prefill_chunk(tokens, full_rope, swa_rope, prompt_length);
+    request_prefills_[request_id] = {prefill_rows_, prompt_length_, model_position_, prefill_complete_, pages};
+    return next;
+  }
+
+  void release_request(const std::string& request_id) {
+    if (!batch_decode_enabled_ || model_pending_ || request_prefills_.erase(request_id) != 1)
+      throw std::invalid_argument("PrivateUse1: invalid request release");
+  }
+
   int32_t prefill(const at::Tensor& tokens, const at::Tensor& full_rope,
                   const at::Tensor& swa_rope) {
     if (prefill_rows_ != 0)
@@ -929,6 +986,42 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
           return token < 0 || token >= static_cast<int32_t>(ModelHead::kVocabSize);
         }))
       throw std::runtime_error("PrivateUse1: invalid batch token or nonfinite logits");
+    return result;
+  }
+
+  std::vector<int32_t> decode_requests(const std::vector<std::string>& request_ids,
+                                       const std::vector<int32_t>& tokens,
+                                       const std::vector<uint32_t>& positions,
+                                       const std::vector<std::vector<int32_t>>& pages) {
+    if (request_ids.empty() || request_ids.size() > 8 || tokens.size() != request_ids.size() ||
+        positions.size() != request_ids.size() || pages.size() != request_ids.size())
+      throw std::invalid_argument("PrivateUse1: invalid batch request geometry");
+    std::unordered_map<std::string, size_t> scheduled;
+    for (size_t row = 0; row < request_ids.size(); ++row) {
+      const auto state = request_prefills_.find(request_ids[row]);
+      if (state == request_prefills_.end() || !state->second.complete ||
+          state->second.position != positions[row] || !scheduled.emplace(request_ids[row], row).second ||
+          pages[row].size() < state->second.pages.size() ||
+          !std::equal(state->second.pages.begin(), state->second.pages.end(), pages[row].begin()))
+        throw std::invalid_argument("PrivateUse1: invalid decode request state");
+    }
+    std::vector<bool> owned(physical_cache_slots_ / 128, false);
+    for (const auto& [id, state] : request_prefills_) {
+      const auto row = scheduled.find(id);
+      const auto& current = row == scheduled.end() ? state.pages : pages[row->second];
+      if (current.size() > 64) throw std::invalid_argument("PrivateUse1: too many request pages");
+      for (auto page : current) {
+        if (page < 0 || static_cast<size_t>(page) >= owned.size() || owned[page])
+          throw std::invalid_argument("PrivateUse1: overlapping request KV pages");
+        owned[page] = true;
+      }
+    }
+    auto result = decode_batch(tokens, positions, pages);
+    for (size_t row = 0; row < request_ids.size(); ++row) {
+      auto& state = request_prefills_.at(request_ids[row]);
+      state.pages = pages[row];
+      ++state.position;
+    }
     return result;
   }
 
@@ -1202,6 +1295,7 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
   std::unordered_map<uint32_t, LayerEntry> entries_;
   std::unordered_map<uint32_t, PendingWeights> pending_;
   std::unordered_map<std::string, uint64_t> model_weights_;
+  std::unordered_map<std::string, PrefillRequestState> request_prefills_;
   std::vector<PreparedLayer> model_layers_;
   runtime::PreparedLaunch prefill_argmax_launch_;
   runtime::PreparedLaunch model_embedding_launch_;
@@ -1310,6 +1404,12 @@ void update_model_pages(uint32_t rank, const at::Tensor& pages) {
   get(rank)->update_model_pages(pages);
 }
 void reset_prefill(uint32_t rank) { get(rank)->reset_prefill(); }
+int32_t prefill_request(uint32_t rank, const std::string& request_id, const at::Tensor& tokens,
+                        const at::Tensor& full_rope, const at::Tensor& swa_rope,
+                        uint32_t prompt_length, const std::vector<int32_t>& pages) {
+  return get(rank)->prefill_request(request_id, tokens, full_rope, swa_rope, prompt_length, pages);
+}
+void release_request(uint32_t rank, const std::string& request_id) { get(rank)->release_request(request_id); }
 
 at::Tensor finalize_model(uint32_t rank, const at::Tensor& full_rope,
                           const at::Tensor& swa_rope, const at::Tensor& pages,
@@ -1322,6 +1422,12 @@ std::vector<int32_t> decode_batch(uint32_t rank, const std::vector<int32_t>& tok
                                   const std::vector<uint32_t>& positions,
                                   const std::vector<std::vector<int32_t>>& pages) {
   return get(rank)->decode_batch(tokens, positions, pages);
+}
+std::vector<int32_t> decode_requests(uint32_t rank, const std::vector<std::string>& ids,
+                                     const std::vector<int32_t>& tokens,
+                                     const std::vector<uint32_t>& positions,
+                                     const std::vector<std::vector<int32_t>>& pages) {
+  return get(rank)->decode_requests(ids, tokens, positions, pages);
 }
 
 at::Tensor model_logits(uint32_t rank) { return get(rank)->model_logits(); }
@@ -1430,9 +1536,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("prefill_chunk", &gaudirt::mimo::prefill_chunk);
   m.def("update_model_pages", &gaudirt::mimo::update_model_pages);
   m.def("reset_prefill", &gaudirt::mimo::reset_prefill);
+  m.def("prefill_request", &gaudirt::mimo::prefill_request);
+  m.def("release_request", &gaudirt::mimo::release_request);
   m.def("finalize_model", &gaudirt::mimo::finalize_model);
   m.def("finish_model_step", &gaudirt::mimo::finish_model_step);
   m.def("decode_batch", &gaudirt::mimo::decode_batch);
+  m.def("decode_requests", &gaudirt::mimo::decode_requests);
   m.def("model_logits", &gaudirt::mimo::model_logits);
   m.def("model_kv", &gaudirt::mimo::model_kv);
   m.def("model_kv_slots", &gaudirt::mimo::model_kv_slots);
