@@ -139,11 +139,11 @@ MimoMoeLayer1::MimoMoeLayer1(uint32_t tp_rank, const Weights& weights,
 
     synTensor attention = nullptr;
     if (gathered_attention_) {
-      synTensor gathered = external(kAttention, "mimo1_attention_gathered",
-                                    rows_ >= 512 ? syn_type_float : gathered_type_,
+      const auto collective_type = rows_ >= 512 ? syn_type_float : gathered_type_;
+      synTensor gathered = external(kAttention, "mimo1_attention_gathered", collective_type,
                                     {kHiddenSize, (rows_ >= 512 ? 1 : kTpSize) * rows_}, 0);
       sections.push_back(nullptr);
-      attention = gaudirt::mimo::append_tp8_reduce(graph, gathered, gathered_type_, sections.back(), rows_);
+      attention = gaudirt::mimo::append_tp8_reduce(graph, gathered, collective_type, sections.back(), rows_);
     } else {
       attention = external(kAttention, "mimo1_attention", syn_type_bf16,
                            {kHiddenSize, rows_}, 0);
