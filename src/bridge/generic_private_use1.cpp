@@ -2179,20 +2179,23 @@ at::Tensor argmax(const at::Tensor& input, std::optional<int64_t> dimension, boo
 // A first executable FX lowering: a weight-transposed GEMM. The hash contains
 // only operator structure and static geometry, never the layer or tensor address.
 ColdRecipe& bucket_linear_recipe(Context& ctx, at::ScalarType dtype, uint64_t k,
-                                 uint64_t n, uint32_t bucket) {
+                                 uint64_t n, uint32_t bucket, bool has_bias) {
   const auto type = cast_type(dtype);
   const std::string structure = "fx_mm_transpose_weight_v1_" + std::string(type.name) +
-                                "_" + std::to_string(k) + "_" + std::to_string(n);
+                                "_" + std::to_string(k) + "_" + std::to_string(n) +
+                                (has_bias ? "_bias" : "");
   const auto digest = gaudirt::common::sha256_bytes(
       reinterpret_cast<const uint8_t*>(structure.data()), structure.size());
   const auto prefix = "g" + digest.substr(0, 12) + "_b" + std::to_string(bucket);
   const auto key = "fx_" + digest + "_b" + std::to_string(bucket);
   auto found = ctx.cold_recipes.find(key);
   if (found != ctx.cold_recipes.end()) return *found->second;
-  auto recipe = std::make_unique<ColdRecipe>(3);
+  const size_t external_count = has_bias ? 4 : 3;
+  auto recipe = std::make_unique<ColdRecipe>(external_count);
   synGraphHandle graph = nullptr;
-  std::array<synSectionHandle, 3> sections{};
-  std::array<synTensor, 3> tensors{};
+  std::array<synSectionHandle, 4> sections{};
+  std::array<synTensor, 7> tensors{};
+  std::array<std::string, 3> intermediate_names{};
   const auto check = [](synStatus status, const char* message) {
     TORCH_CHECK(status == synSuccess, "GaudiRT: ", message, " status=", static_cast<int>(status));
   };
@@ -2203,8 +2206,10 @@ ColdRecipe& bucket_linear_recipe(Context& ctx, at::ScalarType dtype, uint64_t k,
   };
   try {
     check(synGraphCreate(&graph, synDeviceGaudi2), "bucket graph creation failed");
-    const std::array<std::array<uint64_t, 2>, 3> shapes{{{k, bucket}, {k, n}, {n, bucket}}};
-    for (size_t i = 0; i < tensors.size(); ++i) {
+    const std::array<std::array<uint64_t, 2>, 4> shapes = has_bias ?
+        std::array<std::array<uint64_t, 2>, 4>{{{k, bucket}, {k, n}, {n, 1}, {n, bucket}}} :
+        std::array<std::array<uint64_t, 2>, 4>{{{k, bucket}, {k, n}, {n, bucket}, {0, 0}}};
+    for (size_t i = 0; i < external_count; ++i) {
       recipe->names[i] = prefix + "_t" + std::to_string(i);
       check(synSectionCreate(&sections[i], 0, graph), "bucket section creation failed");
       check(synSectionSetPersistent(sections[i], true), "bucket section setup failed");
@@ -2223,8 +2228,46 @@ ColdRecipe& bucket_linear_recipe(Context& ctx, at::ScalarType dtype, uint64_t k,
     synTensor inputs[] = {tensors[0], tensors[1]};
     synGEMMParams params{false, true};
     const auto node = prefix + "_n0";
-    check(synNodeCreate(graph, inputs, &tensors[2], 2, 1, &params, sizeof(params),
+    if (has_bias) {
+      const bool bf16 = dtype == at::kBFloat16;
+      const size_t intermediate_count = bf16 ? 3 : 1;
+      for (size_t i = 0; i < intermediate_count; ++i) {
+        intermediate_names[i] = prefix + "_t" + std::to_string(i + external_count);
+        synTensorDescriptor desc{};
+        desc.m_name = intermediate_names[i].c_str();
+        desc.m_dataType = syn_type_float;
+        desc.m_dims = 2;
+        desc.m_sizes[0] = desc.m_minSizes[0] = n;
+        desc.m_sizes[1] = desc.m_minSizes[1] = bf16 && i == 1 ? 1 : bucket;
+        check(synTensorCreate(&tensors[external_count + i], &desc, nullptr, 0),
+              "bucket intermediate creation failed");
+      }
+    }
+    auto* gemm_output = has_bias ? &tensors[external_count] : &tensors[2];
+    check(synNodeCreate(graph, inputs, gemm_output, 2, 1, &params, sizeof(params),
                         "gemm", node.c_str(), nullptr, nullptr), "bucket GEMM node creation failed");
+    if (has_bias) {
+      const bool bf16 = dtype == at::kBFloat16;
+      ns_CastKernel::ParamsV3 cast{};
+      cast.round_mode = CAST_ROUND_HALF_NE;
+      if (bf16) {
+        const auto cast_node = prefix + "_n1";
+        check(synNodeCreate(graph, &tensors[2], &tensors[5], 1, 1, &cast, sizeof(cast),
+                            "cast_bf16_to_f32", cast_node.c_str(), nullptr, nullptr),
+              "bucket bias cast failed");
+      }
+      synTensor add_inputs[] = {tensors[4], bf16 ? tensors[5] : tensors[2]};
+      auto* add_output = bf16 ? &tensors[6] : &tensors[3];
+      const auto add_node = prefix + "_n2";
+      check(synNodeCreate(graph, add_inputs, add_output, 2, 1, nullptr, 0,
+                          "add_fwd_f32", add_node.c_str(), nullptr, nullptr), "bucket bias add failed");
+      if (bf16) {
+        const auto output_node = prefix + "_n3";
+        check(synNodeCreate(graph, &tensors[6], &tensors[3], 1, 1, &cast, sizeof(cast),
+                            "cast_f32_to_bf16", output_node.c_str(), nullptr, nullptr),
+              "bucket output cast failed");
+      }
+    }
     recipe->recipe = compile_cached(graph, prefix, key, &ctx.cache);
     check(synWorkspaceGetSize(&recipe->workspace, recipe->recipe), "bucket workspace query failed");
     initialize_launch_tensor_ids(recipe->recipe, recipe->tensors.data(), recipe->tensors.size());
@@ -2246,7 +2289,8 @@ struct GraphTemporary {
   uint64_t address;
 };
 
-at::Tensor bucket_linear(const at::Tensor& input, const at::Tensor& weight) {
+at::Tensor bucket_linear(const at::Tensor& input, const at::Tensor& weight,
+                         const std::optional<at::Tensor>& bias) {
   TORCH_CHECK(input.device() == weight.device() && input.device().type() == c10::kPrivateUse1 &&
               input.dim() == 2 && weight.dim() == 2 && input.size(1) == weight.size(1),
               "GaudiRT: bucket GEMM expects same-device [M,K] and [N,K]");
@@ -2255,6 +2299,11 @@ at::Tensor bucket_linear(const at::Tensor& input, const at::Tensor& weight) {
               "GaudiRT: bucket GEMM supports matching BF16 or FP32 tensors");
   const auto m = input.size(0), k = input.size(1), n = weight.size(0);
   TORCH_CHECK(m > 0 && m <= 4096 && k > 0 && n > 0, "GaudiRT: invalid bucket GEMM shape");
+  if (bias) {
+    TORCH_CHECK(bias->device() == input.device() && bias->scalar_type() == input.scalar_type() &&
+                bias->dim() == 1 && bias->size(0) == n,
+                "GaudiRT: bucket GEMM bias must be a same-device [N] tensor of matching dtype");
+  }
   const uint32_t bucket = std::bit_ceil(static_cast<uint32_t>(m));
   const uint64_t item = input.element_size();
   TORCH_CHECK(static_cast<uint64_t>(k) <= UINT64_MAX / bucket / item,
@@ -2276,11 +2325,28 @@ at::Tensor bucket_linear(const at::Tensor& input, const at::Tensor& weight) {
     copy(weight_value, weight, true);
     weight_address = address_of(weight_value, *ctx);
   }
+  at::Tensor bias_value;
+  uint64_t bias_address = 0;
+  if (bias) {
+    bias_value = *bias;
+    bias_address = address_of(bias_value, *ctx);
+    const auto bytes = bias_value.nbytes();
+    const bool input_overlap = direct && input_address < bias_address + bytes &&
+                               bias_address < input_address + bucket_bytes;
+    const bool weight_overlap = weight_address < bias_address + bytes &&
+                                bias_address < weight_address + weight_value.nbytes();
+    if (!bias_value.is_contiguous() || bias_address % BlockCachingAllocator::kAlignment ||
+        input_overlap || weight_overlap) {
+      bias_value = at::empty(bias->sizes(), bias->options());
+      copy(bias_value, *bias, true);
+      bias_address = address_of(bias_value, *ctx);
+    }
+  }
   auto physical = at::empty({static_cast<int64_t>(bucket), n}, input.options());
   auto result = physical.narrow(0, 0, m);
   const auto output_address = address_of(physical, *ctx);
   std::lock_guard lock(ctx->cold_mutex);
-  auto& recipe = bucket_linear_recipe(*ctx, input.scalar_type(), k, n, bucket);
+  auto& recipe = bucket_linear_recipe(*ctx, input.scalar_type(), k, n, bucket, bias.has_value());
   if ((!direct || recipe.workspace) && !ctx->graph_pool) {
     const uint64_t budget = std::min<uint64_t>(ctx->allocator.capacity_bytes() / 8, uint64_t{1} << 30);
     TORCH_CHECK(budget >= 256, "GaudiRT: HBM budget is too small for graph temporaries");
@@ -2289,6 +2355,7 @@ at::Tensor bucket_linear(const at::Tensor& input, const at::Tensor& weight) {
   std::unique_ptr<GraphTemporary> staged, workspace;
   ctx->allocator.record_stream(input_address, stream);
   ctx->allocator.record_stream(weight_address, stream);
+  if (bias) ctx->allocator.record_stream(bias_address, stream);
   ctx->allocator.record_stream(output_address, stream);
   if (!direct) {
     staged = std::make_unique<GraphTemporary>(ctx->graph_pool->allocator(), stream, bucket_bytes);
@@ -2300,7 +2367,8 @@ at::Tensor bucket_linear(const at::Tensor& input, const at::Tensor& weight) {
   auto bindings = recipe.tensors;
   bindings[0].pTensorAddress = staged ? staged->address : input_address;
   bindings[1].pTensorAddress = weight_address;
-  bindings[2].pTensorAddress = output_address;
+  if (bias) bindings[2].pTensorAddress = bias_address;
+  bindings.back().pTensorAddress = output_address;
   TORCH_CHECK(synLaunch(stream, bindings.data(), bindings.size(), workspace ? workspace->address : 0,
                         recipe.recipe, 0) == synSuccess, "GaudiRT: bucket GEMM launch failed");
   return result;
@@ -2349,5 +2417,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("memory_allocated", &gaudirt::generic::memory_allocated);
   m.def("max_memory_allocated", &gaudirt::generic::max_memory_allocated);
   m.def("recipe_cache_stats", &gaudirt::generic::recipe_cache_stats);
-  m.def("bucket_linear", &gaudirt::generic::bucket_linear);
+  m.def("bucket_linear", &gaudirt::generic::bucket_linear,
+        pybind11::arg("input"), pybind11::arg("weight"), pybind11::arg("bias") = pybind11::none());
 }
