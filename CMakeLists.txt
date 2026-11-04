@@ -19,19 +19,24 @@ link_directories(${HABANA_LIB_DIR})
 add_link_options(-Wl,-rpath,${HABANA_LIB_DIR})
 
 add_library(gaudirt STATIC
+    src/block_caching_allocator.cpp
     src/bridge/rank_lifecycle.cpp
     src/device_runtime.cpp
     src/hbm_arena.cpp
+    src/pinned_host_pool.cpp
     src/recipe_registry.cpp
     src/sha256.cpp
     src/weight_manifest.cpp
     src/tp_reduce.cpp
 )
-target_link_libraries(gaudirt PUBLIC Synapse hcl pthread)
+target_link_libraries(gaudirt PUBLIC Synapse hcl pthread ${CMAKE_DL_LIBS})
 
 add_executable(gaudirt_runtime_unit_tests tests/runtime_unit_tests.cpp)
 target_compile_options(gaudirt_runtime_unit_tests PRIVATE -UNDEBUG)
 target_link_libraries(gaudirt_runtime_unit_tests PRIVATE gaudirt)
+
+add_executable(recipe_cache_fingerprint_test tests/recipe_cache_fingerprint_test.cpp)
+target_link_libraries(recipe_cache_fingerprint_test PRIVATE gaudirt)
 
 add_library(mimo_layer_vertical STATIC
     models/mimo/mimo_attention.cpp
@@ -68,6 +73,9 @@ target_link_libraries(mimo_grouped_moe_real_weight_test PRIVATE mimo_layer_verti
 
 add_executable(pinned_host_dma_device_test tests/pinned_host_dma_device_test.cpp)
 target_link_libraries(pinned_host_dma_device_test PRIVATE gaudirt)
+
+add_executable(block_allocator_device_test tests/block_allocator_device_test.cpp)
+target_link_libraries(block_allocator_device_test PRIVATE gaudirt)
 
 add_executable(model_head_batch_device_test tests/model_head_batch_device_test.cpp)
 target_link_libraries(model_head_batch_device_test PRIVATE mimo_layer_vertical)

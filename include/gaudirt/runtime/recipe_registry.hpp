@@ -29,15 +29,15 @@ struct TensorSlotMeta {
 
 uint64_t tensor_byte_size(synDataType dtype, uint64_t elements);
 
-// The caller scopes the directory to one graph/kernel fingerprint. A present
-// but invalid cache entry is an error; only a missing entry requests compilation.
+// Cache paths automatically include the compiler, providers and calling graph
+// builder binaries. A present but invalid entry fails; only a missing one compiles.
 class RecipeCache {
  public:
   RecipeCache() = default;
-  explicit RecipeCache(std::filesystem::path directory)
-      : directory_(std::move(directory)) {}
+  explicit RecipeCache(std::filesystem::path directory);
 
   bool enabled() const noexcept { return !directory_.empty(); }
+  const std::filesystem::path& directory() const noexcept { return directory_; }
   synRecipeHandle load(const std::string& key);
   void save(synRecipeHandle recipe, const std::string& key);
   std::pair<uint64_t, uint64_t> stats() const noexcept {
@@ -116,12 +116,6 @@ class RecipeRegistry {
 
   // Take ownership of an already-compiled synRecipeHandle and introspect it.
   RecipeId register_compiled(const std::string& name, synRecipeHandle handle);
-
-  // Load a serialized recipe from disk via synRecipeDeSerialize.
-  RecipeId load_from_file(const std::string& name, const std::string& path);
-
-  // Save a registered recipe to disk via synRecipeSerialize.
-  void save_to_file(RecipeId id, const std::string& path) const;
 
   const Entry& get(RecipeId id) const;
   BindingTable create_binding_table(RecipeId id) const;

@@ -13,7 +13,6 @@
 
 #include "gaudirt/bridge/rank_lifecycle.hpp"
 #include "gaudirt/bridge/private_use1.hpp"
-#include "gaudirt/common/sha256.hpp"
 #include "gaudirt/runtime/weight_manifest.hpp"
 
 #include <torch/extension.h>
@@ -24,7 +23,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <dlfcn.h>
 #include <filesystem>
 #include <memory>
 #include <new>
@@ -35,40 +33,6 @@
 
 namespace gaudirt::mimo {
 namespace {
-
-std::filesystem::path recipe_cache_directory(const std::filesystem::path& root,
-                                             uint32_t rank) {
-  if (root.empty()) return {};
-  Dl_info builder{}, compiler{};
-  if (!dladdr(reinterpret_cast<void*>(&recipe_cache_directory), &builder) ||
-      !dladdr(reinterpret_cast<void*>(&synGraphCompile), &compiler)) {
-    throw std::runtime_error("PrivateUse1: cannot identify recipe compiler inputs");
-  }
-  const char* kernels = std::getenv("GC_KERNEL_PATH");
-  if (!kernels || !*kernels)
-    throw std::invalid_argument("PrivateUse1: recipe cache requires GC_KERNEL_PATH");
-  std::string inputs = "gaudirt-recipe-cache-v1\n";
-  const auto add = [&](const std::filesystem::path& file) {
-    inputs += common::sha256_file(file);
-    inputs += '\n';
-  };
-  add(builder.dli_fname);
-  add(compiler.dli_fname);
-  add(std::filesystem::path(compiler.dli_fname).parent_path() / "libSynapseMme.so");
-  const std::string paths(kernels);
-  for (size_t start = 0; start < paths.size();) {
-    const size_t end = paths.find(':', start);
-    const std::string file = paths.substr(start, end - start);
-    if (file.empty()) throw std::invalid_argument("PrivateUse1: empty TPC library path");
-    add(file);
-    if (end == std::string::npos) break;
-    start = end + 1;
-    if (start == paths.size()) throw std::invalid_argument("PrivateUse1: empty TPC library path");
-  }
-  const auto digest = common::sha256_bytes(
-      reinterpret_cast<const uint8_t*>(inputs.data()), inputs.size());
-  return root / digest / ("rank" + std::to_string(rank));
-}
 
 enum class Kind : int { A = 0, B = 1, C = 2 };
 
@@ -184,7 +148,8 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
           return config;
         }()),
         arena_(runtime_.device_id(), hbm_bytes),
-        recipe_cache_(recipe_cache_directory(recipe_cache, rank)) {
+        recipe_cache_(recipe_cache.empty() ? std::filesystem::path{} :
+                      recipe_cache / ("rank" + std::to_string(rank))) {
     if (world != 8 || rank >= world) {
       throw std::invalid_argument("PrivateUse1: only TP8 is supported");
     }

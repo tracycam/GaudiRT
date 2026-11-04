@@ -11,6 +11,7 @@
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -355,11 +356,12 @@ void test_foundation_on_hardware() {
   synRecipeHandle raw_recipe = compile_test_add_recipe("gaudirt_test_add", kElems);
   auto id_mem = registry.register_compiled("add_mem", raw_recipe);
 
-  const std::string recipe_path =
-      "/tmp/gaudirt_test_add_" + std::to_string(getpid()) + ".recipe";
-  registry.save_to_file(id_mem, recipe_path);
-  auto id_disk = registry.load_from_file("add_disk", recipe_path);
-  unlink(recipe_path.c_str());
+  const auto recipe_root = std::filesystem::temp_directory_path() /
+                           ("gaudirt_test_add_" + std::to_string(getpid()));
+  RecipeCache disk_cache(recipe_root);
+  disk_cache.save(registry.get(id_mem).handle, "add");
+  auto id_disk = registry.register_compiled("add_disk", disk_cache.load("add"));
+  std::filesystem::remove_all(recipe_root);
 
   const auto& disk_entry = registry.get(id_disk);
   assert(disk_entry.slots.size() == 3);
@@ -496,6 +498,7 @@ void test_recipe_cache_contract() {
   disabled.save(nullptr, "invalid/key");
   assert(disabled.stats().first == 0 && disabled.stats().second == 0);
 
+  setenv("GC_KERNEL_PATH", "/usr/lib/habanalabs/libtpc_kernels.so", 0);
   RecipeCache enabled(std::filesystem::temp_directory_path() / "gaudirt_cache_test");
   bool rejected = false;
   try {
