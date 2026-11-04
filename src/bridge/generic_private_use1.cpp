@@ -2395,7 +2395,7 @@ struct FxValueSpec {
 };
 
 // An FX program is described by external input roles and normalized nodes.
-// Node 0 is linear, node 1 is add, and node 2 is BF16 RMSNorm.
+// Node 0 is linear, 1 is add, 2 is BF16 RMSNorm, and 3 is BF16 SiLU/multiply.
 // A node's output ID is input_count + its index in the program.
 class BucketProgram {
  public:
@@ -2411,11 +2411,12 @@ class BucketProgram {
     for (size_t i = 0; i < operations_.size(); ++i) {
       const auto& op = operations_[i];
       const int64_t upper = roles_.size() + i;
-      TORCH_CHECK(op.size() == 4 && (op[0] == 0 || op[0] == 1 || op[0] == 2) &&
+      TORCH_CHECK(op.size() == 4 && (op[0] == 0 || op[0] == 1 || op[0] == 2 || op[0] == 3) &&
                   op[1] >= 0 && op[1] < upper && op[2] >= 0 && op[2] < upper &&
                   ((op[0] == 0 && (op[3] == -1 || (op[3] >= 0 && op[3] < upper))) ||
                    (op[0] == 1 && op[3] == -1) ||
-                   (op[0] == 2 && op[3] >= 0 && static_cast<uint64_t>(op[3]) <= UINT32_MAX)),
+                   (op[0] == 2 && op[3] >= 0 && static_cast<uint64_t>(op[3]) <= UINT32_MAX) ||
+                   (op[0] == 3 && op[1] == op[2] && op[3] == -1)),
                   "GaudiRT FX: invalid normalized node");
     }
   }
@@ -2438,7 +2439,7 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
   std::vector<FxValueSpec> specs;
   specs.reserve(inputs.size() + operations_.size());
   std::ostringstream normalized;
-  normalized << "fx_program_v4;";
+  normalized << "fx_program_v5;";
   for (size_t i = 0; i < inputs.size(); ++i) {
     const auto& tensor = inputs[i];
     TORCH_CHECK(tensor.device().type() == c10::kPrivateUse1 && tensor.device().index() == 0 &&
@@ -2472,13 +2473,17 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
       TORCH_CHECK(a.dynamic && b.dynamic && a.sizes == b.sizes,
                   "GaudiRT FX: add requires equal dynamic shapes");
       specs.push_back(a);
-    } else {
+    } else if (op[0] == 2) {
       const float epsilon = std::bit_cast<float>(static_cast<uint32_t>(op[3]));
       TORCH_CHECK(a.dtype == at::kBFloat16 && a.dynamic && a.sizes.size() == 2 &&
                   a.sizes[1] <= 8192 && !b.dynamic && b.sizes.size() == 1 &&
                   b.sizes[0] == a.sizes[1] && std::isfinite(epsilon) && epsilon > 0,
                   "GaudiRT FX: invalid BF16 RMSNorm geometry or epsilon");
       specs.push_back(a);
+    } else {
+      TORCH_CHECK(a.dtype == at::kBFloat16 && a.dynamic && a.sizes.size() == 2 &&
+                  a.sizes[1] % 2 == 0, "GaudiRT FX: invalid BF16 SiLU/multiply geometry");
+      specs.push_back({a.dtype, {-1, a.sizes[1] / 2}, true});
     }
     normalized << "n" << op[0] << ":" << op[1] << ":" << op[2] << ":" << op[3] << ";";
   }
@@ -2567,6 +2572,10 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
         const float epsilon = std::bit_cast<float>(static_cast<uint32_t>(op[3]));
         node({values[op[1]], values[op[2]]}, values[id], &epsilon, sizeof(epsilon),
              "gk_rms_norm_bf16_v1");
+        continue;
+      }
+      if (op[0] == 3) {
+        node({values[op[1]]}, values[id], nullptr, 0, "gk_silu_and_mul_bf16_v1");
         continue;
       }
       synGEMMParams gemm{false, true};
@@ -2692,14 +2701,21 @@ at::Tensor bucket_rms_norm(const at::Tensor& input, const at::Tensor& weight, do
   BucketProgram program({1, 0}, {{2, 0, 1, static_cast<int64_t>(bits)}});
   return program.run({input, weight});
 }
+
+at::Tensor bucket_silu_and_mul(const at::Tensor& input) {
+  BucketProgram program({1}, {{3, 0, 0, -1}});
+  return program.run({input});
+}
 }  // namespace gaudirt::generic
 
 TORCH_LIBRARY(gaudirt, m) {
   m.def("rms_norm(Tensor input, Tensor weight, float epsilon) -> Tensor");
+  m.def("silu_and_mul(Tensor input) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(gaudirt, PrivateUse1, m) {
   m.impl("rms_norm", TORCH_FN(gaudirt::generic::bucket_rms_norm));
+  m.impl("silu_and_mul", TORCH_FN(gaudirt::generic::bucket_silu_and_mul));
 }
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {

@@ -35,6 +35,7 @@ def _program_backend(graph_module, example_inputs):
     addmm_targets = (torch.addmm, torch.ops.aten.addmm.default)
     add_targets = (operator.add, torch.add, torch.ops.aten.add.Tensor)
     norm_targets = (torch.ops.gaudirt.rms_norm, torch.ops.gaudirt.rms_norm.default)
+    silu_targets = (torch.ops.gaudirt.silu_and_mul, torch.ops.gaudirt.silu_and_mul.default)
 
     def tensor_id(value):
         if value not in ids:
@@ -85,6 +86,9 @@ def _program_backend(graph_module, example_inputs):
                 raise RuntimeError("GaudiRT FX: RMSNorm epsilon must be positive and finite")
             bits = struct.unpack("<I", struct.pack("<f", epsilon))[0]
             operation = [2, tensor_id(node.args[0]), tensor_id(node.args[1]), bits]
+        elif node.target in silu_targets and len(node.args) == 1 and not node.kwargs:
+            source = tensor_id(node.args[0])
+            operation = [3, source, source, -1]
         else:
             raise RuntimeError(f"GaudiRT FX: unsupported program operation {node.target}")
         ids[node] = len(tensor_indices) + len(operations)
