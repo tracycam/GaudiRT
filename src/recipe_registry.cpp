@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "gaudirt/runtime/recipe_registry.hpp"
+#include "gaudirt/common/sha256.hpp"
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
+#include <dlfcn.h>
+#include <mutex>
 #include <stdexcept>
 #include <utility>
 
@@ -65,6 +69,71 @@ uint64_t dtype_bits(synDataType dtype) {
 }
 
 }  // namespace
+
+namespace {
+std::string digest_text(const std::string& text) {
+  return common::sha256_bytes(reinterpret_cast<const uint8_t*>(text.data()), text.size());
+}
+
+std::string builder_fingerprint(const char* filename) {
+  static std::mutex mutex;
+  static std::unordered_map<std::string, std::string> hashes;
+  std::lock_guard lock(mutex);
+  const auto found = hashes.find(filename);
+  if (found != hashes.end()) return found->second;
+  const auto digest = common::sha256_file(filename);
+  hashes.emplace(filename, digest);
+  return digest;
+}
+
+std::string environment_fingerprint() {
+  // GC_KERNEL_PATH is a process-start contract; compute its ordered content
+  // hashes once, before any recipe load or serialization.
+  struct Fingerprint { std::string providers; std::string digest; };
+  static const Fingerprint fingerprint = [] {
+    Dl_info compiler{};
+    if (!dladdr(reinterpret_cast<void*>(&synGraphCompile), &compiler) || !compiler.dli_fname)
+      throw std::runtime_error("RecipeCache: cannot identify libSynapse");
+    const char* kernels = std::getenv("GC_KERNEL_PATH");
+    if (!kernels || !*kernels)
+      throw std::invalid_argument("RecipeCache: GC_KERNEL_PATH is required");
+    std::string input = "gaudirt-environment-v1\n";
+    const auto add = [&](const std::filesystem::path& path) {
+      input += common::sha256_file(path);
+      input += '\n';
+    };
+    add(compiler.dli_fname);
+    add(std::filesystem::path(compiler.dli_fname).parent_path() / "libSynapseMme.so");
+    const std::string paths(kernels);
+    size_t start = 0;
+    size_t count = 0;
+    while (true) {
+      const auto end = paths.find(':', start);
+      const auto path = paths.substr(start, end - start);
+      if (path.empty()) throw std::invalid_argument("RecipeCache: empty provider path");
+      if (++count > 15) throw std::invalid_argument("RecipeCache: too many TPC providers");
+      add(path);
+      if (end == std::string::npos) break;
+      start = end + 1;
+    }
+    return Fingerprint{paths, digest_text(input)};
+  }();
+  const char* current = std::getenv("GC_KERNEL_PATH");
+  if (!current || fingerprint.providers != current)
+    throw std::runtime_error("RecipeCache: GC_KERNEL_PATH changed after initialization");
+  return fingerprint.digest;
+}
+}  // namespace
+
+RecipeCache::RecipeCache(std::filesystem::path root) {
+  if (root.empty()) return;
+  Dl_info builder{};
+  if (!dladdr(__builtin_return_address(0), &builder) || !builder.dli_fname)
+    throw std::runtime_error("RecipeCache: cannot identify graph builder binary");
+  const std::string input = "gaudirt-recipe-cache-v2\n" + environment_fingerprint() +
+                            "\n" + builder_fingerprint(builder.dli_fname) + "\n";
+  directory_ = std::move(root) / digest_text(input);
+}
 
 uint64_t tensor_byte_size(synDataType dtype, uint64_t elements) {
   const uint64_t bits = dtype_bits(dtype);
@@ -307,26 +376,6 @@ RecipeRegistry::RecipeId RecipeRegistry::register_compiled(
   entries_.push_back(std::move(entry));
   owner.release();
   return entries_.back().id;
-}
-
-RecipeRegistry::RecipeId RecipeRegistry::load_from_file(
-    const std::string& name, const std::string& path) {
-  synRecipeHandle handle = nullptr;
-  const synStatus status = synRecipeDeSerialize(&handle, path.c_str());
-  RecipeHandleGuard owner(handle);
-  if (status != synSuccess || handle == nullptr) {
-    throw std::runtime_error("RecipeRegistry: synRecipeDeSerialize failed for " +
-                             path);
-  }
-  return register_compiled(name, owner.release());
-}
-
-void RecipeRegistry::save_to_file(RecipeId id, const std::string& path) const {
-  const Entry& e = get(id);
-  if (synRecipeSerialize(e.handle, path.c_str()) != synSuccess) {
-    throw std::runtime_error("RecipeRegistry: synRecipeSerialize failed for " +
-                             path);
-  }
 }
 
 const RecipeRegistry::Entry& RecipeRegistry::get(RecipeId id) const {
