@@ -32,6 +32,11 @@ def _fake_rms_norm(input, weight, epsilon):
     return torch.empty_like(input, memory_format=torch.contiguous_format)
 
 
+@torch.library.register_fake("gaudirt::silu_and_mul")
+def _fake_silu_and_mul(input):
+    return input.new_empty((*input.shape[:-1], input.shape[-1] // 2))
+
+
 torch.utils.rename_privateuse1_backend("gaudirt")
 torch._register_device_module("gaudirt", sys.modules[__name__])
 torch.utils.generate_methods_for_privateuse1_backend(for_packed_sequence=False)
