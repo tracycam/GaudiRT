@@ -20,18 +20,26 @@ def gaudirt_backend(graph_module, example_inputs):
         raise RuntimeError("GaudiRT FX: only a single GEMM output is implemented")
     gemm = returned[0]
     mm_targets = (torch.mm, torch.ops.aten.mm.default)
-    if (not isinstance(gemm, torch.fx.Node) or gemm.op != "call_function" or
-            gemm.target not in mm_targets or len(gemm.args) != 2):
+    linear_targets = (torch.nn.functional.linear, torch.ops.aten.linear.default)
+    if not isinstance(gemm, torch.fx.Node) or gemm.op != "call_function" or gemm.kwargs:
         raise RuntimeError("GaudiRT FX: unsupported subgraph")
-    input_node, transposed = gemm.args
-    if (not isinstance(transposed, torch.fx.Node) or transposed.op != "call_method" or
-            transposed.target != "t" or
-            len(transposed.args) != 1):
-        raise RuntimeError("GaudiRT FX: GEMM weight must be transposed with t()")
-    weight_node = transposed.args[0]
+    accepted = {gemm}
+    if gemm.target in mm_targets and len(gemm.args) == 2:
+        input_node, transposed = gemm.args
+        if (not isinstance(transposed, torch.fx.Node) or transposed.op != "call_method" or
+                transposed.target != "t" or len(transposed.args) != 1 or transposed.kwargs):
+            raise RuntimeError("GaudiRT FX: GEMM weight must be transposed with t()")
+        weight_node = transposed.args[0]
+        accepted.add(transposed)
+    elif gemm.target in linear_targets and len(gemm.args) in (2, 3):
+        input_node, weight_node = gemm.args[:2]
+        if len(gemm.args) == 3 and gemm.args[2] is not None:
+            raise RuntimeError("GaudiRT FX: linear bias is not implemented")
+    else:
+        raise RuntimeError("GaudiRT FX: unsupported subgraph")
     if input_node not in placeholders or weight_node not in placeholders:
         raise RuntimeError("GaudiRT FX: GEMM operands must be external inputs")
-    if any(node.op not in ("placeholder", "output") and node not in (gemm, transposed)
+    if any(node.op not in ("placeholder", "output") and node not in accepted
            for node in nodes):
         raise RuntimeError("GaudiRT FX: unsupported additional operation")
     input_index = placeholders.index(input_node)
