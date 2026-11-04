@@ -1359,10 +1359,65 @@ ColdRecipe& range64_recipe(Context& ctx, uint32_t count, at::ScalarType dtype) {
   return *it->second;
 }
 
+at::Tensor pointwise(std::vector<at::Tensor> inputs, const std::vector<int64_t>& shape,
+                     at::ScalarType output_type, const std::string& op,
+                     const std::vector<synDataType>& types);
+at::Tensor& arange_out(const at::Scalar& start_value, const at::Scalar& end_value,
+                       const at::Scalar& step_value, at::Tensor& out);
+
+at::Tensor& arange_dyadic_out(const at::Scalar& start_value, const at::Scalar& end_value,
+                              const at::Scalar& step_value, at::Tensor& out) {
+  TORCH_CHECK(out.scalar_type() == at::kFloat || out.scalar_type() == at::kBFloat16,
+              "GaudiRT: noninteger arange parameters require a floating output");
+  const double start = start_value.toDouble(), end = end_value.toDouble(), step = step_value.toDouble();
+  TORCH_CHECK(std::isfinite(start) && std::isfinite(end) && std::isfinite(step) && step != 0 &&
+              !(start == 0.0 && std::signbit(start)), "GaudiRT: unsupported floating arange bounds");
+  TORCH_CHECK((step > 0 && start <= end) || (step < 0 && start >= end),
+              "GaudiRT: arange bounds and step are inconsistent");
+  const double count_double = std::ceil((end - start) / step);
+  TORCH_CHECK(std::isfinite(count_double) && count_double >= 0 && count_double <= (1 << 24),
+              "GaudiRT: arange is too large");
+  const int64_t count = static_cast<int64_t>(count_double);
+  const std::array<int64_t, 1> shape{count};
+  const int64_t exact_limit = out.scalar_type() == at::kBFloat16 ? 1 << 8 : 1 << 24;
+  int scale_shift = -1;
+  int64_t scaled_start = 0, scaled_step = 0;
+  for (int shift = 0; shift <= 16; ++shift) {
+    const double a = std::ldexp(start, shift), s = std::ldexp(step, shift);
+    if (!std::isfinite(a) || !std::isfinite(s) || std::trunc(a) != a || std::trunc(s) != s ||
+        std::abs(a) > exact_limit || std::abs(s) > exact_limit) continue;
+    const auto ai = static_cast<int64_t>(a), si = static_cast<int64_t>(s);
+    const __int128 offset = static_cast<__int128>(count - 1) * si;
+    const __int128 last = static_cast<__int128>(ai) + offset;
+    if (offset < -exact_limit || offset > exact_limit || last < -exact_limit || last > exact_limit) continue;
+    scale_shift = shift;
+    scaled_start = ai;
+    scaled_step = si;
+    break;
+  }
+  TORCH_CHECK(!count || scale_shift >= 0, "GaudiRT: floating arange exceeds the verified dyadic range");
+  if (out.sizes() != at::IntArrayRef(shape)) {
+    TORCH_CHECK(out.numel() == 0, "GaudiRT: nonempty arange out has the wrong shape");
+    auto replacement = at::empty(shape, out.options());
+    set_storage(out, replacement.storage(), 0, shape, {});
+  }
+  if (!count) return out;
+  auto integral = at::empty(shape, out.options().dtype(at::kInt));
+  const int64_t scaled_end = scaled_start + count * scaled_step;
+  arange_out(at::Scalar(scaled_start), at::Scalar(scaled_end), at::Scalar(scaled_step), integral);
+  auto values = integral.to(at::kFloat);
+  auto scale = at::empty({}, out.options().dtype(at::kFloat));
+  fill(scale, at::Scalar(std::ldexp(1.0, -scale_shift)));
+  const std::vector<int64_t> result_shape{count};
+  auto result = pointwise({values, scale}, result_shape, at::kFloat, "mult_fwd_f32",
+                          {syn_type_float, syn_type_float, syn_type_float});
+  return copy(out, result, true);
+}
+
 at::Tensor& arange_out(const at::Scalar& start_value, const at::Scalar& end_value,
                        const at::Scalar& step_value, at::Tensor& out) {
-  TORCH_CHECK(start_value.isIntegral(false) && end_value.isIntegral(false) &&
-              step_value.isIntegral(false), "GaudiRT: arange currently requires integer parameters");
+  if (!start_value.isIntegral(false) || !end_value.isIntegral(false) || !step_value.isIntegral(false))
+    return arange_dyadic_out(start_value, end_value, step_value, out);
   TORCH_CHECK(out.scalar_type() == at::kInt || out.scalar_type() == at::kLong ||
               out.scalar_type() == at::kFloat || out.scalar_type() == at::kBFloat16,
               "GaudiRT: arange dtype is not implemented");
