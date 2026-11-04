@@ -37,6 +37,10 @@ class PinnedHostPool {
 
   void* allocate(uint64_t bytes);
   void free(void* address);
+  void record_stream(const void* address, synStreamHandle stream);
+  bool contains_live_range(const void* address, uint64_t bytes) const;
+  uint64_t memory_allocated() const;
+  uint64_t largest_free_block() const;
   void copy_h2d(uint64_t dst, const void* src, uint64_t bytes,
                 synStreamHandle stream, bool non_blocking);
   void copy_d2h(void* dst, uint64_t src, uint64_t bytes,
@@ -58,8 +62,9 @@ class PinnedHostPool {
   synDeviceId device_;
   uint64_t capacity_;
   void* base_ = nullptr;
+  uint64_t allocated_ = 0;
   std::map<uint64_t, Block> blocks_;
-  std::mutex mutex_;
+  mutable std::mutex mutex_;
 };
 
 }  // namespace gaudirt::runtime

@@ -80,6 +80,7 @@ void* PinnedHostPool::allocate(uint64_t bytes) {
   best->second.bytes = size;
   best->second.allocated = true;
   best->second.fences.clear();
+  allocated_ += size;
   return reinterpret_cast<void*>(address);
 }
 void PinnedHostPool::free(void* address) {
@@ -96,6 +97,7 @@ void PinnedHostPool::free(void* address) {
     events.push_back(std::move(event));
   }
   it->second.allocated = false;
+  allocated_ -= it->second.bytes;
   it->second.streams.clear();
   it->second.fences = std::move(events);
   const auto append_unique = [](auto& to, const auto& from) {
@@ -116,6 +118,40 @@ void PinnedHostPool::free(void* address) {
       blocks_.erase(it);
     }
   }
+}
+void PinnedHostPool::record_stream(const void* address, synStreamHandle stream) {
+  if (!stream) throw std::invalid_argument("PinnedHostPool: null stream");
+  std::lock_guard lock(mutex_);
+  auto it = blocks_.upper_bound(reinterpret_cast<uint64_t>(address));
+  if (it == blocks_.begin()) throw std::invalid_argument("PinnedHostPool: invalid pointer");
+  --it;
+  const auto offset = reinterpret_cast<uint64_t>(address) - it->first;
+  if (!it->second.allocated || offset >= it->second.bytes)
+    throw std::invalid_argument("PinnedHostPool: invalid pointer");
+  auto& streams = it->second.streams;
+  if (std::find(streams.begin(), streams.end(), stream) == streams.end()) streams.push_back(stream);
+}
+bool PinnedHostPool::contains_live_range(const void* address, uint64_t bytes) const {
+  std::lock_guard lock(mutex_);
+  const auto value = reinterpret_cast<uint64_t>(address);
+  auto it = blocks_.upper_bound(value);
+  if (it == blocks_.begin()) return false;
+  --it;
+  const auto offset = value - it->first;
+  return it->second.allocated && offset <= it->second.bytes && bytes <= it->second.bytes - offset;
+}
+uint64_t PinnedHostPool::memory_allocated() const {
+  std::lock_guard lock(mutex_);
+  return allocated_;
+}
+uint64_t PinnedHostPool::largest_free_block() const {
+  std::lock_guard lock(mutex_);
+  uint64_t largest = 0;
+  for (const auto& [address, block] : blocks_) {
+    (void)address;
+    if (!block.allocated) largest = std::max(largest, block.bytes);
+  }
+  return largest;
 }
 void PinnedHostPool::copy(void* host, uint64_t device, uint64_t bytes,
                           synStreamHandle stream, bool non_blocking, synDmaDir direction) {
