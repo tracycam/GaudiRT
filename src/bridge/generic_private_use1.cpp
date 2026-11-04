@@ -22,10 +22,12 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <sstream>
 #include <unordered_map>
 
 namespace gaudirt::generic {
@@ -2289,6 +2291,19 @@ struct GraphTemporary {
   uint64_t address;
 };
 
+at::Tensor bucket_output(const at::Tensor& reference, at::ScalarType dtype,
+                         uint32_t bucket, int64_t rows, int64_t width) {
+  const uint64_t item = c10::elementSize(dtype);
+  TORCH_CHECK(width > 0 && static_cast<uint64_t>(width) <=
+              (static_cast<uint64_t>(INT64_MAX) - BlockCachingAllocator::kAlignment) / bucket / item,
+              "GaudiRT: bucket output is too large");
+  const uint64_t elements = static_cast<uint64_t>(bucket) * width;
+  const uint64_t bytes = (elements * item + BlockCachingAllocator::kAlignment - 1) &
+                         ~(BlockCachingAllocator::kAlignment - 1);
+  auto storage = at::empty({static_cast<int64_t>(bytes / item)}, reference.options().dtype(dtype));
+  return storage.narrow(0, 0, elements).view({static_cast<int64_t>(bucket), width}).narrow(0, 0, rows);
+}
+
 at::Tensor bucket_linear(const at::Tensor& input, const at::Tensor& weight,
                          const std::optional<at::Tensor>& bias) {
   TORCH_CHECK(input.device() == weight.device() && input.device().type() == c10::kPrivateUse1 &&
@@ -2342,9 +2357,8 @@ at::Tensor bucket_linear(const at::Tensor& input, const at::Tensor& weight,
       bias_address = address_of(bias_value, *ctx);
     }
   }
-  auto physical = at::empty({static_cast<int64_t>(bucket), n}, input.options());
-  auto result = physical.narrow(0, 0, m);
-  const auto output_address = address_of(physical, *ctx);
+  auto result = bucket_output(input, input.scalar_type(), bucket, m, n);
+  const auto output_address = address_of(result, *ctx);
   std::lock_guard lock(ctx->cold_mutex);
   auto& recipe = bucket_linear_recipe(*ctx, input.scalar_type(), k, n, bucket, bias.has_value());
   if ((!direct || recipe.workspace) && !ctx->graph_pool) {
@@ -2371,6 +2385,287 @@ at::Tensor bucket_linear(const at::Tensor& input, const at::Tensor& weight,
   bindings.back().pTensorAddress = output_address;
   TORCH_CHECK(synLaunch(stream, bindings.data(), bindings.size(), workspace ? workspace->address : 0,
                         recipe.recipe, 0) == synSuccess, "GaudiRT: bucket GEMM launch failed");
+  return result;
+}
+
+struct FxValueSpec {
+  at::ScalarType dtype;
+  std::vector<int64_t> sizes;
+  bool dynamic;
+};
+
+// An FX program is described by external input roles and normalized nodes.
+// Node 0 is linear(x, weight, optional_bias); node 1 is add(x, residual).
+// A node's output ID is input_count + its index in the program.
+class BucketProgram {
+ public:
+  BucketProgram(std::vector<int64_t> roles, std::vector<std::vector<int64_t>> operations)
+      : roles_(std::move(roles)), operations_(std::move(operations)) {
+    TORCH_CHECK(!roles_.empty() && !operations_.empty(), "GaudiRT FX: empty program");
+    bool has_dynamic = false;
+    for (auto role : roles_) {
+      TORCH_CHECK(role == 0 || role == 1, "GaudiRT FX: invalid input role");
+      has_dynamic |= role == 1;
+    }
+    TORCH_CHECK(has_dynamic, "GaudiRT FX: no dynamic token input");
+    for (size_t i = 0; i < operations_.size(); ++i) {
+      const auto& op = operations_[i];
+      const int64_t upper = roles_.size() + i;
+      TORCH_CHECK(op.size() == 4 && (op[0] == 0 || op[0] == 1) &&
+                  op[1] >= 0 && op[1] < upper && op[2] >= 0 && op[2] < upper &&
+                  ((op[0] == 0 && (op[3] == -1 || (op[3] >= 0 && op[3] < upper))) ||
+                   (op[0] == 1 && op[3] == -1)), "GaudiRT FX: invalid normalized node");
+    }
+  }
+
+  at::Tensor run(const std::vector<at::Tensor>& inputs);
+
+ private:
+  void initialize_geometry(const std::vector<at::Tensor>& inputs);
+  ColdRecipe& recipe(Context& ctx, uint32_t bucket);
+
+  std::vector<int64_t> roles_;
+  std::vector<std::vector<int64_t>> operations_;
+  std::vector<FxValueSpec> specs_;
+  std::string digest_;
+  std::mutex mutex_;
+};
+
+void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
+  TORCH_CHECK(inputs.size() == roles_.size(), "GaudiRT FX: wrong input count");
+  std::vector<FxValueSpec> specs;
+  specs.reserve(inputs.size() + operations_.size());
+  std::ostringstream normalized;
+  normalized << "fx_program_v3;";
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    const auto& tensor = inputs[i];
+    TORCH_CHECK(tensor.device().type() == c10::kPrivateUse1 && tensor.device().index() == 0 &&
+                (tensor.scalar_type() == at::kBFloat16 || tensor.scalar_type() == at::kFloat),
+                "GaudiRT FX: unsupported input device or dtype");
+    TORCH_CHECK((roles_[i] && tensor.dim() == 2) ||
+                (!roles_[i] && (tensor.dim() == 1 || tensor.dim() == 2)),
+                "GaudiRT FX: unsupported input rank");
+    std::vector<int64_t> sizes(tensor.sizes().begin(), tensor.sizes().end());
+    for (auto size : sizes) TORCH_CHECK(size > 0, "GaudiRT FX: empty input dimension");
+    if (roles_[i]) sizes[0] = -1;
+    normalized << "i" << roles_[i] << ":" << static_cast<int>(tensor.scalar_type());
+    for (auto size : sizes) normalized << ":" << size;
+    normalized << ";";
+    specs.push_back({tensor.scalar_type(), std::move(sizes), roles_[i] == 1});
+  }
+  for (const auto& op : operations_) {
+    const auto& a = specs[op[1]];
+    const auto& b = specs[op[2]];
+    TORCH_CHECK(a.dtype == b.dtype, "GaudiRT FX: input dtype mismatch");
+    if (op[0] == 0) {
+      TORCH_CHECK(a.dynamic && a.sizes.size() == 2 && !b.dynamic && b.sizes.size() == 2 &&
+                  a.sizes[1] == b.sizes[1], "GaudiRT FX: invalid linear geometry");
+      if (op[3] >= 0) {
+        const auto& bias = specs[op[3]];
+        TORCH_CHECK(!bias.dynamic && bias.sizes.size() == 1 && bias.sizes[0] == b.sizes[0] &&
+                    bias.dtype == a.dtype, "GaudiRT FX: invalid linear bias");
+      }
+      specs.push_back({a.dtype, {-1, b.sizes[0]}, true});
+    } else {
+      TORCH_CHECK(a.dynamic && b.dynamic && a.sizes == b.sizes,
+                  "GaudiRT FX: add requires equal dynamic shapes");
+      specs.push_back(a);
+    }
+    normalized << "n" << op[0] << ":" << op[1] << ":" << op[2] << ":" << op[3] << ";";
+  }
+  const auto text = normalized.str();
+  const auto digest = gaudirt::common::sha256_bytes(
+      reinterpret_cast<const uint8_t*>(text.data()), text.size());
+  specs_ = std::move(specs);
+  digest_ = digest;
+}
+
+ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
+  const auto prefix = "g" + digest_.substr(0, 12) + "_b" + std::to_string(bucket);
+  const auto key = "fx_program_" + digest_ + "_b" + std::to_string(bucket);
+  auto found = ctx.cold_recipes.find(key);
+  if (found != ctx.cold_recipes.end()) return *found->second;
+  auto compiled = std::make_unique<ColdRecipe>(roles_.size() + 1);
+  synGraphHandle graph = nullptr;
+  std::vector<synSectionHandle> sections;
+  std::vector<synTensor> created;
+  std::vector<synTensor> values(specs_.size(), nullptr);
+  std::deque<std::string> tensor_names;
+  size_t next_tensor = 0, next_node = 0;
+  const auto check = [](synStatus status, const char* message) {
+    TORCH_CHECK(status == synSuccess, "GaudiRT FX: ", message, " status=", static_cast<int>(status));
+  };
+  auto cleanup = [&] {
+    if (graph) synGraphDestroy(graph);
+    for (auto tensor : created) synTensorDestroy(tensor);
+    for (auto section : sections) synSectionDestroy(section);
+  };
+  try {
+    check(synGraphCreate(&graph, synDeviceGaudi2), "program graph creation failed");
+    auto tensor = [&](synDataType type, uint64_t fcd, uint64_t rows, int slot) {
+      tensor_names.push_back(prefix + "_t" + std::to_string(next_tensor++));
+      synSectionHandle section = nullptr;
+      if (slot >= 0) {
+        check(synSectionCreate(&section, 0, graph), "program section creation failed");
+        sections.push_back(section);
+        check(synSectionSetPersistent(section, true), "program section setup failed");
+        compiled->names[slot] = tensor_names.back();
+      }
+      synTensorDescriptor desc{};
+      desc.m_name = slot >= 0 ? compiled->names[slot].c_str() : tensor_names.back().c_str();
+      desc.m_dataType = type;
+      desc.m_dims = 2;
+      desc.m_sizes[0] = desc.m_minSizes[0] = fcd;
+      desc.m_sizes[1] = desc.m_minSizes[1] = rows;
+      synTensor handle = nullptr;
+      check(synTensorCreate(&handle, &desc, section, 0), "program tensor creation failed");
+      created.push_back(handle);
+      if (slot >= 0) {
+        compiled->tensors[slot].tensorName = compiled->names[slot].c_str();
+        compiled->tensors[slot].tensorType = DATA_TENSOR;
+        compiled->tensors[slot].tensorSize[0] = fcd;
+        compiled->tensors[slot].tensorSize[1] = rows;
+      }
+      return handle;
+    };
+    auto node = [&](const std::vector<synTensor>& in, synTensor out, const void* params,
+                    size_t params_size, const char* guid) {
+      const auto name = prefix + "_n" + std::to_string(next_node++);
+      check(synNodeCreate(graph, in.data(), &out, in.size(), 1, params, params_size,
+                          guid, name.c_str(), nullptr, nullptr), "program node creation failed");
+    };
+    for (size_t i = 0; i < roles_.size(); ++i) {
+      const auto& spec = specs_[i];
+      const uint64_t fcd = spec.sizes.back();
+      const uint64_t rows = spec.dynamic ? bucket : (spec.sizes.size() == 1 ? 1 : spec.sizes[0]);
+      values[i] = tensor(cast_type(spec.dtype).syn, fcd, rows, i);
+    }
+    for (size_t i = 0; i < operations_.size(); ++i) {
+      const auto& op = operations_[i];
+      const auto id = roles_.size() + i;
+      const auto& spec = specs_[id];
+      const auto type = cast_type(spec.dtype);
+      const uint64_t width = spec.sizes[1];
+      const int slot = i + 1 == operations_.size() ? static_cast<int>(roles_.size()) : -1;
+      values[id] = tensor(type.syn, width, bucket, slot);
+      if (op[0] == 1) {
+        const auto guid = spec.dtype == at::kBFloat16 ? std::string("gk_add_bf16_v1") :
+                          "add_fwd_" + std::string(type.name);
+        node({values[op[1]], values[op[2]]}, values[id], nullptr, 0, guid.c_str());
+        continue;
+      }
+      synGEMMParams gemm{false, true};
+      if (op[3] < 0) {
+        node({values[op[1]], values[op[2]]}, values[id], &gemm, sizeof(gemm), "gemm");
+        continue;
+      }
+      auto product = tensor(syn_type_float, width, bucket, -1);
+      node({values[op[1]], values[op[2]]}, product, &gemm, sizeof(gemm), "gemm");
+      const bool bf16 = spec.dtype == at::kBFloat16;
+      auto bias = values[op[3]];
+      ns_CastKernel::ParamsV3 cast{};
+      cast.round_mode = CAST_ROUND_HALF_NE;
+      if (bf16) {
+        auto wide_bias = tensor(syn_type_float, width, 1, -1);
+        node({bias}, wide_bias, &cast, sizeof(cast), "cast_bf16_to_f32");
+        bias = wide_bias;
+      }
+      auto sum = bf16 ? tensor(syn_type_float, width, bucket, -1) : values[id];
+      node({product, bias}, sum, nullptr, 0, "add_fwd_f32");
+      if (bf16) node({sum}, values[id], &cast, sizeof(cast), "cast_f32_to_bf16");
+    }
+    compiled->recipe = compile_cached(graph, prefix, key, &ctx.cache);
+    check(synWorkspaceGetSize(&compiled->workspace, compiled->recipe), "program workspace query failed");
+    initialize_launch_tensor_ids(compiled->recipe, compiled->tensors.data(), compiled->tensors.size());
+    cleanup();
+  } catch (...) {
+    cleanup();
+    throw;
+  }
+  auto [it, inserted] = ctx.cold_recipes.emplace(key, std::move(compiled));
+  TORCH_CHECK(inserted, "GaudiRT FX: duplicate program recipe");
+  return *it->second;
+}
+
+at::Tensor BucketProgram::run(const std::vector<at::Tensor>& inputs) {
+  std::lock_guard program_lock(mutex_);
+  TORCH_CHECK(inputs.size() == roles_.size(), "GaudiRT FX: wrong input count");
+  int64_t m = -1;
+  size_t dynamic_input = 0;
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    if (!roles_[i]) continue;
+    TORCH_CHECK(inputs[i].dim() == 2, "GaudiRT FX: dynamic input must have rank two");
+    if (m < 0) {
+      m = inputs[i].size(0);
+      dynamic_input = i;
+    } else {
+      TORCH_CHECK(inputs[i].size(0) == m, "GaudiRT FX: inconsistent token dimensions");
+    }
+  }
+  TORCH_CHECK(m > 0 && m <= 4096, "GaudiRT FX: token count outside 1..4096");
+  if (specs_.empty()) initialize_geometry(inputs);
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    const auto& input = inputs[i];
+    const auto& spec = specs_[i];
+    TORCH_CHECK(input.device().type() == c10::kPrivateUse1 && input.device().index() == 0 &&
+                input.scalar_type() == spec.dtype && input.dim() == static_cast<int64_t>(spec.sizes.size()),
+                "GaudiRT FX: input device, dtype or rank changed");
+    for (int64_t dim = 0; dim < input.dim(); ++dim) {
+      const auto expected = spec.dynamic && dim == 0 ? m : spec.sizes[dim];
+      TORCH_CHECK(input.size(dim) == expected, "GaudiRT FX: input geometry changed");
+    }
+  }
+  const uint32_t bucket = std::bit_ceil(static_cast<uint32_t>(m));
+  const auto& output_spec = specs_.back();
+  auto ctx = current();
+  auto stream = ctx->device.compute_stream();
+  auto result = bucket_output(inputs[dynamic_input], output_spec.dtype, bucket, m, output_spec.sizes[1]);
+  const auto output_address = address_of(result, *ctx);
+  std::lock_guard recipe_lock(ctx->cold_mutex);
+  auto& compiled = recipe(*ctx, bucket);
+  auto graph_pool = [&]() -> BlockCachingAllocator& {
+    if (!ctx->graph_pool) {
+      const uint64_t budget = std::min<uint64_t>(ctx->allocator.capacity_bytes() / 8, uint64_t{1} << 30);
+      TORCH_CHECK(budget >= 256, "GaudiRT FX: HBM budget is too small for graph temporaries");
+      ctx->graph_pool = std::make_unique<GraphPool>(ctx->allocator, budget, stream);
+    }
+    return ctx->graph_pool->allocator();
+  };
+  std::vector<std::unique_ptr<GraphTemporary>> staged;
+  std::vector<std::pair<uint64_t, uint64_t>> regions;
+  auto bindings = compiled.tensors;
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    const auto& input = inputs[i];
+    const auto& spec = specs_[i];
+    const uint64_t item = input.element_size();
+    TORCH_CHECK(!spec.dynamic || static_cast<uint64_t>(spec.sizes[1]) <= UINT64_MAX / bucket / item,
+                "GaudiRT FX: input allocation size overflow");
+    const uint64_t bytes = spec.dynamic ? static_cast<uint64_t>(bucket) * spec.sizes[1] * item : input.nbytes();
+    const uint64_t address = address_of(input, *ctx);
+    ctx->allocator.record_stream(address, stream);
+    const uint64_t offset = static_cast<uint64_t>(input.storage_offset()) * item;
+    const uint64_t storage = input.storage().nbytes();
+    bool direct = input.is_contiguous() && address % BlockCachingAllocator::kAlignment == 0 &&
+                  offset <= storage && bytes <= storage - offset;
+    for (const auto& [other, length] : regions)
+      if (address < other + length && other < address + bytes) direct = false;
+    uint64_t binding = address;
+    if (!direct) {
+      auto temp = std::make_unique<GraphTemporary>(graph_pool(), stream, bytes);
+      const Layout layout(input);
+      dma_copy(temp->address, nullptr, address, &layout, 0, input.numel(), item, stream, DRAM_TO_DRAM);
+      binding = temp->address;
+      staged.push_back(std::move(temp));
+    }
+    regions.emplace_back(binding, bytes);
+    bindings[i].pTensorAddress = binding;
+  }
+  ctx->allocator.record_stream(output_address, stream);
+  bindings[roles_.size()].pTensorAddress = output_address;
+  std::unique_ptr<GraphTemporary> workspace;
+  if (compiled.workspace) workspace = std::make_unique<GraphTemporary>(graph_pool(), stream, compiled.workspace);
+  TORCH_CHECK(synLaunch(stream, bindings.data(), bindings.size(), workspace ? workspace->address : 0,
+                        compiled.recipe, 0) == synSuccess, "GaudiRT FX: program launch failed");
   return result;
 }
 }  // namespace gaudirt::generic
@@ -2419,4 +2714,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("recipe_cache_stats", &gaudirt::generic::recipe_cache_stats);
   m.def("bucket_linear", &gaudirt::generic::bucket_linear,
         pybind11::arg("input"), pybind11::arg("weight"), pybind11::arg("bias") = pybind11::none());
+  pybind11::class_<gaudirt::generic::BucketProgram>(m, "BucketProgram")
+      .def(pybind11::init<std::vector<int64_t>, std::vector<std::vector<int64_t>>>())
+      .def("run", &gaudirt::generic::BucketProgram::run);
 }
