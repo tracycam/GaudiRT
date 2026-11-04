@@ -26,6 +26,12 @@ import torch
 import _gaudirt_C as _C
 _audit_legacy_bridge()
 
+
+@torch.library.register_fake("gaudirt::rms_norm")
+def _fake_rms_norm(input, weight, epsilon):
+    return torch.empty_like(input, memory_format=torch.contiguous_format)
+
+
 torch.utils.rename_privateuse1_backend("gaudirt")
 torch._register_device_module("gaudirt", sys.modules[__name__])
 torch.utils.generate_methods_for_privateuse1_backend(for_packed_sequence=False)

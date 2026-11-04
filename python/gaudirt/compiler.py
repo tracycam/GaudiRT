@@ -1,7 +1,9 @@
-"""FX entry point for the currently supported bucketed GEMM subgraph."""
+"""FX entry point for the supported bucketed device subgraphs."""
 
 import functools
+import math
 import operator
+import struct
 
 import torch
 import torch.fx.experimental._config
@@ -32,6 +34,7 @@ def _program_backend(graph_module, example_inputs):
                   torch.ops.aten.matmul.default, operator.matmul)
     addmm_targets = (torch.addmm, torch.ops.aten.addmm.default)
     add_targets = (operator.add, torch.add, torch.ops.aten.add.Tensor)
+    norm_targets = (torch.ops.gaudirt.rms_norm, torch.ops.gaudirt.rms_norm.default)
 
     def tensor_id(value):
         if value not in ids:
@@ -57,7 +60,7 @@ def _program_backend(graph_module, example_inputs):
             transposes[node] = node.args[0]
             continue
         if node.op != "call_function":
-            raise RuntimeError("GaudiRT FX: unsupported program node")
+            raise RuntimeError(f"GaudiRT FX: unsupported program node {node.op}: {node.target}")
         if node.target in linear_targets and len(node.args) in (2, 3):
             if set(node.kwargs) - {"bias"} or (len(node.args) == 3 and "bias" in node.kwargs):
                 raise RuntimeError("GaudiRT FX: unsupported linear arguments")
@@ -76,8 +79,14 @@ def _program_backend(graph_module, example_inputs):
             if set(node.kwargs) - {"alpha"} or node.kwargs.get("alpha", 1) != 1:
                 raise RuntimeError("GaudiRT FX: add requires alpha=1")
             operation = [1, tensor_id(node.args[0]), tensor_id(node.args[1]), -1]
+        elif node.target in norm_targets and len(node.args) == 3 and not node.kwargs:
+            epsilon = node.args[2]
+            if not isinstance(epsilon, (int, float)) or not math.isfinite(epsilon) or epsilon <= 0:
+                raise RuntimeError("GaudiRT FX: RMSNorm epsilon must be positive and finite")
+            bits = struct.unpack("<I", struct.pack("<f", epsilon))[0]
+            operation = [2, tensor_id(node.args[0]), tensor_id(node.args[1]), bits]
         else:
-            raise RuntimeError("GaudiRT FX: unsupported program operation")
+            raise RuntimeError(f"GaudiRT FX: unsupported program operation {node.target}")
         ids[node] = len(tensor_indices) + len(operations)
         operations.append(operation)
     if not operations or output not in ids or ids[output] != len(tensor_indices) + len(operations) - 1:
@@ -172,7 +181,8 @@ def compile(module, dynamic_arg_indices=(0,)):
     def execute(*args, **kwargs):
         for index in dynamic_arg_indices:
             torch._dynamo.mark_dynamic(args[index], 0, min=1, max=4096)
-        with torch.fx.experimental._config.patch(backed_size_oblivious=True):
+        with torch._dynamo.config.patch(specialize_float=True), \
+             torch.fx.experimental._config.patch(backed_size_oblivious=True):
             return compiled(*args, **kwargs)
 
     return execute
