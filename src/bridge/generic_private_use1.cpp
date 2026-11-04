@@ -2395,7 +2395,7 @@ struct FxValueSpec {
 };
 
 // An FX program is described by external input roles and normalized nodes.
-// Node 0 is linear(x, weight, optional_bias); node 1 is add(x, residual).
+// Node 0 is linear, node 1 is add, and node 2 is BF16 RMSNorm.
 // A node's output ID is input_count + its index in the program.
 class BucketProgram {
  public:
@@ -2411,10 +2411,12 @@ class BucketProgram {
     for (size_t i = 0; i < operations_.size(); ++i) {
       const auto& op = operations_[i];
       const int64_t upper = roles_.size() + i;
-      TORCH_CHECK(op.size() == 4 && (op[0] == 0 || op[0] == 1) &&
+      TORCH_CHECK(op.size() == 4 && (op[0] == 0 || op[0] == 1 || op[0] == 2) &&
                   op[1] >= 0 && op[1] < upper && op[2] >= 0 && op[2] < upper &&
                   ((op[0] == 0 && (op[3] == -1 || (op[3] >= 0 && op[3] < upper))) ||
-                   (op[0] == 1 && op[3] == -1)), "GaudiRT FX: invalid normalized node");
+                   (op[0] == 1 && op[3] == -1) ||
+                   (op[0] == 2 && op[3] >= 0 && static_cast<uint64_t>(op[3]) <= UINT32_MAX)),
+                  "GaudiRT FX: invalid normalized node");
     }
   }
 
@@ -2436,7 +2438,7 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
   std::vector<FxValueSpec> specs;
   specs.reserve(inputs.size() + operations_.size());
   std::ostringstream normalized;
-  normalized << "fx_program_v3;";
+  normalized << "fx_program_v4;";
   for (size_t i = 0; i < inputs.size(); ++i) {
     const auto& tensor = inputs[i];
     TORCH_CHECK(tensor.device().type() == c10::kPrivateUse1 && tensor.device().index() == 0 &&
@@ -2466,9 +2468,16 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
                     bias.dtype == a.dtype, "GaudiRT FX: invalid linear bias");
       }
       specs.push_back({a.dtype, {-1, b.sizes[0]}, true});
-    } else {
+    } else if (op[0] == 1) {
       TORCH_CHECK(a.dynamic && b.dynamic && a.sizes == b.sizes,
                   "GaudiRT FX: add requires equal dynamic shapes");
+      specs.push_back(a);
+    } else {
+      const float epsilon = std::bit_cast<float>(static_cast<uint32_t>(op[3]));
+      TORCH_CHECK(a.dtype == at::kBFloat16 && a.dynamic && a.sizes.size() == 2 &&
+                  a.sizes[1] <= 8192 && !b.dynamic && b.sizes.size() == 1 &&
+                  b.sizes[0] == a.sizes[1] && std::isfinite(epsilon) && epsilon > 0,
+                  "GaudiRT FX: invalid BF16 RMSNorm geometry or epsilon");
       specs.push_back(a);
     }
     normalized << "n" << op[0] << ":" << op[1] << ":" << op[2] << ":" << op[3] << ";";
@@ -2502,7 +2511,7 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
   };
   try {
     check(synGraphCreate(&graph, synDeviceGaudi2), "program graph creation failed");
-    auto tensor = [&](synDataType type, uint64_t fcd, uint64_t rows, int slot) {
+    auto tensor = [&](synDataType type, uint64_t fcd, uint64_t rows, int slot, uint32_t rank = 2) {
       tensor_names.push_back(prefix + "_t" + std::to_string(next_tensor++));
       synSectionHandle section = nullptr;
       if (slot >= 0) {
@@ -2514,9 +2523,9 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
       synTensorDescriptor desc{};
       desc.m_name = slot >= 0 ? compiled->names[slot].c_str() : tensor_names.back().c_str();
       desc.m_dataType = type;
-      desc.m_dims = 2;
+      desc.m_dims = rank;
       desc.m_sizes[0] = desc.m_minSizes[0] = fcd;
-      desc.m_sizes[1] = desc.m_minSizes[1] = rows;
+      if (rank == 2) desc.m_sizes[1] = desc.m_minSizes[1] = rows;
       synTensor handle = nullptr;
       check(synTensorCreate(&handle, &desc, section, 0), "program tensor creation failed");
       created.push_back(handle);
@@ -2524,7 +2533,7 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
         compiled->tensors[slot].tensorName = compiled->names[slot].c_str();
         compiled->tensors[slot].tensorType = DATA_TENSOR;
         compiled->tensors[slot].tensorSize[0] = fcd;
-        compiled->tensors[slot].tensorSize[1] = rows;
+        if (rank == 2) compiled->tensors[slot].tensorSize[1] = rows;
       }
       return handle;
     };
@@ -2538,7 +2547,7 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
       const auto& spec = specs_[i];
       const uint64_t fcd = spec.sizes.back();
       const uint64_t rows = spec.dynamic ? bucket : (spec.sizes.size() == 1 ? 1 : spec.sizes[0]);
-      values[i] = tensor(cast_type(spec.dtype).syn, fcd, rows, i);
+      values[i] = tensor(cast_type(spec.dtype).syn, fcd, rows, i, spec.sizes.size());
     }
     for (size_t i = 0; i < operations_.size(); ++i) {
       const auto& op = operations_[i];
@@ -2554,6 +2563,12 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
         node({values[op[1]], values[op[2]]}, values[id], nullptr, 0, guid.c_str());
         continue;
       }
+      if (op[0] == 2) {
+        const float epsilon = std::bit_cast<float>(static_cast<uint32_t>(op[3]));
+        node({values[op[1]], values[op[2]]}, values[id], &epsilon, sizeof(epsilon),
+             "gk_rms_norm_bf16_v1");
+        continue;
+      }
       synGEMMParams gemm{false, true};
       if (op[3] < 0) {
         node({values[op[1]], values[op[2]]}, values[id], &gemm, sizeof(gemm), "gemm");
@@ -2566,7 +2581,7 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
       ns_CastKernel::ParamsV3 cast{};
       cast.round_mode = CAST_ROUND_HALF_NE;
       if (bf16) {
-        auto wide_bias = tensor(syn_type_float, width, 1, -1);
+        auto wide_bias = tensor(syn_type_float, width, 1, -1, 1);
         node({bias}, wide_bias, &cast, sizeof(cast), "cast_bf16_to_f32");
         bias = wide_bias;
       }
@@ -2668,7 +2683,24 @@ at::Tensor BucketProgram::run(const std::vector<at::Tensor>& inputs) {
                         compiled.recipe, 0) == synSuccess, "GaudiRT FX: program launch failed");
   return result;
 }
+
+at::Tensor bucket_rms_norm(const at::Tensor& input, const at::Tensor& weight, double epsilon) {
+  const float eps = static_cast<float>(epsilon);
+  TORCH_CHECK(std::isfinite(epsilon) && std::isfinite(eps) && eps > 0,
+              "GaudiRT: RMSNorm epsilon must be a positive finite FP32 value");
+  const auto bits = std::bit_cast<uint32_t>(eps);
+  BucketProgram program({1, 0}, {{2, 0, 1, static_cast<int64_t>(bits)}});
+  return program.run({input, weight});
+}
 }  // namespace gaudirt::generic
+
+TORCH_LIBRARY(gaudirt, m) {
+  m.def("rms_norm(Tensor input, Tensor weight, float epsilon) -> Tensor");
+}
+
+TORCH_LIBRARY_IMPL(gaudirt, PrivateUse1, m) {
+  m.impl("rms_norm", TORCH_FN(gaudirt::generic::bucket_rms_norm));
+}
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("copy_", TORCH_FN(gaudirt::generic::copy));
