@@ -1,6 +1,7 @@
 """FX entry point for the currently supported bucketed GEMM subgraph."""
 
 import functools
+import operator
 
 import torch
 import torch.fx.experimental._config
@@ -19,7 +20,8 @@ def gaudirt_backend(graph_module, example_inputs):
     if not isinstance(returned, (tuple, list)) or len(returned) != 1:
         raise RuntimeError("GaudiRT FX: only a single GEMM output is implemented")
     gemm = returned[0]
-    mm_targets = (torch.mm, torch.ops.aten.mm.default)
+    mm_targets = (torch.mm, torch.ops.aten.mm.default, torch.matmul,
+                  torch.ops.aten.matmul.default, operator.matmul)
     addmm_targets = (torch.addmm, torch.ops.aten.addmm.default)
     linear_targets = (torch.nn.functional.linear, torch.ops.aten.linear.default)
     if not isinstance(gemm, torch.fx.Node) or gemm.op != "call_function":
@@ -28,8 +30,17 @@ def gaudirt_backend(graph_module, example_inputs):
     bias_node = None
 
     def transposed_weight(node):
-        if (not isinstance(node, torch.fx.Node) or node.op != "call_method" or
-                node.target != "t" or len(node.args) != 1 or node.kwargs):
+        if not isinstance(node, torch.fx.Node) or node.kwargs:
+            raise RuntimeError("GaudiRT FX: GEMM weight must be transposed with t()")
+        if node.op == "call_method" and node.target == "t" and len(node.args) == 1:
+            pass
+        elif ((node.op == "call_method" and node.target == "transpose") or
+              (node.op == "call_function" and node.target in (torch.transpose, torch.ops.aten.transpose.int))):
+            if (len(node.args) != 3 or any(not isinstance(dim, int) or dim < -2 or dim > 1
+                                           for dim in node.args[1:]) or
+                    node.args[1] % 2 == node.args[2] % 2):
+                raise RuntimeError("GaudiRT FX: GEMM requires a two-dimensional weight transpose")
+        else:
             raise RuntimeError("GaudiRT FX: GEMM weight must be transposed with t()")
         accepted.add(node)
         return node.args[0]
