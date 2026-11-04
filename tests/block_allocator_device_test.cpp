@@ -30,6 +30,7 @@ int main() {
     require(a % 256 == 0 && b % 256 == 0 && c % 256 == 0, "unaligned allocation");
     require(pool.memory_allocated() == 1024, "allocation accounting");
     require(pool.contains_live_range(b + 1, 511), "live range rejected");
+    pool.record_stream(b + 1, s);
     require(!pool.contains_live_range(b + 1, 512), "out-of-range allocation accepted");
     pool.free(b);
     pool.free(a);

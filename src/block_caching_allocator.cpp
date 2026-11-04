@@ -107,8 +107,11 @@ uint64_t BlockCachingAllocator::allocate(uint64_t bytes, synStreamHandle stream)
 void BlockCachingAllocator::record_stream(uint64_t address, synStreamHandle stream) {
   if (!stream) throw std::invalid_argument("BlockCachingAllocator: null stream");
   std::lock_guard lock(mutex_);
-  auto it = blocks_.find(address);
-  if (it == blocks_.end() || !it->second.allocated)
+  auto it = blocks_.upper_bound(address);
+  if (it == blocks_.begin())
+    throw std::invalid_argument("BlockCachingAllocator: unknown live allocation");
+  --it;
+  if (!it->second.allocated || address - it->first >= it->second.bytes)
     throw std::invalid_argument("BlockCachingAllocator: unknown live allocation");
   auto& streams = it->second.streams;
   if (std::find(streams.begin(), streams.end(), stream) == streams.end())

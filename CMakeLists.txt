@@ -31,6 +31,18 @@ add_library(gaudirt STATIC
 )
 target_link_libraries(gaudirt PUBLIC Synapse hcl pthread ${CMAKE_DL_LIBS})
 
+option(GAUDIRT_BUILD_TORCH "Build the generic PrivateUse1 extension" OFF)
+if(GAUDIRT_BUILD_TORCH)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Module)
+    find_package(Torch REQUIRED)
+    find_library(TORCH_PYTHON_LIBRARY torch_python PATHS "${TORCH_INSTALL_PREFIX}/lib" REQUIRED NO_DEFAULT_PATH)
+    add_library(_gaudirt_C MODULE src/bridge/generic_private_use1.cpp)
+    target_compile_definitions(_gaudirt_C PRIVATE TORCH_EXTENSION_NAME=_gaudirt_C)
+    target_compile_options(_gaudirt_C PRIVATE ${TORCH_CXX_FLAGS})
+    target_link_libraries(_gaudirt_C PRIVATE gaudirt ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIBRARY} Python3::Module)
+    set_target_properties(_gaudirt_C PROPERTIES PREFIX "")
+endif()
+
 add_executable(gaudirt_runtime_unit_tests tests/runtime_unit_tests.cpp)
 target_compile_options(gaudirt_runtime_unit_tests PRIVATE -UNDEBUG)
 target_link_libraries(gaudirt_runtime_unit_tests PRIVATE gaudirt)
