@@ -1276,6 +1276,89 @@ ColdRecipe& range_recipe(Context& ctx, uint32_t count, at::ScalarType dtype, boo
   return *it->second;
 }
 
+ColdRecipe& range64_recipe(Context& ctx, uint32_t count, at::ScalarType dtype) {
+  const auto type = cast_type(dtype);
+  const std::string key = "cold_range64_v1_" + std::string(type.name) + "_" + std::to_string(count);
+  auto found = ctx.cold_recipes.find(key);
+  if (found != ctx.cold_recipes.end()) return *found->second;
+  auto recipe = std::make_unique<ColdRecipe>(3);
+  synGraphHandle graph = nullptr;
+  std::array<synSectionHandle, 3> sections{};
+  std::array<synTensor, 7> tensors{};
+  std::array<std::string, 4> internal_names{};
+  const auto check = [](synStatus status, const char* message) {
+    TORCH_CHECK(status == synSuccess, "GaudiRT: ", message, " status=", static_cast<int>(status));
+  };
+  auto cleanup = [&] {
+    if (graph) synGraphDestroy(graph);
+    for (auto tensor : tensors) if (tensor) synTensorDestroy(tensor);
+    for (auto section : sections) if (section) synSectionDestroy(section);
+  };
+  try {
+    check(synGraphCreate(&graph, synDeviceGaudi2), "wide-parameter range graph creation failed");
+    for (size_t i = 0; i < 3; ++i) {
+      recipe->names[i] = key + "_t" + std::to_string(i);
+      check(synSectionCreate(&sections[i], 0, graph), "wide-parameter range section creation failed");
+      check(synSectionSetPersistent(sections[i], true), "wide-parameter range section setup failed");
+      synTensorDescriptor desc{};
+      desc.m_name = recipe->names[i].c_str();
+      desc.m_dataType = i < 2 ? syn_type_int64 : type.syn;
+      desc.m_dims = 1;
+      desc.m_sizes[0] = desc.m_minSizes[0] = i < 2 ? 1 : count;
+      check(synTensorCreate(&tensors[i], &desc, sections[i], 0), "wide-parameter range tensor creation failed");
+      recipe->tensors[i].tensorName = recipe->names[i].c_str();
+      recipe->tensors[i].tensorType = DATA_TENSOR;
+      recipe->tensors[i].tensorSize[0] = i < 2 ? 1 : count;
+    }
+    const size_t internal_count = dtype == at::kInt ? 4 : 3;
+    for (size_t i = 0; i < internal_count; ++i) {
+      internal_names[i] = key + "_t" + std::to_string(i + 3);
+      synTensorDescriptor desc{};
+      desc.m_name = internal_names[i].c_str();
+      desc.m_dataType = i == 0 ? syn_type_int32 : syn_type_int64;
+      desc.m_dims = 1;
+      desc.m_sizes[0] = desc.m_minSizes[0] = count;
+      check(synTensorCreate(&tensors[i + 3], &desc, nullptr, 0), "wide-parameter range intermediate failed");
+    }
+    ns_RangeKernel::Params params{};
+    params.start.i = 0;
+    params.limit.i = count;
+    params.delta.i = 1;
+    const auto range_node = key + "_n0";
+    check(synNodeCreate(graph, nullptr, &tensors[3], 0, 1, &params, sizeof(params),
+                        "range_i32", range_node.c_str(), nullptr, nullptr), "range node creation failed");
+    ns_CastKernel::ParamsV3 cast{};
+    cast.round_mode = CAST_ROUND_ZERO;
+    const auto cast_node = key + "_n1";
+    check(synNodeCreate(graph, &tensors[3], &tensors[4], 1, 1, &cast, sizeof(cast),
+                        "cast_i32_to_i64", cast_node.c_str(), nullptr, nullptr), "range index cast failed");
+    synTensor multiply[] = {tensors[4], tensors[1]};
+    const auto multiply_node = key + "_n2";
+    check(synNodeCreate(graph, multiply, &tensors[5], 2, 1, nullptr, 0,
+                        "mult_fwd_i64", multiply_node.c_str(), nullptr, nullptr), "range multiply failed");
+    synTensor add[] = {tensors[5], tensors[0]};
+    auto* sum = dtype == at::kInt ? &tensors[6] : &tensors[2];
+    const auto add_node = key + "_n3";
+    check(synNodeCreate(graph, add, sum, 2, 1, nullptr, 0,
+                        "add_fwd_i64", add_node.c_str(), nullptr, nullptr), "range add failed");
+    if (dtype == at::kInt) {
+      const auto output_node = key + "_n4";
+      check(synNodeCreate(graph, &tensors[6], &tensors[2], 1, 1, &cast, sizeof(cast),
+                          "cast_i64_to_i32", output_node.c_str(), nullptr, nullptr), "range output cast failed");
+    }
+    recipe->recipe = compile_cached(graph, key, key, &ctx.cache);
+    check(synWorkspaceGetSize(&recipe->workspace, recipe->recipe), "range workspace query failed");
+    initialize_launch_tensor_ids(recipe->recipe, recipe->tensors.data(), recipe->tensors.size());
+    cleanup();
+  } catch (...) {
+    cleanup();
+    throw;
+  }
+  auto [it, inserted] = ctx.cold_recipes.emplace(key, std::move(recipe));
+  TORCH_CHECK(inserted, "GaudiRT: duplicate wide-parameter range recipe");
+  return *it->second;
+}
+
 at::Tensor& arange_out(const at::Scalar& start_value, const at::Scalar& end_value,
                        const at::Scalar& step_value, at::Tensor& out) {
   TORCH_CHECK(start_value.isIntegral(false) && end_value.isIntegral(false) &&
@@ -1284,23 +1367,45 @@ at::Tensor& arange_out(const at::Scalar& start_value, const at::Scalar& end_valu
               out.scalar_type() == at::kFloat || out.scalar_type() == at::kBFloat16,
               "GaudiRT: arange dtype is not implemented");
   const int64_t start = start_value.toLong(), end = end_value.toLong(), step = step_value.toLong();
-  TORCH_CHECK(start >= INT32_MIN && start <= INT32_MAX && end >= INT32_MIN && end <= INT32_MAX &&
-              step >= INT32_MIN && step <= INT32_MAX && step != 0,
-              "GaudiRT: arange parameters outside the supported int32 range");
+  TORCH_CHECK(step != 0, "GaudiRT: arange step must be nonzero");
   TORCH_CHECK((step > 0 && start <= end) || (step < 0 && start >= end),
               "GaudiRT: arange bounds and step are inconsistent");
-  const int64_t distance = step > 0 ? end - start : start - end;
-  const int64_t magnitude = step > 0 ? step : -step;
-  const int64_t count = distance / magnitude + (distance % magnitude != 0);
-  TORCH_CHECK(count <= (1 << 24), "GaudiRT: arange is too large");
-  const int64_t last_offset = count ? (count - 1) * step : 0;
-  const bool wide = last_offset < INT32_MIN || last_offset > INT32_MAX;
+  const __int128 distance = step > 0 ? static_cast<__int128>(end) - start :
+                                       static_cast<__int128>(start) - end;
+  const __int128 magnitude = step > 0 ? static_cast<__int128>(step) : -static_cast<__int128>(step);
+  __int128 count128 = distance / magnitude + (distance % magnitude != 0);
+  if (out.scalar_type() == at::kLong) {
+    const __int128 difference = static_cast<__int128>(end) - start;
+    const __int128 sum = difference + step;
+    const __int128 adjusted = sum - (step > 0 ? 1 : -1);
+    TORCH_CHECK(difference >= INT64_MIN && difference <= INT64_MAX &&
+                sum >= INT64_MIN && sum <= INT64_MAX &&
+                adjusted >= INT64_MIN && adjusted <= INT64_MAX,
+                "GaudiRT: arange int64 size calculation exceeds the supported range");
+  }
+  if (out.scalar_type() == at::kInt) {
+    // PyTorch computes the INT32 output size from FP64 scalar bounds.
+    const double count_double = std::ceil((static_cast<double>(end) - static_cast<double>(start)) /
+                                          static_cast<double>(step));
+    TORCH_CHECK(count_double >= 0.0 && count_double <= (1 << 24), "GaudiRT: arange is too large");
+    count128 = static_cast<int64_t>(count_double);
+  }
+  TORCH_CHECK(count128 <= (1 << 24), "GaudiRT: arange is too large");
+  const int64_t count = static_cast<int64_t>(count128);
+  const __int128 last_offset = count ? static_cast<__int128>(count - 1) * step : 0;
+  const __int128 last_value = static_cast<__int128>(start) + last_offset;
+  const bool wide = last_offset < INT32_MIN || last_offset > INT32_MAX ||
+                    last_value < INT32_MIN || last_value > INT32_MAX;
+  const bool wide_parameters = start < INT32_MIN || start > INT32_MAX ||
+                               step < INT32_MIN || step > INT32_MAX;
   const bool floating = out.scalar_type() == at::kFloat || out.scalar_type() == at::kBFloat16;
   if (floating && count) {
     const int64_t exact_limit = out.scalar_type() == at::kBFloat16 ? 1 << 8 : 1 << 24;
-    const auto last_value = start + last_offset;
-    TORCH_CHECK(std::abs(start) <= exact_limit && std::abs(step) <= exact_limit &&
-                std::abs(last_offset) <= exact_limit && std::abs(last_value) <= exact_limit,
+    const auto in_exact_range = [exact_limit](__int128 value) {
+      return value >= -exact_limit && value <= exact_limit;
+    };
+    TORCH_CHECK(in_exact_range(start) && in_exact_range(step) &&
+                in_exact_range(last_offset) && in_exact_range(last_value),
                 "GaudiRT: floating arange exceeds the verified exact integer range");
   }
   const std::array<int64_t, 1> shape{count};
@@ -1319,14 +1424,20 @@ at::Tensor& arange_out(const at::Scalar& start_value, const at::Scalar& end_valu
   auto ctx = current();
   const auto target = address_of(out, *ctx);
   std::lock_guard lock(ctx->cold_mutex);
-  auto& recipe = range_recipe(*ctx, count, out.scalar_type(), wide);
+  auto& recipe = wide_parameters ? range64_recipe(*ctx, count, out.scalar_type()) :
+                                   range_recipe(*ctx, count, out.scalar_type(), wide);
   auto stream = ctx->device.compute_stream();
   ctx->allocator.record_stream(target, stream);
   TemporaryDevice scalars(*ctx, 512);
   TemporaryHost host(*ctx, 512);
-  const int32_t start32 = start, step32 = step;
-  std::memcpy(host.address, &start32, sizeof(start32));
-  std::memcpy(static_cast<uint8_t*>(host.address) + 256, &step32, sizeof(step32));
+  if (wide_parameters) {
+    std::memcpy(host.address, &start, sizeof(start));
+    std::memcpy(static_cast<uint8_t*>(host.address) + 256, &step, sizeof(step));
+  } else {
+    const int32_t start32 = start, step32 = step;
+    std::memcpy(host.address, &start32, sizeof(start32));
+    std::memcpy(static_cast<uint8_t*>(host.address) + 256, &step32, sizeof(step32));
+  }
   auto h2d = ctx->device.h2d_stream();
   ctx->allocator.record_stream(scalars.address, h2d);
   StreamEvent reusable(ctx->device.device_id());

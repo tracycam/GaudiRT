@@ -272,7 +272,36 @@ def run():
             out = torch.empty((expected.numel() * 2,), dtype=dtype, device="gaudirt:0")[::2]
             torch.arange(start, end, step, out=out)
             assert torch.equal(out.cpu(), expected), (dtype, start, end, step, "out")
-    for args in ((0.0, 2.0, 0.5), (0, 2**24 + 1, 1), (2**31, 2**31 + 1, 1)):
+    wide_integer_cases = (
+        (2**31 - 2, 2**31 + 4, 1),
+        (2**31 + 7, 2**31 + 31, 3),
+        (-2**40, -2**40 + 31, 3),
+        (2**40 + 31, 2**40, -3),
+        (0, 2**35, 2**33),
+        (2**55, 2**55 + 21, 3),
+        (2**55 + 1, 2**55 + 2, 1),
+    )
+    for dtype in (torch.int32, torch.int64):
+        for start, end, step in wide_integer_cases:
+            expected = torch.arange(start, end, step, dtype=dtype)
+            actual = torch.arange(start, end, step, dtype=dtype, device="gaudirt:0").cpu()
+            if not torch.equal(actual, expected):
+                print("wide integer arange mismatch:", dtype, start, end, step,
+                      "actual", actual.tolist(), "expected", expected.tolist(), file=sys.stderr)
+                raise AssertionError("wide integer arange mismatch")
+    for start, end, step in ((2**55, 2**55 + 21, 3),
+                             (-(2**63), -(2**63) + 21, 3)):
+        expected = torch.arange(start, end, step, dtype=torch.int64)
+        actual = torch.arange(start, end, step, dtype=torch.int64, device="gaudirt:0").cpu()
+        assert torch.equal(actual, expected), (start, end, step, actual.tolist(), expected.tolist())
+    for start, end, step in ((-(2**63), 0, 2**62), (0, 2**63 - 1, 2**62)):
+        try:
+            torch.arange(start, end, step, dtype=torch.int64, device="gaudirt:0")
+        except RuntimeError as error:
+            assert "GaudiRT: arange int64 size calculation" in str(error)
+        else:
+            raise AssertionError("unchecked overflowing int64 arange size was accepted")
+    for args in ((0.0, 2.0, 0.5), (0, 2**24 + 1, 1)):
         try:
             torch.arange(*args, dtype=torch.int64, device="gaudirt:0")
         except RuntimeError as error:
