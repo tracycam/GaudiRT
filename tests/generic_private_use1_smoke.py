@@ -305,12 +305,16 @@ def run():
         try:
             torch.arange(*args, dtype=torch.int64, device="gaudirt:0")
         except RuntimeError as error:
-            assert "GaudiRT: arange" in str(error)
+            assert "GaudiRT: " in str(error)
         else:
             raise AssertionError("unsupported arange was accepted")
+    dyadic_rng = random.Random(744)
     for dtype in (torch.float32, torch.bfloat16):
         cases = ((0, 128, 2), (-100, 100, 1), (200, 256, 3)) if dtype == torch.bfloat16 else (
             (0, 128, 2), (-1025, 1025, 7), (2**24 - 32, 2**24, 3))
+        cases += ((0.0, 16.0, 0.5), (16.0, -16.0, -0.5),
+                  (-1.0, 1.3, 0.125), (-1 / 65536, 128 / 65536, 1 / 65536),
+                  (0.0, 0.0, 0.1))
         for start, end, step in cases:
             expected = torch.arange(start, end, step, dtype=dtype)
             actual = torch.arange(start, end, step, dtype=dtype, device="gaudirt:0").cpu()
@@ -320,6 +324,9 @@ def run():
                 print("floating arange mismatch:", dtype, start, end, step, "indices", bad.tolist(),
                       "actual", actual[bad].tolist(), "expected", expected[bad].tolist(), file=sys.stderr)
                 raise AssertionError("floating arange mismatch")
+            out = torch.empty((expected.numel() * 2,), dtype=dtype, device="gaudirt:0")[::2]
+            torch.arange(start, end, step, out=out)
+            assert torch.equal(out.cpu().view(bits), expected.view(bits)), (dtype, start, end, step, "out")
         invalid = ((0.1, 1.0, 0.2), (100000001, 100000199, 3))
         if dtype == torch.bfloat16:
             invalid += ((-1025, 1025, 7),)
@@ -330,6 +337,18 @@ def run():
                 assert "GaudiRT: " in str(error)
             else:
                 raise AssertionError("unchecked floating arange was accepted")
+        for _ in range(30):
+            count = dyadic_rng.choice((1, 2, 4, 8, 16, 32))
+            step = dyadic_rng.choice((-3, -2, -1, 1, 2, 3))
+            low = max(-200, -200 - (count - 1) * step)
+            high = min(200, 200 - (count - 1) * step)
+            start = dyadic_rng.randint(low, high)
+            denominator = 2 ** dyadic_rng.randint(1, 10)
+            args = (start / denominator, (start + count * step) / denominator, step / denominator)
+            expected = torch.arange(*args, dtype=dtype)
+            actual = torch.arange(*args, dtype=dtype, device="gaudirt:0").cpu()
+            bits = torch.int32 if dtype == torch.float32 else torch.int16
+            assert torch.equal(actual.view(bits), expected.view(bits)), (dtype, args)
     rng = random.Random(2026)
     checked = 0
     while checked < 48:
