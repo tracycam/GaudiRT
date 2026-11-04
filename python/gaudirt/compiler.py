@@ -20,20 +20,34 @@ def gaudirt_backend(graph_module, example_inputs):
         raise RuntimeError("GaudiRT FX: only a single GEMM output is implemented")
     gemm = returned[0]
     mm_targets = (torch.mm, torch.ops.aten.mm.default)
+    addmm_targets = (torch.addmm, torch.ops.aten.addmm.default)
     linear_targets = (torch.nn.functional.linear, torch.ops.aten.linear.default)
     if not isinstance(gemm, torch.fx.Node) or gemm.op != "call_function":
         raise RuntimeError("GaudiRT FX: unsupported subgraph")
     accepted = {gemm}
     bias_node = None
+
+    def transposed_weight(node):
+        if (not isinstance(node, torch.fx.Node) or node.op != "call_method" or
+                node.target != "t" or len(node.args) != 1 or node.kwargs):
+            raise RuntimeError("GaudiRT FX: GEMM weight must be transposed with t()")
+        accepted.add(node)
+        return node.args[0]
+
     if gemm.target in mm_targets and len(gemm.args) == 2:
         if gemm.kwargs:
             raise RuntimeError("GaudiRT FX: unsupported GEMM arguments")
         input_node, transposed = gemm.args
-        if (not isinstance(transposed, torch.fx.Node) or transposed.op != "call_method" or
-                transposed.target != "t" or len(transposed.args) != 1 or transposed.kwargs):
-            raise RuntimeError("GaudiRT FX: GEMM weight must be transposed with t()")
-        weight_node = transposed.args[0]
-        accepted.add(transposed)
+        weight_node = transposed_weight(transposed)
+    elif gemm.target in addmm_targets and len(gemm.args) == 3:
+        if set(gemm.kwargs) - {"alpha", "beta"} or any(
+            not isinstance(value, (int, float)) or value != 1 for value in gemm.kwargs.values()
+        ):
+            raise RuntimeError("GaudiRT FX: addmm requires alpha=beta=1")
+        bias_node, input_node, transposed = gemm.args
+        if bias_node not in placeholders:
+            raise RuntimeError("GaudiRT FX: addmm bias must be an external tensor")
+        weight_node = transposed_weight(transposed)
     elif gemm.target in linear_targets and len(gemm.args) in (2, 3):
         input_node, weight_node = gemm.args[:2]
         if set(gemm.kwargs) - {"bias"} or (len(gemm.args) == 3 and "bias" in gemm.kwargs):
