@@ -63,6 +63,7 @@ struct Context {
   }
   DeviceRuntime device;
   BlockCachingAllocator allocator;
+  std::unique_ptr<GraphPool> graph_pool;
   PinnedHostPool pinned;
   RecipeCache cache;
   std::mutex cold_mutex;
@@ -277,7 +278,9 @@ void shutdown() {
   {
     std::lock_guard lock(context_mutex);
     TORCH_CHECK(context, "GaudiRT: device is not initialized");
-    TORCH_CHECK(context->allocator.memory_allocated() == 0,
+    const uint64_t graph_reservation = context->graph_pool ?
+        context->graph_pool->allocator().capacity_bytes() : 0;
+    TORCH_CHECK(context->allocator.memory_allocated() == graph_reservation,
                 "GaudiRT: device tensors must be destroyed before shutdown");
     TORCH_CHECK(context->pinned.memory_allocated() == 0,
                 "GaudiRT: pinned tensors must be destroyed before shutdown");
@@ -314,7 +317,12 @@ std::vector<uint64_t> recipe_cache_stats() {
   const auto [loaded, saved] = ctx->cache.stats();
   return {loaded, saved, ctx->cold_recipes.size()};
 }
-void empty_cache() { current()->allocator.empty_cache(); }
+void empty_cache() {
+  auto ctx = current();
+  std::lock_guard lock(ctx->cold_mutex);
+  if (ctx->graph_pool && !ctx->graph_pool->allocator().memory_allocated()) ctx->graph_pool.reset();
+  ctx->allocator.empty_cache();
+}
 void synchronize() { current()->device.synchronize_all(); }
 
 // The DMA engine copies contiguous runs. Addresses are derived from tensor
@@ -2167,6 +2175,136 @@ at::Tensor argmax(const at::Tensor& input, std::optional<int64_t> dimension, boo
   }
   return reduced.to(at::kLong).view(shape);
 }
+
+// A first executable FX lowering: a weight-transposed GEMM. The hash contains
+// only operator structure and static geometry, never the layer or tensor address.
+ColdRecipe& bucket_linear_recipe(Context& ctx, at::ScalarType dtype, uint64_t k,
+                                 uint64_t n, uint32_t bucket) {
+  const auto type = cast_type(dtype);
+  const std::string structure = "fx_mm_transpose_weight_v1_" + std::string(type.name) +
+                                "_" + std::to_string(k) + "_" + std::to_string(n);
+  const auto digest = gaudirt::common::sha256_bytes(
+      reinterpret_cast<const uint8_t*>(structure.data()), structure.size());
+  const auto prefix = "g" + digest.substr(0, 12) + "_b" + std::to_string(bucket);
+  const auto key = "fx_" + digest + "_b" + std::to_string(bucket);
+  auto found = ctx.cold_recipes.find(key);
+  if (found != ctx.cold_recipes.end()) return *found->second;
+  auto recipe = std::make_unique<ColdRecipe>(3);
+  synGraphHandle graph = nullptr;
+  std::array<synSectionHandle, 3> sections{};
+  std::array<synTensor, 3> tensors{};
+  const auto check = [](synStatus status, const char* message) {
+    TORCH_CHECK(status == synSuccess, "GaudiRT: ", message, " status=", static_cast<int>(status));
+  };
+  auto cleanup = [&] {
+    if (graph) synGraphDestroy(graph);
+    for (auto tensor : tensors) if (tensor) synTensorDestroy(tensor);
+    for (auto section : sections) if (section) synSectionDestroy(section);
+  };
+  try {
+    check(synGraphCreate(&graph, synDeviceGaudi2), "bucket graph creation failed");
+    const std::array<std::array<uint64_t, 2>, 3> shapes{{{k, bucket}, {k, n}, {n, bucket}}};
+    for (size_t i = 0; i < tensors.size(); ++i) {
+      recipe->names[i] = prefix + "_t" + std::to_string(i);
+      check(synSectionCreate(&sections[i], 0, graph), "bucket section creation failed");
+      check(synSectionSetPersistent(sections[i], true), "bucket section setup failed");
+      synTensorDescriptor desc{};
+      desc.m_name = recipe->names[i].c_str();
+      desc.m_dataType = type.syn;
+      desc.m_dims = 2;
+      for (size_t dim = 0; dim < 2; ++dim)
+        desc.m_sizes[dim] = desc.m_minSizes[dim] = shapes[i][dim];
+      check(synTensorCreate(&tensors[i], &desc, sections[i], 0), "bucket tensor creation failed");
+      recipe->tensors[i].tensorName = recipe->names[i].c_str();
+      recipe->tensors[i].tensorType = DATA_TENSOR;
+      recipe->tensors[i].tensorSize[0] = shapes[i][0];
+      recipe->tensors[i].tensorSize[1] = shapes[i][1];
+    }
+    synTensor inputs[] = {tensors[0], tensors[1]};
+    synGEMMParams params{false, true};
+    const auto node = prefix + "_n0";
+    check(synNodeCreate(graph, inputs, &tensors[2], 2, 1, &params, sizeof(params),
+                        "gemm", node.c_str(), nullptr, nullptr), "bucket GEMM node creation failed");
+    recipe->recipe = compile_cached(graph, prefix, key, &ctx.cache);
+    check(synWorkspaceGetSize(&recipe->workspace, recipe->recipe), "bucket workspace query failed");
+    initialize_launch_tensor_ids(recipe->recipe, recipe->tensors.data(), recipe->tensors.size());
+    cleanup();
+  } catch (...) {
+    cleanup();
+    throw;
+  }
+  auto [it, inserted] = ctx.cold_recipes.emplace(key, std::move(recipe));
+  TORCH_CHECK(inserted, "GaudiRT: duplicate bucket recipe");
+  return *it->second;
+}
+
+struct GraphTemporary {
+  GraphTemporary(BlockCachingAllocator& pool, synStreamHandle stream, uint64_t bytes)
+      : pool(pool), address(pool.allocate(bytes, stream)) {}
+  ~GraphTemporary() { pool.free(address); }
+  BlockCachingAllocator& pool;
+  uint64_t address;
+};
+
+at::Tensor bucket_linear(const at::Tensor& input, const at::Tensor& weight) {
+  TORCH_CHECK(input.device() == weight.device() && input.device().type() == c10::kPrivateUse1 &&
+              input.dim() == 2 && weight.dim() == 2 && input.size(1) == weight.size(1),
+              "GaudiRT: bucket GEMM expects same-device [M,K] and [N,K]");
+  TORCH_CHECK(input.scalar_type() == weight.scalar_type() &&
+              (input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kFloat),
+              "GaudiRT: bucket GEMM supports matching BF16 or FP32 tensors");
+  const auto m = input.size(0), k = input.size(1), n = weight.size(0);
+  TORCH_CHECK(m > 0 && m <= 4096 && k > 0 && n > 0, "GaudiRT: invalid bucket GEMM shape");
+  const uint32_t bucket = std::bit_ceil(static_cast<uint32_t>(m));
+  const uint64_t item = input.element_size();
+  TORCH_CHECK(static_cast<uint64_t>(k) <= UINT64_MAX / bucket / item,
+              "GaudiRT: bucket GEMM input is too large");
+  const uint64_t bucket_bytes = static_cast<uint64_t>(bucket) * k * item;
+  auto ctx = current();
+  auto stream = ctx->device.compute_stream();
+  const auto input_address = address_of(input, *ctx);
+  auto weight_value = weight;
+  auto weight_address = address_of(weight_value, *ctx);
+  const uint64_t offset = static_cast<uint64_t>(input.storage_offset()) * item;
+  const uint64_t storage_bytes = input.storage().nbytes();
+  const bool direct = input.is_contiguous() && input_address % BlockCachingAllocator::kAlignment == 0 &&
+                      offset <= storage_bytes && bucket_bytes <= storage_bytes - offset;
+  const bool overlaps = direct && input_address < weight_address + weight.nbytes() &&
+                        weight_address < input_address + bucket_bytes;
+  if (!weight_value.is_contiguous() || weight_address % BlockCachingAllocator::kAlignment || overlaps) {
+    weight_value = at::empty(weight.sizes(), weight.options());
+    copy(weight_value, weight, true);
+    weight_address = address_of(weight_value, *ctx);
+  }
+  auto physical = at::empty({static_cast<int64_t>(bucket), n}, input.options());
+  auto result = physical.narrow(0, 0, m);
+  const auto output_address = address_of(physical, *ctx);
+  std::lock_guard lock(ctx->cold_mutex);
+  auto& recipe = bucket_linear_recipe(*ctx, input.scalar_type(), k, n, bucket);
+  if ((!direct || recipe.workspace) && !ctx->graph_pool) {
+    const uint64_t budget = std::min<uint64_t>(ctx->allocator.capacity_bytes() / 8, uint64_t{1} << 30);
+    TORCH_CHECK(budget >= 256, "GaudiRT: HBM budget is too small for graph temporaries");
+    ctx->graph_pool = std::make_unique<GraphPool>(ctx->allocator, budget, stream);
+  }
+  std::unique_ptr<GraphTemporary> staged, workspace;
+  ctx->allocator.record_stream(input_address, stream);
+  ctx->allocator.record_stream(weight_address, stream);
+  ctx->allocator.record_stream(output_address, stream);
+  if (!direct) {
+    staged = std::make_unique<GraphTemporary>(ctx->graph_pool->allocator(), stream, bucket_bytes);
+    const Layout layout(input);
+    dma_copy(staged->address, nullptr, input_address, &layout, 0, input.numel(), item, stream, DRAM_TO_DRAM);
+  }
+  if (recipe.workspace)
+    workspace = std::make_unique<GraphTemporary>(ctx->graph_pool->allocator(), stream, recipe.workspace);
+  auto bindings = recipe.tensors;
+  bindings[0].pTensorAddress = staged ? staged->address : input_address;
+  bindings[1].pTensorAddress = weight_address;
+  bindings[2].pTensorAddress = output_address;
+  TORCH_CHECK(synLaunch(stream, bindings.data(), bindings.size(), workspace ? workspace->address : 0,
+                        recipe.recipe, 0) == synSuccess, "GaudiRT: bucket GEMM launch failed");
+  return result;
+}
 }  // namespace gaudirt::generic
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
@@ -2211,4 +2349,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("memory_allocated", &gaudirt::generic::memory_allocated);
   m.def("max_memory_allocated", &gaudirt::generic::max_memory_allocated);
   m.def("recipe_cache_stats", &gaudirt::generic::recipe_cache_stats);
+  m.def("bucket_linear", &gaudirt::generic::bucket_linear);
 }
