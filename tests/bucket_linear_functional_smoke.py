@@ -1,0 +1,53 @@
+"""Normalize bias-free functional linear and transposed GEMM to one recipe."""
+
+import os
+import sys
+
+assert os.environ.get("TORCH_DEVICE_BACKEND_AUTOLOAD") == "0"
+assert "habana_frameworks" not in sys.modules
+
+import torch
+torch.manual_seed(874)
+import gaudirt
+from gaudirt.compiler import compile
+
+
+def linear(x, weight):
+    return torch.nn.functional.linear(x, weight)
+
+
+def matrix_product(x, weight):
+    return torch.mm(x, weight.t())
+
+
+def biased_linear(x, weight, bias):
+    return torch.nn.functional.linear(x, weight, bias)
+
+
+gaudirt.initialize(hbm_bytes=64 * 1024 * 1024, pinned_bytes=4 * 1024 * 1024)
+cpu_x = torch.randn(137, 64, dtype=torch.bfloat16)
+cpu_weight = torch.randn(64, 64, dtype=torch.bfloat16)
+x = cpu_x.to("gaudirt:0")
+weight = cpu_weight.to("gaudirt:0")
+first = compile(linear)(x, weight)
+stats = gaudirt.recipe_cache_stats()
+second = compile(matrix_product)(x, weight)
+assert gaudirt.recipe_cache_stats() == stats == [0, 1, 1], stats
+assert torch.equal(first.cpu().view(torch.int16), second.cpu().view(torch.int16))
+reference = cpu_x.double() @ cpu_weight.double().t()
+result = first.cpu().double()
+assert torch.isfinite(reference).all() and torch.isfinite(result).all()
+denom = torch.linalg.vector_norm(reference, dim=-1).clamp_min(1e-30)
+error = (torch.linalg.vector_norm(result - reference, dim=-1) / denom).max().item()
+assert error <= 3e-3, error
+bias = torch.empty((64,), dtype=torch.bfloat16, device="gaudirt:0")
+try:
+    compile(biased_linear)(x, weight, bias)
+except Exception as error:
+    assert "linear bias is not implemented" in str(error), str(error)
+else:
+    raise AssertionError("linear bias silently ignored")
+del x, weight, first, second, bias
+gaudirt.empty_cache()
+gaudirt.shutdown()
+print("bias-free linear and transposed GEMM reused one recipe; bias rejected", flush=True)
