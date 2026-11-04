@@ -9,8 +9,88 @@ import torch.fx.experimental._config
 from . import _C
 
 
+def _program_backend(graph_module, example_inputs):
+    nodes = tuple(graph_module.graph.nodes)
+    placeholders = tuple(node for node in nodes if node.op == "placeholder")
+    if len(placeholders) != len(example_inputs):
+        raise RuntimeError("GaudiRT FX: placeholder count mismatch")
+    tensor_indices, roles, ids = [], [], {}
+    for index, (node, value) in enumerate(zip(placeholders, example_inputs)):
+        if not isinstance(value, torch.Tensor):
+            continue
+        dynamic = getattr(value, "_dynamo_dynamic_indices", set()) or set()
+        if dynamic and dynamic != {0}:
+            raise RuntimeError("GaudiRT FX: only the outer token dimension may be dynamic")
+        ids[node] = len(tensor_indices)
+        tensor_indices.append(index)
+        roles.append(int(bool(dynamic)))
+    if not any(roles):
+        raise RuntimeError("GaudiRT FX: mark each dynamic token input before capture")
+    operations, transposes = [], {}
+    linear_targets = (torch.nn.functional.linear, torch.ops.aten.linear.default)
+    mm_targets = (torch.mm, torch.ops.aten.mm.default, torch.matmul,
+                  torch.ops.aten.matmul.default, operator.matmul)
+    addmm_targets = (torch.addmm, torch.ops.aten.addmm.default)
+    add_targets = (operator.add, torch.add, torch.ops.aten.add.Tensor)
+
+    def tensor_id(value):
+        if value not in ids:
+            raise RuntimeError("GaudiRT FX: unsupported tensor or scalar input")
+        return ids[value]
+
+    def weight_id(value):
+        if value not in transposes:
+            raise RuntimeError("GaudiRT FX: GEMM weight must be transposed")
+        return tensor_id(transposes[value])
+
+    output = None
+    for node in nodes:
+        if node.op == "placeholder":
+            continue
+        if node.op == "output":
+            returned = node.args[0]
+            if not isinstance(returned, (tuple, list)) or len(returned) != 1:
+                raise RuntimeError("GaudiRT FX: only one program output is implemented")
+            output = returned[0]
+            continue
+        if node.op == "call_method" and node.target == "t" and len(node.args) == 1 and not node.kwargs:
+            transposes[node] = node.args[0]
+            continue
+        if node.op != "call_function":
+            raise RuntimeError("GaudiRT FX: unsupported program node")
+        if node.target in linear_targets and len(node.args) in (2, 3):
+            if set(node.kwargs) - {"bias"} or (len(node.args) == 3 and "bias" in node.kwargs):
+                raise RuntimeError("GaudiRT FX: unsupported linear arguments")
+            bias = node.args[2] if len(node.args) == 3 else node.kwargs.get("bias")
+            operation = [0, tensor_id(node.args[0]), tensor_id(node.args[1]),
+                         -1 if bias is None else tensor_id(bias)]
+        elif node.target in mm_targets and len(node.args) == 2 and not node.kwargs:
+            operation = [0, tensor_id(node.args[0]), weight_id(node.args[1]), -1]
+        elif node.target in addmm_targets and len(node.args) == 3:
+            if set(node.kwargs) - {"alpha", "beta"} or any(
+                not isinstance(value, (int, float)) or value != 1 for value in node.kwargs.values()
+            ):
+                raise RuntimeError("GaudiRT FX: addmm requires alpha=beta=1")
+            operation = [0, tensor_id(node.args[1]), weight_id(node.args[2]), tensor_id(node.args[0])]
+        elif node.target in add_targets and len(node.args) == 2:
+            if set(node.kwargs) - {"alpha"} or node.kwargs.get("alpha", 1) != 1:
+                raise RuntimeError("GaudiRT FX: add requires alpha=1")
+            operation = [1, tensor_id(node.args[0]), tensor_id(node.args[1]), -1]
+        else:
+            raise RuntimeError("GaudiRT FX: unsupported program operation")
+        ids[node] = len(tensor_indices) + len(operations)
+        operations.append(operation)
+    if not operations or output not in ids or ids[output] != len(tensor_indices) + len(operations) - 1:
+        raise RuntimeError("GaudiRT FX: unsupported program output")
+    program = _C.BucketProgram(roles, operations)
+
+    def execute(*args):
+        return (program.run([args[index] for index in tensor_indices]),)
+
+    return execute
+
+
 def gaudirt_backend(graph_module, example_inputs):
-    del example_inputs
     nodes = tuple(graph_module.graph.nodes)
     placeholders = tuple(node for node in nodes if node.op == "placeholder")
     outputs = tuple(node for node in nodes if node.op == "output")
@@ -25,7 +105,7 @@ def gaudirt_backend(graph_module, example_inputs):
     addmm_targets = (torch.addmm, torch.ops.aten.addmm.default)
     linear_targets = (torch.nn.functional.linear, torch.ops.aten.linear.default)
     if not isinstance(gemm, torch.fx.Node) or gemm.op != "call_function":
-        raise RuntimeError("GaudiRT FX: unsupported subgraph")
+        return _program_backend(graph_module, example_inputs)
     accepted = {gemm}
     bias_node = None
 
@@ -67,12 +147,12 @@ def gaudirt_backend(graph_module, example_inputs):
         if bias_node is not None and bias_node not in placeholders:
             raise RuntimeError("GaudiRT FX: linear bias must be an external tensor")
     else:
-        raise RuntimeError("GaudiRT FX: unsupported subgraph")
+        return _program_backend(graph_module, example_inputs)
     if input_node not in placeholders or weight_node not in placeholders:
-        raise RuntimeError("GaudiRT FX: GEMM operands must be external inputs")
+        return _program_backend(graph_module, example_inputs)
     if any(node.op not in ("placeholder", "output") and node not in accepted
            for node in nodes):
-        raise RuntimeError("GaudiRT FX: unsupported additional operation")
+        return _program_backend(graph_module, example_inputs)
     input_index = placeholders.index(input_node)
     weight_index = placeholders.index(weight_node)
     bias_index = placeholders.index(bias_node) if bias_node is not None else None
