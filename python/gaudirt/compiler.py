@@ -21,10 +21,13 @@ def gaudirt_backend(graph_module, example_inputs):
     gemm = returned[0]
     mm_targets = (torch.mm, torch.ops.aten.mm.default)
     linear_targets = (torch.nn.functional.linear, torch.ops.aten.linear.default)
-    if not isinstance(gemm, torch.fx.Node) or gemm.op != "call_function" or gemm.kwargs:
+    if not isinstance(gemm, torch.fx.Node) or gemm.op != "call_function":
         raise RuntimeError("GaudiRT FX: unsupported subgraph")
     accepted = {gemm}
+    bias_node = None
     if gemm.target in mm_targets and len(gemm.args) == 2:
+        if gemm.kwargs:
+            raise RuntimeError("GaudiRT FX: unsupported GEMM arguments")
         input_node, transposed = gemm.args
         if (not isinstance(transposed, torch.fx.Node) or transposed.op != "call_method" or
                 transposed.target != "t" or len(transposed.args) != 1 or transposed.kwargs):
@@ -33,8 +36,11 @@ def gaudirt_backend(graph_module, example_inputs):
         accepted.add(transposed)
     elif gemm.target in linear_targets and len(gemm.args) in (2, 3):
         input_node, weight_node = gemm.args[:2]
-        if len(gemm.args) == 3 and gemm.args[2] is not None:
-            raise RuntimeError("GaudiRT FX: linear bias is not implemented")
+        if set(gemm.kwargs) - {"bias"} or (len(gemm.args) == 3 and "bias" in gemm.kwargs):
+            raise RuntimeError("GaudiRT FX: unsupported linear arguments")
+        bias_node = gemm.args[2] if len(gemm.args) == 3 else gemm.kwargs.get("bias")
+        if bias_node is not None and bias_node not in placeholders:
+            raise RuntimeError("GaudiRT FX: linear bias must be an external tensor")
     else:
         raise RuntimeError("GaudiRT FX: unsupported subgraph")
     if input_node not in placeholders or weight_node not in placeholders:
@@ -44,9 +50,11 @@ def gaudirt_backend(graph_module, example_inputs):
         raise RuntimeError("GaudiRT FX: unsupported additional operation")
     input_index = placeholders.index(input_node)
     weight_index = placeholders.index(weight_node)
+    bias_index = placeholders.index(bias_node) if bias_node is not None else None
 
     def execute(*args):
-        return (_C.bucket_linear(args[input_index], args[weight_index]),)
+        bias = None if bias_index is None else args[bias_index]
+        return (_C.bucket_linear(args[input_index], args[weight_index], bias),)
 
     return execute
 

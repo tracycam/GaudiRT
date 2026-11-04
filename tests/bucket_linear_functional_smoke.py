@@ -20,10 +20,6 @@ def matrix_product(x, weight):
     return torch.mm(x, weight.t())
 
 
-def biased_linear(x, weight, bias):
-    return torch.nn.functional.linear(x, weight, bias)
-
-
 gaudirt.initialize(hbm_bytes=64 * 1024 * 1024, pinned_bytes=4 * 1024 * 1024)
 cpu_x = torch.randn(137, 64, dtype=torch.bfloat16)
 cpu_weight = torch.randn(64, 64, dtype=torch.bfloat16)
@@ -40,14 +36,7 @@ assert torch.isfinite(reference).all() and torch.isfinite(result).all()
 denom = torch.linalg.vector_norm(reference, dim=-1).clamp_min(1e-30)
 error = (torch.linalg.vector_norm(result - reference, dim=-1) / denom).max().item()
 assert error <= 3e-3, error
-bias = torch.empty((64,), dtype=torch.bfloat16, device="gaudirt:0")
-try:
-    compile(biased_linear)(x, weight, bias)
-except Exception as error:
-    assert "linear bias is not implemented" in str(error), str(error)
-else:
-    raise AssertionError("linear bias silently ignored")
-del x, weight, first, second, bias
+del x, weight, first, second
 gaudirt.empty_cache()
 gaudirt.shutdown()
-print("bias-free linear and transposed GEMM reused one recipe; bias rejected", flush=True)
+print("bias-free linear and transposed GEMM reused one recipe", flush=True)
