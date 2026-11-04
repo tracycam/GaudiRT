@@ -884,11 +884,12 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
     fill_step_metadata_prevalidated(metadata, model_position_, rope_first_position_, full_rope_.data(),
                                     swa_rope_.data(), model_pages_);
     model_pending_ = true;
-    // Both copies are ordered with the model graphs on the same stream.
-    const auto stream = runtime_.compute_stream();
-    check_syn(synMemCopyAsync(stream, reinterpret_cast<uint64_t>(metadata_host_),
+    check_syn(synMemCopyAsync(runtime_.h2d_stream(), reinterpret_cast<uint64_t>(metadata_host_),
                               sizeof(StepMetadata), metadata_device_, HOST_TO_DRAM),
               "step metadata H2D");
+    check_syn(synEventRecord(metadata_ready_, runtime_.h2d_stream()), "metadata event record");
+    check_syn(synStreamWaitEvent(runtime_.compute_stream(), metadata_ready_, 0), "metadata wait");
+    const auto stream = runtime_.compute_stream();
     model_embedding_launch_.execute(stream);
     if (fused_model_) {
       for (const auto& layer : model_layers_) layer.execute_fused(stream);
@@ -901,10 +902,12 @@ class PrivateProgram final : public std::enable_shared_from_this<PrivateProgram>
                       hcclBfloat16, runtime_.comm(), stream) != hcclSuccess)
       throw std::runtime_error("PrivateUse1: model logits AllGather failed");
     model_argmax_launch_.execute(stream);
-    check_syn(synMemCopyAsync(stream, token_device_, sizeof(int32_t),
+    check_syn(synEventRecord(compute_done_, runtime_.compute_stream()), "compute event record");
+    check_syn(synStreamWaitEvent(runtime_.d2h_stream(), compute_done_, 0), "output wait");
+    check_syn(synMemCopyAsync(runtime_.d2h_stream(), token_device_, sizeof(int32_t),
                               reinterpret_cast<uint64_t>(token_host_), DRAM_TO_HOST),
               "token D2H");
-    check_syn(synEventRecord(token_ready_, stream), "token completion event");
+    check_syn(synEventRecord(token_ready_, runtime_.d2h_stream()), "token completion event");
     return wrap(token_device_, {1}, at::kInt);
   }
 
