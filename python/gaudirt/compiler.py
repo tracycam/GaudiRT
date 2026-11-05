@@ -53,9 +53,9 @@ def _program_backend(graph_module, example_inputs):
             continue
         if node.op == "output":
             returned = node.args[0]
-            if not isinstance(returned, (tuple, list)) or len(returned) != 1:
-                raise RuntimeError("GaudiRT FX: only one program output is implemented")
-            output = returned[0]
+            if not isinstance(returned, (tuple, list)) or not returned:
+                raise RuntimeError("GaudiRT FX: program output must be a nonempty tensor sequence")
+            output = returned
             continue
         if node.op == "call_method" and node.target == "t" and len(node.args) == 1 and not node.kwargs:
             transposes[node] = node.args[0]
@@ -93,12 +93,15 @@ def _program_backend(graph_module, example_inputs):
             raise RuntimeError(f"GaudiRT FX: unsupported program operation {node.target}")
         ids[node] = len(tensor_indices) + len(operations)
         operations.append(operation)
-    if not operations or output not in ids or ids[output] != len(tensor_indices) + len(operations) - 1:
+    if not operations or output is None or any(value not in ids for value in output):
         raise RuntimeError("GaudiRT FX: unsupported program output")
-    program = _C.BucketProgram(roles, operations)
+    output_ids = [ids[value] for value in output]
+    if any(value < len(tensor_indices) for value in output_ids) or len(set(output_ids)) != len(output_ids):
+        raise RuntimeError("GaudiRT FX: outputs must be distinct program operations")
+    program = _C.BucketProgram(roles, operations, output_ids)
 
     def execute(*args):
-        return (program.run([args[index] for index in tensor_indices]),)
+        return tuple(program.run([args[index] for index in tensor_indices]))
 
     return execute
 
@@ -110,8 +113,10 @@ def gaudirt_backend(graph_module, example_inputs):
     if len(outputs) != 1:
         raise RuntimeError("GaudiRT FX: expected one graph output")
     returned = outputs[0].args[0]
-    if not isinstance(returned, (tuple, list)) or len(returned) != 1:
-        raise RuntimeError("GaudiRT FX: only a single GEMM output is implemented")
+    if not isinstance(returned, (tuple, list)) or not returned:
+        raise RuntimeError("GaudiRT FX: program output must be a nonempty tensor sequence")
+    if len(returned) != 1:
+        return _program_backend(graph_module, example_inputs)
     gemm = returned[0]
     mm_targets = (torch.mm, torch.ops.aten.mm.default, torch.matmul,
                   torch.ops.aten.matmul.default, operator.matmul)
