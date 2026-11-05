@@ -519,6 +519,18 @@ std::vector<uint64_t> recipe_cache_stats() {
   const auto [loaded, saved] = ctx->cache.stats();
   return {loaded, saved, ctx->cold_recipes.size()};
 }
+std::vector<std::string> recipe_cache_keys() {
+  auto ctx = current();
+  std::lock_guard lock(ctx->cold_mutex);
+  std::vector<std::string> keys;
+  keys.reserve(ctx->cold_recipes.size());
+  for (const auto& [key, recipe] : ctx->cold_recipes) {
+    (void)recipe;
+    keys.push_back(key);
+  }
+  std::sort(keys.begin(), keys.end());
+  return keys;
+}
 void empty_cache() {
   auto ctx = current();
   std::lock_guard lock(ctx->cold_mutex);
@@ -4359,6 +4371,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("memory_allocated", &gaudirt::generic::memory_allocated);
   m.def("max_memory_allocated", &gaudirt::generic::max_memory_allocated);
   m.def("recipe_cache_stats", &gaudirt::generic::recipe_cache_stats);
+  m.def("_recipe_cache_keys", &gaudirt::generic::recipe_cache_keys);
   m.def("_prepare_strided_input", &gaudirt::generic::prepare_strided_input);
   m.def("bucket_linear", &gaudirt::generic::bucket_linear,
         pybind11::arg("input"), pybind11::arg("weight"), pybind11::arg("bias") = pybind11::none());
