@@ -142,14 +142,15 @@ void invalidate_events(Context& ctx) {
 }
 
 struct AllocationLease {
-  AllocationLease(std::shared_ptr<Context> owner, uint64_t address, bool pinned)
-      : owner(std::move(owner)), address(address), pinned(pinned) {}
+  AllocationLease(std::shared_ptr<Context> owner, uint64_t address, bool pinned, bool graph)
+      : owner(std::move(owner)), address(address), pinned(pinned), graph(graph) {}
   ~AllocationLease() { release(); }
   void release() {
     std::lock_guard lock(mutex);
     auto ctx = owner;
     if (!ctx) return;
-    if (pinned) ctx->pinned.free(reinterpret_cast<void*>(address));
+    if (graph) ctx->graph_pool->free(address);
+    else if (pinned) ctx->pinned.free(reinterpret_cast<void*>(address));
     else ctx->allocator.free(address);
     {
       std::lock_guard leases_lock(ctx->leases_mutex);
@@ -162,15 +163,17 @@ struct AllocationLease {
   uint64_t address;
   uint64_t id = 0;
   bool pinned;
+  bool graph;
 };
 
 std::shared_ptr<AllocationLease> make_lease(const std::shared_ptr<Context>& ctx,
-                                             uint64_t address, bool pinned) {
+                                             uint64_t address, bool pinned, bool graph = false) {
   std::shared_ptr<AllocationLease> lease;
   try {
-    lease = std::make_shared<AllocationLease>(ctx, address, pinned);
+    lease = std::make_shared<AllocationLease>(ctx, address, pinned, graph);
   } catch (...) {
-    if (pinned) ctx->pinned.free(reinterpret_cast<void*>(address));
+    if (graph) ctx->graph_pool->free(address);
+    else if (pinned) ctx->pinned.free(reinterpret_cast<void*>(address));
     else ctx->allocator.free(address);
     throw;
   }
@@ -218,7 +221,14 @@ void record_stream(at::Tensor& tensor, c10::Stream stream) {
   auto ctx = current();
   TORCH_CHECK(stream.device_type() == c10::kPrivateUse1 && stream.device_index() == 0,
               "GaudiRT: record_stream requires a gaudirt:0 stream");
-  if (tensor.numel()) ctx->allocator.record_stream(address_of(tensor, *ctx), ctx->streams.get(stream.id()));
+  if (tensor.numel()) {
+    const auto address = address_of(tensor, *ctx);
+    auto handle = ctx->streams.get(stream.id());
+    std::lock_guard lock(ctx->cold_mutex);
+    if (ctx->graph_pool && ctx->graph_pool->contains_live_range(address, 1))
+      ctx->graph_pool->record_stream(address, handle);
+    ctx->allocator.record_stream(address, handle);
+  }
 }
 
 c10::Allocator* pinned_allocator();
@@ -470,6 +480,8 @@ void shutdown() {
     TORCH_CHECK(context, "GaudiRT: device is not initialized");
     const uint64_t graph_reservation = context->graph_pool ?
         context->graph_pool->capacity_bytes() : 0;
+    TORCH_CHECK(!context->graph_pool || context->graph_pool->memory_allocated() == 0,
+                "GaudiRT: graph tensors must be destroyed before shutdown");
     TORCH_CHECK(context->allocator.memory_allocated() == graph_reservation,
                 "GaudiRT: device tensors must be destroyed before shutdown");
     TORCH_CHECK(context->pinned.memory_allocated() == 0,
@@ -2704,6 +2716,53 @@ struct GraphTemporary {
   uint64_t address;
 };
 
+std::optional<at::Tensor> prepare_strided_input(const at::Tensor& input) {
+  TORCH_CHECK(input.device().type() == c10::kPrivateUse1 && input.device().index() == 0 &&
+              input.dim() >= 1 && input.dim() <= 3 && input.size(0) > 0 && input.size(0) <= 4096,
+              "GaudiRT FX: invalid dynamic input");
+  if (input.is_contiguous()) return std::nullopt;
+  const auto rows = input.size(0);
+  const auto bucket = std::bit_ceil(static_cast<uint32_t>(rows));
+  uint64_t width = 1;
+  for (int64_t dim = 1; dim < input.dim(); ++dim) {
+    TORCH_CHECK(input.size(dim) > 0 && width <= UINT64_MAX / static_cast<uint64_t>(input.size(dim)),
+                "GaudiRT FX: invalid input geometry");
+    width *= static_cast<uint64_t>(input.size(dim));
+  }
+  const uint64_t item = input.element_size();
+  TORCH_CHECK(width <= UINT64_MAX / bucket / item, "GaudiRT FX: input allocation size overflow");
+  const uint64_t bytes = width * bucket * item;
+  auto ctx = current();
+  auto stream = ctx->stream();
+  const auto source = address_of(input, *ctx);
+  std::shared_ptr<AllocationLease> lease;
+  uint64_t destination = 0;
+  {
+    std::lock_guard lock(ctx->cold_mutex);
+    if (!ctx->graph_pool) {
+      const uint64_t budget = std::min<uint64_t>(ctx->allocator.capacity_bytes() / 8, uint64_t{1} << 30);
+      TORCH_CHECK(budget >= 256, "GaudiRT FX: HBM budget is too small for graph temporaries");
+      ctx->graph_pool = std::make_unique<GraphPool>(ctx->allocator, budget, stream);
+    }
+    destination = ctx->graph_pool->allocate(bytes, stream);
+    lease = make_lease(ctx, destination, false, true);
+    if (ctx->graph_pool->contains_live_range(source, 1)) ctx->graph_pool->record_stream(source, stream);
+    ctx->allocator.record_stream(source, stream);
+  }
+  if (input.scalar_type() == at::kInt || input.scalar_type() == at::kLong) {
+    TORCH_CHECK(bytes <= UINT64_MAX - 3 && (bytes + 3) / 4 <= UINT32_MAX &&
+                synMemsetD32Async(destination, 0, (bytes + 3) / 4, stream) == synSuccess,
+                "GaudiRT FX: index tail zeroing failed");
+  }
+  const Layout layout(input);
+  dma_copy(destination, nullptr, source, &layout, 0, input.numel(), item, stream, DRAM_TO_DRAM);
+  std::vector<int64_t> shape(input.sizes().begin(), input.sizes().end());
+  shape[0] = bucket;
+  auto staged = at::from_blob(reinterpret_cast<void*>(destination), shape,
+                              [lease](void*) { lease->release(); }, input.options());
+  return staged.narrow(0, 0, rows);
+}
+
 at::Tensor bucket_output(const at::Tensor& reference, at::ScalarType dtype,
                          uint32_t bucket, int64_t rows, int64_t width) {
   const uint64_t item = c10::elementSize(dtype);
@@ -4259,6 +4318,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("memory_allocated", &gaudirt::generic::memory_allocated);
   m.def("max_memory_allocated", &gaudirt::generic::max_memory_allocated);
   m.def("recipe_cache_stats", &gaudirt::generic::recipe_cache_stats);
+  m.def("_prepare_strided_input", &gaudirt::generic::prepare_strided_input);
   m.def("bucket_linear", &gaudirt::generic::bucket_linear,
         pybind11::arg("input"), pybind11::arg("weight"), pybind11::arg("bias") = pybind11::none());
   pybind11::class_<gaudirt::generic::BucketProgram>(m, "BucketProgram")
