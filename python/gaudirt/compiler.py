@@ -28,7 +28,8 @@ def _program_backend(graph_module, example_inputs):
         roles.append(int(bool(dynamic)))
     if not any(roles):
         raise RuntimeError("GaudiRT FX: mark each dynamic token input before capture")
-    operations, transposes, splits, fused_norms, rotations = [], {}, {}, {}, {}
+    operations, transposes, splits, fused_norms, rotations, index_casts = [], {}, {}, {}, {}, {}
+    validated_token_bindings = []
     linear_targets = (torch.nn.functional.linear, torch.ops.aten.linear.default)
     mm_targets = (torch.mm, torch.ops.aten.mm.default, torch.matmul,
                   torch.ops.aten.matmul.default, operator.matmul)
@@ -41,6 +42,7 @@ def _program_backend(graph_module, example_inputs):
     rotary_targets = (torch.ops.gaudirt._rotary_embedding_validated,
                       torch.ops.gaudirt._rotary_embedding_validated.default)
     split_targets = (torch.split, torch.ops.aten.split_with_sizes.default)
+    embedding_targets = (torch.nn.functional.embedding, torch.ops.aten.embedding.default)
 
     def tensor_id(value):
         if value not in ids:
@@ -65,6 +67,9 @@ def _program_backend(graph_module, example_inputs):
         if node.op == "call_method" and node.target == "t" and len(node.args) == 1 and not node.kwargs:
             transposes[node] = node.args[0]
             continue
+        if node.op == "call_method" and node.target == "long" and len(node.args) == 1 and not node.kwargs:
+            index_casts[node] = node.args[0]
+            continue
         if ((node.op == "call_method" and node.target == "split") or
                 (node.op == "call_function" and node.target in split_targets)):
             if len(node.args) not in (2, 3) or set(node.kwargs) - {"dim"} or (
@@ -81,6 +86,27 @@ def _program_backend(graph_module, example_inputs):
             continue
         if node.op != "call_function":
             raise RuntimeError(f"GaudiRT FX: unsupported program node {node.op}: {node.target}")
+        if node.target in embedding_targets:
+            if node.target is torch.nn.functional.embedding:
+                if len(node.args) != 2 or set(node.kwargs) - {
+                    "padding_idx", "max_norm", "norm_type", "scale_grad_by_freq", "sparse"
+                } or node.kwargs.get("max_norm") is not None or node.kwargs.get("scale_grad_by_freq", False) \
+                        or node.kwargs.get("sparse", False):
+                    raise RuntimeError("GaudiRT FX: unsupported embedding arguments")
+                indices, weight = node.args
+            else:
+                if (len(node.args) < 2 or len(node.args) > 5 or node.kwargs or
+                        (len(node.args) > 3 and node.args[3]) or (len(node.args) > 4 and node.args[4])):
+                    raise RuntimeError("GaudiRT FX: unsupported embedding arguments")
+                weight, indices = node.args[:2]
+            indices = index_casts.get(indices, indices)
+            index_id, weight_id_value = tensor_id(indices), tensor_id(weight)
+            if index_id >= len(tensor_indices) or weight_id_value >= len(tensor_indices):
+                raise RuntimeError("GaudiRT FX: embedding requires validated external IDs and weights")
+            validated_token_bindings.append((index_id, weight_id_value))
+            ids[node] = len(tensor_indices) + len(operations)
+            operations.append([9, index_id, weight_id_value, -1])
+            continue
         if node.target in rotary_targets:
             if len(node.args) != 9 or node.kwargs:
                 raise RuntimeError("GaudiRT FX: unsupported rotary arguments")
@@ -179,6 +205,12 @@ def _program_backend(graph_module, example_inputs):
     program = _C.BucketProgram(roles, operations, output_ids)
 
     def execute(*args):
+        for index_id, weight_id_value in validated_token_bindings:
+            index = args[tensor_indices[index_id]]
+            weight = args[tensor_indices[weight_id_value]]
+            vocabulary = getattr(index, "_gaudirt_validated_vocab", None)
+            if not isinstance(vocabulary, int) or vocabulary <= 0 or vocabulary > weight.shape[0]:
+                raise RuntimeError("GaudiRT FX: embedding token IDs must pass batch metadata validation")
         return tuple(program.run([args[index] for index in tensor_indices]))
 
     return execute

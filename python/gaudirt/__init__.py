@@ -103,6 +103,16 @@ def initialize(module_id=0, hbm_bytes=256 * 1024 * 1024, pinned_bytes=8 * 1024 *
     _C.initialize(module_id, hbm_bytes, pinned_bytes)
 
 
+def validated_token_ids(metadata):
+    """Return logical token IDs that have passed the batch metadata gate."""
+    tokens = metadata.token_ids()
+    vocabulary = metadata.vocabulary()
+    if vocabulary <= 0:
+        raise ValueError("GaudiRT: token metadata has no validated vocabulary")
+    tokens._gaudirt_validated_vocab = vocabulary
+    return tokens
+
+
 def is_initialized():
     return _C.is_initialized()
 

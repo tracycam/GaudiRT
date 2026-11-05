@@ -12,12 +12,12 @@ import gaudirt
 import paged_device_metadata_smoke as paged
 
 
-def prepare(rows, source, sliced=False):
+def prepare(rows, source, sliced=False, vocabulary=32000):
     locations, requests, positions, mapping, prefixes, lengths, _ = paged.data(rows)
     values = [value.to("gaudirt:0") for value in (locations, requests, positions, mapping)]
     tokens, storage = paged.to_device(source, sliced)
     metadata = torch.classes.gaudirt.PagedMetadata.from_device_with_tokens(
-        *values, prefixes, lengths, paged.SLOTS, tokens, 32000
+        *values, prefixes, lengths, paged.SLOTS, tokens, vocabulary
     )
     return metadata, (values, tokens, storage)
 
