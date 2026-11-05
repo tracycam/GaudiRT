@@ -16,6 +16,10 @@ def identity(x):
     return x
 
 
+def pair(x):
+    return x, x
+
+
 def main():
     gaudirt.initialize(hbm_bytes=128 * 1024**2, pinned_bytes=4 * 1024**2)
     cpu = torch.arange(3 * 34, dtype=torch.float32).reshape(3, 34)
@@ -57,14 +61,35 @@ def main():
     first.synchronize()
 
     result = compiler.compile(identity)(view)
-    assert result.is_contiguous() and torch.equal(result.cpu(), cpu[:, ::2])
+    assert result.data_ptr() == view.data_ptr() and result.stride() == view.stride()
+    assert torch.equal(result.cpu(), cpu[:, ::2])
+    aliases = compiler.compile(pair)(view)
+    assert all(value.data_ptr() == view.data_ptr() and value.stride() == view.stride() for value in aliases)
+    staged = gaudirt._C._prepare_strided_input(view)
+    reshaped = staged.as_strided((51,), (1,), 0)
+    restored = gaudirt._C._restore_staged_alias(view, staged, reshaped)
+    assert restored.data_ptr() == view.data_ptr() and restored.stride() == (2,)
+    assert torch.equal(restored.cpu(), cpu[:, ::2].reshape(-1))
+    transposed = base.t()
+    staged_transposed = gaudirt._C._prepare_strided_input(transposed)
+    restored_transposed = gaudirt._C._restore_staged_alias(transposed, staged_transposed, staged_transposed.t())
+    assert restored_transposed.data_ptr() == base.data_ptr() and restored_transposed.stride() == base.stride()
+    assert torch.equal(restored_transposed.cpu(), cpu)
+    try:
+        gaudirt._C._restore_staged_alias(transposed, staged_transposed, staged_transposed.view(-1))
+    except RuntimeError as error:
+        assert "cannot preserve the original layout" in str(error)
+    else:
+        raise AssertionError("accepted an unrepresentable staged alias")
+    del aliases, staged, reshaped, restored, transposed, staged_transposed, restored_transposed
+    live = gaudirt._C._prepare_strided_input(view)
     try:
         gaudirt.shutdown()
     except RuntimeError as error:
         assert "graph tensors must be destroyed" in str(error)
     else:
         raise AssertionError("shutdown accepted a live graph-pool tensor")
-    del result, view, base, output, event
+    del live, result, view, base, output, event
     gaudirt.empty_cache()
     gaudirt.shutdown()
     print("graph input staging, alias lifetime and cross-stream reuse passed", flush=True)
