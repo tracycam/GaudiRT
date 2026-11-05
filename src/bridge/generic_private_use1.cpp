@@ -3066,7 +3066,8 @@ class PagedMetadata : public torch::CustomClassHolder {
                 const at::Tensor& positions, const at::Tensor& mapping, int64_t slots);
   PagedMetadata(const at::Tensor& locations, const at::Tensor& batch_requests,
                 const at::Tensor& positions, const at::Tensor& mapping,
-                std::vector<int64_t> prefixes, std::vector<int64_t> lengths, int64_t slots);
+                std::vector<int64_t> prefixes, std::vector<int64_t> lengths, int64_t slots,
+                const at::Tensor& token_ids = {}, int64_t vocabulary = 0);
   static c10::intrusive_ptr<PagedMetadata> from_device(
       const at::Tensor& locations, const at::Tensor& batch_requests,
       const at::Tensor& positions, const at::Tensor& mapping,
@@ -3074,36 +3075,56 @@ class PagedMetadata : public torch::CustomClassHolder {
     return c10::make_intrusive<PagedMetadata>(locations, batch_requests, positions, mapping,
                                              std::move(prefixes), std::move(lengths), slots);
   }
+  static c10::intrusive_ptr<PagedMetadata> from_device_with_tokens(
+      const at::Tensor& locations, const at::Tensor& batch_requests,
+      const at::Tensor& positions, const at::Tensor& mapping,
+      std::vector<int64_t> prefixes, std::vector<int64_t> lengths, int64_t slots,
+      const at::Tensor& token_ids, int64_t vocabulary) {
+    return c10::make_intrusive<PagedMetadata>(locations, batch_requests, positions, mapping,
+                                             std::move(prefixes), std::move(lengths), slots,
+                                             token_ids, vocabulary);
+  }
   int64_t rows() const { return rows_; }
   int64_t slots() const { return slots_; }
   int64_t context() const { return context_; }
   at::Tensor rotary_positions() const { return positions_.narrow(0, 0, rows_); }
   at::Tensor rotary_header() const { return header_; }
+  at::Tensor token_ids() const {
+    TORCH_CHECK(token_ids_.defined(), "GaudiRT: token IDs were not validated in this metadata");
+    return token_ids_.narrow(0, 0, rows_);
+  }
+  int64_t vocabulary() const { return vocabulary_; }
 
-  int64_t rows_ = 0, slots_ = 0, request_count_ = 0, context_ = 0;
+  int64_t rows_ = 0, slots_ = 0, request_count_ = 0, context_ = 0, vocabulary_ = 0;
   uint32_t bucket_ = 0;
-  at::Tensor locations_, requests_, positions_, mapping_, header_;
+  at::Tensor locations_, requests_, positions_, mapping_, header_, token_ids_;
 };
 
 ColdRecipe& device_metadata_recipe(Context& ctx, uint32_t bucket, uint64_t requests, uint64_t context,
-                                   int32_t slots, const std::array<int, 3>& lanes) {
+                                   int32_t slots, const std::array<int, 4>& lanes, int32_t vocabulary) {
   std::ostringstream signature;
   signature << "device_metadata_v1;" << bucket << ":" << requests << ":" << context << ":" << slots;
   for (auto lane : lanes) signature << ":" << lane;
+  signature << ":" << vocabulary;
   const auto structure = signature.str();
   const auto digest = common::sha256_bytes(reinterpret_cast<const uint8_t*>(structure.data()), structure.size());
   const auto prefix = "g" + digest.substr(0, 12) + "_b" + std::to_string(bucket);
   const auto key = "device_metadata_" + digest;
   auto found = ctx.cold_recipes.find(key);
   if (found != ctx.cold_recipes.end()) return *found->second;
-  const std::array<std::vector<uint64_t>, 10> shapes{{
+  std::vector<std::vector<uint64_t>> shapes{
       {static_cast<uint64_t>(lanes[0]), bucket}, {static_cast<uint64_t>(lanes[1]), bucket},
       {static_cast<uint64_t>(lanes[2]), bucket}, {context, requests}, {1}, {1 + 4 * bucket},
-      {bucket}, {bucket}, {bucket}, {bucket}}};
+      {bucket}, {bucket}, {bucket}, {bucket}};
+  if (vocabulary) {
+    shapes.push_back({static_cast<uint64_t>(lanes[3]), bucket});
+    shapes.push_back({bucket});
+    shapes.push_back({bucket});
+  }
   auto compiled = std::make_unique<ColdRecipe>(shapes.size());
   synGraphHandle graph = nullptr;
-  std::array<synSectionHandle, 10> sections{};
-  std::array<synTensor, 10> tensors{};
+  std::vector<synSectionHandle> sections(shapes.size(), nullptr);
+  std::vector<synTensor> tensors(shapes.size(), nullptr);
   const auto check = [](synStatus status, const char* message) {
     TORCH_CHECK(status == synSuccess, "GaudiRT device metadata: ", message,
                 " status=", static_cast<int>(status));
@@ -3134,6 +3155,14 @@ ColdRecipe& device_metadata_recipe(Context& ctx, uint32_t bucket, uint64_t reque
     const auto node = prefix + "_n0";
     check(synNodeCreate(graph, tensors.data(), tensors.data() + 6, 6, 4, &slots, sizeof(slots),
                         "gk_paged_metadata_i32_v1", node.c_str(), nullptr, nullptr), "node creation failed");
+    if (vocabulary) {
+      const std::array<synTensor, 2> token_inputs{tensors[10], tensors[4]};
+      const std::array<synTensor, 2> token_outputs{tensors[11], tensors[12]};
+      const auto token_node = prefix + "_n1";
+      check(synNodeCreate(graph, token_inputs.data(), token_outputs.data(), token_inputs.size(), token_outputs.size(),
+                          &vocabulary, sizeof(vocabulary), "gk_token_indices_i32_v1", token_node.c_str(),
+                          nullptr, nullptr), "token validation node creation failed");
+    }
     compiled->recipe = compile_cached(graph, prefix, key, &ctx.cache);
     check(synWorkspaceGetSize(&compiled->workspace, compiled->recipe), "workspace query failed");
     initialize_launch_tensor_ids(compiled->recipe, compiled->tensors.data(), compiled->tensors.size());
@@ -3239,7 +3268,8 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& requ
 
 PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batch_requests,
                              const at::Tensor& positions, const at::Tensor& mapping,
-                             std::vector<int64_t> prefixes, std::vector<int64_t> lengths, int64_t slots) {
+                             std::vector<int64_t> prefixes, std::vector<int64_t> lengths, int64_t slots,
+                             const at::Tensor& token_ids, int64_t vocabulary) {
   for (const auto& tensor : {locations, batch_requests, positions})
     TORCH_CHECK(tensor.device().type() == c10::kPrivateUse1 && tensor.device().index() == 0 &&
                 tensor.dim() == 1 && (tensor.scalar_type() == at::kInt || tensor.scalar_type() == at::kLong),
@@ -3249,6 +3279,12 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
               "GaudiRT device metadata: expected a contiguous gaudirt int32 request map");
   const int64_t m = locations.numel(), batch = batch_requests.numel();
   const int64_t request_count = mapping.size(0), context = mapping.size(1);
+  const bool has_tokens = token_ids.defined();
+  TORCH_CHECK((has_tokens && token_ids.device().type() == c10::kPrivateUse1 && token_ids.device().index() == 0 &&
+               token_ids.dim() == 1 && token_ids.numel() == m &&
+               (token_ids.scalar_type() == at::kInt || token_ids.scalar_type() == at::kLong) &&
+               vocabulary > 0 && vocabulary <= INT32_MAX) || (!has_tokens && vocabulary == 0),
+              "GaudiRT device metadata: invalid token ID inputs or vocabulary");
   TORCH_CHECK(m > 0 && m <= 4096 && positions.numel() == m && batch > 0 && batch <= m &&
               static_cast<int64_t>(prefixes.size()) == batch && static_cast<int64_t>(lengths.size()) == batch &&
               slots > 0 && slots <= INT32_MAX && request_count > 0 && request_count <= INT32_MAX &&
@@ -3281,6 +3317,11 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
   header_ = at::empty({1}, options);
   auto device_info = at::empty({static_cast<int64_t>(info.size())}, options);
   auto status = at::empty({bucket}, options);
+  at::Tensor token_status;
+  if (has_tokens) {
+    token_ids_ = at::empty({bucket}, options);
+    token_status = at::empty({bucket}, options);
+  }
   const auto mapping_address = address_of(mapping_, *ctx);
   TORCH_CHECK(mapping_address % BlockCachingAllocator::kAlignment == 0,
               "GaudiRT device metadata: request map must be 256-byte aligned");
@@ -3305,15 +3346,17 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
     ready.record(h2d);
     ready.wait(compute);
   }
-  const std::array<at::Tensor, 3> sources{locations, batch_requests, positions};
-  const std::array<int, 3> lanes{locations.element_size() == 8 ? 2 : 1,
+  const std::array<at::Tensor, 4> sources{locations, batch_requests, positions, token_ids};
+  const std::array<int, 4> lanes{locations.element_size() == 8 ? 2 : 1,
                                   batch_requests.element_size() == 8 ? 2 : 1,
-                                  positions.element_size() == 8 ? 2 : 1};
+                                  positions.element_size() == 8 ? 2 : 1,
+                                  has_tokens ? (token_ids.element_size() == 8 ? 2 : 1) : 0};
   std::vector<std::unique_ptr<GraphTemporary>> staged;
   std::unique_ptr<GraphTemporary> workspace;
   {
     std::lock_guard lock(ctx->cold_mutex);
-    auto& recipe = device_metadata_recipe(*ctx, bucket, request_count, context, static_cast<int32_t>(slots), lanes);
+    auto& recipe = device_metadata_recipe(*ctx, bucket, request_count, context, static_cast<int32_t>(slots),
+                                          lanes, static_cast<int32_t>(vocabulary));
     auto graph_pool = [&]() -> GraphPool& {
       if (!ctx->graph_pool) {
         const uint64_t budget = std::min<uint64_t>(ctx->allocator.capacity_bytes() / 8, uint64_t{1} << 30);
@@ -3323,8 +3366,8 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
       return *ctx->graph_pool;
     };
     std::vector<std::pair<uint64_t, uint64_t>> reserved{{mapping_address, mapping_.nbytes()}};
-    std::array<uint64_t, 3> input_addresses{};
-    for (size_t i = 0; i < sources.size(); ++i) {
+    std::array<uint64_t, 4> input_addresses{};
+    for (size_t i = 0; i < (has_tokens ? sources.size() : sources.size() - 1); ++i) {
       const auto& input = sources[i];
       const uint64_t address = address_of(input, *ctx);
       ctx->allocator.record_stream(address, compute);
@@ -3354,7 +3397,16 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
     const uint64_t addresses[] = {input_addresses[0], input_addresses[1], input_addresses[2], mapping_address,
                                   header_address, info_address, location_address, request_address,
                                   position_address, status_address};
-    for (size_t i = 0; i < bindings.size(); ++i) bindings[i].pTensorAddress = addresses[i];
+    for (size_t i = 0; i < std::size(addresses); ++i) bindings[i].pTensorAddress = addresses[i];
+    if (has_tokens) {
+      const auto token_address = address_of(token_ids_, *ctx);
+      const auto token_status_address = address_of(token_status, *ctx);
+      ctx->allocator.record_stream(token_address, compute);
+      ctx->allocator.record_stream(token_status_address, compute);
+      bindings[10].pTensorAddress = input_addresses[3];
+      bindings[11].pTensorAddress = token_address;
+      bindings[12].pTensorAddress = token_status_address;
+    }
     TORCH_CHECK(synLaunch(compute, bindings.data(), bindings.size(), workspace ? workspace->address : 0,
                           recipe.recipe, 0) == synSuccess, "GaudiRT device metadata: validation launch failed");
   }
@@ -3363,18 +3415,28 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
   ready.record(compute);
   ready.wait(d2h);
   ctx->allocator.record_stream(status_address, d2h);
-  TemporaryHost host_status(*ctx, static_cast<uint64_t>(m) * sizeof(int32_t));
+  TemporaryHost host_status(*ctx, static_cast<uint64_t>(m) * sizeof(int32_t) * (has_tokens ? 2 : 1));
   ctx->pinned.copy_d2h(host_status.address, status_address, static_cast<uint64_t>(m) * sizeof(int32_t), d2h, true);
+  if (has_tokens) {
+    const auto token_status_address = address_of(token_status, *ctx);
+    ctx->allocator.record_stream(token_status_address, d2h);
+    ctx->pinned.copy_d2h(static_cast<int32_t*>(host_status.address) + m, token_status_address,
+                         static_cast<uint64_t>(m) * sizeof(int32_t), d2h, true);
+  }
   completed.record(d2h);
   completed.synchronize();
   const auto* flags = static_cast<const int32_t*>(host_status.address);
   for (int64_t row = 0; row < m; ++row)
     TORCH_CHECK(flags[row] == 0, "GaudiRT device metadata: invalid scheduler metadata at row ", row,
                 ", code ", flags[row]);
+  if (has_tokens)
+    for (int64_t row = 0; row < m; ++row)
+      TORCH_CHECK(flags[m + row] == 0, "GaudiRT device metadata: token ID outside vocabulary at row ", row);
   rows_ = m;
   slots_ = slots;
   request_count_ = request_count;
   context_ = context;
+  vocabulary_ = vocabulary;
   bucket_ = bucket;
 }
 
@@ -3722,11 +3784,14 @@ TORCH_LIBRARY(gaudirt, m) {
   m.class_<gaudirt::generic::PagedMetadata>("PagedMetadata")
       .def(torch::init<at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t>())
       .def_static("from_device", &gaudirt::generic::PagedMetadata::from_device)
+      .def_static("from_device_with_tokens", &gaudirt::generic::PagedMetadata::from_device_with_tokens)
       .def("rows", &gaudirt::generic::PagedMetadata::rows)
       .def("slots", &gaudirt::generic::PagedMetadata::slots)
       .def("context", &gaudirt::generic::PagedMetadata::context)
       .def("rotary_positions", &gaudirt::generic::PagedMetadata::rotary_positions)
-      .def("rotary_header", &gaudirt::generic::PagedMetadata::rotary_header);
+      .def("rotary_header", &gaudirt::generic::PagedMetadata::rotary_header)
+      .def("token_ids", &gaudirt::generic::PagedMetadata::token_ids)
+      .def("vocabulary", &gaudirt::generic::PagedMetadata::vocabulary);
   m.def("rms_norm(Tensor input, Tensor weight, float epsilon) -> Tensor");
   m.def("fused_add_rms_norm(Tensor input, Tensor residual, Tensor weight, float epsilon) -> (Tensor, Tensor)");
   m.def("silu_and_mul(Tensor input) -> Tensor");
