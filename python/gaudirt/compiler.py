@@ -180,20 +180,38 @@ def _program_backend(graph_module, example_inputs):
                 ids[node] = len(tensor_indices) + len(operations)
                 operations.append([17, source_id, result.ndim, *shape[1:]])
             continue
-        if node.op == "call_method" and node.target in ("to", "float"):
-            if node.kwargs or (node.target == "float" and len(node.args) != 1) or (
-                node.target == "to" and len(node.args) != 2
-            ):
-                raise RuntimeError("GaudiRT FX: unsupported cast arguments")
-            dtype = torch.float32 if node.target == "float" else node.args[1]
-            if dtype not in (torch.bfloat16, torch.float32):
-                raise RuntimeError("GaudiRT FX: cast supports BF16 and FP32")
+        if ((node.op == "call_method" and node.target in ("to", "float")) or
+                (node.op == "call_function" and node.target is torch.ops.aten._to_copy.default)):
+            explicit_copy = node.op == "call_function"
+            if explicit_copy:
+                if len(node.args) != 1 or set(node.kwargs) - {"dtype"}:
+                    raise RuntimeError("GaudiRT FX: unsupported copy arguments")
+                dtype = node.kwargs.get("dtype")
+            elif node.target == "float":
+                if len(node.args) != 1 or node.kwargs:
+                    raise RuntimeError("GaudiRT FX: unsupported cast arguments")
+                dtype = torch.float32
+            else:
+                if (len(node.args) not in (1, 2) or set(node.kwargs) - {"dtype"} or
+                        (len(node.args) == 2 and "dtype" in node.kwargs)):
+                    raise RuntimeError("GaudiRT FX: unsupported cast arguments")
+                dtype = node.args[1] if len(node.args) == 2 else node.kwargs.get("dtype")
             source = node.args[0]
             example = source.meta.get("example_value")
             if not isinstance(example, torch.Tensor):
                 raise RuntimeError("GaudiRT FX: missing cast metadata")
+            if explicit_copy and dtype is None:
+                dtype = example.dtype
+            if dtype not in (torch.bfloat16, torch.float32):
+                raise RuntimeError("GaudiRT FX: cast supports BF16 and FP32")
             if example.dtype == dtype:
-                ids[node] = tensor_id(source)
+                if explicit_copy:
+                    ids[node] = len(tensor_indices) + len(operations)
+                    operations.append([19, tensor_id(source), 0, -1])
+                else:
+                    ids[node] = tensor_id(source)
+                    if source in alias_views:
+                        alias_views[node] = alias_views[source]
             else:
                 ids[node] = len(tensor_indices) + len(operations)
                 operations.append([11, tensor_id(source), int(dtype == torch.float32), -1])
