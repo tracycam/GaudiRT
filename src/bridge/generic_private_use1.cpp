@@ -3036,6 +3036,8 @@ class BucketProgram {
                     std::all_of(op.begin() + 3, op.end(), [](int64_t size) { return size > 0; })) ||
                    (op[0] == 18 && op.size() == 4 && op[2] == 1 && op[3] == 2) ||
                    (op[0] == 19 && op.size() == 4 && op[2] == 0 && op[3] == -1) ||
+                   (op[0] >= 20 && op[0] <= 23 && op.size() == 4 &&
+                    static_cast<uint64_t>(op[2]) <= UINT32_MAX && (op[3] == 0 || op[3] == 1)) ||
                    (op[0] == 15 && std::all_of(op.begin() + 1, op.end(),
                                                [upper](int64_t id) { return id >= 0 && id < upper; }))),
                   "GaudiRT FX: invalid normalized node");
@@ -3103,6 +3105,15 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
   }
   for (const auto& op : operations_) {
     const auto& a = specs[op[1]];
+    if (op[0] >= 20 && op[0] <= 23) {
+      TORCH_CHECK(a.dynamic && a.sizes.size() == 2 &&
+                  (a.dtype == at::kBFloat16 || a.dtype == at::kFloat) &&
+                  std::isfinite(std::bit_cast<float>(static_cast<uint32_t>(op[2]))),
+                  "GaudiRT FX: scalar arithmetic requires a finite FP32 scalar and rank-two input");
+      specs.push_back(a);
+      normalized << "n" << op[0] << ":" << op[1] << ":" << op[2] << ":" << op[3] << ";";
+      continue;
+    }
     if (op[0] == 19) {
       TORCH_CHECK(a.dynamic && a.sizes.size() == 2 &&
                   (a.dtype == at::kBFloat16 || a.dtype == at::kFloat),
@@ -3460,6 +3471,53 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
         const auto name = prefix + "_n" + std::to_string(next_node++);
         check(synNodeCreate(graph, &values[op[1]], parts.data(), 1, parts.size(), &params, sizeof(params),
                             "split", name.c_str(), nullptr, nullptr), "program feature split failed");
+        continue;
+      }
+      if (op[0] >= 20 && op[0] <= 23) {
+        const bool bf16 = spec.dtype == at::kBFloat16;
+        const bool wide = bf16 && op[0] >= 22;
+        const auto arithmetic_type = wide ? syn_type_float : type.syn;
+        const auto arithmetic_name = wide ? std::string("f32") : std::string(type.name);
+        auto input = values[op[1]];
+        ns_CastKernel::ParamsV3 cast{};
+        cast.round_mode = CAST_ROUND_HALF_NE;
+        if (wide) {
+          input = tensor(syn_type_float, width, rows, -1);
+          node({values[op[1]]}, input, &cast, sizeof(cast), "cast_bf16_to_f32");
+        }
+        auto constant = [&](float value) {
+          auto result = tensor(arithmetic_type, width, rows, -1);
+          ns_ConstantKernel::ParamsV3 params{};
+          params.constant.f = value;
+          const auto guid = "constant_" + arithmetic_name;
+          node({}, result, &params, sizeof(params), guid.c_str());
+          return result;
+        };
+        const auto scalar = constant(std::bit_cast<float>(static_cast<uint32_t>(op[2])));
+        const bool reversed = op[3] != 0;
+        if (op[0] == 23 && reversed) {
+          const auto one = constant(1.f);
+          auto reciprocal = tensor(syn_type_float, width, rows, -1);
+          node({one, input}, reciprocal, nullptr, 0, "div_fwd_f32");
+          if (bf16) {
+            auto rounded = tensor(syn_type_bf16, width, rows, -1);
+            node({reciprocal}, rounded, nullptr, 0, "gk_cast_f32_to_bf16_v1");
+            reciprocal = tensor(syn_type_float, width, rows, -1);
+            node({rounded}, reciprocal, &cast, sizeof(cast), "cast_bf16_to_f32");
+          }
+          auto result = bf16 ? tensor(syn_type_float, width, rows, -1) : values[id];
+          node({reciprocal, scalar}, result, nullptr, 0, "mult_fwd_f32");
+          if (bf16) node({result}, values[id], nullptr, 0, "gk_cast_f32_to_bf16_v1");
+          continue;
+        }
+        const auto left = reversed ? scalar : input;
+        const auto right = reversed ? input : scalar;
+        auto result = wide ? tensor(syn_type_float, width, rows, -1) : values[id];
+        const auto guid = op[0] == 20 && bf16 ? std::string("gk_add_bf16_v1") :
+            std::string(op[0] == 20 ? "add_fwd_" : op[0] == 21 ? "sub_fwd_" :
+                        op[0] == 22 ? "mult_fwd_" : "div_fwd_") + arithmetic_name;
+        node({left, right}, result, nullptr, 0, guid.c_str());
+        if (wide) node({result}, values[id], nullptr, 0, "gk_cast_f32_to_bf16_v1");
         continue;
       }
       if (op[0] == 1 || (op[0] >= 12 && op[0] <= 14)) {
