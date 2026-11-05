@@ -269,7 +269,7 @@ def compile(module, dynamic_arg_indices=(0,)):
         for index in dynamic_arg_indices:
             torch._dynamo.mark_dynamic(args[index], 0, min=1, max=4096)
         with torch._dynamo.config.patch(specialize_float=True), \
-             torch.fx.experimental._config.patch(backed_size_oblivious=True):
+             torch.fx.experimental._config.patch(backed_size_oblivious=True, use_duck_shape=False):
             return compiled(*args, **kwargs)
 
     return execute
