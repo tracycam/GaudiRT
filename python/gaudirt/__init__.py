@@ -81,6 +81,12 @@ def _fake_paged_attn(query, key, value, key_pool, value_pool, metadata, head_dim
     return torch.empty_like(query, memory_format=torch.contiguous_format)
 
 
+@torch.library.register_fake("gaudirt::_paged_attn_validated")
+def _fake_paged_attn_validated(query, key, value, key_pool, value_pool, locations,
+                               requests, positions, mapping, header, head_dim, scale):
+    return torch.empty_like(query, memory_format=torch.contiguous_format)
+
+
 @torch.library.register_fake("gaudirt::rotary_embedding")
 def _fake_rotary_embedding(query, key, cache, metadata, head_dim, rotary_dim, is_neox):
     return (torch.empty_like(query, memory_format=torch.contiguous_format),
