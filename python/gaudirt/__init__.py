@@ -42,6 +42,12 @@ def _fake_paged_attn(query, key, value, key_pool, value_pool, metadata, head_dim
     return torch.empty_like(query, memory_format=torch.contiguous_format)
 
 
+@torch.library.register_fake("gaudirt::rotary_embedding")
+def _fake_rotary_embedding(query, key, cache, metadata, head_dim, rotary_dim, is_neox):
+    return (torch.empty_like(query, memory_format=torch.contiguous_format),
+            torch.empty_like(key, memory_format=torch.contiguous_format))
+
+
 torch.utils.rename_privateuse1_backend("gaudirt")
 torch._register_device_module("gaudirt", sys.modules[__name__])
 torch.utils.generate_methods_for_privateuse1_backend(for_packed_sequence=False)

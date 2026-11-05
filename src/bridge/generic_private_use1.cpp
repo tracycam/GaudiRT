@@ -29,6 +29,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <sstream>
+#include <tuple>
 #include <unordered_map>
 
 namespace gaudirt::generic {
@@ -2984,6 +2985,149 @@ at::Tensor paged_attn(const at::Tensor& query, const at::Tensor& key, const at::
                         attention_recipe.recipe, 0) == synSuccess, "GaudiRT paged attention: attention launch failed");
   return result;
 }
+
+ColdRecipe& rotary_recipe(Context& ctx, const PagedMetadata& metadata, uint64_t q_width,
+                          uint64_t k_width, uint64_t cache_rows, int32_t head_dim,
+                          int32_t rotary_dim, bool is_neox) {
+  std::ostringstream signature;
+  signature << "rotary_v1;" << metadata.bucket_ << ":" << q_width << ":" << k_width << ":"
+            << cache_rows << ":" << head_dim << ":" << rotary_dim << ":" << is_neox;
+  const auto structure = signature.str();
+  const auto digest = common::sha256_bytes(reinterpret_cast<const uint8_t*>(structure.data()), structure.size());
+  const auto prefix = "g" + digest.substr(0, 12) + "_b" + std::to_string(metadata.bucket_);
+  const auto key = "rotary_" + digest;
+  auto found = ctx.cold_recipes.find(key);
+  if (found != ctx.cold_recipes.end()) return *found->second;
+  struct TensorShape { synDataType type; std::vector<uint64_t> dims; };
+  const uint64_t bucket = metadata.bucket_;
+  const std::array<TensorShape, 7> shapes{{
+      {syn_type_bf16, {q_width, bucket}}, {syn_type_bf16, {k_width, bucket}},
+      {syn_type_int32, {bucket}}, {syn_type_bf16, {static_cast<uint64_t>(rotary_dim), cache_rows}},
+      {syn_type_int32, {1}}, {syn_type_bf16, {q_width, bucket}}, {syn_type_bf16, {k_width, bucket}}}};
+  auto compiled = std::make_unique<ColdRecipe>(shapes.size());
+  synGraphHandle graph = nullptr;
+  std::array<synSectionHandle, 7> sections{};
+  std::array<synTensor, 7> tensors{};
+  const auto check = [](synStatus status, const char* message) {
+    TORCH_CHECK(status == synSuccess, "GaudiRT rotary: ", message, " status=", static_cast<int>(status));
+  };
+  auto cleanup = [&] {
+    if (graph) synGraphDestroy(graph);
+    for (auto tensor : tensors) if (tensor) synTensorDestroy(tensor);
+    for (auto section : sections) if (section) synSectionDestroy(section);
+  };
+  try {
+    check(synGraphCreate(&graph, synDeviceGaudi2), "graph creation failed");
+    for (size_t i = 0; i < shapes.size(); ++i) {
+      compiled->names[i] = prefix + "_t" + std::to_string(i);
+      check(synSectionCreate(&sections[i], 0, graph), "section creation failed");
+      check(synSectionSetPersistent(sections[i], true), "persistent section setup failed");
+      synTensorDescriptor desc{};
+      desc.m_name = compiled->names[i].c_str();
+      desc.m_dataType = shapes[i].type;
+      desc.m_dims = shapes[i].dims.size();
+      for (size_t dim = 0; dim < shapes[i].dims.size(); ++dim) {
+        desc.m_sizes[dim] = desc.m_minSizes[dim] = shapes[i].dims[dim];
+        compiled->tensors[i].tensorSize[dim] = shapes[i].dims[dim];
+      }
+      check(synTensorCreate(&tensors[i], &desc, sections[i], 0), "tensor creation failed");
+      compiled->tensors[i].tensorName = compiled->names[i].c_str();
+      compiled->tensors[i].tensorType = DATA_TENSOR;
+    }
+    struct Params { int32_t head_dim, rotary_dim, is_neox; } params{head_dim, rotary_dim, is_neox};
+    const auto node = prefix + "_n0";
+    check(synNodeCreate(graph, tensors.data(), tensors.data() + 5, 5, 2, &params, sizeof(params),
+                        "gk_rotary_bf16_v1", node.c_str(), nullptr, nullptr), "node creation failed");
+    compiled->recipe = compile_cached(graph, prefix, key, &ctx.cache);
+    check(synWorkspaceGetSize(&compiled->workspace, compiled->recipe), "workspace query failed");
+    initialize_launch_tensor_ids(compiled->recipe, compiled->tensors.data(), compiled->tensors.size());
+    cleanup();
+  } catch (...) {
+    cleanup();
+    throw;
+  }
+  auto [it, inserted] = ctx.cold_recipes.emplace(key, std::move(compiled));
+  TORCH_CHECK(inserted, "GaudiRT rotary: duplicate recipe");
+  return *it->second;
+}
+
+std::tuple<at::Tensor, at::Tensor> rotary_embedding(const at::Tensor& query, const at::Tensor& key,
+    const at::Tensor& cache, c10::intrusive_ptr<PagedMetadata> metadata,
+    int64_t head_dim, int64_t rotary_dim, bool is_neox) {
+  TORCH_CHECK(metadata, "GaudiRT rotary: metadata is required");
+  TORCH_CHECK(head_dim > 0 && head_dim <= INT32_MAX && rotary_dim > 0 && rotary_dim <= head_dim &&
+              rotary_dim % 2 == 0, "GaudiRT rotary: invalid head or rotary dimension");
+  for (const auto& tensor : {query, key, cache})
+    TORCH_CHECK(tensor.device().type() == c10::kPrivateUse1 && tensor.device().index() == 0 &&
+                tensor.scalar_type() == at::kBFloat16, "GaudiRT rotary: expected gaudirt BF16 tensors");
+  TORCH_CHECK(query.dim() == 2 && key.dim() == 2 && query.size(0) == metadata->rows_ &&
+              key.size(0) == metadata->rows_ && query.size(1) > 0 && key.size(1) > 0 &&
+              query.size(1) <= INT32_MAX && key.size(1) <= INT32_MAX &&
+              query.size(1) % head_dim == 0 && key.size(1) % head_dim == 0,
+              "GaudiRT rotary: invalid query or key geometry");
+  TORCH_CHECK(cache.dim() == 2 && cache.size(0) >= metadata->context_ && cache.size(0) <= INT32_MAX &&
+              cache.size(1) == rotary_dim, "GaudiRT rotary: cache does not cover validated positions");
+  auto ctx = current();
+  auto stream = ctx->device.compute_stream();
+  auto cache_value = cache;
+  auto cache_address = address_of(cache_value, *ctx);
+  if (!cache_value.is_contiguous() || cache_address % BlockCachingAllocator::kAlignment) {
+    cache_value = at::empty(cache.sizes(), cache.options());
+    copy(cache_value, cache, true);
+    cache_address = address_of(cache_value, *ctx);
+  }
+  auto q_out = bucket_output(query, at::kBFloat16, metadata->bucket_, metadata->rows_, query.size(1));
+  auto k_out = bucket_output(key, at::kBFloat16, metadata->bucket_, metadata->rows_, key.size(1));
+  const auto q_out_address = address_of(q_out, *ctx), k_out_address = address_of(k_out, *ctx);
+  std::lock_guard lock(ctx->cold_mutex);
+  auto& recipe = rotary_recipe(*ctx, *metadata, query.size(1), key.size(1), cache.size(0),
+                               static_cast<int32_t>(head_dim), static_cast<int32_t>(rotary_dim), is_neox);
+  auto graph_pool = [&]() -> GraphPool& {
+    if (!ctx->graph_pool) {
+      const uint64_t budget = std::min<uint64_t>(ctx->allocator.capacity_bytes() / 8, uint64_t{1} << 30);
+      TORCH_CHECK(budget >= 256, "GaudiRT rotary: HBM budget is too small for graph temporaries");
+      ctx->graph_pool = std::make_unique<GraphPool>(ctx->allocator, budget, stream);
+    }
+    return *ctx->graph_pool;
+  };
+  std::vector<std::unique_ptr<GraphTemporary>> staged;
+  std::vector<std::pair<uint64_t, uint64_t>> reserved{{cache_address, cache_value.nbytes()}};
+  auto bind_input = [&](const at::Tensor& input) {
+    const auto address = address_of(input, *ctx);
+    ctx->allocator.record_stream(address, stream);
+    const uint64_t bytes = static_cast<uint64_t>(metadata->bucket_) * input.size(1) * sizeof(uint16_t);
+    const uint64_t offset = static_cast<uint64_t>(input.storage_offset()) * input.element_size();
+    const uint64_t storage = input.storage().nbytes();
+    bool direct = input.is_contiguous() && address % BlockCachingAllocator::kAlignment == 0 &&
+                  offset <= storage && bytes <= storage - offset;
+    for (const auto& [other, length] : reserved)
+      if (address < other + length && other < address + bytes) direct = false;
+    auto binding = address;
+    if (!direct) {
+      auto temporary = std::make_unique<GraphTemporary>(graph_pool(), stream, bytes);
+      binding = temporary->address;
+      const Layout layout(input);
+      dma_copy(binding, nullptr, address, &layout, 0, input.numel(), input.element_size(), stream, DRAM_TO_DRAM);
+      staged.push_back(std::move(temporary));
+    }
+    reserved.emplace_back(binding, bytes);
+    return binding;
+  };
+  const auto q_address = bind_input(query), k_address = bind_input(key);
+  const auto positions_address = address_of(metadata->positions_, *ctx);
+  const auto header_address = address_of(metadata->header_, *ctx);
+  for (auto address : {cache_address, positions_address, header_address, q_out_address, k_out_address})
+    ctx->allocator.record_stream(address, stream);
+  std::unique_ptr<GraphTemporary> workspace;
+  if (recipe.workspace) workspace = std::make_unique<GraphTemporary>(graph_pool(), stream, recipe.workspace);
+  auto bindings = recipe.tensors;
+  const uint64_t addresses[] = {q_address, k_address, positions_address, cache_address,
+                                header_address, q_out_address, k_out_address};
+  for (size_t i = 0; i < bindings.size(); ++i) bindings[i].pTensorAddress = addresses[i];
+  TORCH_CHECK(synLaunch(stream, bindings.data(), bindings.size(), workspace ? workspace->address : 0,
+                        recipe.recipe, 0) == synSuccess, "GaudiRT rotary: launch failed");
+  return {q_out, k_out};
+}
 }  // namespace gaudirt::generic
 
 TORCH_LIBRARY(gaudirt, m) {
@@ -2995,12 +3139,16 @@ TORCH_LIBRARY(gaudirt, m) {
   m.def("silu_and_mul(Tensor input) -> Tensor");
   m.def("paged_attn(Tensor query, Tensor key, Tensor value, Tensor(a!) key_pool, Tensor(b!) value_pool, "
         "__torch__.torch.classes.gaudirt.PagedMetadata metadata, int head_dim, float scale) -> Tensor");
+  m.def("rotary_embedding(Tensor query, Tensor key, Tensor cache, "
+        "__torch__.torch.classes.gaudirt.PagedMetadata metadata, int head_dim, int rotary_dim, bool is_neox) "
+        "-> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(gaudirt, PrivateUse1, m) {
   m.impl("rms_norm", TORCH_FN(gaudirt::generic::bucket_rms_norm));
   m.impl("silu_and_mul", TORCH_FN(gaudirt::generic::bucket_silu_and_mul));
   m.impl("paged_attn", TORCH_FN(gaudirt::generic::paged_attn));
+  m.impl("rotary_embedding", TORCH_FN(gaudirt::generic::rotary_embedding));
 }
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
