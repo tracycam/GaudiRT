@@ -40,9 +40,10 @@ def aten_layer(x, weight):
 def check(outputs, x, weight):
     truth = direct_bf16(x.double() @ weight.double().t()).split(SIZES, dim=-1)
     baseline = (x.float() @ weight.float().t()).to(torch.bfloat16).float().double().split(SIZES, dim=-1)
+    assert len({output.untyped_storage().data_ptr() for output in outputs}) == 1
     checked = []
     for output, expected, floor_value in zip(outputs, truth, baseline):
-        assert output.shape == expected.shape and output.is_contiguous()
+        assert output.shape == expected.shape and output.stride() == expected.stride()
         bucket = 1 << (x.size(0) - 1).bit_length()
         assert output.untyped_storage().nbytes() >= bucket * output.size(1) * 2
         assert output.untyped_storage().nbytes() % 256 == 0
