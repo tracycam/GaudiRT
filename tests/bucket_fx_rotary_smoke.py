@@ -14,6 +14,8 @@ import gaudirt.compiler as compiler
 from fp64_reference import direct_bf16
 from rotary_runtime_smoke import reference as rotary_reference
 
+INPUT_WIDTH = 256 if os.environ.get("GAUDIRT_TEST_REFINED") == "1" else 128
+
 
 def metadata(rows):
     requests, context = 64, 128
@@ -64,7 +66,7 @@ def main():
     torch.set_num_threads(4)
     torch.random.default_generator.manual_seed(7219)
     gaudirt.initialize(hbm_bytes=512 * 1024 * 1024, pinned_bytes=4 * 1024 * 1024)
-    weights_cpu = [(torch.randn(256, 128) * 0.05).to(torch.bfloat16) for _ in range(2)]
+    weights_cpu = [(torch.randn(256, INPUT_WIDTH) * 0.05).to(torch.bfloat16) for _ in range(2)]
     weights = [value.to("gaudirt:0") for value in weights_cpu]
     cache_cpu = torch.randn(128, 64, dtype=torch.bfloat16)
     cache = cache_cpu.to("gaudirt:0")
@@ -74,7 +76,7 @@ def main():
     for rows in (1, 3, 17, 137, 513, 2048, 4096):
         prepared, positions_cpu = metadata(rows)
         positions, header = prepared.rotary_positions(), prepared.rotary_header()
-        x_cpu = torch.randn(rows, 128, dtype=torch.bfloat16)
+        x_cpu = torch.randn(rows, INPUT_WIDTH, dtype=torch.bfloat16)
         x = x_cpu.to("gaudirt:0")
         first = first_graph(x, weights[0], positions, header, cache)
         before = gaudirt.recipe_cache_stats()
@@ -92,7 +94,7 @@ def main():
     if path := os.environ.get("GAUDIRT_TEST_OUTPUT"):
         with open(path, "wb") as output:
             output.write(payload)
-    print("FX rotary recipes", counts, "max row error", max(errors), "FP32 floor", max(floors),
+    print("FX rotary input width", INPUT_WIDTH, "recipes", counts, "max row error", max(errors), "FP32 floor", max(floors),
           "max abs", max(absolutes), "sha256", hashlib.sha256(payload).hexdigest(), flush=True)
 
 
