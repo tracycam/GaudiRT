@@ -74,6 +74,8 @@ class GraphPool {
   BlockCachingAllocator& allocator() noexcept { return *pool_; }
   uint64_t allocate(uint64_t bytes, synStreamHandle stream);
   void free(uint64_t address);
+  bool contains_live_range(uint64_t address, uint64_t bytes) const;
+  void record_stream(uint64_t address, synStreamHandle stream);
   uint64_t capacity_bytes() const;
   uint64_t memory_allocated() const;
  private:

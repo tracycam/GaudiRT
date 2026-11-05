@@ -268,6 +268,22 @@ void GraphPool::free(uint64_t address) {
   throw std::invalid_argument("GraphPool: unknown or freed allocation");
 }
 
+bool GraphPool::contains_live_range(uint64_t address, uint64_t bytes) const {
+  std::lock_guard lock(mutex_);
+  if (pool_->contains_live_range(address, bytes)) return true;
+  for (const auto& region : extra_regions_)
+    if (region.pool->contains_live_range(address, bytes)) return true;
+  return false;
+}
+
+void GraphPool::record_stream(uint64_t address, synStreamHandle stream) {
+  std::lock_guard lock(mutex_);
+  if (pool_->contains_live_range(address, 1)) return pool_->record_stream(address, stream);
+  for (const auto& region : extra_regions_)
+    if (region.pool->contains_live_range(address, 1)) return region.pool->record_stream(address, stream);
+  throw std::invalid_argument("GraphPool: unknown or freed allocation");
+}
+
 uint64_t GraphPool::capacity_bytes() const {
   std::lock_guard lock(mutex_);
   uint64_t total = pool_->capacity_bytes();
