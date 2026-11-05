@@ -47,6 +47,7 @@ def _program_backend(graph_module, example_inputs):
         raise RuntimeError("GaudiRT FX: mark each dynamic token input before capture")
     operations, transposes, splits, fused_norms, rotations, index_casts = [], {}, {}, {}, {}, {}
     views = {}
+    feature_views = {}
     validated_token_bindings, validated_row_bindings = [], []
     linear_targets = (torch.nn.functional.linear, torch.ops.aten.linear.default)
     mm_targets = (torch.mm, torch.ops.aten.mm.default, torch.matmul,
@@ -88,9 +89,13 @@ def _program_backend(graph_module, example_inputs):
         source_id = tensor_id(source)
         if start == 0 and stop == example.shape[1]:
             ids[node] = source_id
+            if source in feature_views:
+                feature_views[node] = feature_views[source]
         else:
             ids[node] = len(tensor_indices) + len(operations)
             operations.append([4, source_id, start, stop - start, example.shape[1]])
+            base, offset, _ = feature_views.get(source, (source_id, 0, example.shape[1]))
+            feature_views[node] = (base, offset + start, stop - start)
 
     output, single_output = None, False
     for node in nodes:
@@ -158,7 +163,11 @@ def _program_backend(graph_module, example_inputs):
                 not isinstance(size, int) or isinstance(size, bool) or size <= 0 for size in sizes
             ):
                 raise RuntimeError("GaudiRT FX: split requires positive feature sizes")
-            splits[node] = (tensor_id(node.args[0]), tuple(sizes))
+            example = node.args[0].meta.get("example_value")
+            if (not isinstance(example, torch.Tensor) or example.ndim != 2 or
+                    not isinstance(example.shape[1], int) or sum(sizes) != example.shape[1]):
+                raise RuntimeError("GaudiRT FX: split sizes do not match the static feature width")
+            splits[node] = (tensor_id(node.args[0]), tuple(sizes), node.args[0])
             continue
         if node.op != "call_function":
             raise RuntimeError(f"GaudiRT FX: unsupported program node {node.op}: {node.target}")
@@ -271,14 +280,19 @@ def _program_backend(graph_module, example_inputs):
             fused_norms[node.args[0]][1] = len(tensor_indices) + len(operations)
             operation = [6, producer, 0, -1]
         elif node.target is operator.getitem and len(node.args) == 2 and node.args[0] in splits:
-            source, sizes = splits[node.args[0]]
+            source, sizes, source_node = splits[node.args[0]]
             index = node.args[1]
             if node.kwargs or not isinstance(index, int) or index < 0 or index >= len(sizes):
                 raise RuntimeError("GaudiRT FX: invalid split output index")
             if len(sizes) == 1:
                 ids[node] = source
+                if source_node in feature_views:
+                    feature_views[node] = feature_views[source_node]
                 continue
-            operation = [4, source, sum(sizes[:index]), sizes[index], sum(sizes)]
+            start = sum(sizes[:index])
+            base, offset, _ = feature_views.get(source_node, (source, 0, sum(sizes)))
+            feature_views[node] = (base, offset + start, sizes[index])
+            operation = [4, source, start, sizes[index], sum(sizes)]
         elif (node.target is operator.getitem and len(node.args) == 2 and not node.kwargs and
               isinstance(node.args[1], torch.fx.Node)) or node.target in index_select_targets:
             if node.target in index_select_targets:
@@ -341,11 +355,11 @@ def _program_backend(graph_module, example_inputs):
         operations.append(operation)
     if output is None or any(value not in ids for value in output):
         raise RuntimeError("GaudiRT FX: unsupported program output")
-    output_ids = [ids[value] for value in output]
+    output_ids = [feature_views[value][0] if value in feature_views else ids[value] for value in output]
     computed_ids = list(dict.fromkeys(value for value in output_ids if value >= len(tensor_indices)))
-    if operations and not computed_ids:
+    if operations and not computed_ids and any(operation[0] != 4 for operation in operations):
         raise RuntimeError("GaudiRT FX: program operations have no output")
-    program = _C.BucketProgram(roles, operations, computed_ids) if operations else None
+    program = _C.BucketProgram(roles, operations, computed_ids) if computed_ids else None
     if program is None and (computed_ids or validated_token_bindings):
         raise RuntimeError("GaudiRT FX: unsupported identity graph")
 
@@ -364,6 +378,8 @@ def _program_backend(graph_module, example_inputs):
         computed = dict(zip(computed_ids, program.run([args[index] for index in tensor_indices]))) if program else {}
         result = tuple(args[tensor_indices[value]] if value < len(tensor_indices) else computed[value]
                        for value in output_ids)
+        result = tuple(_C._feature_view(tensor, feature_views[node][1], feature_views[node][2])
+                       if node in feature_views else tensor for node, tensor in zip(output, result))
         return result[0] if single_output else result
 
     return execute
@@ -521,6 +537,10 @@ def compile(module, dynamic_arg_indices=(0,)):
         prepared_args = list(args)
         staged_inputs = {}
         replacements = []
+        dynamic_ids = {id(args[index]) for index in dynamic_arg_indices}
+        for value in args:
+            if isinstance(value, torch.Tensor) and id(value) not in dynamic_ids:
+                torch._dynamo.mark_static(value)
         for index in dynamic_arg_indices:
             original = args[index]
             if id(original) not in staged_inputs:

@@ -2860,6 +2860,13 @@ std::optional<at::Tensor> restore_staged_alias(const at::Tensor& original,
   return original.as_strided(output.sizes(), strides, offset);
 }
 
+at::Tensor feature_view(const at::Tensor& tensor, int64_t start, int64_t length) {
+  TORCH_CHECK(tensor.dim() == 2 && start >= 0 && length > 0 &&
+              start <= tensor.size(1) && length <= tensor.size(1) - start,
+              "GaudiRT FX: invalid feature view");
+  return tensor.narrow(1, start, length);
+}
+
 at::Tensor bucket_output(const at::Tensor& reference, at::ScalarType dtype,
                          uint32_t bucket, int64_t rows, int64_t width) {
   const uint64_t item = c10::elementSize(dtype);
@@ -4446,6 +4453,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("_recipe_cache_keys", &gaudirt::generic::recipe_cache_keys);
   m.def("_prepare_strided_input", &gaudirt::generic::prepare_strided_input);
   m.def("_restore_staged_alias", &gaudirt::generic::restore_staged_alias);
+  m.def("_feature_view", &gaudirt::generic::feature_view);
   m.def("bucket_linear", &gaudirt::generic::bucket_linear,
         pybind11::arg("input"), pybind11::arg("weight"), pybind11::arg("bias") = pybind11::none());
   pybind11::class_<gaudirt::generic::BucketProgram>(m, "BucketProgram")
