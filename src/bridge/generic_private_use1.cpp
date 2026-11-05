@@ -2166,6 +2166,131 @@ at::Tensor index_select(const at::Tensor& input, int64_t axis, const at::Tensor&
   return result;
 }
 
+ColdRecipe& index_put_recipe(Context& ctx, uint32_t count, uint32_t slots) {
+  const auto key = "cold_index_put_i64_" + std::to_string(count) + "_" + std::to_string(slots);
+  auto found = ctx.cold_recipes.find(key);
+  if (found != ctx.cold_recipes.end()) return *found->second;
+  auto compiled = std::make_unique<ColdRecipe>(3);
+  synGraphHandle graph = nullptr;
+  std::array<synSectionHandle, 3> sections{};
+  std::array<synTensor, 3> tensors{};
+  const auto check = [](synStatus status, const char* message) {
+    TORCH_CHECK(status == synSuccess, "GaudiRT index put: ", message, " status=", static_cast<int>(status));
+  };
+  auto cleanup = [&] {
+    if (graph) synGraphDestroy(graph);
+    for (auto tensor : tensors) if (tensor) synTensorDestroy(tensor);
+    for (auto section : sections) if (section) synSectionDestroy(section);
+  };
+  try {
+    check(synGraphCreate(&graph, synDeviceGaudi2), "graph creation failed");
+    for (size_t i = 0; i < tensors.size(); ++i) {
+      compiled->names[i] = key + "_t" + std::to_string(i);
+      check(synSectionCreate(&sections[i], 0, graph), "section creation failed");
+      check(synSectionSetPersistent(sections[i], true), "section setup failed");
+      synTensorDescriptor desc{};
+      desc.m_name = compiled->names[i].c_str();
+      desc.m_dataType = syn_type_int32;
+      desc.m_dims = i == 0 ? 1 : 2;
+      desc.m_sizes[0] = desc.m_minSizes[0] = i == 0 ? count : 2;
+      if (i != 0) desc.m_sizes[1] = desc.m_minSizes[1] = i == 1 ? count : slots;
+      check(synTensorCreate(&tensors[i], &desc, sections[i], 0), "tensor creation failed");
+      compiled->tensors[i].tensorName = compiled->names[i].c_str();
+      compiled->tensors[i].tensorType = DATA_TENSOR;
+      for (unsigned dim = 0; dim < desc.m_dims; ++dim)
+        compiled->tensors[i].tensorSize[dim] = desc.m_sizes[dim];
+    }
+    const auto node = key + "_n0";
+    check(synNodeCreate(graph, tensors.data(), tensors.data() + 2, 2, 1, nullptr, 0,
+                        "gk_index_put_i64_v1", node.c_str(), nullptr, nullptr), "node creation failed");
+    compiled->recipe = compile_cached(graph, key, key, &ctx.cache);
+    check(synWorkspaceGetSize(&compiled->workspace, compiled->recipe), "workspace query failed");
+    initialize_launch_tensor_ids(compiled->recipe, compiled->tensors.data(), compiled->tensors.size());
+    cleanup();
+  } catch (...) {
+    cleanup();
+    throw;
+  }
+  auto [it, inserted] = ctx.cold_recipes.emplace(key, std::move(compiled));
+  TORCH_CHECK(inserted, "GaudiRT index put: duplicate recipe");
+  return *it->second;
+}
+
+at::Tensor index_tensor(const at::Tensor& input, const c10::List<std::optional<at::Tensor>>& indices) {
+  TORCH_CHECK(indices.size() == 1 && indices.get(0).has_value() && indices.get(0)->dim() == 1,
+              "GaudiRT: index supports one one-dimensional index tensor");
+  return gaudirt::generic::index_select(input, 0, *indices.get(0));
+}
+
+at::Tensor& index_put(at::Tensor& self, const c10::List<std::optional<at::Tensor>>& indices,
+                      const at::Tensor& values, bool accumulate, bool unsafe) {
+  TORCH_CHECK(!accumulate && !unsafe && indices.size() == 1 && indices.get(0).has_value(),
+              "GaudiRT: index put supports one safe non-accumulating index");
+  auto index = *indices.get(0);
+  auto incoming = values;
+  if (self.device().type() == c10::kPrivateUse1 && values.device().is_cpu() && values.dim() == 0) {
+    incoming = at::empty({}, self.options());
+    fill(incoming, values.item());
+  }
+  TORCH_CHECK(self.device().type() == c10::kPrivateUse1 && self.device() == incoming.device() &&
+              self.device() == index.device() && self.scalar_type() == at::kLong &&
+              incoming.scalar_type() == at::kLong && self.dim() == 1 && incoming.dim() <= 1 &&
+              index.dim() == 1 && (index.scalar_type() == at::kInt || index.scalar_type() == at::kLong) &&
+              (incoming.numel() == index.numel() || incoming.numel() == 1) && index.numel() <= 4096,
+              "GaudiRT: index put supports INT64 vectors with matching device indices and values; ",
+              "self=", self.scalar_type(), "/", self.dim(), " values=", incoming.scalar_type(), "/", incoming.dim(),
+              "/", incoming.numel(), " indices=", index.scalar_type(), "/", index.dim(), "/", index.numel());
+  validate_indices(index, self.numel());
+  if (!index.numel()) return self;
+  auto ctx = current();
+  auto output = self;
+  auto output_address = address_of(output, *ctx);
+  if (!output.is_contiguous() || output_address % BlockCachingAllocator::kAlignment) {
+    output = at::empty(self.sizes(), self.options());
+    copy(output, self, true);
+    output_address = address_of(output, *ctx);
+  }
+  auto ids = index.scalar_type() == at::kInt ? index : index.to(at::kInt);
+  auto id_address = address_of(ids, *ctx);
+  auto overlaps = [](uint64_t a, uint64_t a_bytes, uint64_t b, uint64_t b_bytes) {
+    return a < b + b_bytes && b < a + a_bytes;
+  };
+  if (!ids.is_contiguous() || id_address % BlockCachingAllocator::kAlignment ||
+      overlaps(id_address, ids.nbytes(), output_address, output.nbytes())) {
+    auto staged = at::empty(ids.sizes(), ids.options());
+    copy(staged, ids, true);
+    ids = std::move(staged);
+    id_address = address_of(ids, *ctx);
+  }
+  auto source = incoming.expand({index.numel()});
+  auto source_address = address_of(source, *ctx);
+  if (!source.is_contiguous() || source_address % BlockCachingAllocator::kAlignment ||
+      overlaps(source_address, source.nbytes(), output_address, output.nbytes()) ||
+      overlaps(source_address, source.nbytes(), id_address, ids.nbytes())) {
+    auto staged = at::empty(source.sizes(), source.options());
+    copy(staged, source, true);
+    source = std::move(staged);
+    source_address = address_of(source, *ctx);
+  }
+  {
+    std::lock_guard lock(ctx->cold_mutex);
+    auto& recipe = index_put_recipe(*ctx, index.numel(), self.numel());
+    auto stream = ctx->stream();
+    auto bindings = recipe.tensors;
+    bindings[0].pTensorAddress = id_address;
+    bindings[1].pTensorAddress = source_address;
+    bindings[2].pTensorAddress = output_address;
+    for (const auto& binding : bindings) ctx->allocator.record_stream(binding.pTensorAddress, stream);
+    std::unique_ptr<TemporaryDevice> workspace;
+    if (recipe.workspace) workspace = std::make_unique<TemporaryDevice>(*ctx, recipe.workspace);
+    TORCH_CHECK(synLaunch(stream, bindings.data(), bindings.size(),
+                          workspace ? workspace->address : 0, recipe.recipe, 0) == synSuccess,
+                "GaudiRT: index put launch failed");
+  }
+  if (output.unsafeGetTensorImpl() != self.unsafeGetTensorImpl()) copy(self, output, true);
+  return self;
+}
+
 at::Tensor embedding(const at::Tensor& weight, const at::Tensor& index, int64_t padding_idx,
                      bool scale_grad_by_freq, bool sparse) {
   (void)padding_idx;
@@ -4022,6 +4147,8 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("sub.Scalar_out", TORCH_FN(gaudirt::generic::subtract_scalar_out));
   m.impl("where.self", TORCH_FN(gaudirt::generic::where));
   m.impl("index_select", TORCH_FN(gaudirt::generic::index_select));
+  m.impl("index.Tensor", TORCH_FN(gaudirt::generic::index_tensor));
+  m.impl("_index_put_impl_", TORCH_FN(gaudirt::generic::index_put));
   m.impl("embedding", TORCH_FN(gaudirt::generic::embedding));
   m.impl("argmax", TORCH_FN(gaudirt::generic::argmax));
 }
