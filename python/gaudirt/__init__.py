@@ -32,6 +32,12 @@ def _fake_rms_norm(input, weight, epsilon):
     return torch.empty_like(input, memory_format=torch.contiguous_format)
 
 
+@torch.library.register_fake("gaudirt::fused_add_rms_norm")
+def _fake_fused_add_rms_norm(input, residual, weight, epsilon):
+    return (torch.empty_like(input, memory_format=torch.contiguous_format),
+            torch.empty_like(residual, memory_format=torch.contiguous_format))
+
+
 @torch.library.register_fake("gaudirt::silu_and_mul")
 def _fake_silu_and_mul(input):
     return input.new_empty((*input.shape[:-1], input.shape[-1] // 2))
