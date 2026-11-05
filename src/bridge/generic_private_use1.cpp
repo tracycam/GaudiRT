@@ -1876,6 +1876,61 @@ GAUDIRT_COMPARE(gt, "greater")
 GAUDIRT_COMPARE(ge, "greater_equal")
 #undef GAUDIRT_COMPARE
 
+at::Tensor subtract_scalar(const at::Tensor& a, const at::Scalar& b, const at::Scalar& alpha);
+
+at::Tensor subtract(const at::Tensor& a, const at::Tensor& b, const at::Scalar& alpha) {
+  if (a.device().type() == c10::kPrivateUse1 && b.device().is_cpu() && b.dim() == 0)
+    return subtract_scalar(a, b.item(), alpha);
+  if (b.device().type() == c10::kPrivateUse1 && a.device().is_cpu() && a.dim() == 0) {
+    auto scalar = at::empty({}, b.options().dtype(at::result_type(a, b)));
+    fill(scalar, a.item());
+    return gaudirt::generic::subtract(scalar, b, alpha);
+  }
+  TORCH_CHECK(a.device() == b.device() && a.device().type() == c10::kPrivateUse1,
+              "GaudiRT: subtraction requires same-device tensors");
+  TORCH_CHECK(alpha.toDouble() == 1.0, "GaudiRT: subtraction supports alpha=1 only");
+  const auto dtype = at::result_type(a, b);
+  TORCH_CHECK(dtype == at::kInt || dtype == at::kLong || dtype == at::kFloat || dtype == at::kBFloat16,
+              "GaudiRT: subtraction dtype is not supported");
+  auto left = a.scalar_type() == dtype ? a : a.to(dtype);
+  auto right = b.scalar_type() == dtype ? b : b.to(dtype);
+  const auto inferred = at::infer_size(left.sizes(), right.sizes());
+  const std::vector<int64_t> shape(inferred.begin(), inferred.end());
+  const auto type = cast_type(dtype);
+  if (dtype == at::kLong) {
+    auto minus_one = at::empty({}, left.options());
+    fill(minus_one, at::Scalar(int64_t{-1}));
+    auto negated = pointwise({right, minus_one}, shape, dtype, "mult_fwd_i64",
+                             {type.syn, type.syn, type.syn});
+    return pointwise({left, negated}, shape, dtype, "add_fwd_i64", {type.syn, type.syn, type.syn});
+  }
+  return pointwise({left, right}, shape, dtype, std::string("sub_fwd_") + type.name,
+                   {type.syn, type.syn, type.syn});
+}
+
+at::Tensor subtract_scalar(const at::Tensor& a, const at::Scalar& b, const at::Scalar& alpha) {
+  const auto dtype = at::result_type(a, b);
+  auto left = a.scalar_type() == dtype ? a : a.to(dtype);
+  auto right = at::empty({}, left.options());
+  fill(right, b);
+  return gaudirt::generic::subtract(left, right, alpha);
+}
+
+at::Tensor& subtract_out(const at::Tensor& a, const at::Tensor& b, const at::Scalar& alpha, at::Tensor& out) {
+  auto value = gaudirt::generic::subtract(a, b, alpha);
+  TORCH_CHECK(out.device() == value.device() && out.scalar_type() == value.scalar_type() &&
+              out.sizes() == value.sizes(), "GaudiRT: subtraction output geometry or dtype mismatch");
+  return copy(out, value, true);
+}
+
+at::Tensor& subtract_scalar_out(const at::Tensor& a, const at::Scalar& b, const at::Scalar& alpha,
+                                at::Tensor& out) {
+  auto value = subtract_scalar(a, b, alpha);
+  TORCH_CHECK(out.device() == value.device() && out.scalar_type() == value.scalar_type() &&
+              out.sizes() == value.sizes(), "GaudiRT: subtraction output geometry or dtype mismatch");
+  return copy(out, value, true);
+}
+
 at::Tensor where(const at::Tensor& condition, const at::Tensor& a, const at::Tensor& b) {
   TORCH_CHECK(condition.scalar_type() == at::kBool && condition.device() == a.device() &&
               a.device() == b.device() && a.device().type() == c10::kPrivateUse1,
@@ -3961,6 +4016,10 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("gt.Scalar", TORCH_FN(gaudirt::generic::gt_scalar));
   m.impl("ge.Tensor", TORCH_FN(gaudirt::generic::ge_tensor));
   m.impl("ge.Scalar", TORCH_FN(gaudirt::generic::ge_scalar));
+  m.impl("sub.Tensor", TORCH_FN(gaudirt::generic::subtract));
+  m.impl("sub.Scalar", TORCH_FN(gaudirt::generic::subtract_scalar));
+  m.impl("sub.out", TORCH_FN(gaudirt::generic::subtract_out));
+  m.impl("sub.Scalar_out", TORCH_FN(gaudirt::generic::subtract_scalar_out));
   m.impl("where.self", TORCH_FN(gaudirt::generic::where));
   m.impl("index_select", TORCH_FN(gaudirt::generic::index_select));
   m.impl("embedding", TORCH_FN(gaudirt::generic::embedding));
