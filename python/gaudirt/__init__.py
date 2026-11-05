@@ -119,6 +119,13 @@ def validated_token_ids(metadata):
     return tokens
 
 
+def validated_last_token_indices(metadata):
+    """Return one validated last-row index per request in the current batch."""
+    indices = metadata.last_token_indices()
+    indices._gaudirt_validated_rows = metadata.rows()
+    return indices
+
+
 def is_initialized():
     return _C.is_initialized()
 

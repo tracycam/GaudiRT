@@ -3118,6 +3118,10 @@ class PagedMetadata : public torch::CustomClassHolder {
   at::Tensor row_locations() const { return locations_.narrow(0, 0, rows_); }
   at::Tensor row_requests() const { return requests_.narrow(0, 0, rows_); }
   at::Tensor request_mapping() const { return mapping_; }
+  at::Tensor last_token_indices() const {
+    TORCH_CHECK(last_token_indices_.defined(), "GaudiRT: last-token indices require batched metadata");
+    return last_token_indices_;
+  }
   at::Tensor token_ids() const {
     TORCH_CHECK(token_ids_.defined(), "GaudiRT: token IDs were not validated in this metadata");
     return token_ids_.narrow(0, 0, rows_);
@@ -3126,7 +3130,7 @@ class PagedMetadata : public torch::CustomClassHolder {
 
   int64_t rows_ = 0, slots_ = 0, request_count_ = 0, context_ = 0, vocabulary_ = 0;
   uint32_t bucket_ = 0;
-  at::Tensor locations_, requests_, positions_, mapping_, header_, token_ids_;
+  at::Tensor locations_, requests_, positions_, mapping_, header_, token_ids_, last_token_indices_;
 };
 
 ColdRecipe& device_metadata_recipe(Context& ctx, uint32_t bucket, uint64_t requests, uint64_t context,
@@ -3320,7 +3324,7 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
               context > 0 && context <= INT32_MAX && mapping.numel() <= INT32_MAX,
               "GaudiRT device metadata: dimensions outside supported range");
   const uint32_t bucket = std::bit_ceil(static_cast<uint32_t>(m));
-  std::vector<int32_t> info(1 + 4 * bucket, 0);
+  std::vector<int32_t> info(1 + 4 * bucket, 0), last_token_indices(batch);
   info[0] = static_cast<int32_t>(batch);
   int64_t cursor = 0;
   for (int64_t index = 0; index < batch; ++index) {
@@ -3333,6 +3337,7 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
       info[1 + cursor] = static_cast<int32_t>(index);
       info[1 + bucket + cursor] = static_cast<int32_t>(prefix + offset);
     }
+    last_token_indices[index] = static_cast<int32_t>(cursor - 1);
   }
   TORCH_CHECK(cursor == m, "GaudiRT device metadata: sequence lengths do not cover token rows");
   auto ctx = current();
@@ -3344,6 +3349,7 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
   positions_ = at::empty({bucket}, options);
   mapping_ = mapping;
   header_ = at::empty({1}, options);
+  last_token_indices_ = at::empty({batch}, options);
   auto device_info = at::empty({static_cast<int64_t>(info.size())}, options);
   auto status = at::empty({bucket}, options);
   at::Tensor token_status;
@@ -3355,23 +3361,27 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
   TORCH_CHECK(mapping_address % BlockCachingAllocator::kAlignment == 0,
               "GaudiRT device metadata: request map must be 256-byte aligned");
   const auto header_address = address_of(header_, *ctx), info_address = address_of(device_info, *ctx);
+  const auto last_token_address = address_of(last_token_indices_, *ctx);
   const auto location_address = address_of(locations_, *ctx), request_address = address_of(requests_, *ctx);
   const auto position_address = address_of(positions_, *ctx), status_address = address_of(status, *ctx);
   {
-    const uint64_t bytes = (1 + info.size()) * sizeof(int32_t);
+    const uint64_t bytes = (1 + info.size() + last_token_indices.size()) * sizeof(int32_t);
     TemporaryHost staging(*ctx, bytes);
     auto* host = static_cast<int32_t*>(staging.address);
     host[0] = static_cast<int32_t>(m);
     std::memcpy(host + 1, info.data(), info.size() * sizeof(int32_t));
+    std::memcpy(host + 1 + info.size(), last_token_indices.data(), last_token_indices.size() * sizeof(int32_t));
     StreamEvent reusable(ctx->device.device_id()), ready(ctx->device.device_id());
     reusable.record(compute);
     reusable.wait(h2d);
-    for (const auto address : {header_address, info_address}) {
+    for (const auto address : {header_address, info_address, last_token_address}) {
       ctx->allocator.record_stream(address, h2d);
       ctx->allocator.record_stream(address, compute);
     }
     ctx->pinned.copy_h2d(header_address, host, sizeof(int32_t), h2d, true);
     ctx->pinned.copy_h2d(info_address, host + 1, info.size() * sizeof(int32_t), h2d, true);
+    ctx->pinned.copy_h2d(last_token_address, host + 1 + info.size(),
+                         last_token_indices.size() * sizeof(int32_t), h2d, true);
     ready.record(h2d);
     ready.wait(compute);
   }
@@ -3856,6 +3866,7 @@ TORCH_LIBRARY(gaudirt, m) {
       .def("row_locations", &gaudirt::generic::PagedMetadata::row_locations)
       .def("row_requests", &gaudirt::generic::PagedMetadata::row_requests)
       .def("request_mapping", &gaudirt::generic::PagedMetadata::request_mapping)
+      .def("last_token_indices", &gaudirt::generic::PagedMetadata::last_token_indices)
       .def("token_ids", &gaudirt::generic::PagedMetadata::token_ids)
       .def("vocabulary", &gaudirt::generic::PagedMetadata::vocabulary);
   m.def("rms_norm(Tensor input, Tensor weight, float epsilon) -> Tensor");
