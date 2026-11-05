@@ -3087,7 +3087,7 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
   std::vector<FxValueSpec> specs;
   specs.reserve(inputs.size() + operations_.size());
   std::ostringstream normalized;
-  normalized << "fx_program_v10;";
+  normalized << "fx_program_v11;";
   for (size_t i = 0; i < inputs.size(); ++i) {
     const auto& tensor = inputs[i];
     const bool floating = tensor.scalar_type() == at::kBFloat16 || tensor.scalar_type() == at::kFloat;
@@ -3618,8 +3618,8 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
         node({p0, p1}, sum, nullptr, 0, "add_fwd_f32");
         node({full}, first, nullptr, 0, "gk_cast_f32_to_bf16_v1");
         node({sum}, second, nullptr, 0, "gk_cast_f32_to_bf16_v1");
-        node({values[op[1]], values[op[2]], first, second}, values[id], nullptr, 0,
-             "gk_linear_refine_bf16_v1");
+        node({values[op[1]], values[op[2]], first, second, full, sum}, values[id], nullptr, 0,
+             "gk_linear_refine_bf16_v2");
         continue;
       }
       if (op[3] < 0) {
