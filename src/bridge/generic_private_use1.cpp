@@ -126,6 +126,7 @@ struct Context {
   std::unordered_map<std::string, std::unique_ptr<ColdRecipe>> cold_recipes;
   std::mutex leases_mutex;
   std::unordered_map<uint64_t, std::shared_ptr<AllocationLease>> leases;
+  std::unordered_map<uint64_t, int64_t> paged_max_positions;
   std::unordered_set<EventState*> events;
   uint64_t next_lease = 1;
   bool closing = false;
@@ -3783,6 +3784,35 @@ class PagedMetadata : public torch::CustomClassHolder {
   at::Tensor locations_, requests_, positions_, mapping_, header_, token_ids_, last_token_indices_;
 };
 
+// Keep the validated maximum prefix with the header storage, which can outlive
+// the PagedMetadata object when the stateful operation is captured by FX.
+at::Tensor paged_header(const std::shared_ptr<Context>& ctx, int64_t max_position,
+                        const at::TensorOptions& options) {
+  const auto address = ctx->allocator.allocate(sizeof(int32_t), ctx->stream());
+  auto lease = make_lease(ctx, address, false);
+  try {
+    {
+      std::lock_guard lock(ctx->leases_mutex);
+      ctx->paged_max_positions.emplace(address, max_position);
+    }
+    std::weak_ptr<Context> weak = ctx;
+    return at::from_blob(reinterpret_cast<void*>(address), {1}, [lease, weak, address](void*) {
+      if (auto owner = weak.lock()) {
+        std::lock_guard lock(owner->leases_mutex);
+        owner->paged_max_positions.erase(address);
+      }
+      lease->release();
+    }, options);
+  } catch (...) {
+    {
+      std::lock_guard lock(ctx->leases_mutex);
+      ctx->paged_max_positions.erase(address);
+    }
+    lease->release();
+    throw;
+  }
+}
+
 ColdRecipe& device_metadata_recipe(Context& ctx, uint32_t bucket, uint64_t requests, uint64_t context,
                                    int32_t slots, const std::array<int, 4>& lanes, int32_t vocabulary) {
   std::ostringstream signature;
@@ -3919,7 +3949,7 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& requ
   requests_ = at::empty({bucket}, options);
   positions_ = at::empty({bucket}, options);
   mapping_ = at::empty({request_count, context}, options);
-  header_ = at::empty({1}, options);
+  header_ = paged_header(ctx, *std::max_element(max_position.begin(), max_position.end()), options);
   const std::array<const std::vector<int32_t>*, 5> sources{
       &host_locations, &host_requests, &host_positions, &host_mapping, &host_header};
   const std::array<at::Tensor*, 5> destinations{&locations_, &requests_, &positions_, &mapping_, &header_};
@@ -3976,11 +4006,12 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
   const uint32_t bucket = std::bit_ceil(static_cast<uint32_t>(m));
   std::vector<int32_t> info(1 + 4 * bucket, 0), last_token_indices(batch);
   info[0] = static_cast<int32_t>(batch);
-  int64_t cursor = 0;
+  int64_t cursor = 0, max_position = -1;
   for (int64_t index = 0; index < batch; ++index) {
     const auto prefix = prefixes[index], length = lengths[index];
     TORCH_CHECK(prefix >= 0 && prefix < context && length > 0 && length <= context - prefix &&
                 length <= m - cursor, "GaudiRT device metadata: invalid sequence lengths");
+    max_position = std::max(max_position, prefix + length - 1);
     info[1 + 2 * bucket + index] = static_cast<int32_t>(prefix);
     info[1 + 3 * bucket + index] = static_cast<int32_t>(length);
     for (int64_t offset = 0; offset < length; ++offset, ++cursor) {
@@ -3998,7 +4029,7 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
   requests_ = at::empty({bucket}, options);
   positions_ = at::empty({bucket}, options);
   mapping_ = mapping;
-  header_ = at::empty({1}, options);
+  header_ = paged_header(ctx, max_position, options);
   last_token_indices_ = at::empty({batch}, options);
   auto device_info = at::empty({static_cast<int64_t>(info.size())}, options);
   auto status = at::empty({bucket}, options);
@@ -4135,9 +4166,10 @@ struct PagedGeometry {
 };
 
 ColdRecipe& paged_recipe(Context& ctx, const PagedGeometry& metadata, uint64_t q_width,
-                         uint64_t kv_width, int32_t head_dim, float scale, bool store) {
+                         uint64_t kv_width, int32_t head_dim, float scale, bool store, bool use_mme = false) {
   std::ostringstream signature;
-  signature << (store ? "paged_store_v1;" : "paged_gqa_v1;") << metadata.bucket_ << ":"
+  signature << (store ? "paged_store_v1;" : use_mme ? "paged_gqa_mme_v1;" : "paged_gqa_v1;")
+            << metadata.bucket_ << ":"
             << kv_width << ":" << metadata.slots_;
   if (!store)
     signature << ":" << q_width << ":" << head_dim << ":" << std::bit_cast<uint32_t>(scale)
@@ -4164,12 +4196,16 @@ ColdRecipe& paged_recipe(Context& ctx, const PagedGeometry& metadata, uint64_t q
   synGraphHandle graph = nullptr;
   std::vector<synSectionHandle> sections(shapes.size(), nullptr);
   std::vector<synTensor> tensors(shapes.size(), nullptr);
+  std::vector<synTensor> intermediates;
+  std::vector<std::string> intermediate_names;
+  intermediate_names.reserve(12);
   const auto check = [](synStatus status, const char* message) {
     TORCH_CHECK(status == synSuccess, "GaudiRT paged attention: ", message,
                 " status=", static_cast<int>(status));
   };
   auto cleanup = [&] {
     if (graph) synGraphDestroy(graph);
+    for (auto tensor : intermediates) if (tensor) synTensorDestroy(tensor);
     for (auto tensor : tensors) if (tensor) synTensorDestroy(tensor);
     for (auto section : sections) if (section) synSectionDestroy(section);
   };
@@ -4191,14 +4227,72 @@ ColdRecipe& paged_recipe(Context& ctx, const PagedGeometry& metadata, uint64_t q
       compiled->tensors[i].tensorName = compiled->names[i].c_str();
       compiled->tensors[i].tensorType = DATA_TENSOR;
     }
-    struct Params { int32_t head_dim; float scale; } params{head_dim, scale};
-    const auto node = prefix + "_n0";
-    const auto input_count = store ? 4u : 7u;
-    const auto output_count = store ? 2u : 1u;
-    const auto guid = store ? "gk_kv_store_bf16_v1" : "gk_paged_gqa_bf16_v1";
-    check(synNodeCreate(graph, tensors.data(), tensors.data() + input_count, input_count, output_count,
-                        store ? nullptr : &params, store ? 0 : sizeof(params), guid, node.c_str(), nullptr, nullptr),
-          "node creation failed");
+    if (use_mme) {
+      const auto intermediate = [&](synDataType type, std::initializer_list<uint64_t> dims) {
+        intermediate_names.push_back(prefix + "_t" + std::to_string(shapes.size() + intermediates.size()));
+        synTensorDescriptor desc{};
+        desc.m_name = intermediate_names.back().c_str();
+        desc.m_dataType = type;
+        desc.m_dims = dims.size();
+        size_t dim = 0;
+        for (auto size : dims) {
+          desc.m_sizes[dim] = desc.m_minSizes[dim] = size;
+          ++dim;
+        }
+        synTensor tensor = nullptr;
+        check(synTensorCreate(&tensor, &desc, nullptr, 0), "intermediate tensor creation failed");
+        intermediates.push_back(tensor);
+        return tensor;
+      };
+      unsigned next_node = 0;
+      const auto append = [&](std::vector<synTensor> inputs, std::vector<synTensor> outputs,
+                              const void* params, size_t size, const char* guid) {
+        const auto name = prefix + "_n" + std::to_string(next_node++);
+        check(synNodeCreate(graph, inputs.data(), outputs.data(), inputs.size(), outputs.size(),
+                            params, size, guid, name.c_str(), nullptr, nullptr), "node creation failed");
+      };
+      const uint64_t context = metadata.context_;
+      const uint64_t kv_heads = kv_width / head_dim, ratio = q_width / kv_width;
+      const uint64_t groups = kv_heads * bucket;
+      const auto dimension = static_cast<uint64_t>(head_dim);
+      auto key4 = intermediate(syn_type_bf16, {dimension, context, kv_heads, bucket});
+      auto value4 = intermediate(syn_type_bf16, {dimension, context, kv_heads, bucket});
+      auto key3 = intermediate(syn_type_bf16, {dimension, context, groups});
+      auto value3 = intermediate(syn_type_bf16, {dimension, context, groups});
+      auto query3 = intermediate(syn_type_bf16, {dimension, ratio, groups});
+      auto scores = intermediate(syn_type_float, {context, ratio, groups});
+      auto probability = intermediate(syn_type_bf16, {context, ratio, groups});
+      auto correction = intermediate(syn_type_bf16, {context, ratio, groups});
+      auto main_context = intermediate(syn_type_float, {dimension, ratio, groups});
+      auto correction_context = intermediate(syn_type_float, {dimension, ratio, groups});
+      auto sum_context = intermediate(syn_type_float, {dimension, ratio, groups});
+      auto flat_context = intermediate(syn_type_float, {q_width, bucket});
+      append({tensors[1], tensors[2], tensors[3], tensors[4], tensors[5], tensors[6]},
+             {key4, value4}, &head_dim, sizeof(head_dim), "gk_paged_gqa_mme_gather_bf16_v1");
+      append({key4}, {key3}, nullptr, 0, "reshape");
+      append({value4}, {value3}, nullptr, 0, "reshape");
+      append({tensors[0]}, {query3}, nullptr, 0, "reshape");
+      const synGEMMParams qk{false, true};
+      append({query3, key3}, {scores}, &qk, sizeof(qk), "batch_gemm");
+      struct SoftmaxParams { int32_t kv_heads; float scale; } softmax{static_cast<int32_t>(kv_heads), scale};
+      append({scores, tensors[4], tensors[6]}, {probability, correction},
+             &softmax, sizeof(softmax), "gk_paged_gqa_mme_softmax_bf16_v1");
+      const synGEMMParams pv{false, false};
+      append({probability, value3}, {main_context}, &pv, sizeof(pv), "batch_gemm");
+      append({correction, value3}, {correction_context}, &pv, sizeof(pv), "batch_gemm");
+      append({main_context, correction_context}, {sum_context}, nullptr, 0, "add_fwd_f32");
+      append({sum_context}, {flat_context}, nullptr, 0, "reshape");
+      append({flat_context}, {tensors[7]}, nullptr, 0, "gk_cast_f32_to_bf16_v1");
+    } else {
+      struct Params { int32_t head_dim; float scale; } params{head_dim, scale};
+      const auto node = prefix + "_n0";
+      const auto input_count = store ? 4u : 7u;
+      const auto output_count = store ? 2u : 1u;
+      const auto guid = store ? "gk_kv_store_bf16_v1" : "gk_paged_gqa_bf16_v1";
+      check(synNodeCreate(graph, tensors.data(), tensors.data() + input_count, input_count, output_count,
+                          store ? nullptr : &params, store ? 0 : sizeof(params), guid, node.c_str(), nullptr, nullptr),
+            "node creation failed");
+    }
     compiled->recipe = compile_cached(graph, prefix, key, &ctx.cache);
     check(synWorkspaceGetSize(&compiled->workspace, compiled->recipe), "workspace query failed");
     initialize_launch_tensor_ids(compiled->recipe, compiled->tensors.data(), compiled->tensors.size());
@@ -4252,6 +4346,19 @@ at::Tensor paged_attn_validated(const at::Tensor& query, const at::Tensor& key, 
               "GaudiRT paged attention: invalid GQA head geometry");
   auto ctx = current();
   auto stream = ctx->stream();
+  const auto header_address = address_of(header, *ctx);
+  int64_t max_position;
+  {
+    std::lock_guard lock(ctx->leases_mutex);
+    const auto hint = ctx->paged_max_positions.find(header_address);
+    TORCH_CHECK(hint != ctx->paged_max_positions.end(), "GaudiRT paged attention: expected validated header");
+    max_position = hint->second;
+  }
+  // Measured crossover for decode on 32+ query heads; other geometries keep
+  // the online TPC implementation until they have a measured crossover.
+  const auto q_heads = q_width / head_dim;
+  const bool use_mme = geometry.rows_ == 1 && q_heads >= 32 && geometry.context_ <= 4224 &&
+      max_position + 1 >= std::max<int64_t>(256, (geometry.context_ + 7) / 8);
   const auto k_pool_address = address_of(key_pool, *ctx), v_pool_address = address_of(value_pool, *ctx);
   const uint64_t pool_bytes = key_pool.nbytes();
   TORCH_CHECK(k_pool_address % BlockCachingAllocator::kAlignment == 0 &&
@@ -4262,7 +4369,8 @@ at::Tensor paged_attn_validated(const at::Tensor& query, const at::Tensor& key, 
   const auto result_address = address_of(result, *ctx);
   std::lock_guard lock(ctx->cold_mutex);
   auto& write_recipe = paged_recipe(*ctx, geometry, q_width, kv_width, head_dim, static_cast<float>(scale), true);
-  auto& attention_recipe = paged_recipe(*ctx, geometry, q_width, kv_width, head_dim, static_cast<float>(scale), false);
+  auto& attention_recipe = paged_recipe(*ctx, geometry, q_width, kv_width, head_dim,
+                                        static_cast<float>(scale), false, use_mme);
   auto graph_pool = [&]() -> GraphPool& {
     if (!ctx->graph_pool) {
       const uint64_t budget = std::min<uint64_t>(ctx->allocator.capacity_bytes() / 8, uint64_t{1} << 30);
@@ -4302,7 +4410,6 @@ at::Tensor paged_attn_validated(const at::Tensor& query, const at::Tensor& key, 
   const auto request_address = address_of(requests, *ctx);
   const auto position_address = address_of(positions, *ctx);
   const auto mapping_address = address_of(mapping, *ctx);
-  const auto header_address = address_of(header, *ctx);
   for (const auto address : {location_address, request_address, position_address, mapping_address, header_address})
     TORCH_CHECK(address % BlockCachingAllocator::kAlignment == 0,
                 "GaudiRT paged attention: validated metadata must be aligned");

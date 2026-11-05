@@ -18,7 +18,9 @@ def main():
     torch.random.default_generator.manual_seed(28194)
     assert (reference.HEADS, reference.KV_HEADS, reference.DIM) == (56, 8, 128)
     gaudirt.initialize(hbm_bytes=512 * 1024**2, pinned_bytes=8 * 1024**2)
-    prefix, rows, context = 17, 137, 160
+    prefix, rows, context = {
+        "0": (17, 137, 160), "1": (511, 137, 1024), "2": (3959, 137, 4224)
+    }[os.environ.get("GAUDIRT_TEST_LONG_PREFIX", "0")]
     slots = context + 1
     mapping = torch.arange(1, slots, dtype=torch.int32).reshape(1, context)
     requests = torch.zeros(rows, dtype=torch.int64)

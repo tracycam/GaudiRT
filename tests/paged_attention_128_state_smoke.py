@@ -19,31 +19,35 @@ def main():
     torch.random.default_generator.manual_seed(8721)
     gaudirt.initialize(hbm_bytes=256 * 1024**2, pinned_bytes=8 * 1024**2)
     heads, kv_heads, head_dim, steps = 56, 8, 128, 128
-    slots, context = steps + 1, steps
+    prefix = 512 if os.environ.get("GAUDIRT_TEST_LONG_PREFIX") == "1" else 0
+    context, slots = prefix + steps, prefix + steps + (2 if prefix else 1)
     scale = 1 / math.sqrt(head_dim)
     scale32 = torch.tensor(scale, dtype=torch.float32).item()
-    mapping = torch.arange(1, slots, dtype=torch.int32).view(1, context)
+    mapping = torch.arange(1, context + 1, dtype=torch.int32).view(1, context)
     queries = (torch.randn(steps, heads * head_dim) * 0.125).to(torch.bfloat16)
     keys = (torch.randn(steps, kv_heads * head_dim) * 0.125).to(torch.bfloat16)
     values = (torch.randn(steps, kv_heads * head_dim) * 0.125).to(torch.bfloat16)
     expected_key = torch.zeros(slots, kv_heads, head_dim, dtype=torch.bfloat16)
     expected_value = torch.zeros_like(expected_key)
+    if prefix:
+        expected_key[1:prefix + 1] = (torch.randn(prefix, kv_heads, head_dim) * 0.125).to(torch.bfloat16)
+        expected_value[1:prefix + 1] = (torch.randn(prefix, kv_heads, head_dim) * 0.125).to(torch.bfloat16)
     key_pool, value_pool = expected_key.to("gaudirt:0"), expected_value.to("gaudirt:0")
     head_map = torch.arange(heads) // (heads // kv_heads)
     audit = os.environ.get("GAUDIRT_STATE_AUDIT") == "1"
     payload = bytearray()
     worst, worst_floor, worst_absolute = 0.0, 0.0, 0.0
     for step in range(steps):
-        location = torch.tensor([step + 1], dtype=torch.int64)
+        location = torch.tensor([prefix + step + 1], dtype=torch.int64)
         requests = torch.tensor([0], dtype=torch.int64)
-        position = torch.tensor([step], dtype=torch.int64)
+        position = torch.tensor([prefix + step], dtype=torch.int64)
         metadata = torch.classes.gaudirt.PagedMetadata(location, requests, position, mapping, slots)
         output = torch.ops.gaudirt.paged_attn.default(
             queries[step:step + 1].to("gaudirt:0"), keys[step:step + 1].to("gaudirt:0"),
             values[step:step + 1].to("gaudirt:0"), key_pool, value_pool, metadata, head_dim, scale,
         )
-        expected_key[step + 1] = keys[step].view(kv_heads, head_dim)
-        expected_value[step + 1] = values[step].view(kv_heads, head_dim)
+        expected_key[prefix + step + 1] = keys[step].view(kv_heads, head_dim)
+        expected_value[prefix + step + 1] = values[step].view(kv_heads, head_dim)
         if audit:
             assert torch.equal(key_pool.cpu().view(torch.int16), expected_key.view(torch.int16))
             assert torch.equal(value_pool.cpu().view(torch.int16), expected_value.view(torch.int16))
@@ -52,8 +56,8 @@ def main():
 
         def reference(dtype):
             query = queries[step].view(heads, head_dim).to(dtype)
-            key = expected_key[1:step + 2, head_map].to(dtype)
-            value = expected_value[1:step + 2, head_map].to(dtype)
+            key = expected_key[1:prefix + step + 2, head_map].to(dtype)
+            value = expected_value[1:prefix + step + 2, head_map].to(dtype)
             scores = torch.einsum("hd,thd->ht", query, key) * scale32
             return torch.einsum("ht,thd->hd", torch.softmax(scores, dim=-1), value)
 
@@ -80,7 +84,7 @@ def main():
         assert stats[0] == 0 and stats[1] > 0, stats
     elif os.environ.get("GAUDIRT_TEST_CACHE") == "warm":
         assert stats[0] > 0 and stats[1] == 0, stats
-    print("128-step paged GQA", "audit", audit, "stats", stats,
+    print("128-step paged GQA", "prefix", prefix, "audit", audit, "stats", stats,
           "max_row_relative_l2", worst, "max_fp32_floor", worst_floor, "max_abs", worst_absolute,
           "output_and_kv_sha256", hashlib.sha256(payload).hexdigest(), flush=True)
 
