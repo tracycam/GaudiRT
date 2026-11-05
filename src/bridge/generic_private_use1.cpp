@@ -3038,6 +3038,8 @@ class BucketProgram {
                    (op[0] == 19 && op.size() == 4 && op[2] == 0 && op[3] == -1) ||
                    (op[0] >= 20 && op[0] <= 23 && op.size() == 4 &&
                     static_cast<uint64_t>(op[2]) <= UINT32_MAX && (op[3] == 0 || op[3] == 1)) ||
+                   (op[0] == 24 && op.size() == 4 && op[2] < upper &&
+                    (op[3] == -1 || (op[3] >= 0 && op[3] < upper))) ||
                    (op[0] == 15 && std::all_of(op.begin() + 1, op.end(),
                                                [upper](int64_t id) { return id >= 0 && id < upper; }))),
                   "GaudiRT FX: invalid normalized node");
@@ -3243,15 +3245,16 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
       normalized << "n" << op[0] << ":" << op[1] << ":" << op[2] << ":" << op[3] << ":" << op[4] << ";";
       continue;
     }
-    if (op[0] == 0) {
+    if (op[0] == 0 || op[0] == 24) {
       TORCH_CHECK(a.sizes.size() == 2 && !b.dynamic && b.sizes.size() == 2 &&
-                  a.sizes[1] == b.sizes[1], "GaudiRT FX: invalid linear geometry");
+                  a.sizes[1] == b.sizes[op[0] == 0 ? 1 : 0], "GaudiRT FX: invalid linear geometry");
+      const auto output_width = b.sizes[op[0] == 0 ? 0 : 1];
       if (op[3] >= 0) {
         const auto& bias = specs[op[3]];
-        TORCH_CHECK(!bias.dynamic && bias.sizes.size() == 1 && bias.sizes[0] == b.sizes[0] &&
+        TORCH_CHECK(!bias.dynamic && bias.sizes.size() == 1 && bias.sizes[0] == output_width &&
                     bias.dtype == a.dtype, "GaudiRT FX: invalid linear bias");
       }
-      specs.push_back({a.dtype, {a.sizes[0], b.sizes[0]}, a.dynamic});
+      specs.push_back({a.dtype, {a.sizes[0], output_width}, a.dynamic});
     } else if (op[0] == 16) {
       TORCH_CHECK(a.dynamic && b.dynamic && a.sizes.size() == 3 && b.sizes.size() == 3 &&
                   a.sizes[2] == b.sizes[1], "GaudiRT FX: invalid batch GEMM geometry");
@@ -3570,7 +3573,7 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
         node({values[op[1]]}, values[id], nullptr, 0, "gk_silu_and_mul_bf16_v1");
         continue;
       }
-      synGEMMParams gemm{false, true};
+      synGEMMParams gemm{false, op[0] == 0};
       if (op[3] < 0) {
         node({values[op[1]], values[op[2]]}, values[id], &gemm, sizeof(gemm), "gemm");
         continue;
