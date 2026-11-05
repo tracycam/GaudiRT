@@ -2584,7 +2584,7 @@ struct FxValueSpec {
 
 // An FX program is described by external input roles and normalized nodes.
 // Nodes 0..4 are linear, add, RMSNorm, SiLU/multiply and split; 5/6 are fused norm outputs,
-// and 7/8 are validated rotary query/key outputs.
+// 7/8 are validated rotary query/key outputs, and 9 is validated embedding.
 // A node's output ID is input_count + its index in the program.
 class BucketProgram {
  public:
@@ -2598,6 +2598,7 @@ class BucketProgram {
       has_dynamic |= role == 1;
     }
     TORCH_CHECK(has_dynamic, "GaudiRT FX: no dynamic token input");
+    embedding_inputs_.resize(roles_.size(), false);
     std::vector<int64_t> residual_producers, rotary_producers;
     for (size_t i = 0; i < operations_.size(); ++i) {
       const auto& op = operations_[i];
@@ -2620,8 +2621,11 @@ class BucketProgram {
                     op[5] >= 0 && op[5] < upper && op[6] > 0 && op[7] > 0 && op[8] > 0 &&
                     (op[9] == 0 || op[9] == 1)) ||
                    (op[0] == 8 && op.size() == 4 && op[1] >= static_cast<int64_t>(roles_.size()) &&
-                    operations_[op[1] - roles_.size()][0] == 7 && op[2] == 0 && op[3] == -1)),
+                    operations_[op[1] - roles_.size()][0] == 7 && op[2] == 0 && op[3] == -1) ||
+                   (op[0] == 9 && op.size() == 4 && op[1] < static_cast<int64_t>(roles_.size()) &&
+                    op[2] < static_cast<int64_t>(roles_.size()) && op[3] == -1)),
                   "GaudiRT FX: invalid normalized node");
+      if (op[0] == 9) embedding_inputs_[op[1]] = true;
       if (op[0] == 6) {
         TORCH_CHECK(std::find(residual_producers.begin(), residual_producers.end(), op[1]) == residual_producers.end(),
                     "GaudiRT FX: duplicate fused residual output");
@@ -2653,6 +2657,7 @@ class BucketProgram {
   std::vector<int64_t> roles_;
   std::vector<std::vector<int64_t>> operations_;
   std::vector<int64_t> outputs_;
+  std::vector<bool> embedding_inputs_;
   std::vector<FxValueSpec> specs_;
   std::string digest_;
   std::mutex mutex_;
@@ -2684,6 +2689,16 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
   }
   for (const auto& op : operations_) {
     const auto& a = specs[op[1]];
+    if (op[0] == 9) {
+      const auto& weight = specs[op[2]];
+      TORCH_CHECK(a.dtype == at::kInt && a.dynamic && a.sizes.size() == 1 &&
+                  (weight.dtype == at::kBFloat16 || weight.dtype == at::kFloat) &&
+                  !weight.dynamic && weight.sizes.size() == 2,
+                  "GaudiRT FX: invalid validated embedding geometry");
+      specs.push_back({weight.dtype, {-1, weight.sizes[1]}, true});
+      normalized << "n" << op[0] << ":" << op[1] << ":" << op[2] << ":" << op[3] << ";";
+      continue;
+    }
     if (op[0] == 8) {
       specs.push_back(specs[operations_[op[1] - roles_.size()][2]]);
       normalized << "n" << op[0] << ":" << op[1] << ":" << op[2] << ":" << op[3] << ";";
@@ -2844,6 +2859,14 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
       const int slot = output == outputs_.end() ? -1 :
           static_cast<int>(roles_.size() + std::distance(outputs_.begin(), output));
       values[id] = tensor(type.syn, width, bucket, slot);
+      if (op[0] == 9) {
+        ns_GatherKernel::ParamsV2 params{};
+        params.axis = 1;
+        params.batchDims = 0;
+        const auto guid = "gather_fwd_" + std::string(type.name);
+        node({values[op[2]], values[op[1]]}, values[id], &params, sizeof(params), guid.c_str());
+        continue;
+      }
       if (op[0] == 7) {
         size_t key_id = specs_.size();
         for (size_t j = i + 1; j < operations_.size(); ++j)
@@ -3015,6 +3038,9 @@ std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs
     uint64_t binding = address;
     if (!direct) {
       auto temp = std::make_unique<GraphTemporary>(graph_pool(), stream, bytes);
+      if (embedding_inputs_[i] && m < bucket)
+        TORCH_CHECK(synMemsetD32Async(temp->address, 0, bucket, stream) == synSuccess,
+                    "GaudiRT FX: index tail zeroing failed");
       const Layout layout(input);
       dma_copy(temp->address, nullptr, address, &layout, 0, input.numel(), item, stream, DRAM_TO_DRAM);
       binding = temp->address;
