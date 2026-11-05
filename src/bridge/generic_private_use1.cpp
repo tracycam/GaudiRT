@@ -3087,7 +3087,7 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
   std::vector<FxValueSpec> specs;
   specs.reserve(inputs.size() + operations_.size());
   std::ostringstream normalized;
-  normalized << "fx_program_v9;";
+  normalized << "fx_program_v10;";
   for (size_t i = 0; i < inputs.size(); ++i) {
     const auto& tensor = inputs[i];
     const bool floating = tensor.scalar_type() == at::kBFloat16 || tensor.scalar_type() == at::kFloat;
@@ -3585,7 +3585,7 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
       }
       synGEMMParams gemm{false, op[0] == 0};
       const auto input_width = specs_[op[1]].sizes.back();
-      const bool rotary_projection = bucket == 1 && spec.dtype == at::kBFloat16 && op[0] == 0 &&
+      const bool rotary_projection = spec.dynamic && spec.dtype == at::kBFloat16 && op[0] == 0 &&
           op[3] < 0 && input_width % 256 == 0 &&
           std::any_of(operations_.begin(), operations_.end(), [&](const auto& candidate) {
             return candidate[0] == 7 &&
@@ -3593,16 +3593,16 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
                  rotary_source(candidate[2], static_cast<int64_t>(id)));
           });
       if (rotary_projection) {
-        auto full = tensor(syn_type_float, width, 1, -1);
-        auto x0 = tensor(syn_type_bf16, input_width / 2, 1, -1);
-        auto x1 = tensor(syn_type_bf16, input_width / 2, 1, -1);
+        auto full = tensor(syn_type_float, width, rows, -1);
+        auto x0 = tensor(syn_type_bf16, input_width / 2, rows, -1);
+        auto x1 = tensor(syn_type_bf16, input_width / 2, rows, -1);
         auto w0 = tensor(syn_type_bf16, input_width / 2, width, -1);
         auto w1 = tensor(syn_type_bf16, input_width / 2, width, -1);
-        auto p0 = tensor(syn_type_float, width, 1, -1);
-        auto p1 = tensor(syn_type_float, width, 1, -1);
-        auto sum = tensor(syn_type_float, width, 1, -1);
-        auto first = tensor(syn_type_bf16, width, 1, -1);
-        auto second = tensor(syn_type_bf16, width, 1, -1);
+        auto p0 = tensor(syn_type_float, width, rows, -1);
+        auto p1 = tensor(syn_type_float, width, rows, -1);
+        auto sum = tensor(syn_type_float, width, rows, -1);
+        auto first = tensor(syn_type_bf16, width, rows, -1);
+        auto second = tensor(syn_type_bf16, width, rows, -1);
         node({values[op[1]], values[op[2]]}, full, &gemm, sizeof(gemm), "gemm");
         synSplitParams split{0};
         const auto split_tensor = [&](synTensor source, synTensor left, synTensor right) {
