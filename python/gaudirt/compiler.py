@@ -37,6 +37,9 @@ def _program_backend(graph_module, example_inputs):
                   torch.ops.aten.matmul.default, operator.matmul)
     addmm_targets = (torch.addmm, torch.ops.aten.addmm.default)
     add_targets = (operator.add, torch.add, torch.ops.aten.add.Tensor)
+    sub_targets = (operator.sub, torch.sub, torch.ops.aten.sub.Tensor)
+    mul_targets = (operator.mul, torch.mul, torch.ops.aten.mul.Tensor)
+    div_targets = (operator.truediv, torch.div, torch.true_divide, torch.ops.aten.div.Tensor)
     norm_targets = (torch.ops.gaudirt.rms_norm, torch.ops.gaudirt.rms_norm.default)
     fused_norm_targets = (torch.ops.gaudirt.fused_add_rms_norm,
                           torch.ops.gaudirt.fused_add_rms_norm.default)
@@ -238,6 +241,14 @@ def _program_backend(graph_module, example_inputs):
             if set(node.kwargs) - {"alpha"} or node.kwargs.get("alpha", 1) != 1:
                 raise RuntimeError("GaudiRT FX: add requires alpha=1")
             operation = [1, tensor_id(node.args[0]), tensor_id(node.args[1]), -1]
+        elif node.target in sub_targets and len(node.args) == 2:
+            if set(node.kwargs) - {"alpha"} or node.kwargs.get("alpha", 1) != 1:
+                raise RuntimeError("GaudiRT FX: sub requires alpha=1")
+            operation = [12, tensor_id(node.args[0]), tensor_id(node.args[1]), -1]
+        elif node.target in mul_targets and len(node.args) == 2 and not node.kwargs:
+            operation = [13, tensor_id(node.args[0]), tensor_id(node.args[1]), -1]
+        elif node.target in div_targets and len(node.args) == 2 and not node.kwargs:
+            operation = [14, tensor_id(node.args[0]), tensor_id(node.args[1]), -1]
         elif node.target in norm_targets and len(node.args) == 3 and not node.kwargs:
             epsilon = node.args[2]
             if not isinstance(epsilon, (int, float)) or not math.isfinite(epsilon) or epsilon <= 0:
