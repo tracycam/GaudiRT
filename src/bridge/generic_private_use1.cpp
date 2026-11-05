@@ -2401,8 +2401,9 @@ struct FxValueSpec {
 // A node's output ID is input_count + its index in the program.
 class BucketProgram {
  public:
-  BucketProgram(std::vector<int64_t> roles, std::vector<std::vector<int64_t>> operations)
-      : roles_(std::move(roles)), operations_(std::move(operations)) {
+  BucketProgram(std::vector<int64_t> roles, std::vector<std::vector<int64_t>> operations,
+                std::vector<int64_t> outputs = {})
+      : roles_(std::move(roles)), operations_(std::move(operations)), outputs_(std::move(outputs)) {
     TORCH_CHECK(!roles_.empty() && !operations_.empty(), "GaudiRT FX: empty program");
     bool has_dynamic = false;
     for (auto role : roles_) {
@@ -2421,9 +2422,18 @@ class BucketProgram {
                    (op[0] == 3 && op[1] == op[2] && op[3] == -1)),
                   "GaudiRT FX: invalid normalized node");
     }
+    if (outputs_.empty()) outputs_.push_back(roles_.size() + operations_.size() - 1);
+    std::vector<int64_t> unique_outputs = outputs_;
+    std::sort(unique_outputs.begin(), unique_outputs.end());
+    TORCH_CHECK(std::adjacent_find(unique_outputs.begin(), unique_outputs.end()) == unique_outputs.end(),
+                "GaudiRT FX: duplicate program output");
+    for (auto id : outputs_)
+      TORCH_CHECK(id >= static_cast<int64_t>(roles_.size()) &&
+                  id < static_cast<int64_t>(roles_.size() + operations_.size()),
+                  "GaudiRT FX: output must be a program operation");
   }
 
-  at::Tensor run(const std::vector<at::Tensor>& inputs);
+  std::vector<at::Tensor> run(const std::vector<at::Tensor>& inputs);
 
  private:
   void initialize_geometry(const std::vector<at::Tensor>& inputs);
@@ -2431,6 +2441,7 @@ class BucketProgram {
 
   std::vector<int64_t> roles_;
   std::vector<std::vector<int64_t>> operations_;
+  std::vector<int64_t> outputs_;
   std::vector<FxValueSpec> specs_;
   std::string digest_;
   std::mutex mutex_;
@@ -2441,7 +2452,7 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
   std::vector<FxValueSpec> specs;
   specs.reserve(inputs.size() + operations_.size());
   std::ostringstream normalized;
-  normalized << "fx_program_v5;";
+  normalized << "fx_program_v6;";
   for (size_t i = 0; i < inputs.size(); ++i) {
     const auto& tensor = inputs[i];
     TORCH_CHECK(tensor.device().type() == c10::kPrivateUse1 && tensor.device().index() == 0 &&
@@ -2489,6 +2500,7 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
     }
     normalized << "n" << op[0] << ":" << op[1] << ":" << op[2] << ":" << op[3] << ";";
   }
+  for (auto id : outputs_) normalized << "o" << id << ";";
   const auto text = normalized.str();
   const auto digest = gaudirt::common::sha256_bytes(
       reinterpret_cast<const uint8_t*>(text.data()), text.size());
@@ -2501,7 +2513,7 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
   const auto key = "fx_program_" + digest_ + "_b" + std::to_string(bucket);
   auto found = ctx.cold_recipes.find(key);
   if (found != ctx.cold_recipes.end()) return *found->second;
-  auto compiled = std::make_unique<ColdRecipe>(roles_.size() + 1);
+  auto compiled = std::make_unique<ColdRecipe>(roles_.size() + outputs_.size());
   synGraphHandle graph = nullptr;
   std::vector<synSectionHandle> sections;
   std::vector<synTensor> created;
@@ -2562,7 +2574,9 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
       const auto& spec = specs_[id];
       const auto type = cast_type(spec.dtype);
       const uint64_t width = spec.sizes[1];
-      const int slot = i + 1 == operations_.size() ? static_cast<int>(roles_.size()) : -1;
+      const auto output = std::find(outputs_.begin(), outputs_.end(), static_cast<int64_t>(id));
+      const int slot = output == outputs_.end() ? -1 :
+          static_cast<int>(roles_.size() + std::distance(outputs_.begin(), output));
       values[id] = tensor(type.syn, width, bucket, slot);
       if (op[0] == 1) {
         const auto guid = spec.dtype == at::kBFloat16 ? std::string("gk_add_bf16_v1") :
@@ -2613,7 +2627,7 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
   return *it->second;
 }
 
-at::Tensor BucketProgram::run(const std::vector<at::Tensor>& inputs) {
+std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs) {
   std::lock_guard program_lock(mutex_);
   TORCH_CHECK(inputs.size() == roles_.size(), "GaudiRT FX: wrong input count");
   int64_t m = -1;
@@ -2642,11 +2656,14 @@ at::Tensor BucketProgram::run(const std::vector<at::Tensor>& inputs) {
     }
   }
   const uint32_t bucket = std::bit_ceil(static_cast<uint32_t>(m));
-  const auto& output_spec = specs_.back();
   auto ctx = current();
   auto stream = ctx->device.compute_stream();
-  auto result = bucket_output(inputs[dynamic_input], output_spec.dtype, bucket, m, output_spec.sizes[1]);
-  const auto output_address = address_of(result, *ctx);
+  std::vector<at::Tensor> results;
+  results.reserve(outputs_.size());
+  for (auto id : outputs_) {
+    const auto& spec = specs_[id];
+    results.push_back(bucket_output(inputs[dynamic_input], spec.dtype, bucket, m, spec.sizes[1]));
+  }
   std::lock_guard recipe_lock(ctx->cold_mutex);
   auto& compiled = recipe(*ctx, bucket);
   auto graph_pool = [&]() -> GraphPool& {
@@ -2686,13 +2703,16 @@ at::Tensor BucketProgram::run(const std::vector<at::Tensor>& inputs) {
     regions.emplace_back(binding, bytes);
     bindings[i].pTensorAddress = binding;
   }
-  ctx->allocator.record_stream(output_address, stream);
-  bindings[roles_.size()].pTensorAddress = output_address;
+  for (size_t i = 0; i < results.size(); ++i) {
+    const auto address = address_of(results[i], *ctx);
+    ctx->allocator.record_stream(address, stream);
+    bindings[roles_.size() + i].pTensorAddress = address;
+  }
   std::unique_ptr<GraphTemporary> workspace;
   if (compiled.workspace) workspace = std::make_unique<GraphTemporary>(graph_pool(), stream, compiled.workspace);
   TORCH_CHECK(synLaunch(stream, bindings.data(), bindings.size(), workspace ? workspace->address : 0,
                         compiled.recipe, 0) == synSuccess, "GaudiRT FX: program launch failed");
-  return result;
+  return results;
 }
 
 at::Tensor bucket_rms_norm(const at::Tensor& input, const at::Tensor& weight, double epsilon) {
@@ -2701,12 +2721,12 @@ at::Tensor bucket_rms_norm(const at::Tensor& input, const at::Tensor& weight, do
               "GaudiRT: RMSNorm epsilon must be a positive finite FP32 value");
   const auto bits = std::bit_cast<uint32_t>(eps);
   BucketProgram program({1, 0}, {{2, 0, 1, static_cast<int64_t>(bits)}});
-  return program.run({input, weight});
+  return program.run({input, weight})[0];
 }
 
 at::Tensor bucket_silu_and_mul(const at::Tensor& input) {
   BucketProgram program({1}, {{3, 0, 0, -1}});
-  return program.run({input});
+  return program.run({input})[0];
 }
 
 class PagedMetadata : public torch::CustomClassHolder {
@@ -3196,6 +3216,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("bucket_linear", &gaudirt::generic::bucket_linear,
         pybind11::arg("input"), pybind11::arg("weight"), pybind11::arg("bias") = pybind11::none());
   pybind11::class_<gaudirt::generic::BucketProgram>(m, "BucketProgram")
-      .def(pybind11::init<std::vector<int64_t>, std::vector<std::vector<int64_t>>>())
+      .def(pybind11::init<std::vector<int64_t>, std::vector<std::vector<int64_t>>, std::vector<int64_t>>())
       .def("run", &gaudirt::generic::BucketProgram::run);
 }
