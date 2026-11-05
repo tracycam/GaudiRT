@@ -28,7 +28,7 @@ def _program_backend(graph_module, example_inputs):
         roles.append(int(bool(dynamic)))
     if not any(roles):
         raise RuntimeError("GaudiRT FX: mark each dynamic token input before capture")
-    operations, transposes = [], {}
+    operations, transposes, splits = [], {}, {}
     linear_targets = (torch.nn.functional.linear, torch.ops.aten.linear.default)
     mm_targets = (torch.mm, torch.ops.aten.mm.default, torch.matmul,
                   torch.ops.aten.matmul.default, operator.matmul)
@@ -36,6 +36,7 @@ def _program_backend(graph_module, example_inputs):
     add_targets = (operator.add, torch.add, torch.ops.aten.add.Tensor)
     norm_targets = (torch.ops.gaudirt.rms_norm, torch.ops.gaudirt.rms_norm.default)
     silu_targets = (torch.ops.gaudirt.silu_and_mul, torch.ops.gaudirt.silu_and_mul.default)
+    split_targets = (torch.split, torch.ops.aten.split_with_sizes.default)
 
     def tensor_id(value):
         if value not in ids:
@@ -60,9 +61,32 @@ def _program_backend(graph_module, example_inputs):
         if node.op == "call_method" and node.target == "t" and len(node.args) == 1 and not node.kwargs:
             transposes[node] = node.args[0]
             continue
+        if ((node.op == "call_method" and node.target == "split") or
+                (node.op == "call_function" and node.target in split_targets)):
+            if len(node.args) not in (2, 3) or set(node.kwargs) - {"dim"} or (
+                len(node.args) == 3 and "dim" in node.kwargs
+            ):
+                raise RuntimeError("GaudiRT FX: unsupported split arguments")
+            dim = node.args[2] if len(node.args) == 3 else node.kwargs.get("dim", 0)
+            sizes = node.args[1]
+            if dim not in (-1, 1) or not isinstance(sizes, (tuple, list)) or not sizes or any(
+                not isinstance(size, int) or isinstance(size, bool) or size <= 0 for size in sizes
+            ):
+                raise RuntimeError("GaudiRT FX: split requires positive feature sizes")
+            splits[node] = (tensor_id(node.args[0]), tuple(sizes))
+            continue
         if node.op != "call_function":
             raise RuntimeError(f"GaudiRT FX: unsupported program node {node.op}: {node.target}")
-        if node.target in linear_targets and len(node.args) in (2, 3):
+        if node.target is operator.getitem and len(node.args) == 2 and node.args[0] in splits:
+            source, sizes = splits[node.args[0]]
+            index = node.args[1]
+            if node.kwargs or not isinstance(index, int) or index < 0 or index >= len(sizes):
+                raise RuntimeError("GaudiRT FX: invalid split output index")
+            if len(sizes) == 1:
+                ids[node] = source
+                continue
+            operation = [4, source, sum(sizes[:index]), sizes[index], sum(sizes)]
+        elif node.target in linear_targets and len(node.args) in (2, 3):
             if set(node.kwargs) - {"bias"} or (len(node.args) == 3 and "bias" in node.kwargs):
                 raise RuntimeError("GaudiRT FX: unsupported linear arguments")
             bias = node.args[2] if len(node.args) == 3 else node.kwargs.get("bias")
