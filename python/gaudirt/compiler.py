@@ -1,5 +1,6 @@
 """FX entry point for the supported bucketed device subgraphs."""
 
+import builtins
 import functools
 import math
 import operator
@@ -30,7 +31,7 @@ def _program_backend(graph_module, example_inputs):
         raise RuntimeError("GaudiRT FX: mark each dynamic token input before capture")
     operations, transposes, splits, fused_norms, rotations, index_casts = [], {}, {}, {}, {}, {}
     views = {}
-    validated_token_bindings = []
+    validated_token_bindings, validated_row_bindings = [], []
     linear_targets = (torch.nn.functional.linear, torch.ops.aten.linear.default)
     mm_targets = (torch.mm, torch.ops.aten.mm.default, torch.matmul,
                   torch.ops.aten.matmul.default, operator.matmul)
@@ -44,6 +45,7 @@ def _program_backend(graph_module, example_inputs):
                       torch.ops.gaudirt._rotary_embedding_validated.default)
     split_targets = (torch.split, torch.ops.aten.split_with_sizes.default)
     embedding_targets = (torch.nn.functional.embedding, torch.ops.aten.embedding.default)
+    index_select_targets = (torch.index_select, torch.ops.aten.index_select.default)
 
     def tensor_id(value):
         if value not in ids:
@@ -70,6 +72,10 @@ def _program_backend(graph_module, example_inputs):
         if node.op == "call_method" and node.target == "t" and len(node.args) == 1 and not node.kwargs:
             transposes[node] = node.args[0]
             continue
+        if (node.op == "call_function" and node.target is builtins.getattr and len(node.args) == 2 and
+                node.args[1] == "T" and not node.kwargs):
+            transposes[node] = node.args[0]
+            continue
         if node.op == "call_method" and node.target == "long" and len(node.args) == 1 and not node.kwargs:
             index_casts[node] = node.args[0]
             continue
@@ -86,6 +92,24 @@ def _program_backend(graph_module, example_inputs):
                 raise RuntimeError("GaudiRT FX: view must preserve contiguous layout")
             if original.shape == result.shape:
                 ids[node] = ids[source]
+            continue
+        if node.op == "call_method" and node.target in ("to", "float"):
+            if node.kwargs or (node.target == "float" and len(node.args) != 1) or (
+                node.target == "to" and len(node.args) != 2
+            ):
+                raise RuntimeError("GaudiRT FX: unsupported cast arguments")
+            dtype = torch.float32 if node.target == "float" else node.args[1]
+            if dtype not in (torch.bfloat16, torch.float32):
+                raise RuntimeError("GaudiRT FX: cast supports BF16 and FP32")
+            source = node.args[0]
+            example = source.meta.get("example_value")
+            if not isinstance(example, torch.Tensor):
+                raise RuntimeError("GaudiRT FX: missing cast metadata")
+            if example.dtype == dtype:
+                ids[node] = tensor_id(source)
+            else:
+                ids[node] = len(tensor_indices) + len(operations)
+                operations.append([11, tensor_id(source), int(dtype == torch.float32), -1])
             continue
         if ((node.op == "call_method" and node.target == "split") or
                 (node.op == "call_function" and node.target in split_targets)):
@@ -183,6 +207,19 @@ def _program_backend(graph_module, example_inputs):
                 ids[node] = source
                 continue
             operation = [4, source, sum(sizes[:index]), sizes[index], sum(sizes)]
+        elif (node.target is operator.getitem and len(node.args) == 2 and not node.kwargs and
+              isinstance(node.args[1], torch.fx.Node)) or node.target in index_select_targets:
+            if node.target in index_select_targets:
+                if len(node.args) != 3 or node.args[1] != 0 or node.kwargs:
+                    raise RuntimeError("GaudiRT FX: only outer-dimension index_select is supported")
+                source, index = node.args[0], node.args[2]
+            else:
+                source, index = node.args
+            index_id = tensor_id(index)
+            if index_id >= len(tensor_indices) or roles[index_id]:
+                raise RuntimeError("GaudiRT FX: row gather requires external validated indices")
+            validated_row_bindings.append(index_id)
+            operation = [10, tensor_id(source), index_id, -1]
         elif node.target in linear_targets and len(node.args) in (2, 3):
             if set(node.kwargs) - {"bias"} or (len(node.args) == 3 and "bias" in node.kwargs):
                 raise RuntimeError("GaudiRT FX: unsupported linear arguments")
@@ -231,6 +268,11 @@ def _program_backend(graph_module, example_inputs):
             vocabulary = getattr(index, "_gaudirt_validated_vocab", None)
             if not isinstance(vocabulary, int) or vocabulary <= 0 or vocabulary > weight.shape[0]:
                 raise RuntimeError("GaudiRT FX: embedding token IDs must pass batch metadata validation")
+        for index_id in validated_row_bindings:
+            index = args[tensor_indices[index_id]]
+            dynamic = args[tensor_indices[roles.index(1)]]
+            if getattr(index, "_gaudirt_validated_rows", None) != dynamic.shape[0]:
+                raise RuntimeError("GaudiRT FX: row indices must pass batch metadata validation")
         computed = dict(zip(computed_ids, program.run([args[index] for index in tensor_indices]))) if program else {}
         result = tuple(args[tensor_indices[value]] if value < len(tensor_indices) else computed[value]
                        for value in output_ids)

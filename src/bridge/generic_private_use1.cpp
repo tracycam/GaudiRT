@@ -2584,7 +2584,8 @@ struct FxValueSpec {
 
 // An FX program is described by external input roles and normalized nodes.
 // Nodes 0..4 are linear, add, RMSNorm, SiLU/multiply and split; 5/6 are fused norm outputs,
-// 7/8 are validated rotary query/key outputs, and 9 is validated embedding.
+// 7/8 are validated rotary query/key outputs, 9 is validated embedding,
+// 10 gathers validated last-token rows, and 11 casts BF16/FP32.
 // A node's output ID is input_count + its index in the program.
 class BucketProgram {
  public:
@@ -2623,7 +2624,10 @@ class BucketProgram {
                    (op[0] == 8 && op.size() == 4 && op[1] >= static_cast<int64_t>(roles_.size()) &&
                     operations_[op[1] - roles_.size()][0] == 7 && op[2] == 0 && op[3] == -1) ||
                    (op[0] == 9 && op.size() == 4 && op[1] < static_cast<int64_t>(roles_.size()) &&
-                    op[2] < static_cast<int64_t>(roles_.size()) && op[3] == -1)),
+                    op[2] < static_cast<int64_t>(roles_.size()) && op[3] == -1) ||
+                   (op[0] == 10 && op.size() == 4 && op[2] < static_cast<int64_t>(roles_.size()) &&
+                    op[3] == -1) ||
+                   (op[0] == 11 && op.size() == 4 && op[2] <= 1 && op[3] == -1)),
                   "GaudiRT FX: invalid normalized node");
       if (op[0] == 9) embedding_inputs_[op[1]] = true;
       if (op[0] == 6) {
@@ -2689,6 +2693,23 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
   }
   for (const auto& op : operations_) {
     const auto& a = specs[op[1]];
+    if (op[0] == 10) {
+      const auto& index = specs[op[2]];
+      TORCH_CHECK(a.dynamic && a.sizes.size() == 2 && !index.dynamic && index.dtype == at::kInt &&
+                  index.sizes.size() == 1 && index.sizes[0] > 0 && index.sizes[0] <= 4096,
+                  "GaudiRT FX: invalid validated row gather geometry");
+      specs.push_back({a.dtype, {index.sizes[0], a.sizes[1]}, false});
+      normalized << "n" << op[0] << ":" << op[1] << ":" << op[2] << ":" << op[3] << ";";
+      continue;
+    }
+    if (op[0] == 11) {
+      const auto dtype = op[2] == 0 ? at::kBFloat16 : at::kFloat;
+      TORCH_CHECK(a.sizes.size() == 2 && (a.dtype == at::kBFloat16 || a.dtype == at::kFloat) &&
+                  a.dtype != dtype, "GaudiRT FX: invalid BF16/FP32 cast");
+      specs.push_back({dtype, a.sizes, a.dynamic});
+      normalized << "n" << op[0] << ":" << op[1] << ":" << op[2] << ":" << op[3] << ";";
+      continue;
+    }
     if (op[0] == 9) {
       const auto& weight = specs[op[2]];
       TORCH_CHECK(a.dtype == at::kInt && a.dynamic && a.sizes.size() == 1 &&
@@ -2751,14 +2772,14 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
       continue;
     }
     if (op[0] == 0) {
-      TORCH_CHECK(a.dynamic && a.sizes.size() == 2 && !b.dynamic && b.sizes.size() == 2 &&
+      TORCH_CHECK(a.sizes.size() == 2 && !b.dynamic && b.sizes.size() == 2 &&
                   a.sizes[1] == b.sizes[1], "GaudiRT FX: invalid linear geometry");
       if (op[3] >= 0) {
         const auto& bias = specs[op[3]];
         TORCH_CHECK(!bias.dynamic && bias.sizes.size() == 1 && bias.sizes[0] == b.sizes[0] &&
                     bias.dtype == a.dtype, "GaudiRT FX: invalid linear bias");
       }
-      specs.push_back({a.dtype, {-1, b.sizes[0]}, true});
+      specs.push_back({a.dtype, {a.sizes[0], b.sizes[0]}, a.dynamic});
     } else if (op[0] == 1) {
       TORCH_CHECK(a.dynamic && b.dynamic && a.sizes == b.sizes,
                   "GaudiRT FX: add requires equal dynamic shapes");
@@ -2855,10 +2876,28 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
       const auto& spec = specs_[id];
       const auto type = cast_type(spec.dtype);
       const uint64_t width = spec.sizes[1];
+      const uint64_t rows = spec.dynamic ? bucket : spec.sizes[0];
       const auto output = std::find(outputs_.begin(), outputs_.end(), static_cast<int64_t>(id));
       const int slot = output == outputs_.end() ? -1 :
           static_cast<int>(roles_.size() + std::distance(outputs_.begin(), output));
-      values[id] = tensor(type.syn, width, bucket, slot);
+      values[id] = tensor(type.syn, width, rows, slot);
+      if (op[0] == 10) {
+        ns_GatherKernel::ParamsV2 params{};
+        params.axis = 1;
+        params.batchDims = 0;
+        const auto guid = "gather_fwd_" + std::string(type.name);
+        node({values[op[1]], values[op[2]]}, values[id], &params, sizeof(params), guid.c_str());
+        continue;
+      }
+      if (op[0] == 11) {
+        ns_CastKernel::ParamsV3 params{};
+        params.round_mode = CAST_ROUND_HALF_NE;
+        if (spec.dtype == at::kFloat)
+          node({values[op[1]]}, values[id], &params, sizeof(params), "cast_bf16_to_f32");
+        else
+          node({values[op[1]]}, values[id], nullptr, 0, "gk_cast_f32_to_bf16_v1");
+        continue;
+      }
       if (op[0] == 9) {
         ns_GatherKernel::ParamsV2 params{};
         params.axis = 1;
@@ -2940,7 +2979,7 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
         node({values[op[1]], values[op[2]]}, values[id], &gemm, sizeof(gemm), "gemm");
         continue;
       }
-      auto product = tensor(syn_type_float, width, bucket, -1);
+      auto product = tensor(syn_type_float, width, rows, -1);
       node({values[op[1]], values[op[2]]}, product, &gemm, sizeof(gemm), "gemm");
       const bool bf16 = spec.dtype == at::kBFloat16;
       auto bias = values[op[3]];
@@ -2951,7 +2990,7 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
         node({bias}, wide_bias, &cast, sizeof(cast), "cast_bf16_to_f32");
         bias = wide_bias;
       }
-      auto sum = bf16 ? tensor(syn_type_float, width, bucket, -1) : values[id];
+      auto sum = bf16 ? tensor(syn_type_float, width, rows, -1) : values[id];
       node({product, bias}, sum, nullptr, 0, "add_fwd_f32");
       if (bf16) node({sum}, values[id], &cast, sizeof(cast), "cast_f32_to_bf16");
     }
@@ -3004,7 +3043,8 @@ std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs
   results.reserve(outputs_.size());
   for (auto id : outputs_) {
     const auto& spec = specs_[id];
-    results.push_back(bucket_output(inputs[dynamic_input], spec.dtype, bucket, m, spec.sizes[1]));
+    results.push_back(spec.dynamic ? bucket_output(inputs[dynamic_input], spec.dtype, bucket, m, spec.sizes[1]) :
+                      at::empty(spec.sizes, inputs[dynamic_input].options().dtype(spec.dtype)));
   }
   std::lock_guard recipe_lock(ctx->cold_mutex);
   auto& compiled = recipe(*ctx, bucket);
