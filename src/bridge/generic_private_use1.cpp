@@ -2810,7 +2810,7 @@ struct FxValueSpec {
 // An FX program is described by external input roles and normalized nodes.
 // Nodes 0..4 are linear, add, RMSNorm, SiLU/multiply and split; 5/6 are fused norm outputs,
 // 7/8 are validated rotary query/key outputs, 9 is validated embedding,
-// 10 gathers validated last-token rows, and 11 casts BF16/FP32.
+// 10 gathers validated last-token rows, 11 casts BF16/FP32, and 12..14 are sub/mul/div.
 // A node's output ID is input_count + its index in the program.
 class BucketProgram {
  public:
@@ -2852,7 +2852,8 @@ class BucketProgram {
                     op[2] < static_cast<int64_t>(roles_.size()) && op[3] == -1) ||
                    (op[0] == 10 && op.size() == 4 && op[2] < static_cast<int64_t>(roles_.size()) &&
                     op[3] == -1) ||
-                   (op[0] == 11 && op.size() == 4 && op[2] <= 1 && op[3] == -1)),
+                   (op[0] == 11 && op.size() == 4 && op[2] <= 1 && op[3] == -1) ||
+                   (op[0] >= 12 && op[0] <= 14 && op.size() == 4 && op[2] < upper && op[3] == -1)),
                   "GaudiRT FX: invalid normalized node");
       if (op[0] == 9) embedding_inputs_[op[1]] = true;
       if (op[0] == 6) {
@@ -3005,9 +3006,9 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
                     bias.dtype == a.dtype, "GaudiRT FX: invalid linear bias");
       }
       specs.push_back({a.dtype, {a.sizes[0], b.sizes[0]}, a.dynamic});
-    } else if (op[0] == 1) {
+    } else if (op[0] == 1 || (op[0] >= 12 && op[0] <= 14)) {
       TORCH_CHECK(a.dynamic && b.dynamic && a.sizes == b.sizes,
-                  "GaudiRT FX: add requires equal dynamic shapes");
+                  "GaudiRT FX: elementwise operation requires equal dynamic shapes");
       specs.push_back(a);
     } else if (op[0] == 2) {
       const float epsilon = std::bit_cast<float>(static_cast<uint32_t>(op[3]));
@@ -3186,6 +3187,24 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
       if (op[0] == 1) {
         const auto guid = spec.dtype == at::kBFloat16 ? std::string("gk_add_bf16_v1") :
                           "add_fwd_" + std::string(type.name);
+        node({values[op[1]], values[op[2]]}, values[id], nullptr, 0, guid.c_str());
+        continue;
+      }
+      if (op[0] >= 12 && op[0] <= 14) {
+        if (op[0] == 14 && spec.dtype == at::kBFloat16) {
+          auto numerator = tensor(syn_type_float, width, rows, -1);
+          auto denominator = tensor(syn_type_float, width, rows, -1);
+          auto quotient = tensor(syn_type_float, width, rows, -1);
+          ns_CastKernel::ParamsV3 params{};
+          params.round_mode = CAST_ROUND_HALF_NE;
+          node({values[op[1]]}, numerator, &params, sizeof(params), "cast_bf16_to_f32");
+          node({values[op[2]]}, denominator, &params, sizeof(params), "cast_bf16_to_f32");
+          node({numerator, denominator}, quotient, nullptr, 0, "div_fwd_f32");
+          node({quotient}, values[id], nullptr, 0, "gk_cast_f32_to_bf16_v1");
+          continue;
+        }
+        const auto operation = op[0] == 12 ? "sub_fwd_" : (op[0] == 13 ? "mult_fwd_" : "div_fwd_");
+        const auto guid = std::string(operation) + type.name;
         node({values[op[1]], values[op[2]]}, values[id], nullptr, 0, guid.c_str());
         continue;
       }
