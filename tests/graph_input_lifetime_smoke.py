@@ -22,6 +22,12 @@ def main():
     base = cpu.to("gaudirt:0")
     view = base[:, ::2]
     assert gaudirt._C._prepare_strided_input(base) is None
+    singleton = base[::4]
+    assert singleton.is_contiguous() and singleton.stride(0) != base.stride(0)
+    canonical = gaudirt._C._prepare_strided_input(singleton)
+    assert canonical is not None and canonical.data_ptr() == singleton.data_ptr()
+    assert canonical.stride() == (34, 1) and torch.equal(canonical.cpu(), cpu[::4])
+    del singleton, canonical
     ids_cpu = torch.tensor([[4, 9], [5, 9], [6, 9]], dtype=torch.int32)
     ids = ids_cpu.to("gaudirt:0")
     staged_ids = gaudirt._C._prepare_strided_input(ids[:, 0])

@@ -2720,7 +2720,20 @@ std::optional<at::Tensor> prepare_strided_input(const at::Tensor& input) {
   TORCH_CHECK(input.device().type() == c10::kPrivateUse1 && input.device().index() == 0 &&
               input.dim() >= 1 && input.dim() <= 3 && input.size(0) > 0 && input.size(0) <= 4096,
               "GaudiRT FX: invalid dynamic input");
-  if (input.is_contiguous()) return std::nullopt;
+  if (input.is_contiguous()) {
+    std::vector<int64_t> strides(input.dim());
+    int64_t expected = 1;
+    bool canonical = true;
+    for (int64_t dim = input.dim() - 1; dim >= 0; --dim) {
+      strides[dim] = expected;
+      canonical &= input.stride(dim) == expected;
+      TORCH_CHECK(input.size(dim) > 0 && expected <= INT64_MAX / input.size(dim),
+                  "GaudiRT FX: invalid input geometry");
+      expected *= input.size(dim);
+    }
+    if (canonical) return std::nullopt;
+    return input.as_strided(input.sizes(), strides, input.storage_offset());
+  }
   const auto rows = input.size(0);
   const auto bucket = std::bit_ceil(static_cast<uint32_t>(rows));
   uint64_t width = 1;
