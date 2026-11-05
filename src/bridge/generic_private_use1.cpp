@@ -2874,6 +2874,11 @@ at::Tensor reshape_view(const at::Tensor& tensor, const std::vector<int64_t>& sh
   return tensor.view(shape);
 }
 
+at::Tensor transpose_feature_view(const at::Tensor& tensor) {
+  TORCH_CHECK(tensor.dim() == 3, "GaudiRT FX: invalid feature transpose view");
+  return tensor.transpose(1, 2);
+}
+
 at::Tensor bucket_output(const at::Tensor& reference, at::ScalarType dtype,
                          uint32_t bucket, int64_t rows, int64_t width) {
   const uint64_t item = c10::elementSize(dtype);
@@ -3029,6 +3034,7 @@ class BucketProgram {
                    (op[0] == 17 && (op[2] == 2 || op[2] == 3) &&
                     op.size() == static_cast<size_t>(op[2] + 2) &&
                     std::all_of(op.begin() + 3, op.end(), [](int64_t size) { return size > 0; })) ||
+                   (op[0] == 18 && op.size() == 4 && op[2] == 1 && op[3] == 2) ||
                    (op[0] == 15 && std::all_of(op.begin() + 1, op.end(),
                                                [upper](int64_t id) { return id >= 0 && id < upper; }))),
                   "GaudiRT FX: invalid normalized node");
@@ -3096,6 +3102,13 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
   }
   for (const auto& op : operations_) {
     const auto& a = specs[op[1]];
+    if (op[0] == 18) {
+      TORCH_CHECK(a.dynamic && a.sizes.size() == 3,
+                  "GaudiRT FX: feature transpose requires a dynamic rank-three input");
+      specs.push_back({a.dtype, {-1, a.sizes[2], a.sizes[1]}, true});
+      normalized << "n" << op[0] << ":" << op[1] << ":" << op[2] << ":" << op[3] << ";";
+      continue;
+    }
     if (op[0] == 17) {
       TORCH_CHECK(a.dynamic && (a.sizes.size() == 2 || a.sizes.size() == 3),
                   "GaudiRT FX: invalid reshape input");
@@ -3338,6 +3351,15 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
           static_cast<int>(roles_.size() + std::distance(outputs_.begin(), output));
       values[id] = tensor(type.syn, width, rows, slot, spec.sizes.size(),
                           spec.sizes.size() == 3 ? bucket : 1);
+      if (op[0] == 18) {
+        synTransposeParams params{};
+        params.tensorDim = 3;
+        params.permutation[0] = TPD_Width;
+        params.permutation[1] = TPD_Channel;
+        params.permutation[2] = TPD_Height;
+        node({values[op[1]]}, values[id], &params, sizeof(params), "transpose");
+        continue;
+      }
       if (op[0] == 17) {
         node({values[op[1]]}, values[id], nullptr, 0, "reshape");
         continue;
@@ -4513,6 +4535,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("_restore_staged_alias", &gaudirt::generic::restore_staged_alias);
   m.def("_feature_view", &gaudirt::generic::feature_view);
   m.def("_reshape_view", &gaudirt::generic::reshape_view);
+  m.def("_transpose_feature_view", &gaudirt::generic::transpose_feature_view);
   m.def("bucket_linear", &gaudirt::generic::bucket_linear,
         pybind11::arg("input"), pybind11::arg("weight"), pybind11::arg("bias") = pybind11::none());
   pybind11::class_<gaudirt::generic::BucketProgram>(m, "BucketProgram")

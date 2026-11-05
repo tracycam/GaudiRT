@@ -68,6 +68,7 @@ def _program_backend(graph_module, example_inputs):
     embedding_targets = (torch.nn.functional.embedding, torch.ops.aten.embedding.default)
     index_select_targets = (torch.index_select, torch.ops.aten.index_select.default)
     reshape_targets = (torch.reshape, torch.ops.aten.view.default, torch.ops.aten.reshape.default)
+    transpose_targets = (torch.transpose, torch.ops.aten.transpose.int)
 
     def tensor_id(value):
         if value not in ids:
@@ -124,6 +125,34 @@ def _program_backend(graph_module, example_inputs):
                 node.args[1] == "T" and not node.kwargs):
             transposes[node] = node.args[0]
             continue
+        if ((node.op == "call_method" and node.target == "transpose") or
+                (node.op == "call_function" and node.target in transpose_targets)):
+            if len(node.args) != 3 or node.kwargs:
+                raise RuntimeError("GaudiRT FX: unsupported transpose arguments")
+            source, dim0, dim1 = node.args
+            example = source.meta.get("example_value")
+            if (not isinstance(example, torch.Tensor) or
+                    any(not isinstance(dim, int) or isinstance(dim, bool) or
+                        dim < -example.ndim or dim >= example.ndim for dim in (dim0, dim1))):
+                raise RuntimeError("GaudiRT FX: invalid transpose dimensions")
+            dim0, dim1 = dim0 % example.ndim, dim1 % example.ndim
+            if dim0 == dim1:
+                ids[node] = tensor_id(source)
+                if source in alias_views:
+                    alias_views[node] = alias_views[source]
+            elif example.ndim == 2:
+                transposes[node] = source
+            elif example.ndim == 3 and {dim0, dim1} == {1, 2}:
+                source_id = tensor_id(source)
+                add_alias(node, source, ("transpose",))
+                if all(user.op == "output" for user in node.users):
+                    ids[node] = source_id
+                else:
+                    ids[node] = len(tensor_indices) + len(operations)
+                    operations.append([18, source_id, 1, 2])
+            else:
+                raise RuntimeError("GaudiRT FX: transpose must keep the outer token dimension")
+            continue
         if node.op == "call_method" and node.target == "long" and len(node.args) == 1 and not node.kwargs:
             index_casts[node] = node.args[0]
             continue
@@ -140,9 +169,12 @@ def _program_backend(graph_module, example_inputs):
                     any(not isinstance(size, int) or size <= 0 for size in result.shape[1:])):
                 raise RuntimeError("GaudiRT FX: view must keep the outer token dimension")
             shape = (-1, *(int(size) for size in result.shape[1:]))
-            add_alias(node, source, ("reshape", shape))
             same_shape = tuple(map(str, original.shape)) == tuple(map(str, result.shape))
-            if same_shape or all(user.op == "output" or is_reshape_node(user) for user in node.users):
+            if original.is_contiguous():
+                add_alias(node, source, ("reshape", shape))
+            if original.is_contiguous() and (
+                same_shape or all(user.op == "output" or is_reshape_node(user) for user in node.users)
+            ):
                 ids[node] = source_id
             else:
                 ids[node] = len(tensor_indices) + len(operations)
@@ -371,7 +403,7 @@ def _program_backend(graph_module, example_inputs):
         raise RuntimeError("GaudiRT FX: unsupported program output")
     output_ids = [alias_views[value][0] if value in alias_views else ids[value] for value in output]
     computed_ids = list(dict.fromkeys(value for value in output_ids if value >= len(tensor_indices)))
-    if operations and not computed_ids and any(operation[0] not in (4, 17) for operation in operations):
+    if operations and not computed_ids and any(operation[0] not in (4, 17, 18) for operation in operations):
         raise RuntimeError("GaudiRT FX: program operations have no output")
     program = _C.BucketProgram(roles, operations, computed_ids) if computed_ids else None
     if program is None and (computed_ids or validated_token_bindings):
@@ -396,8 +428,10 @@ def _program_backend(graph_module, example_inputs):
             for operation in alias_views.get(node, (None, ()))[1]:
                 if operation[0] == "feature":
                     tensor = _C._feature_view(tensor, operation[1], operation[2])
-                else:
+                elif operation[0] == "reshape":
                     tensor = _C._reshape_view(tensor, operation[1])
+                else:
+                    tensor = _C._transpose_feature_view(tensor)
             return tensor
 
         result = tuple(apply_views(node, tensor) for node, tensor in zip(output, result))
