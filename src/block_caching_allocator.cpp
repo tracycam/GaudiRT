@@ -63,8 +63,8 @@ BlockCachingAllocator::~BlockCachingAllocator() {
   for (auto& [address, block] : blocks_) {
     (void)address;
     for (auto stream : block.streams) synStreamSynchronize(stream);
-    for (const auto& event : block.fences)
-      synEventSynchronize(static_cast<synEventHandle>(event.get()));
+    for (const auto& fence : block.fences)
+      synEventSynchronize(static_cast<synEventHandle>(fence.event.get()));
   }
   blocks_.clear();
   if (base_ && owns_slab_) synDeviceFree(device_, base_, 0);
@@ -85,8 +85,8 @@ uint64_t BlockCachingAllocator::allocate(uint64_t bytes, synStreamHandle stream)
                              std::to_string(size) + ", allocated=" +
                              std::to_string(allocated_) + ", capacity=" +
                              std::to_string(capacity_));
-  for (const auto& event : best->second.fences)
-    check(synStreamWaitEvent(stream, static_cast<synEventHandle>(event.get()), 0),
+  for (const auto& fence : best->second.fences)
+    check(synStreamWaitEvent(stream, static_cast<synEventHandle>(fence.event.get()), 0),
           "stream wait failed");
   const uint64_t address = best->first;
   if (best->second.bytes > size) {
@@ -119,21 +119,28 @@ void BlockCachingAllocator::record_stream(uint64_t address, synStreamHandle stre
 }
 
 BlockCachingAllocator::Blocks::iterator BlockCachingAllocator::merge_free(Blocks::iterator it) {
-  const auto append_unique = [](auto& to, const auto& from) {
-    for (const auto& event : from)
-      if (std::find(to.begin(), to.end(), event) == to.end()) to.push_back(event);
+  // Records are serialized by mutex_. A later event on the same stream
+  // subsumes all earlier events on that stream, even for adjacent blocks.
+  const auto retain_latest_per_stream = [](auto& to, const auto& from) {
+    for (const auto& fence : from) {
+      const auto previous = std::find_if(to.begin(), to.end(), [&](const auto& candidate) {
+        return candidate.stream == fence.stream;
+      });
+      if (previous == to.end()) to.push_back(fence);
+      else if (previous->sequence < fence.sequence) *previous = fence;
+    }
   };
   auto next = std::next(it);
   if (next != blocks_.end() && !next->second.allocated) {
     it->second.bytes += next->second.bytes;
-    append_unique(it->second.fences, next->second.fences);
+    retain_latest_per_stream(it->second.fences, next->second.fences);
     blocks_.erase(next);
   }
   if (it != blocks_.begin()) {
     auto prev = std::prev(it);
     if (!prev->second.allocated) {
       prev->second.bytes += it->second.bytes;
-      append_unique(prev->second.fences, it->second.fences);
+      retain_latest_per_stream(prev->second.fences, it->second.fences);
       blocks_.erase(it);
       it = prev;
     }
@@ -146,14 +153,14 @@ void BlockCachingAllocator::free(uint64_t address) {
   auto it = blocks_.find(address);
   if (it == blocks_.end() || !it->second.allocated)
     throw std::invalid_argument("BlockCachingAllocator: unknown or freed allocation");
-  std::vector<Event> events;
+  std::vector<Fence> events;
   events.reserve(it->second.streams.size());
   for (auto stream : it->second.streams) {
     synEventHandle raw = nullptr;
     check(synEventCreate(&raw, device_, 0), "event creation failed");
     Event event(raw, EventDeleter{});
     check(synEventRecord(raw, stream), "event record failed");
-    events.push_back(std::move(event));
+    events.push_back({stream, ++next_fence_sequence_, std::move(event)});
   }
   allocated_ -= it->second.bytes;
   it->second.allocated = false;
@@ -166,8 +173,8 @@ void BlockCachingAllocator::empty_cache() {
   std::lock_guard lock(mutex_);
   for (auto& [address, block] : blocks_) {
     (void)address;
-    for (const auto& event : block.fences)
-      check(synEventSynchronize(static_cast<synEventHandle>(event.get())), "event wait failed");
+    for (const auto& fence : block.fences)
+      check(synEventSynchronize(static_cast<synEventHandle>(fence.event.get())), "event wait failed");
     block.fences.clear();
   }
   if (base_ && owns_slab_ && allocated_ == 0) {

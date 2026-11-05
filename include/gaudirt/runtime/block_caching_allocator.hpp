@@ -43,11 +43,16 @@ class BlockCachingAllocator {
                         BorrowedSlab);
   struct EventDeleter { void operator()(void* event) const noexcept; };
   using Event = std::shared_ptr<void>;
+  struct Fence {
+    synStreamHandle stream;
+    uint64_t sequence;
+    Event event;
+  };
   struct Block {
     uint64_t bytes = 0;
     bool allocated = false;
     std::vector<synStreamHandle> streams;
-    std::vector<Event> fences;
+    std::vector<Fence> fences;
   };
   using Blocks = std::map<uint64_t, Block>;
   void reserve_slab();
@@ -58,6 +63,7 @@ class BlockCachingAllocator {
   uint64_t base_ = 0;
   uint64_t allocated_ = 0;
   uint64_t peak_ = 0;
+  uint64_t next_fence_sequence_ = 0;
   bool owns_slab_ = true;
   Blocks blocks_;
   mutable std::mutex mutex_;
