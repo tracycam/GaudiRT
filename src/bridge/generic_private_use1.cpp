@@ -2397,7 +2397,7 @@ struct FxValueSpec {
 };
 
 // An FX program is described by external input roles and normalized nodes.
-// Node 0 is linear, 1 is add, 2 is BF16 RMSNorm, and 3 is BF16 SiLU/multiply.
+// Node 0 is linear, 1 is add, 2 is BF16 RMSNorm, 3 is SiLU/multiply, and 4 is a feature split.
 // A node's output ID is input_count + its index in the program.
 class BucketProgram {
  public:
@@ -2414,12 +2414,14 @@ class BucketProgram {
     for (size_t i = 0; i < operations_.size(); ++i) {
       const auto& op = operations_[i];
       const int64_t upper = roles_.size() + i;
-      TORCH_CHECK(op.size() == 4 && (op[0] == 0 || op[0] == 1 || op[0] == 2 || op[0] == 3) &&
-                  op[1] >= 0 && op[1] < upper && op[2] >= 0 && op[2] < upper &&
-                  ((op[0] == 0 && (op[3] == -1 || (op[3] >= 0 && op[3] < upper))) ||
-                   (op[0] == 1 && op[3] == -1) ||
-                   (op[0] == 2 && op[3] >= 0 && static_cast<uint64_t>(op[3]) <= UINT32_MAX) ||
-                   (op[0] == 3 && op[1] == op[2] && op[3] == -1)),
+      TORCH_CHECK((op.size() == 4 || (op.size() == 5 && op[0] == 4)) &&
+                  op[1] >= 0 && op[1] < upper && op[2] >= 0 &&
+                  ((op[0] == 0 && op[2] < upper && (op[3] == -1 || (op[3] >= 0 && op[3] < upper))) ||
+                   (op[0] == 1 && op[2] < upper && op[3] == -1) ||
+                   (op[0] == 2 && op[2] < upper && op[3] >= 0 &&
+                    static_cast<uint64_t>(op[3]) <= UINT32_MAX) ||
+                   (op[0] == 3 && op[1] == op[2] && op[3] == -1) ||
+                   (op[0] == 4 && op.size() == 5 && op[3] > 0 && op[4] > 0)),
                   "GaudiRT FX: invalid normalized node");
     }
     if (outputs_.empty()) outputs_.push_back(roles_.size() + operations_.size() - 1);
@@ -2452,7 +2454,7 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
   std::vector<FxValueSpec> specs;
   specs.reserve(inputs.size() + operations_.size());
   std::ostringstream normalized;
-  normalized << "fx_program_v6;";
+  normalized << "fx_program_v7;";
   for (size_t i = 0; i < inputs.size(); ++i) {
     const auto& tensor = inputs[i];
     TORCH_CHECK(tensor.device().type() == c10::kPrivateUse1 && tensor.device().index() == 0 &&
@@ -2471,6 +2473,14 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
   }
   for (const auto& op : operations_) {
     const auto& a = specs[op[1]];
+    if (op[0] == 4) {
+      TORCH_CHECK(a.dynamic && a.sizes.size() == 2 && op[4] == a.sizes[1] && op[2] < a.sizes[1] &&
+                  op[3] <= a.sizes[1] - op[2] && (op[2] > 0 || op[3] < a.sizes[1]),
+                  "GaudiRT FX: invalid feature split geometry");
+      specs.push_back({a.dtype, {-1, op[3]}, true});
+      normalized << "n" << op[0] << ":" << op[1] << ":" << op[2] << ":" << op[3] << ":" << op[4] << ";";
+      continue;
+    }
     const auto& b = specs[op[2]];
     TORCH_CHECK(a.dtype == b.dtype, "GaudiRT FX: input dtype mismatch");
     if (op[0] == 0) {
@@ -2578,6 +2588,18 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
       const int slot = output == outputs_.end() ? -1 :
           static_cast<int>(roles_.size() + std::distance(outputs_.begin(), output));
       values[id] = tensor(type.syn, width, bucket, slot);
+      if (op[0] == 4) {
+        const auto total = specs_[op[1]].sizes[1];
+        std::vector<synTensor> parts;
+        if (op[2]) parts.push_back(tensor(type.syn, op[2], bucket, -1));
+        parts.push_back(values[id]);
+        if (op[2] + op[3] < total) parts.push_back(tensor(type.syn, total - op[2] - op[3], bucket, -1));
+        synSplitParams params{0};
+        const auto name = prefix + "_n" + std::to_string(next_node++);
+        check(synNodeCreate(graph, &values[op[1]], parts.data(), 1, parts.size(), &params, sizeof(params),
+                            "split", name.c_str(), nullptr, nullptr), "program feature split failed");
+        continue;
+      }
       if (op[0] == 1) {
         const auto guid = spec.dtype == at::kBFloat16 ? std::string("gk_add_bf16_v1") :
                           "add_fwd_" + std::string(type.name);
