@@ -2810,7 +2810,8 @@ struct FxValueSpec {
 // An FX program is described by external input roles and normalized nodes.
 // Nodes 0..4 are linear, add, RMSNorm, SiLU/multiply and split; 5/6 are fused norm outputs,
 // 7/8 are validated rotary query/key outputs, 9 is validated embedding,
-// 10 gathers validated last-token rows, 11 casts BF16/FP32, and 12..14 are sub/mul/div.
+// 10 gathers validated last-token rows, 11 casts BF16/FP32, 12..14 are sub/mul/div,
+// and 15 concatenates dynamic feature tensors.
 // A node's output ID is input_count + its index in the program.
 class BucketProgram {
  public:
@@ -2830,7 +2831,7 @@ class BucketProgram {
       const auto& op = operations_[i];
       const int64_t upper = roles_.size() + i;
       TORCH_CHECK((op.size() == 4 || (op.size() == 5 && (op[0] == 4 || op[0] == 5)) ||
-                   (op.size() == 10 && op[0] == 7)) &&
+                   (op.size() == 10 && op[0] == 7) || (op.size() >= 3 && op[0] == 15)) &&
                   op[1] >= 0 && op[1] < upper && op[2] >= 0 &&
                   ((op[0] == 0 && op[2] < upper && (op[3] == -1 || (op[3] >= 0 && op[3] < upper))) ||
                    (op[0] == 1 && op[2] < upper && op[3] == -1) ||
@@ -2853,7 +2854,9 @@ class BucketProgram {
                    (op[0] == 10 && op.size() == 4 && op[2] < static_cast<int64_t>(roles_.size()) &&
                     op[3] == -1) ||
                    (op[0] == 11 && op.size() == 4 && op[2] <= 1 && op[3] == -1) ||
-                   (op[0] >= 12 && op[0] <= 14 && op.size() == 4 && op[2] < upper && op[3] == -1)),
+                   (op[0] >= 12 && op[0] <= 14 && op.size() == 4 && op[2] < upper && op[3] == -1) ||
+                   (op[0] == 15 && std::all_of(op.begin() + 1, op.end(),
+                                               [upper](int64_t id) { return id >= 0 && id < upper; }))),
                   "GaudiRT FX: invalid normalized node");
       if (op[0] == 9) embedding_inputs_[op[1]] = true;
       if (op[0] == 6) {
@@ -2919,6 +2922,21 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
   }
   for (const auto& op : operations_) {
     const auto& a = specs[op[1]];
+    if (op[0] == 15) {
+      TORCH_CHECK(a.dynamic && a.sizes.size() == 2, "GaudiRT FX: invalid cat input");
+      int64_t width = 0;
+      for (size_t i = 1; i < op.size(); ++i) {
+        const auto& input = specs[op[i]];
+        TORCH_CHECK(input.dynamic && input.dtype == a.dtype && input.sizes.size() == 2 &&
+                    input.sizes[1] <= INT64_MAX - width, "GaudiRT FX: invalid cat input geometry");
+        width += input.sizes[1];
+      }
+      specs.push_back({a.dtype, {-1, width}, true});
+      normalized << "n" << op[0];
+      for (size_t i = 1; i < op.size(); ++i) normalized << ":" << op[i];
+      normalized << ";";
+      continue;
+    }
     if (op[0] == 10) {
       const auto& index = specs[op[2]];
       TORCH_CHECK(a.dynamic && a.sizes.size() == 2 && !index.dynamic && index.dtype == at::kInt &&
@@ -3122,6 +3140,13 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
           node({values[op[1]]}, values[id], &params, sizeof(params), "cast_bf16_to_f32");
         else
           node({values[op[1]]}, values[id], nullptr, 0, "gk_cast_f32_to_bf16_v1");
+        continue;
+      }
+      if (op[0] == 15) {
+        std::vector<synTensor> inputs;
+        for (size_t j = 1; j < op.size(); ++j) inputs.push_back(values[op[j]]);
+        synConcatenateParams params{0};
+        node(inputs, values[id], &params, sizeof(params), "concat");
         continue;
       }
       if (op[0] == 9) {

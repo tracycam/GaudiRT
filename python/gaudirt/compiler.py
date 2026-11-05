@@ -47,6 +47,7 @@ def _program_backend(graph_module, example_inputs):
     rotary_targets = (torch.ops.gaudirt._rotary_embedding_validated,
                       torch.ops.gaudirt._rotary_embedding_validated.default)
     split_targets = (torch.split, torch.ops.aten.split_with_sizes.default)
+    cat_targets = (torch.cat, torch.concat, torch.concatenate, torch.ops.aten.cat.default)
     embedding_targets = (torch.nn.functional.embedding, torch.ops.aten.embedding.default)
     index_select_targets = (torch.index_select, torch.ops.aten.index_select.default)
 
@@ -59,6 +60,20 @@ def _program_backend(graph_module, example_inputs):
         if value not in transposes:
             raise RuntimeError("GaudiRT FX: GEMM weight must be transposed")
         return tensor_id(transposes[value])
+
+    def feature_slice(node, source, index):
+        example = source.meta.get("example_value")
+        if not isinstance(example, torch.Tensor) or example.ndim != 2 or not isinstance(example.shape[1], int):
+            raise RuntimeError("GaudiRT FX: feature slice requires a static width")
+        start, stop, step = index.indices(example.shape[1])
+        if step != 1 or stop <= start:
+            raise RuntimeError("GaudiRT FX: feature slice requires a nonempty unit step")
+        source_id = tensor_id(source)
+        if start == 0 and stop == example.shape[1]:
+            ids[node] = source_id
+        else:
+            ids[node] = len(tensor_indices) + len(operations)
+            operations.append([4, source_id, start, stop - start, example.shape[1]])
 
     output, single_output = None, False
     for node in nodes:
@@ -130,6 +145,43 @@ def _program_backend(graph_module, example_inputs):
             continue
         if node.op != "call_function":
             raise RuntimeError(f"GaudiRT FX: unsupported program node {node.op}: {node.target}")
+        if node.target in cat_targets:
+            if len(node.args) not in (1, 2) or set(node.kwargs) - {"dim"} or (
+                len(node.args) == 2 and "dim" in node.kwargs
+            ):
+                raise RuntimeError("GaudiRT FX: unsupported cat arguments")
+            tensors = node.args[0]
+            dim = node.args[1] if len(node.args) == 2 else node.kwargs.get("dim", 0)
+            if not isinstance(tensors, (tuple, list)) or len(tensors) < 2 or dim not in (-1, 1):
+                raise RuntimeError("GaudiRT FX: cat requires at least two feature tensors")
+            ids[node] = len(tensor_indices) + len(operations)
+            operations.append([15, *(tensor_id(value) for value in tensors)])
+            continue
+        if (node.target is operator.getitem and len(node.args) == 2 and not node.kwargs and
+                isinstance(node.args[1], tuple)):
+            source, index = node.args
+            if (len(index) != 2 or index[0] != slice(None) or not isinstance(index[1], slice)):
+                raise RuntimeError("GaudiRT FX: only feature slices with all token rows are supported")
+            feature_slice(node, source, index[1])
+            continue
+        if node.target is torch.ops.aten.slice.Tensor:
+            names = ("dim", "start", "end", "step")
+            if not 1 <= len(node.args) <= 5 or set(node.kwargs) - set(names):
+                raise RuntimeError("GaudiRT FX: unsupported slice arguments")
+            values = [0, None, None, 1]
+            for i, value in enumerate(node.args[1:]):
+                if names[i] in node.kwargs:
+                    raise RuntimeError("GaudiRT FX: duplicate slice argument")
+                values[i] = value
+            for i, name in enumerate(names):
+                if name in node.kwargs:
+                    values[i] = node.kwargs[name]
+            dim, start, end, step = values
+            if dim not in (-1, 1) or any(value is not None and not isinstance(value, int)
+                                         for value in (start, end, step)):
+                raise RuntimeError("GaudiRT FX: invalid feature slice arguments")
+            feature_slice(node, node.args[0], slice(start, end, step))
+            continue
         if node.target in embedding_targets:
             if node.target is torch.nn.functional.embedding:
                 if len(node.args) != 2 or set(node.kwargs) - {
@@ -437,6 +489,8 @@ def compile(module, dynamic_arg_indices=(0,)):
     @functools.wraps(module)
     def execute(*args, **kwargs):
         for index in dynamic_arg_indices:
+            if args[index].ndim > 1:
+                torch._dynamo.mark_static(args[index], list(range(1, args[index].ndim)))
             torch._dynamo.mark_dynamic(args[index], 0, min=1, max=4096)
         with torch._dynamo.config.patch(specialize_float=True, suppress_errors=False,
                                        fail_on_recompile_limit_hit=True), \
