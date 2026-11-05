@@ -2788,6 +2788,78 @@ std::optional<at::Tensor> prepare_strided_input(const at::Tensor& input) {
   return staged.narrow(0, 0, rows);
 }
 
+std::optional<at::Tensor> restore_staged_alias(const at::Tensor& original,
+                                               const at::Tensor& staged,
+                                               const at::Tensor& output) {
+  if (!output.storage().is_alias_of(staged.storage())) return std::nullopt;
+  if (original.storage().is_alias_of(staged.storage())) return output;
+  TORCH_CHECK(output.scalar_type() == original.scalar_type() && staged.is_contiguous(),
+              "GaudiRT FX: unsupported staged output alias");
+  if (output.sizes() == staged.sizes() && output.strides() == staged.strides() &&
+      output.storage_offset() == staged.storage_offset()) return original;
+  TORCH_CHECK(output.storage_offset() >= staged.storage_offset(),
+              "GaudiRT FX: staged output alias is outside the logical input");
+  const auto delta = output.storage_offset() - staged.storage_offset();
+  int64_t maximum = delta;
+  for (int64_t dim = 0; dim < output.dim(); ++dim) {
+    const auto count = std::max<int64_t>(0, output.size(dim) - 1);
+    TORCH_CHECK(output.stride(dim) >= 0 &&
+                (!count || output.stride(dim) <= (INT64_MAX - maximum) / count),
+                "GaudiRT FX: invalid staged output alias stride");
+    maximum += count * output.stride(dim);
+  }
+  TORCH_CHECK(!output.numel() || maximum < original.numel(),
+              "GaudiRT FX: staged output alias is outside the logical input");
+  int64_t scale = 1, expected = 1;
+  bool have_scale = false, uniformly_strided = true;
+  for (int64_t dim = original.dim() - 1; dim >= 0; --dim) {
+    if (original.size(dim) == 1) continue;
+    if (!have_scale) {
+      scale = expected = original.stride(dim);
+      have_scale = true;
+    }
+    if (original.stride(dim) != expected) uniformly_strided = false;
+    TORCH_CHECK(!expected || expected <= INT64_MAX / original.size(dim),
+                "GaudiRT FX: staged output alias stride overflow");
+    expected *= original.size(dim);
+  }
+  if (uniformly_strided) {
+    std::vector<int64_t> strides(output.dim());
+    for (int64_t dim = 0; dim < output.dim(); ++dim) {
+      TORCH_CHECK(!scale || output.stride(dim) <= INT64_MAX / scale,
+                  "GaudiRT FX: staged output alias stride overflow");
+      strides[dim] = output.stride(dim) * scale;
+    }
+    TORCH_CHECK(!scale || delta <= (INT64_MAX - original.storage_offset()) / scale,
+                "GaudiRT FX: staged output alias offset overflow");
+    return original.as_strided(output.sizes(), strides, original.storage_offset() + delta * scale);
+  }
+  std::vector<int64_t> canonical(original.dim()), position(original.dim()), maxima(original.dim());
+  int64_t width = 1;
+  for (int64_t dim = original.dim() - 1; dim >= 0; --dim) {
+    canonical[dim] = width;
+    width *= original.size(dim);
+  }
+  int64_t offset = original.storage_offset();
+  for (int64_t dim = 0; dim < original.dim(); ++dim) {
+    position[dim] = (delta / canonical[dim]) % original.size(dim);
+    maxima[dim] = position[dim];
+    offset += position[dim] * original.stride(dim);
+  }
+  std::vector<int64_t> strides(output.dim(), 0);
+  for (int64_t dim = 0; dim < output.dim(); ++dim) {
+    for (int64_t src = 0; src < original.dim(); ++src) {
+      const auto step = (output.stride(dim) / canonical[src]) % original.size(src);
+      maxima[src] += std::max<int64_t>(0, output.size(dim) - 1) * step;
+      strides[dim] += step * original.stride(src);
+    }
+  }
+  for (int64_t dim = 0; dim < original.dim(); ++dim)
+    TORCH_CHECK(maxima[dim] < original.size(dim),
+                "GaudiRT FX: staged output alias cannot preserve the original layout");
+  return original.as_strided(output.sizes(), strides, offset);
+}
+
 at::Tensor bucket_output(const at::Tensor& reference, at::ScalarType dtype,
                          uint32_t bucket, int64_t rows, int64_t width) {
   const uint64_t item = c10::elementSize(dtype);
@@ -4373,6 +4445,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("recipe_cache_stats", &gaudirt::generic::recipe_cache_stats);
   m.def("_recipe_cache_keys", &gaudirt::generic::recipe_cache_keys);
   m.def("_prepare_strided_input", &gaudirt::generic::prepare_strided_input);
+  m.def("_restore_staged_alias", &gaudirt::generic::restore_staged_alias);
   m.def("bucket_linear", &gaudirt::generic::bucket_linear,
         pybind11::arg("input"), pybind11::arg("weight"), pybind11::arg("bias") = pybind11::none());
   pybind11::class_<gaudirt::generic::BucketProgram>(m, "BucketProgram")

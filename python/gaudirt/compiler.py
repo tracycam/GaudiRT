@@ -12,6 +12,22 @@ import torch.fx.experimental._config
 from . import _C
 
 
+def _restore_staged_outputs(value, replacements):
+    if isinstance(value, torch.Tensor):
+        for original, staged in replacements:
+            alias = _C._restore_staged_alias(original, staged, value)
+            if alias is not None:
+                return alias
+    elif isinstance(value, tuple):
+        values = tuple(_restore_staged_outputs(item, replacements) for item in value)
+        return type(value)(*values) if hasattr(value, "_fields") else values
+    elif isinstance(value, list):
+        return [_restore_staged_outputs(item, replacements) for item in value]
+    elif isinstance(value, dict):
+        return {key: _restore_staged_outputs(item, replacements) for key, item in value.items()}
+    return value
+
+
 def _program_backend(graph_module, example_inputs):
     nodes = tuple(graph_module.graph.nodes)
     placeholders = tuple(node for node in nodes if node.op == "placeholder")
@@ -504,11 +520,13 @@ def compile(module, dynamic_arg_indices=(0,)):
     def execute(*args, **kwargs):
         prepared_args = list(args)
         staged_inputs = {}
+        replacements = []
         for index in dynamic_arg_indices:
             original = args[index]
             if id(original) not in staged_inputs:
                 staged = _C._prepare_strided_input(original)
                 if staged is not None:
+                    replacements.append((original, staged))
                     for name in ("_gaudirt_validated_vocab", "_gaudirt_validated_rows"):
                         if hasattr(original, name):
                             setattr(staged, name, getattr(original, name))
@@ -521,6 +539,8 @@ def compile(module, dynamic_arg_indices=(0,)):
                                        fail_on_recompile_limit_hit=True), \
              torch.fx.experimental._config.patch(backed_size_oblivious=True, use_duck_shape=False), \
              torch._dynamo.error_on_graph_break(True):
-            return compiled(*prepared_args, **kwargs)
+            result = compiled(*prepared_args, **kwargs)
+
+        return _restore_staged_outputs(result, replacements) if replacements else result
 
     return execute
