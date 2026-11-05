@@ -83,6 +83,11 @@ def main():
             positions = positions.to(torch.int32)
         prepared, keep = prepare(locations, requests, positions, mapping, prefixes, lengths, sliced=rows == 137)
         assert prepared.rows() == rows and prepared.slots() == SLOTS
+        indices = gaudirt.validated_last_token_indices(prepared)
+        assert indices.dtype == torch.int32 and getattr(indices, "_gaudirt_validated_rows") == rows
+        expected_indices = torch.cumsum(torch.tensor(lengths, dtype=torch.int32), dim=0) - 1
+        assert torch.equal(indices.cpu().long(), expected_indices)
+        payload.extend(indices.cpu().numpy().tobytes())
         if rows < 4096:
             query_cpu, key_cpu, value_cpu = [torch.randn(rows, width, dtype=torch.bfloat16)
                                             for width in (attention.Q_WIDTH, attention.KV_WIDTH, attention.KV_WIDTH)]
@@ -98,7 +103,7 @@ def main():
                 payload.extend(result[0]); errors.append(result[1]); floors.append(result[2]); absolutes.append(result[3])
             del first, second, result
         print("device metadata rows", rows, "recipe stats", gaudirt.recipe_cache_stats(), flush=True)
-        del prepared, keep
+        del prepared, keep, indices
 
     locations, requests, positions, mapping, prefixes, lengths, row_requests = data(7)
     invalid = locations.clone(); invalid[0] += 1 << 32
