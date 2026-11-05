@@ -3791,7 +3791,8 @@ class PagedMetadata : public torch::CustomClassHolder {
   PagedMetadata(const at::Tensor& locations, const at::Tensor& batch_requests,
                 const at::Tensor& positions, const at::Tensor& mapping,
                 std::vector<int64_t> prefixes, std::vector<int64_t> lengths, int64_t slots,
-                const at::Tensor& token_ids = {}, int64_t vocabulary = 0);
+                const at::Tensor& token_ids = {}, int64_t vocabulary = 0,
+                bool scheduler_owned = false);
   static c10::intrusive_ptr<PagedMetadata> from_device(
       const at::Tensor& locations, const at::Tensor& batch_requests,
       const at::Tensor& positions, const at::Tensor& mapping,
@@ -3807,6 +3808,17 @@ class PagedMetadata : public torch::CustomClassHolder {
     return c10::make_intrusive<PagedMetadata>(locations, batch_requests, positions, mapping,
                                              std::move(prefixes), std::move(lengths), slots,
                                              token_ids, vocabulary);
+  }
+  // Internal scheduler inputs have already been checked at request entry;
+  // slots and request mappings are produced by the scheduler's own pools.
+  static c10::intrusive_ptr<PagedMetadata> from_scheduler(
+      const at::Tensor& locations, const at::Tensor& batch_requests,
+      const at::Tensor& positions, const at::Tensor& mapping,
+      std::vector<int64_t> prefixes, std::vector<int64_t> lengths, int64_t slots,
+      const at::Tensor& token_ids, int64_t vocabulary) {
+    return c10::make_intrusive<PagedMetadata>(locations, batch_requests, positions, mapping,
+                                             std::move(prefixes), std::move(lengths), slots,
+                                             token_ids, vocabulary, true);
   }
   int64_t rows() const { return rows_; }
   int64_t slots() const { return slots_; }
@@ -3861,11 +3873,12 @@ at::Tensor paged_header(const std::shared_ptr<Context>& ctx, int64_t max_positio
 }
 
 ColdRecipe& device_metadata_recipe(Context& ctx, uint32_t bucket, uint64_t requests, uint64_t context,
-                                   int32_t slots, const std::array<int, 4>& lanes, int32_t vocabulary) {
+                                   int32_t slots, const std::array<int, 4>& lanes, int32_t vocabulary,
+                                   bool scheduler_owned) {
   std::ostringstream signature;
   signature << "device_metadata_v1;" << bucket << ":" << requests << ":" << context << ":" << slots;
   for (auto lane : lanes) signature << ":" << lane;
-  signature << ":" << vocabulary;
+  signature << ":" << vocabulary << ":" << scheduler_owned;
   const auto structure = signature.str();
   const auto digest = common::sha256_bytes(reinterpret_cast<const uint8_t*>(structure.data()), structure.size());
   const auto prefix = "g" + digest.substr(0, 12) + "_b" + std::to_string(bucket);
@@ -3914,13 +3927,16 @@ ColdRecipe& device_metadata_recipe(Context& ctx, uint32_t bucket, uint64_t reque
     }
     const auto node = prefix + "_n0";
     check(synNodeCreate(graph, tensors.data(), tensors.data() + 6, 6, 4, &slots, sizeof(slots),
-                        "gk_paged_metadata_i32_v1", node.c_str(), nullptr, nullptr), "node creation failed");
+                        scheduler_owned ? "gk_scheduler_metadata_i32_v1" : "gk_paged_metadata_i32_v1",
+                        node.c_str(), nullptr, nullptr), "node creation failed");
     if (vocabulary) {
       const std::array<synTensor, 2> token_inputs{tensors[10], tensors[4]};
       const std::array<synTensor, 2> token_outputs{tensors[11], tensors[12]};
       const auto token_node = prefix + "_n1";
       check(synNodeCreate(graph, token_inputs.data(), token_outputs.data(), token_inputs.size(), token_outputs.size(),
-                          &vocabulary, sizeof(vocabulary), "gk_token_indices_i32_v1", token_node.c_str(),
+                          &vocabulary, sizeof(vocabulary),
+                          scheduler_owned ? "gk_scheduler_tokens_i32_v1" : "gk_token_indices_i32_v1",
+                          token_node.c_str(),
                           nullptr, nullptr), "token validation node creation failed");
     }
     compiled->recipe = compile_cached(graph, prefix, key, &ctx.cache);
@@ -4029,7 +4045,7 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& requ
 PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batch_requests,
                              const at::Tensor& positions, const at::Tensor& mapping,
                              std::vector<int64_t> prefixes, std::vector<int64_t> lengths, int64_t slots,
-                             const at::Tensor& token_ids, int64_t vocabulary) {
+                             const at::Tensor& token_ids, int64_t vocabulary, bool scheduler_owned) {
   for (const auto& tensor : {locations, batch_requests, positions})
     TORCH_CHECK(tensor.device().type() == c10::kPrivateUse1 && tensor.device().index() == 0 &&
                 tensor.dim() == 1 && (tensor.scalar_type() == at::kInt || tensor.scalar_type() == at::kLong),
@@ -4040,6 +4056,7 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
   const int64_t m = locations.numel(), batch = batch_requests.numel();
   const int64_t request_count = mapping.size(0), context = mapping.size(1);
   const bool has_tokens = token_ids.defined();
+  TORCH_CHECK(!scheduler_owned || has_tokens, "GaudiRT: scheduler metadata requires token IDs");
   TORCH_CHECK((has_tokens && token_ids.device().type() == c10::kPrivateUse1 && token_ids.device().index() == 0 &&
                token_ids.dim() == 1 && token_ids.numel() == m &&
                (token_ids.scalar_type() == at::kInt || token_ids.scalar_type() == at::kLong) &&
@@ -4123,7 +4140,7 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
   {
     std::lock_guard lock(ctx->cold_mutex);
     auto& recipe = device_metadata_recipe(*ctx, bucket, request_count, context, static_cast<int32_t>(slots),
-                                          lanes, static_cast<int32_t>(vocabulary));
+                                          lanes, static_cast<int32_t>(vocabulary), scheduler_owned);
     auto graph_pool = [&]() -> GraphPool& {
       if (!ctx->graph_pool) {
         const uint64_t budget = std::min<uint64_t>(ctx->allocator.capacity_bytes() / 8, uint64_t{1} << 30);
@@ -4177,28 +4194,30 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
     TORCH_CHECK(synLaunch(compute, bindings.data(), bindings.size(), workspace ? workspace->address : 0,
                           recipe.recipe, 0) == synSuccess, "GaudiRT device metadata: validation launch failed");
   }
-  auto d2h = ctx->device.d2h_stream();
-  StreamEvent ready(ctx->device.device_id()), completed(ctx->device.device_id());
-  ready.record(compute);
-  ready.wait(d2h);
-  ctx->allocator.record_stream(status_address, d2h);
-  TemporaryHost host_status(*ctx, static_cast<uint64_t>(m) * sizeof(int32_t) * (has_tokens ? 2 : 1));
-  ctx->pinned.copy_d2h(host_status.address, status_address, static_cast<uint64_t>(m) * sizeof(int32_t), d2h, true);
-  if (has_tokens) {
-    const auto token_status_address = address_of(token_status, *ctx);
-    ctx->allocator.record_stream(token_status_address, d2h);
-    ctx->pinned.copy_d2h(static_cast<int32_t*>(host_status.address) + m, token_status_address,
-                         static_cast<uint64_t>(m) * sizeof(int32_t), d2h, true);
-  }
-  completed.record(d2h);
-  completed.synchronize();
-  const auto* flags = static_cast<const int32_t*>(host_status.address);
-  for (int64_t row = 0; row < m; ++row)
-    TORCH_CHECK(flags[row] == 0, "GaudiRT device metadata: invalid scheduler metadata at row ", row,
-                ", code ", flags[row]);
-  if (has_tokens)
+  if (!scheduler_owned) {
+    auto d2h = ctx->device.d2h_stream();
+    StreamEvent ready(ctx->device.device_id()), completed(ctx->device.device_id());
+    ready.record(compute);
+    ready.wait(d2h);
+    ctx->allocator.record_stream(status_address, d2h);
+    TemporaryHost host_status(*ctx, static_cast<uint64_t>(m) * sizeof(int32_t) * (has_tokens ? 2 : 1));
+    ctx->pinned.copy_d2h(host_status.address, status_address, static_cast<uint64_t>(m) * sizeof(int32_t), d2h, true);
+    if (has_tokens) {
+      const auto token_status_address = address_of(token_status, *ctx);
+      ctx->allocator.record_stream(token_status_address, d2h);
+      ctx->pinned.copy_d2h(static_cast<int32_t*>(host_status.address) + m, token_status_address,
+                           static_cast<uint64_t>(m) * sizeof(int32_t), d2h, true);
+    }
+    completed.record(d2h);
+    completed.synchronize();
+    const auto* flags = static_cast<const int32_t*>(host_status.address);
     for (int64_t row = 0; row < m; ++row)
-      TORCH_CHECK(flags[m + row] == 0, "GaudiRT device metadata: token ID outside vocabulary at row ", row);
+      TORCH_CHECK(flags[row] == 0, "GaudiRT device metadata: invalid scheduler metadata at row ", row,
+                  ", code ", flags[row]);
+    if (has_tokens)
+      for (int64_t row = 0; row < m; ++row)
+        TORCH_CHECK(flags[m + row] == 0, "GaudiRT device metadata: token ID outside vocabulary at row ", row);
+  }
   rows_ = m;
   slots_ = slots;
   request_count_ = request_count;
@@ -4662,6 +4681,7 @@ TORCH_LIBRARY(gaudirt, m) {
       .def(torch::init<at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t>())
       .def_static("from_device", &gaudirt::generic::PagedMetadata::from_device)
       .def_static("from_device_with_tokens", &gaudirt::generic::PagedMetadata::from_device_with_tokens)
+      .def_static("_from_scheduler", &gaudirt::generic::PagedMetadata::from_scheduler)
       .def("rows", &gaudirt::generic::PagedMetadata::rows)
       .def("slots", &gaudirt::generic::PagedMetadata::slots)
       .def("context", &gaudirt::generic::PagedMetadata::context)
