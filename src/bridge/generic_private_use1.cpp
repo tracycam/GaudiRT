@@ -31,11 +31,20 @@
 #include <sstream>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace gaudirt::generic {
 using namespace runtime;
 
 struct AllocationLease;
+struct Context;
+struct EventState {
+  Context* owner;
+  synEventHandle handle;
+  bool timing;
+};
+std::mutex event_mutex;
+void invalidate_events(Context& ctx);
 thread_local c10::StreamId active_stream_id = 0;
 
 class StreamRegistry {
@@ -90,6 +99,7 @@ struct Context {
     try { streams.synchronize(); } catch (...) {}
     synStreamSynchronize(device.h2d_stream());
     synStreamSynchronize(device.d2h_stream());
+    invalidate_events(*this);
   }
   synStreamHandle stream() { return streams.get(active_stream_id); }
   void synchronize_stream() {
@@ -116,9 +126,20 @@ struct Context {
   std::unordered_map<std::string, std::unique_ptr<ColdRecipe>> cold_recipes;
   std::mutex leases_mutex;
   std::unordered_map<uint64_t, std::shared_ptr<AllocationLease>> leases;
+  std::unordered_set<EventState*> events;
   uint64_t next_lease = 1;
   bool closing = false;
 };
+
+void invalidate_events(Context& ctx) {
+  std::lock_guard lock(event_mutex);
+  for (auto* event : ctx.events) {
+    if (event->handle) synEventDestroy(event->handle);
+    event->handle = nullptr;
+    event->owner = nullptr;
+  }
+  ctx.events.clear();
+}
 
 struct AllocationLease {
   AllocationLease(std::shared_ptr<Context> owner, uint64_t address, bool pinned)
@@ -306,6 +327,80 @@ class Guard final : public c10::impl::DeviceGuardImplInterface {
   }
   void* getStreamNativeHandle(const c10::Stream stream) const override {
     return checked(stream.device())->streams.get(stream.id());
+  }
+  void record(void** event, const c10::Stream& stream, c10::DeviceIndex index,
+              c10::EventFlag flag) const override {
+    TORCH_CHECK(index < 0 || index == 0, "GaudiRT: invalid event device");
+    TORCH_CHECK(flag == c10::EventFlag::PYTORCH_DEFAULT || flag == c10::EventFlag::BACKEND_DEFAULT,
+                "GaudiRT: unsupported event flags");
+    auto ctx = checked(stream.device());
+    auto native = ctx->streams.get(stream.id());
+    std::lock_guard lock(event_mutex);
+    if (!*event) {
+      auto state = std::make_unique<EventState>();
+      state->owner = ctx.get();
+      state->timing = flag == c10::EventFlag::BACKEND_DEFAULT;
+      state->handle = nullptr;
+      TORCH_CHECK(synEventCreate(&state->handle, ctx->device.device_id(),
+                                 state->timing ? EVENT_COLLECT_TIME : 0) == synSuccess,
+                  "GaudiRT: event creation failed");
+      try { ctx->events.insert(state.get()); }
+      catch (...) { synEventDestroy(state->handle); throw; }
+      *event = state.release();
+    }
+    auto* state = static_cast<EventState*>(*event);
+    TORCH_CHECK(state->owner == ctx.get() && state->handle,
+                "GaudiRT: event belongs to a different or shut down runtime");
+    TORCH_CHECK(synEventRecord(state->handle, native) == synSuccess, "GaudiRT: event record failed");
+  }
+  void destroyEvent(void* event, c10::DeviceIndex) const noexcept override {
+    if (!event) return;
+    std::lock_guard lock(event_mutex);
+    auto* state = static_cast<EventState*>(event);
+    if (state->owner) {
+      state->owner->events.erase(state);
+      if (state->handle) synEventDestroy(state->handle);
+    }
+    delete state;
+  }
+  void block(void* event, const c10::Stream& stream) const override {
+    if (!event) return;
+    auto ctx = checked(stream.device());
+    auto native = ctx->streams.get(stream.id());
+    std::lock_guard lock(event_mutex);
+    auto* state = static_cast<EventState*>(event);
+    TORCH_CHECK(state->owner == ctx.get() && state->handle,
+                "GaudiRT: event belongs to a different or shut down runtime");
+    TORCH_CHECK(synStreamWaitEvent(native, state->handle, 0) == synSuccess,
+                "GaudiRT: stream event wait failed");
+  }
+  bool queryEvent(void* event) const override {
+    if (!event) return true;
+    std::lock_guard lock(event_mutex);
+    auto* state = static_cast<EventState*>(event);
+    TORCH_CHECK(state->owner && state->handle, "GaudiRT: event belongs to a shut down runtime");
+    const auto status = synEventQuery(state->handle);
+    TORCH_CHECK(status == synSuccess || status == synBusy, "GaudiRT: event query failed");
+    return status == synSuccess;
+  }
+  void synchronizeEvent(void* event) const override {
+    if (!event) return;
+    std::lock_guard lock(event_mutex);
+    auto* state = static_cast<EventState*>(event);
+    TORCH_CHECK(state->owner && state->handle, "GaudiRT: event belongs to a shut down runtime");
+    TORCH_CHECK(synEventSynchronize(state->handle) == synSuccess, "GaudiRT: event synchronization failed");
+  }
+  double elapsedTime(void* first, void* second, c10::DeviceIndex index) const override {
+    TORCH_CHECK((index < 0 || index == 0) && first && second, "GaudiRT: invalid timing events");
+    std::lock_guard lock(event_mutex);
+    auto* start = static_cast<EventState*>(first);
+    auto* end = static_cast<EventState*>(second);
+    TORCH_CHECK(start->owner && start->owner == end->owner && start->handle && end->handle &&
+                start->timing && end->timing, "GaudiRT: events do not support timing");
+    uint64_t ns = 0;
+    TORCH_CHECK(synEventElapsedTime(&ns, start->handle, end->handle) == synSuccess,
+                "GaudiRT: event elapsed time failed");
+    return static_cast<double>(ns) * 1e-6;
   }
   c10::DeviceIndex deviceCount() const noexcept override { return 1; }
   bool queryStream(const c10::Stream& stream) const override {

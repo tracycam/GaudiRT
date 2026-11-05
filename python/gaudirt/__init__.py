@@ -33,6 +33,13 @@ class Stream(torch.Stream):
         return super().__new__(cls, device="gaudirt:0", priority=priority)
 
 
+class Event:
+    def __new__(cls, enable_timing=False, blocking=False, interprocess=False):
+        if blocking or interprocess:
+            raise ValueError("GaudiRT: blocking and interprocess events are unsupported")
+        return torch.Event(device="gaudirt:0", enable_timing=enable_timing)
+
+
 def set_device(device):
     if device not in (0, "gaudirt", "gaudirt:0", torch.device("gaudirt:0")):
         raise ValueError("GaudiRT: invalid device")
