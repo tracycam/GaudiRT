@@ -3115,6 +3115,9 @@ class PagedMetadata : public torch::CustomClassHolder {
   int64_t context() const { return context_; }
   at::Tensor rotary_positions() const { return positions_.narrow(0, 0, rows_); }
   at::Tensor rotary_header() const { return header_; }
+  at::Tensor row_locations() const { return locations_.narrow(0, 0, rows_); }
+  at::Tensor row_requests() const { return requests_.narrow(0, 0, rows_); }
+  at::Tensor request_mapping() const { return mapping_; }
   at::Tensor token_ids() const {
     TORCH_CHECK(token_ids_.defined(), "GaudiRT: token IDs were not validated in this metadata");
     return token_ids_.narrow(0, 0, rows_);
@@ -3466,7 +3469,12 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
   bucket_ = bucket;
 }
 
-ColdRecipe& paged_recipe(Context& ctx, const PagedMetadata& metadata, uint64_t q_width,
+struct PagedGeometry {
+  int64_t rows_, slots_, request_count_, context_;
+  uint32_t bucket_;
+};
+
+ColdRecipe& paged_recipe(Context& ctx, const PagedGeometry& metadata, uint64_t q_width,
                          uint64_t kv_width, int32_t head_dim, float scale, bool store) {
   std::ostringstream signature;
   signature << (store ? "paged_store_v1;" : "paged_gqa_v1;") << metadata.bucket_ << ":"
@@ -3544,10 +3552,10 @@ ColdRecipe& paged_recipe(Context& ctx, const PagedMetadata& metadata, uint64_t q
   return *it->second;
 }
 
-at::Tensor paged_attn(const at::Tensor& query, const at::Tensor& key, const at::Tensor& value,
-                      const at::Tensor& key_pool, const at::Tensor& value_pool,
-                      c10::intrusive_ptr<PagedMetadata> metadata, int64_t head_dim, double scale) {
-  TORCH_CHECK(metadata, "GaudiRT paged attention: metadata is required");
+at::Tensor paged_attn_validated(const at::Tensor& query, const at::Tensor& key, const at::Tensor& value,
+    const at::Tensor& key_pool, const at::Tensor& value_pool, const at::Tensor& locations,
+    const at::Tensor& requests, const at::Tensor& positions, const at::Tensor& mapping,
+    const at::Tensor& header, int64_t head_dim, double scale) {
   TORCH_CHECK((head_dim == 64 || head_dim == 128) && std::isfinite(scale) && scale > 0 &&
               std::isfinite(static_cast<float>(scale)) && static_cast<float>(scale) > 0,
               "GaudiRT paged attention: invalid head dimension or scale");
@@ -3555,12 +3563,29 @@ at::Tensor paged_attn(const at::Tensor& query, const at::Tensor& key, const at::
     TORCH_CHECK(tensor.device().type() == c10::kPrivateUse1 && tensor.device().index() == 0 &&
                 tensor.scalar_type() == at::kBFloat16, "GaudiRT paged attention: expected gaudirt BF16 tensors");
   TORCH_CHECK(query.dim() == 2 && key.dim() == 2 && value.dim() == 2 &&
-              query.size(0) == metadata->rows_ && key.size(0) == metadata->rows_ &&
+              query.size(0) > 0 && query.size(0) <= 4096 && key.size(0) == query.size(0) &&
               value.sizes() == key.sizes(), "GaudiRT paged attention: invalid token tensor geometry");
+  TORCH_CHECK(mapping.device() == query.device() && mapping.scalar_type() == at::kInt &&
+              mapping.dim() == 2 && mapping.is_contiguous() && mapping.size(0) > 0 && mapping.size(1) > 0,
+              "GaudiRT paged attention: invalid validated request map");
+  const PagedGeometry geometry{query.size(0), key_pool.size(0), mapping.size(0), mapping.size(1),
+                               std::bit_ceil(static_cast<uint32_t>(query.size(0)))};
+  for (const auto& tensor : {locations, requests, positions}) {
+    TORCH_CHECK(tensor.device() == query.device() && tensor.scalar_type() == at::kInt &&
+                tensor.dim() == 1 && tensor.size(0) == geometry.rows_ && tensor.is_contiguous() &&
+                tensor.storage_offset() >= 0 &&
+                static_cast<uint64_t>(tensor.storage_offset()) * sizeof(int32_t) <= tensor.storage().nbytes() &&
+                static_cast<uint64_t>(geometry.bucket_) * sizeof(int32_t) <= tensor.storage().nbytes() -
+                    static_cast<uint64_t>(tensor.storage_offset()) * sizeof(int32_t),
+                "GaudiRT paged attention: invalid validated row metadata");
+  }
+  TORCH_CHECK(header.device() == query.device() && header.scalar_type() == at::kInt && header.dim() == 1 &&
+              header.size(0) == 1 && header.is_contiguous(),
+              "GaudiRT paged attention: invalid validated header");
   TORCH_CHECK((key_pool.dim() == 2 || key_pool.dim() == 3) && key_pool.sizes() == value_pool.sizes() &&
-              key_pool.is_contiguous() && value_pool.is_contiguous() && key_pool.size(0) == metadata->slots_,
+              key_pool.is_contiguous() && value_pool.is_contiguous() && key_pool.size(0) > 0,
               "GaudiRT paged attention: expected matching contiguous NHD KV pools");
-  const int64_t kv_width = key_pool.numel() / metadata->slots_, q_width = query.size(1);
+  const int64_t kv_width = key_pool.numel() / geometry.slots_, q_width = query.size(1);
   TORCH_CHECK(kv_width > 0 && q_width > 0 && key.size(1) == kv_width &&
               kv_width % head_dim == 0 && q_width % kv_width == 0 &&
               (key_pool.dim() != 3 || key_pool.size(2) == head_dim),
@@ -3573,11 +3598,11 @@ at::Tensor paged_attn(const at::Tensor& query, const at::Tensor& key, const at::
               v_pool_address % BlockCachingAllocator::kAlignment == 0 &&
               !(k_pool_address < v_pool_address + pool_bytes && v_pool_address < k_pool_address + pool_bytes),
               "GaudiRT paged attention: KV pools must be aligned and disjoint");
-  auto result = bucket_output(query, at::kBFloat16, metadata->bucket_, metadata->rows_, q_width);
+  auto result = bucket_output(query, at::kBFloat16, geometry.bucket_, geometry.rows_, q_width);
   const auto result_address = address_of(result, *ctx);
   std::lock_guard lock(ctx->cold_mutex);
-  auto& write_recipe = paged_recipe(*ctx, *metadata, q_width, kv_width, head_dim, static_cast<float>(scale), true);
-  auto& attention_recipe = paged_recipe(*ctx, *metadata, q_width, kv_width, head_dim, static_cast<float>(scale), false);
+  auto& write_recipe = paged_recipe(*ctx, geometry, q_width, kv_width, head_dim, static_cast<float>(scale), true);
+  auto& attention_recipe = paged_recipe(*ctx, geometry, q_width, kv_width, head_dim, static_cast<float>(scale), false);
   auto graph_pool = [&]() -> GraphPool& {
     if (!ctx->graph_pool) {
       const uint64_t budget = std::min<uint64_t>(ctx->allocator.capacity_bytes() / 8, uint64_t{1} << 30);
@@ -3607,17 +3632,20 @@ at::Tensor paged_attn(const at::Tensor& query, const at::Tensor& key, const at::
   };
   const std::vector<std::pair<uint64_t, uint64_t>> pools{{k_pool_address, pool_bytes}, {v_pool_address, pool_bytes}};
   auto reserved = pools;
-  const uint64_t kv_bytes = static_cast<uint64_t>(metadata->bucket_) * kv_width * sizeof(uint16_t);
-  const uint64_t q_bytes = static_cast<uint64_t>(metadata->bucket_) * q_width * sizeof(uint16_t);
+  const uint64_t kv_bytes = static_cast<uint64_t>(geometry.bucket_) * kv_width * sizeof(uint16_t);
+  const uint64_t q_bytes = static_cast<uint64_t>(geometry.bucket_) * q_width * sizeof(uint16_t);
   const auto key_address = bind_input(key, kv_bytes, reserved);
   reserved.emplace_back(key_address, kv_bytes);
   const auto value_address = bind_input(value, kv_bytes, reserved);
   const auto query_address = bind_input(query, q_bytes, pools);
-  const auto location_address = address_of(metadata->locations_, *ctx);
-  const auto request_address = address_of(metadata->requests_, *ctx);
-  const auto position_address = address_of(metadata->positions_, *ctx);
-  const auto mapping_address = address_of(metadata->mapping_, *ctx);
-  const auto header_address = address_of(metadata->header_, *ctx);
+  const auto location_address = address_of(locations, *ctx);
+  const auto request_address = address_of(requests, *ctx);
+  const auto position_address = address_of(positions, *ctx);
+  const auto mapping_address = address_of(mapping, *ctx);
+  const auto header_address = address_of(header, *ctx);
+  for (const auto address : {location_address, request_address, position_address, mapping_address, header_address})
+    TORCH_CHECK(address % BlockCachingAllocator::kAlignment == 0,
+                "GaudiRT paged attention: validated metadata must be aligned");
   for (const auto address : {k_pool_address, v_pool_address, result_address, location_address,
                              request_address, position_address, mapping_address, header_address})
     ctx->allocator.record_stream(address, stream);
@@ -3639,6 +3667,15 @@ at::Tensor paged_attn(const at::Tensor& query, const at::Tensor& key, const at::
   TORCH_CHECK(synLaunch(stream, attention_bindings.data(), attention_bindings.size(), workspace_address,
                         attention_recipe.recipe, 0) == synSuccess, "GaudiRT paged attention: attention launch failed");
   return result;
+}
+
+at::Tensor paged_attn(const at::Tensor& query, const at::Tensor& key, const at::Tensor& value,
+                      const at::Tensor& key_pool, const at::Tensor& value_pool,
+                      c10::intrusive_ptr<PagedMetadata> metadata, int64_t head_dim, double scale) {
+  TORCH_CHECK(metadata, "GaudiRT paged attention: metadata is required");
+  return paged_attn_validated(query, key, value, key_pool, value_pool,
+                              metadata->row_locations(), metadata->row_requests(), metadata->rotary_positions(),
+                              metadata->request_mapping(), metadata->rotary_header(), head_dim, scale);
 }
 
 ColdRecipe& rotary_recipe(Context& ctx, uint32_t bucket, uint64_t q_width,
@@ -3816,6 +3853,9 @@ TORCH_LIBRARY(gaudirt, m) {
       .def("context", &gaudirt::generic::PagedMetadata::context)
       .def("rotary_positions", &gaudirt::generic::PagedMetadata::rotary_positions)
       .def("rotary_header", &gaudirt::generic::PagedMetadata::rotary_header)
+      .def("row_locations", &gaudirt::generic::PagedMetadata::row_locations)
+      .def("row_requests", &gaudirt::generic::PagedMetadata::row_requests)
+      .def("request_mapping", &gaudirt::generic::PagedMetadata::request_mapping)
       .def("token_ids", &gaudirt::generic::PagedMetadata::token_ids)
       .def("vocabulary", &gaudirt::generic::PagedMetadata::vocabulary);
   m.def("rms_norm(Tensor input, Tensor weight, float epsilon) -> Tensor");
@@ -3823,6 +3863,9 @@ TORCH_LIBRARY(gaudirt, m) {
   m.def("silu_and_mul(Tensor input) -> Tensor");
   m.def("paged_attn(Tensor query, Tensor key, Tensor value, Tensor(a!) key_pool, Tensor(b!) value_pool, "
         "__torch__.torch.classes.gaudirt.PagedMetadata metadata, int head_dim, float scale) -> Tensor");
+  m.def("_paged_attn_validated(Tensor query, Tensor key, Tensor value, Tensor(a!) key_pool, Tensor(b!) value_pool, "
+        "Tensor locations, Tensor requests, Tensor positions, Tensor mapping, Tensor header, "
+        "int head_dim, float scale) -> Tensor");
   m.def("rotary_embedding(Tensor query, Tensor key, Tensor cache, "
         "__torch__.torch.classes.gaudirt.PagedMetadata metadata, int head_dim, int rotary_dim, bool is_neox) "
         "-> (Tensor, Tensor)");
@@ -3835,6 +3878,7 @@ TORCH_LIBRARY_IMPL(gaudirt, PrivateUse1, m) {
   m.impl("fused_add_rms_norm", TORCH_FN(gaudirt::generic::bucket_fused_add_rms_norm));
   m.impl("silu_and_mul", TORCH_FN(gaudirt::generic::bucket_silu_and_mul));
   m.impl("paged_attn", TORCH_FN(gaudirt::generic::paged_attn));
+  m.impl("_paged_attn_validated", TORCH_FN(gaudirt::generic::paged_attn_validated));
   m.impl("rotary_embedding", TORCH_FN(gaudirt::generic::rotary_embedding));
   m.impl("_rotary_embedding_validated", TORCH_FN(gaudirt::generic::rotary_embedding_validated));
 }
