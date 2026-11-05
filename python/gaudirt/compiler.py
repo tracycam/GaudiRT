@@ -402,14 +402,19 @@ def _program_backend(graph_module, example_inputs):
             if (isinstance(left, torch.Tensor) and isinstance(right, torch.Tensor) and
                     left.ndim == right.ndim == 3):
                 operation = [16, tensor_id(node.args[0]), tensor_id(node.args[1]), -1]
-            else:
+            elif node.args[1] in transposes:
                 operation = [0, tensor_id(node.args[0]), weight_id(node.args[1]), -1]
+            else:
+                operation = [24, tensor_id(node.args[0]), tensor_id(node.args[1]), -1]
         elif node.target in addmm_targets and len(node.args) == 3:
             if set(node.kwargs) - {"alpha", "beta"} or any(
                 not isinstance(value, (int, float)) or value != 1 for value in node.kwargs.values()
             ):
                 raise RuntimeError("GaudiRT FX: addmm requires alpha=beta=1")
-            operation = [0, tensor_id(node.args[1]), weight_id(node.args[2]), tensor_id(node.args[0])]
+            if node.args[2] in transposes:
+                operation = [0, tensor_id(node.args[1]), weight_id(node.args[2]), tensor_id(node.args[0])]
+            else:
+                operation = [24, tensor_id(node.args[1]), tensor_id(node.args[2]), tensor_id(node.args[0])]
         elif node.target in add_targets and len(node.args) == 2:
             if set(node.kwargs) - {"alpha"} or node.kwargs.get("alpha", 1) != 1:
                 raise RuntimeError("GaudiRT FX: add requires alpha=1")
@@ -575,6 +580,12 @@ def gaudirt_backend(graph_module, example_inputs):
         accepted.add(node)
         return node.args[0]
 
+    def has_transposed_weight(node):
+        return isinstance(node, torch.fx.Node) and (
+            (node.op == "call_method" and node.target in ("t", "transpose")) or
+            (node.op == "call_function" and node.target in (torch.transpose, torch.ops.aten.transpose.int))
+        )
+
     if gemm.target in mm_targets and len(gemm.args) == 2:
         if gemm.kwargs:
             raise RuntimeError("GaudiRT FX: unsupported GEMM arguments")
@@ -583,6 +594,8 @@ def gaudirt_backend(graph_module, example_inputs):
         right = transposed.meta.get("example_value")
         if (isinstance(left, torch.Tensor) and isinstance(right, torch.Tensor) and
                 left.ndim == right.ndim == 3):
+            return _program_backend(graph_module, example_inputs)
+        if not has_transposed_weight(transposed):
             return _program_backend(graph_module, example_inputs)
         weight_node = transposed_weight(transposed)
     elif gemm.target in addmm_targets and len(gemm.args) == 3:
@@ -593,6 +606,8 @@ def gaudirt_backend(graph_module, example_inputs):
         bias_node, input_node, transposed = gemm.args
         if bias_node not in placeholders:
             raise RuntimeError("GaudiRT FX: addmm bias must be an external tensor")
+        if not has_transposed_weight(transposed):
+            return _program_backend(graph_module, example_inputs)
         weight_node = transposed_weight(transposed)
     elif gemm.target in linear_targets and len(gemm.args) in (2, 3):
         input_node, weight_node = gemm.args[:2]
