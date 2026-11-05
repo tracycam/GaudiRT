@@ -36,6 +36,41 @@ namespace gaudirt::generic {
 using namespace runtime;
 
 struct AllocationLease;
+thread_local c10::StreamId active_stream_id = 0;
+
+class StreamRegistry {
+ public:
+  StreamRegistry(synDeviceId device, synStreamHandle primary) : device_(device), streams_{primary} {}
+  ~StreamRegistry() {
+    for (size_t i = 1; i < streams_.size(); ++i) {
+      synStreamSynchronize(streams_[i]);
+      synStreamDestroy(streams_[i]);
+    }
+  }
+  c10::StreamId create() {
+    synStreamHandle stream = nullptr;
+    TORCH_CHECK(synStreamCreateGeneric(&stream, device_, 0) == synSuccess,
+                "GaudiRT: stream creation failed");
+    std::lock_guard lock(mutex_);
+    try { streams_.push_back(stream); }
+    catch (...) { synStreamDestroy(stream); throw; }
+    return static_cast<c10::StreamId>(streams_.size() - 1);
+  }
+  synStreamHandle get(c10::StreamId id) {
+    std::lock_guard lock(mutex_);
+    TORCH_CHECK(id >= 0 && static_cast<size_t>(id) < streams_.size(), "GaudiRT: invalid stream");
+    return streams_[static_cast<size_t>(id)];
+  }
+  void synchronize() {
+    std::lock_guard lock(mutex_);
+    for (auto stream : streams_)
+      TORCH_CHECK(synStreamSynchronize(stream) == synSuccess, "GaudiRT: stream synchronization failed");
+  }
+ private:
+  synDeviceId device_;
+  std::mutex mutex_;
+  std::vector<synStreamHandle> streams_;
+};
 
 struct ColdRecipe {
   explicit ColdRecipe(size_t count = 2) : names(count), tensors(count) {}
@@ -48,13 +83,19 @@ struct ColdRecipe {
 
 struct Context {
   Context(uint32_t module, uint64_t hbm_bytes, uint64_t pinned_bytes)
-      : device(config(module)), allocator(device.device_id(), hbm_bytes),
+      : device(config(module)), streams(device.device_id(), device.compute_stream()),
+        allocator(device.device_id(), hbm_bytes),
         pinned(device.device_id(), pinned_bytes), cache(cache_path()) {}
   ~Context() {
-    synStreamSynchronize(device.compute_stream());
+    try { streams.synchronize(); } catch (...) {}
     synStreamSynchronize(device.h2d_stream());
     synStreamSynchronize(device.d2h_stream());
   }
+  synStreamHandle stream() { return streams.get(active_stream_id); }
+  void synchronize_stream() {
+    TORCH_CHECK(synStreamSynchronize(stream()) == synSuccess, "GaudiRT: stream synchronization failed");
+  }
+  void synchronize_all() { streams.synchronize(); device.synchronize_all(); }
   static std::filesystem::path cache_path() {
     const char* path = std::getenv("GAUDIRT_RECIPE_CACHE");
     return path ? std::filesystem::path(path) : std::filesystem::path{};
@@ -66,6 +107,7 @@ struct Context {
     return cfg;
   }
   DeviceRuntime device;
+  StreamRegistry streams;
   BlockCachingAllocator allocator;
   std::unique_ptr<GraphPool> graph_pool;
   PinnedHostPool pinned;
@@ -151,6 +193,13 @@ uint64_t address_of(const at::Tensor& tensor, const Context& ctx) {
   return address;
 }
 
+void record_stream(at::Tensor& tensor, c10::Stream stream) {
+  auto ctx = current();
+  TORCH_CHECK(stream.device_type() == c10::kPrivateUse1 && stream.device_index() == 0,
+              "GaudiRT: record_stream requires a gaudirt:0 stream");
+  if (tensor.numel()) ctx->allocator.record_stream(address_of(tensor, *ctx), ctx->streams.get(stream.id()));
+}
+
 c10::Allocator* pinned_allocator();
 
 class Hooks final : public at::PrivateUse1HooksInterface {
@@ -178,7 +227,7 @@ class Allocator final : public c10::Allocator {
   c10::DataPtr allocate(size_t bytes) override {
     auto ctx = current();
     if (!bytes) return {nullptr, c10::Device(c10::kPrivateUse1, 0)};
-    const uint64_t address = ctx->allocator.allocate(bytes, ctx->device.compute_stream());
+    const uint64_t address = ctx->allocator.allocate(bytes, ctx->stream());
     auto lease = make_lease(ctx, address, false);
     try {
       return c10::InefficientStdFunctionContext::makeDataPtr(
@@ -192,10 +241,10 @@ class Allocator final : public c10::Allocator {
   void copy_data(void* dst, const void* src, size_t bytes) const override {
     if (!bytes) return;
     auto ctx = current();
-    ctx->allocator.record_stream(reinterpret_cast<uint64_t>(src), ctx->device.compute_stream());
-    ctx->allocator.record_stream(reinterpret_cast<uint64_t>(dst), ctx->device.compute_stream());
+    ctx->allocator.record_stream(reinterpret_cast<uint64_t>(src), ctx->stream());
+    ctx->allocator.record_stream(reinterpret_cast<uint64_t>(dst), ctx->stream());
     PinnedHostPool::copy_d2d(reinterpret_cast<uint64_t>(dst), reinterpret_cast<uint64_t>(src),
-                             bytes, ctx->device.compute_stream(), false);
+                             bytes, ctx->stream(), false);
   }
 };
 
@@ -231,25 +280,50 @@ class Guard final : public c10::impl::DeviceGuardImplInterface {
   void setDevice(c10::Device device) const override { checked(device); }
   void uncheckedSetDevice(c10::Device) const noexcept override {}
   c10::Stream getStream(c10::Device device) const override {
-    checked(device); return c10::Stream(c10::Stream::DEFAULT, c10::Device(type(), 0));
+    auto ctx = checked(device);
+    ctx->streams.get(active_stream_id);
+    return c10::Stream(c10::Stream::UNSAFE, c10::Device(type(), 0), active_stream_id);
+  }
+  c10::Stream getDefaultStream(c10::Device device) const override {
+    checked(device);
+    return c10::Stream(c10::Stream::DEFAULT, c10::Device(type(), 0));
+  }
+  c10::Stream getNewStream(c10::Device device, int priority) const override {
+    TORCH_CHECK(priority == 0, "GaudiRT: stream priorities are unsupported");
+    auto ctx = checked(device);
+    return c10::Stream(c10::Stream::UNSAFE, c10::Device(type(), 0), ctx->streams.create());
+  }
+  c10::Stream getStreamFromGlobalPool(c10::Device device, bool high_priority) const override {
+    TORCH_CHECK(!high_priority, "GaudiRT: stream priorities are unsupported");
+    return getNewStream(device, 0);
   }
   c10::Stream exchangeStream(c10::Stream stream) const override {
-    checked(stream.device());
-    TORCH_CHECK(stream.id() == 0, "GaudiRT: only the default stream is supported");
-    return c10::Stream(c10::Stream::DEFAULT, c10::Device(type(), 0));
+    auto ctx = checked(stream.device());
+    ctx->streams.get(stream.id());
+    const auto previous = active_stream_id;
+    active_stream_id = stream.id();
+    return c10::Stream(c10::Stream::UNSAFE, c10::Device(type(), 0), previous);
+  }
+  void* getStreamNativeHandle(const c10::Stream stream) const override {
+    return checked(stream.device())->streams.get(stream.id());
   }
   c10::DeviceIndex deviceCount() const noexcept override { return 1; }
   bool queryStream(const c10::Stream& stream) const override {
     auto ctx = checked(stream.device());
-    auto status = synStreamQuery(ctx->device.compute_stream());
+    auto status = synStreamQuery(ctx->streams.get(stream.id()));
     TORCH_CHECK(status == synSuccess || status == synBusy, "GaudiRT: stream query failed");
     return status == synSuccess;
   }
   void synchronizeStream(const c10::Stream& stream) const override {
-    checked(stream.device())->device.synchronize_compute();
+    TORCH_CHECK(synStreamSynchronize(checked(stream.device())->streams.get(stream.id())) == synSuccess,
+                "GaudiRT: stream synchronization failed");
   }
   void synchronizeDevice(c10::DeviceIndex index) const override {
-    checked({type(), index})->device.synchronize_all();
+    checked({type(), index})->synchronize_all();
+  }
+  void recordDataPtrOnStream(const c10::DataPtr& data, const c10::Stream& stream) const override {
+    auto ctx = checked(stream.device());
+    if (data.get()) ctx->allocator.record_stream(reinterpret_cast<uint64_t>(data.get()), ctx->streams.get(stream.id()));
   }
  private:
   static std::shared_ptr<Context> checked(c10::Device device) {
@@ -276,6 +350,7 @@ void initialize(uint32_t module, uint64_t hbm_bytes, uint64_t pinned_bytes) {
   std::lock_guard lock(context_mutex);
   TORCH_CHECK(!context, "GaudiRT: device already initialized");
   context = std::make_shared<Context>(module, hbm_bytes, pinned_bytes);
+  active_stream_id = 0;
 }
 bool is_initialized() {
   std::lock_guard lock(context_mutex);
@@ -306,7 +381,7 @@ void shutdown() {
                 "GaudiRT: pinned tensors must be destroyed before shutdown");
     old = std::move(context);
   }
-  old->device.synchronize_all();
+  old->synchronize_all();
   old.reset();
 }
 void shutdown_at_exit() {
@@ -325,7 +400,7 @@ void shutdown_at_exit() {
       live.push_back(lease);
     }
   }
-  old->device.synchronize_all();
+  old->synchronize_all();
   for (const auto& lease : live) lease->release();
   old.reset();
 }
@@ -343,7 +418,7 @@ void empty_cache() {
   if (ctx->graph_pool && !ctx->graph_pool->memory_allocated()) ctx->graph_pool.reset();
   ctx->allocator.empty_cache();
 }
-void synchronize() { current()->device.synchronize_all(); }
+void synchronize() { current()->synchronize_all(); }
 
 // The DMA engine copies contiguous runs. Addresses are derived from tensor
 // metadata on the host; device data never leaves HBM for device-to-device copies.
@@ -411,7 +486,7 @@ void dma_copy(uint64_t dst, const Layout* dst_layout, uint64_t src,
 
 struct TemporaryDevice {
   TemporaryDevice(Context& ctx, uint64_t bytes)
-      : ctx(ctx), address(ctx.allocator.allocate(bytes, ctx.device.compute_stream())) {}
+      : ctx(ctx), address(ctx.allocator.allocate(bytes, ctx.stream())) {}
   ~TemporaryDevice() { ctx.allocator.free(address); }
   Context& ctx;
   uint64_t address;
@@ -711,7 +786,7 @@ at::Tensor& fill(at::Tensor& tensor, const at::Scalar& scalar) {
   if (width == 2) pattern = (pattern & 0xffff) | ((pattern & 0xffff) << 16);
   std::lock_guard lock(ctx->cold_mutex);
   auto& recipe = broadcast_recipe(*ctx, tensor.numel(), width);
-  auto compute = ctx->device.compute_stream();
+  auto compute = ctx->stream();
   auto h2d = ctx->device.h2d_stream();
   const uint64_t scalar_bytes = std::max<uint64_t>(width, 4);
   TemporaryDevice value(*ctx, scalar_bytes);
@@ -755,7 +830,7 @@ void cast_direct(at::Tensor& dst, const at::Tensor& src, bool non_blocking) {
   at::assert_no_overlap(dst, src);
   std::lock_guard lock(ctx->cold_mutex);
   auto& recipe = cast_recipe(*ctx, src.numel(), src.scalar_type(), dst.scalar_type());
-  auto stream = ctx->device.compute_stream();
+  auto stream = ctx->stream();
   ctx->allocator.record_stream(source, stream);
   ctx->allocator.record_stream(target, stream);
   std::unique_ptr<TemporaryDevice> input, output, workspace;
@@ -779,7 +854,7 @@ void cast_direct(at::Tensor& dst, const at::Tensor& src, bool non_blocking) {
     dma_copy(target, &layout, output->address, nullptr, 0, dst.numel(), dst.element_size(),
              stream, DRAM_TO_DRAM);
   }
-  if (!non_blocking) ctx->device.synchronize_compute();
+  if (!non_blocking) ctx->synchronize_stream();
 }
 
 at::Tensor compare(const at::Tensor& a, const at::Tensor& b, const char* op);
@@ -945,7 +1020,7 @@ at::Tensor& copy(at::Tensor& dst, const at::Tensor& src, bool non_blocking) {
     }
     return dst;
   }
-  auto compute = ctx->device.compute_stream();
+  auto compute = ctx->stream();
   const uint64_t bytes = src.nbytes();
   if (dst_device && src_device) {
     auto d = address_of(dst, *ctx), s = address_of(src, *ctx);
@@ -955,7 +1030,7 @@ at::Tensor& copy(at::Tensor& dst, const at::Tensor& src, bool non_blocking) {
     ctx->allocator.record_stream(s, compute);
     const Layout dl(dst), sl(src);
     dma_copy(d, &dl, s, &sl, 0, src.numel(), src.element_size(), compute, DRAM_TO_DRAM);
-    if (!non_blocking) ctx->device.synchronize_compute();
+    if (!non_blocking) ctx->synchronize_stream();
     return dst;
   }
   const uint64_t device = address_of(dst_device ? dst : src, *ctx);
@@ -1013,7 +1088,7 @@ at::Tensor& copy(at::Tensor& dst, const at::Tensor& src, bool non_blocking) {
       loaded.record(stream);
       loaded.wait(compute);
     }
-    if (!non_blocking) ctx->device.synchronize_compute();
+    if (!non_blocking) ctx->synchronize_stream();
   } else {
     auto stream = ctx->device.d2h_stream();
     StreamEvent ready(ctx->device.device_id());
@@ -1173,7 +1248,7 @@ at::Tensor cat(const at::ITensorListRef& tensors, int64_t axis) {
   }
   std::lock_guard lock(ctx->cold_mutex);
   auto& recipe = cat_recipe(*ctx, active, result, axis);
-  auto stream = ctx->device.compute_stream();
+  auto stream = ctx->stream();
   auto bindings = recipe.tensors;
   for (size_t i = 0; i < active.size(); ++i) {
     bindings[i].pTensorAddress = address_of(active[i], *ctx);
@@ -1509,7 +1584,7 @@ at::Tensor& arange_out(const at::Scalar& start_value, const at::Scalar& end_valu
   std::lock_guard lock(ctx->cold_mutex);
   auto& recipe = wide_parameters ? range64_recipe(*ctx, count, out.scalar_type()) :
                                    range_recipe(*ctx, count, out.scalar_type(), wide);
-  auto stream = ctx->device.compute_stream();
+  auto stream = ctx->stream();
   ctx->allocator.record_stream(target, stream);
   TemporaryDevice scalars(*ctx, 512);
   TemporaryHost host(*ctx, 512);
@@ -1649,7 +1724,7 @@ at::Tensor pointwise(std::vector<at::Tensor> inputs, const std::vector<int64_t>&
   }
   std::lock_guard lock(ctx->cold_mutex);
   auto& recipe = pointwise_recipe(*ctx, op, types, result.numel());
-  auto stream = ctx->device.compute_stream();
+  auto stream = ctx->stream();
   auto bindings = recipe.tensors;
   for (size_t i = 0; i < inputs.size(); ++i) {
     bindings[i].pTensorAddress = address_of(inputs[i], *ctx);
@@ -1807,7 +1882,7 @@ void validate_indices(const at::Tensor& index, int64_t upper) {
   auto ctx = current();
   std::lock_guard lock(ctx->cold_mutex);
   auto& recipe = invalid_reduce_recipe(*ctx, index.numel());
-  auto stream = ctx->device.compute_stream();
+  auto stream = ctx->stream();
   const auto input = address_of(values, *ctx);
   ctx->allocator.record_stream(input, stream);
   TemporaryDevice result(*ctx, sizeof(float));
@@ -1927,7 +2002,7 @@ at::Tensor index_select(const at::Tensor& input, int64_t axis, const at::Tensor&
   }
   std::lock_guard lock(ctx->cold_mutex);
   auto& recipe = gather_recipe(*ctx, source, result, count, axis);
-  auto stream = ctx->device.compute_stream();
+  auto stream = ctx->stream();
   auto bindings = recipe.tensors;
   bindings[0].pTensorAddress = address_of(source, *ctx);
   bindings[1].pTensorAddress = address_of(ids, *ctx);
@@ -2107,7 +2182,7 @@ at::Tensor reduce_max_i32(const at::Tensor& input, int64_t axis) {
   auto result = at::empty(shape, source.options());
   std::lock_guard lock(ctx->cold_mutex);
   auto& recipe = argmax_recipe(*ctx, source, result, axis, true);
-  auto stream = ctx->device.compute_stream();
+  auto stream = ctx->stream();
   auto bindings = recipe.tensors;
   bindings[0].pTensorAddress = address_of(source, *ctx);
   bindings[1].pTensorAddress = address_of(result, *ctx);
@@ -2182,7 +2257,7 @@ at::Tensor argmax(const at::Tensor& input, std::optional<int64_t> dimension, boo
   {
     std::lock_guard lock(ctx->cold_mutex);
     auto& recipe = argmax_recipe(*ctx, source, reduced, axis);
-    auto stream = ctx->device.compute_stream();
+    auto stream = ctx->stream();
     auto bindings = recipe.tensors;
     bindings[0].pTensorAddress = address_of(source, *ctx);
     bindings[1].pTensorAddress = address_of(reduced, *ctx);
@@ -2343,7 +2418,7 @@ at::Tensor bucket_linear(const at::Tensor& input, const at::Tensor& weight,
               "GaudiRT: bucket GEMM input is too large");
   const uint64_t bucket_bytes = static_cast<uint64_t>(bucket) * k * item;
   auto ctx = current();
-  auto stream = ctx->device.compute_stream();
+  auto stream = ctx->stream();
   const auto input_address = address_of(input, *ctx);
   auto weight_value = weight;
   auto weight_address = address_of(weight_value, *ctx);
@@ -2744,7 +2819,7 @@ std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs
   }
   const uint32_t bucket = std::bit_ceil(static_cast<uint32_t>(m));
   auto ctx = current();
-  auto stream = ctx->device.compute_stream();
+  auto stream = ctx->stream();
   std::vector<at::Tensor> results;
   results.reserve(outputs_.size());
   for (auto id : outputs_) {
@@ -2977,7 +3052,7 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& requ
   const std::array<at::Tensor*, 5> destinations{&locations_, &requests_, &positions_, &mapping_, &header_};
   TemporaryHost staging(*ctx, total);
   auto* host = static_cast<uint8_t*>(staging.address);
-  auto compute = ctx->device.compute_stream();
+  auto compute = ctx->stream();
   auto stream = ctx->device.h2d_stream();
   StreamEvent reusable(ctx->device.device_id()), ready(ctx->device.device_id());
   reusable.record(compute);
@@ -3035,7 +3110,7 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
   }
   TORCH_CHECK(cursor == m, "GaudiRT device metadata: sequence lengths do not cover token rows");
   auto ctx = current();
-  auto compute = ctx->device.compute_stream();
+  auto compute = ctx->stream();
   auto h2d = ctx->device.h2d_stream();
   const auto options = at::TensorOptions().device(c10::Device(c10::kPrivateUse1, 0)).dtype(at::kInt);
   locations_ = at::empty({bucket}, options);
@@ -3242,7 +3317,7 @@ at::Tensor paged_attn(const at::Tensor& query, const at::Tensor& key, const at::
               (key_pool.dim() != 3 || key_pool.size(2) == head_dim),
               "GaudiRT paged attention: invalid GQA head geometry");
   auto ctx = current();
-  auto stream = ctx->device.compute_stream();
+  auto stream = ctx->stream();
   const auto k_pool_address = address_of(key_pool, *ctx), v_pool_address = address_of(value_pool, *ctx);
   const uint64_t pool_bytes = key_pool.nbytes();
   TORCH_CHECK(k_pool_address % BlockCachingAllocator::kAlignment == 0 &&
@@ -3399,7 +3474,7 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding(const at::Tensor& query, con
   TORCH_CHECK(cache.dim() == 2 && cache.size(0) >= metadata->context_ && cache.size(0) <= INT32_MAX &&
               cache.size(1) == rotary_dim, "GaudiRT rotary: cache does not cover validated positions");
   auto ctx = current();
-  auto stream = ctx->device.compute_stream();
+  auto stream = ctx->stream();
   auto cache_value = cache;
   auto cache_address = address_of(cache_value, *ctx);
   if (!cache_value.is_contiguous() || cache_address % BlockCachingAllocator::kAlignment) {
@@ -3486,6 +3561,7 @@ TORCH_LIBRARY_IMPL(gaudirt, PrivateUse1, m) {
 }
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
+  m.impl("record_stream", TORCH_FN(gaudirt::generic::record_stream));
   m.impl("copy_", TORCH_FN(gaudirt::generic::copy));
   m.impl("empty.memory_format", TORCH_FN(gaudirt::generic::empty));
   m.impl("empty_strided", TORCH_FN(gaudirt::generic::empty_strided));

@@ -26,9 +26,31 @@ import torch
 import _gaudirt_C as _C
 _audit_legacy_bridge()
 
-# SGLang uses the device module's Stream type in runtime annotations. The
-# generic PyTorch type preserves the backend's own stream support checks.
-Stream = torch.Stream
+class Stream(torch.Stream):
+    def __new__(cls, device=None, priority=0):
+        if device not in (None, 0, "gaudirt", "gaudirt:0", torch.device("gaudirt:0")):
+            raise ValueError("GaudiRT: invalid device")
+        return super().__new__(cls, device="gaudirt:0", priority=priority)
+
+
+def set_device(device):
+    if device not in (0, "gaudirt", "gaudirt:0", torch.device("gaudirt:0")):
+        raise ValueError("GaudiRT: invalid device")
+
+
+def current_stream(device=None):
+    if device not in (None, 0, "gaudirt", "gaudirt:0", torch.device("gaudirt:0")):
+        raise ValueError("GaudiRT: invalid device")
+    return torch.accelerator.current_stream(0)
+
+
+def stream(value):
+    if not isinstance(value, torch.Stream) or value.device.type != "gaudirt":
+        raise ValueError("GaudiRT: expected a gaudirt stream")
+    return value
+
+
+StreamContext = stream
 
 
 @torch.library.register_fake("gaudirt::rms_norm")
