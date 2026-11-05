@@ -87,6 +87,9 @@ def main():
         assert torch.equal(actual, expected)
         assert captures == before_captures, "singleton-stride input triggered a new capture"
     stats = gaudirt.recipe_cache_stats()
+    keys = gaudirt._C._recipe_cache_keys()
+    assert len(keys) == stats[2] and keys == sorted(set(keys))
+    assert all(key.startswith("fx_program_") for key in keys)
     if os.environ.get("GAUDIRT_TEST_CACHE") == "cold":
         assert stats[:2] == [0, 12], stats
     elif os.environ.get("GAUDIRT_TEST_CACHE") == "warm":
