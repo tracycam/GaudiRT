@@ -78,7 +78,7 @@ def main():
         payload.extend(data); errors.append(error); floors.append(floor); absolutes.append(absolute)
         print("FX embedding rows", rows, "captures", len(captures),
               "recipes", gaudirt.recipe_cache_stats(), flush=True)
-    assert len(captures) <= 2, captures  # The noncontiguous input has a different stride guard.
+    assert len(captures) == 1, captures
     unvalidated = torch.tensor([1, 2, 3], dtype=torch.int32, device="gaudirt:0")
     try:
         compiled(unvalidated, table, gamma, weight)
