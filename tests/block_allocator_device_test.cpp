@@ -67,6 +67,17 @@ int main() {
       auto whole_graph = graph.allocator().allocate(1024 * 1024, s);
       graph.allocator().free(whole_graph);
       graph.allocator().empty_cache();
+      auto first = graph.allocate(800 * 1024, s);
+      auto second = graph.allocate(700 * 1024, s);
+      require(first % 256 == 0 && second % 256 == 0, "graph growth alignment");
+      require(graph.capacity_bytes() == 2 * 1024 * 1024, "graph pool did not grow");
+      require(graph.memory_allocated() == 1500 * 1024, "graph growth accounting");
+      graph.free(first);
+      graph.free(second);
+      auto reused_graph = graph.allocate(1024 * 1024, s);
+      require(graph.capacity_bytes() == 2 * 1024 * 1024, "graph pool failed to reuse a region");
+      graph.free(reused_graph);
+      require(graph.memory_allocated() == 0, "graph allocation leak");
     }
     entire = pool.allocate(slab_bytes, s);
     pool.free(entire);

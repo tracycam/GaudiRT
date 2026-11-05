@@ -32,6 +32,7 @@ class BlockCachingAllocator {
   void empty_cache();
   uint64_t memory_allocated() const;
   uint64_t max_memory_allocated() const;
+  uint64_t largest_free_block() const;
   uint64_t capacity_bytes() const noexcept { return capacity_; }
   bool contains_live_range(uint64_t address, uint64_t bytes) const;
 
@@ -71,10 +72,20 @@ class GraphPool {
   GraphPool(const GraphPool&) = delete;
   GraphPool& operator=(const GraphPool&) = delete;
   BlockCachingAllocator& allocator() noexcept { return *pool_; }
+  uint64_t allocate(uint64_t bytes, synStreamHandle stream);
+  void free(uint64_t address);
+  uint64_t capacity_bytes() const;
+  uint64_t memory_allocated() const;
  private:
+  struct Region {
+    uint64_t reservation;
+    std::unique_ptr<BlockCachingAllocator> pool;
+  };
   BlockCachingAllocator& parent_;
   uint64_t reservation_ = 0;
   std::unique_ptr<BlockCachingAllocator> pool_;
+  std::vector<Region> extra_regions_;
+  mutable std::mutex mutex_;
 };
 
 }  // namespace gaudirt::runtime
