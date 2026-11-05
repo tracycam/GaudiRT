@@ -37,6 +37,11 @@ def _fake_silu_and_mul(input):
     return input.new_empty((*input.shape[:-1], input.shape[-1] // 2))
 
 
+@torch.library.register_fake("gaudirt::paged_attn")
+def _fake_paged_attn(query, key, value, key_pool, value_pool, metadata, head_dim, scale):
+    return torch.empty_like(query, memory_format=torch.contiguous_format)
+
+
 torch.utils.rename_privateuse1_backend("gaudirt")
 torch._register_device_module("gaudirt", sys.modules[__name__])
 torch.utils.generate_methods_for_privateuse1_backend(for_packed_sequence=False)
