@@ -47,6 +47,11 @@ add_executable(gaudirt_runtime_unit_tests tests/runtime_unit_tests.cpp)
 target_compile_options(gaudirt_runtime_unit_tests PRIVATE -UNDEBUG)
 target_link_libraries(gaudirt_runtime_unit_tests PRIVATE gaudirt)
 
+add_executable(block_allocator_fences_unit_test
+    src/block_caching_allocator.cpp tests/block_allocator_fences_unit_test.cpp)
+target_include_directories(block_allocator_fences_unit_test BEFORE PRIVATE tests/mock_synapse)
+target_compile_options(block_allocator_fences_unit_test PRIVATE -UNDEBUG)
+
 add_executable(recipe_cache_fingerprint_test tests/recipe_cache_fingerprint_test.cpp)
 target_link_libraries(recipe_cache_fingerprint_test PRIVATE gaudirt)
 

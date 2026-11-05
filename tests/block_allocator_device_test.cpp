@@ -114,6 +114,29 @@ int main() {
     require(synStreamSynchronize(s) == synSuccess, "reuse sync");
     require(std::equal(in, in + bytes, out), "cross-stream copy mismatch");
     pool.free(reused);
+
+    // Exercise repeated coalescing with both equal and distinct producer
+    // streams before the combined region is consumed on the compute stream.
+    for (int iteration = 0; iteration < 128; ++iteration) {
+      const auto left = pool.allocate(bytes, s);
+      const auto right = pool.allocate(bytes, s);
+      require(right == left + bytes, "cross-stream stress blocks not adjacent");
+      const auto second_stream = iteration % 2 ? rt.d2h_stream() : rt.h2d_stream();
+      host.copy_h2d(left, in, bytes, rt.h2d_stream(), true);
+      host.copy_h2d(right, in, bytes, second_stream, true);
+      pool.record_stream(left, rt.h2d_stream());
+      pool.record_stream(right, second_stream);
+      pool.free(iteration % 2 ? right : left);
+      pool.free(iteration % 2 ? left : right);
+      const auto combined = pool.allocate(2 * bytes, s);
+      require(combined == left, "cross-stream stress did not coalesce");
+      host.copy_d2h(out, combined, bytes, s, false);
+      require(std::equal(in, in + bytes, out), "left cross-stream stress mismatch");
+      host.copy_d2h(out, combined + bytes, bytes, s, false);
+      require(std::equal(in, in + bytes, out), "right cross-stream stress mismatch");
+      pool.free(combined);
+    }
+
     auto sync_device = pool.allocate(bytes, s);
     host.copy_h2d(sync_device, in, bytes, s, false);
     std::fill(out, out + bytes, 0);
