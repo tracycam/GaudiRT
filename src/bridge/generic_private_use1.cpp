@@ -2867,6 +2867,13 @@ at::Tensor feature_view(const at::Tensor& tensor, int64_t start, int64_t length)
   return tensor.narrow(1, start, length);
 }
 
+at::Tensor reshape_view(const at::Tensor& tensor, const std::vector<int64_t>& shape) {
+  TORCH_CHECK((shape.size() == 2 || shape.size() == 3) && shape[0] == -1 &&
+              std::all_of(shape.begin() + 1, shape.end(), [](int64_t size) { return size > 0; }),
+              "GaudiRT FX: invalid reshape view");
+  return tensor.view(shape);
+}
+
 at::Tensor bucket_output(const at::Tensor& reference, at::ScalarType dtype,
                          uint32_t bucket, int64_t rows, int64_t width) {
   const uint64_t item = c10::elementSize(dtype);
@@ -2974,7 +2981,7 @@ struct FxValueSpec {
 // Nodes 0..4 are linear, add, RMSNorm, SiLU/multiply and split; 5/6 are fused norm outputs,
 // 7/8 are validated rotary query/key outputs, 9 is validated embedding,
 // 10 gathers validated last-token rows, 11 casts BF16/FP32, 12..14 are sub/mul/div,
-// 15 concatenates dynamic feature tensors, and 16 is batch GEMM.
+// 15 concatenates dynamic feature tensors, 16 is batch GEMM, and 17 is reshape.
 // A node's output ID is input_count + its index in the program.
 class BucketProgram {
  public:
@@ -2993,7 +3000,7 @@ class BucketProgram {
     for (size_t i = 0; i < operations_.size(); ++i) {
       const auto& op = operations_[i];
       const int64_t upper = roles_.size() + i;
-      TORCH_CHECK((op.size() == 4 || (op.size() == 5 && (op[0] == 4 || op[0] == 5)) ||
+      TORCH_CHECK((op.size() == 4 || (op.size() == 5 && (op[0] == 4 || op[0] == 5 || op[0] == 17)) ||
                    (op.size() == 10 && op[0] == 7) || (op.size() >= 3 && op[0] == 15)) &&
                   op[1] >= 0 && op[1] < upper && op[2] >= 0 &&
                   ((op[0] == 0 && op[2] < upper && (op[3] == -1 || (op[3] >= 0 && op[3] < upper))) ||
@@ -3019,6 +3026,9 @@ class BucketProgram {
                    (op[0] == 11 && op.size() == 4 && op[2] <= 1 && op[3] == -1) ||
                    (op[0] >= 12 && op[0] <= 14 && op.size() == 4 && op[2] < upper && op[3] == -1) ||
                    (op[0] == 16 && op.size() == 4 && op[2] < upper && op[3] == -1) ||
+                   (op[0] == 17 && (op[2] == 2 || op[2] == 3) &&
+                    op.size() == static_cast<size_t>(op[2] + 2) &&
+                    std::all_of(op.begin() + 3, op.end(), [](int64_t size) { return size > 0; })) ||
                    (op[0] == 15 && std::all_of(op.begin() + 1, op.end(),
                                                [upper](int64_t id) { return id >= 0 && id < upper; }))),
                   "GaudiRT FX: invalid normalized node");
@@ -3086,6 +3096,27 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
   }
   for (const auto& op : operations_) {
     const auto& a = specs[op[1]];
+    if (op[0] == 17) {
+      TORCH_CHECK(a.dynamic && (a.sizes.size() == 2 || a.sizes.size() == 3),
+                  "GaudiRT FX: invalid reshape input");
+      int64_t source_width = 1, target_width = 1;
+      for (size_t i = 1; i < a.sizes.size(); ++i) {
+        TORCH_CHECK(source_width <= INT64_MAX / a.sizes[i], "GaudiRT FX: reshape input is too large");
+        source_width *= a.sizes[i];
+      }
+      std::vector<int64_t> sizes{-1};
+      for (size_t i = 3; i < op.size(); ++i) {
+        TORCH_CHECK(target_width <= INT64_MAX / op[i], "GaudiRT FX: reshape output is too large");
+        target_width *= op[i];
+        sizes.push_back(op[i]);
+      }
+      TORCH_CHECK(source_width == target_width, "GaudiRT FX: reshape changes the token width");
+      specs.push_back({a.dtype, std::move(sizes), true});
+      normalized << "n" << op[0];
+      for (size_t i = 1; i < op.size(); ++i) normalized << ":" << op[i];
+      normalized << ";";
+      continue;
+    }
     if (op[0] == 15) {
       TORCH_CHECK(a.dynamic && a.sizes.size() == 2, "GaudiRT FX: invalid cat input");
       int64_t width = 0;
@@ -3300,6 +3331,10 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
           static_cast<int>(roles_.size() + std::distance(outputs_.begin(), output));
       values[id] = tensor(type.syn, width, rows, slot, spec.sizes.size(),
                           spec.sizes.size() == 3 ? bucket : 1);
+      if (op[0] == 17) {
+        node({values[op[1]]}, values[id], nullptr, 0, "reshape");
+        continue;
+      }
       if (op[0] == 16) {
         synGEMMParams params{false, false};
         node({values[op[1]], values[op[2]]}, values[id], &params, sizeof(params), "batch_gemm");
@@ -4454,6 +4489,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("_prepare_strided_input", &gaudirt::generic::prepare_strided_input);
   m.def("_restore_staged_alias", &gaudirt::generic::restore_staged_alias);
   m.def("_feature_view", &gaudirt::generic::feature_view);
+  m.def("_reshape_view", &gaudirt::generic::reshape_view);
   m.def("bucket_linear", &gaudirt::generic::bucket_linear,
         pybind11::arg("input"), pybind11::arg("weight"), pybind11::arg("bias") = pybind11::none());
   pybind11::class_<gaudirt::generic::BucketProgram>(m, "BucketProgram")

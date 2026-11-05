@@ -46,8 +46,7 @@ def _program_backend(graph_module, example_inputs):
     if not any(roles):
         raise RuntimeError("GaudiRT FX: mark each dynamic token input before capture")
     operations, transposes, splits, fused_norms, rotations, index_casts = [], {}, {}, {}, {}, {}
-    views = {}
-    feature_views = {}
+    alias_views = {}
     validated_token_bindings, validated_row_bindings = [], []
     linear_targets = (torch.nn.functional.linear, torch.ops.aten.linear.default)
     mm_targets = (torch.mm, torch.ops.aten.mm.default, torch.matmul,
@@ -68,6 +67,7 @@ def _program_backend(graph_module, example_inputs):
     cat_targets = (torch.cat, torch.concat, torch.concatenate, torch.ops.aten.cat.default)
     embedding_targets = (torch.nn.functional.embedding, torch.ops.aten.embedding.default)
     index_select_targets = (torch.index_select, torch.ops.aten.index_select.default)
+    reshape_targets = (torch.reshape, torch.ops.aten.view.default, torch.ops.aten.reshape.default)
 
     def tensor_id(value):
         if value not in ids:
@@ -79,6 +79,15 @@ def _program_backend(graph_module, example_inputs):
             raise RuntimeError("GaudiRT FX: GEMM weight must be transposed")
         return tensor_id(transposes[value])
 
+    def add_alias(node, source, operation):
+        source_id = tensor_id(source)
+        base, chain = alias_views.get(source, (source_id, ()))
+        alias_views[node] = (base, chain + (operation,))
+
+    def is_reshape_node(node):
+        return ((node.op == "call_method" and node.target in ("view", "reshape")) or
+                (node.op == "call_function" and node.target in reshape_targets))
+
     def feature_slice(node, source, index):
         example = source.meta.get("example_value")
         if not isinstance(example, torch.Tensor) or example.ndim != 2 or not isinstance(example.shape[1], int):
@@ -89,13 +98,12 @@ def _program_backend(graph_module, example_inputs):
         source_id = tensor_id(source)
         if start == 0 and stop == example.shape[1]:
             ids[node] = source_id
-            if source in feature_views:
-                feature_views[node] = feature_views[source]
+            if source in alias_views:
+                alias_views[node] = alias_views[source]
         else:
             ids[node] = len(tensor_indices) + len(operations)
             operations.append([4, source_id, start, stop - start, example.shape[1]])
-            base, offset, _ = feature_views.get(source, (source_id, 0, example.shape[1]))
-            feature_views[node] = (base, offset + start, stop - start)
+            add_alias(node, source, ("feature", start, stop - start))
 
     output, single_output = None, False
     for node in nodes:
@@ -119,19 +127,26 @@ def _program_backend(graph_module, example_inputs):
         if node.op == "call_method" and node.target == "long" and len(node.args) == 1 and not node.kwargs:
             index_casts[node] = node.args[0]
             continue
-        if node.op == "call_method" and node.target in ("view", "reshape") and not node.kwargs:
-            source = views.get(node.args[0], node.args[0])
-            if source not in ids or ids[source] < len(tensor_indices):
-                raise RuntimeError("GaudiRT FX: view requires a contiguous computed tensor")
-            views[node] = source
+        if is_reshape_node(node) and not node.kwargs:
+            source = node.args[0]
+            source_id = tensor_id(source)
             original = source.meta.get("example_value")
             result = node.meta.get("example_value")
             if not isinstance(original, torch.Tensor) or not isinstance(result, torch.Tensor):
                 raise RuntimeError("GaudiRT FX: missing view shape metadata")
-            if not result.is_contiguous():
-                raise RuntimeError("GaudiRT FX: view must preserve contiguous layout")
-            if original.shape == result.shape:
-                ids[node] = ids[source]
+            if (original.ndim not in (2, 3) or result.ndim not in (2, 3) or
+                    original.dtype != result.dtype or not result.is_contiguous() or
+                    str(original.shape[0]) != str(result.shape[0]) or
+                    any(not isinstance(size, int) or size <= 0 for size in result.shape[1:])):
+                raise RuntimeError("GaudiRT FX: view must keep the outer token dimension")
+            shape = (-1, *(int(size) for size in result.shape[1:]))
+            add_alias(node, source, ("reshape", shape))
+            same_shape = tuple(map(str, original.shape)) == tuple(map(str, result.shape))
+            if same_shape or all(user.op == "output" or is_reshape_node(user) for user in node.users):
+                ids[node] = source_id
+            else:
+                ids[node] = len(tensor_indices) + len(operations)
+                operations.append([17, source_id, result.ndim, *shape[1:]])
             continue
         if node.op == "call_method" and node.target in ("to", "float"):
             if node.kwargs or (node.target == "float" and len(node.args) != 1) or (
@@ -286,12 +301,11 @@ def _program_backend(graph_module, example_inputs):
                 raise RuntimeError("GaudiRT FX: invalid split output index")
             if len(sizes) == 1:
                 ids[node] = source
-                if source_node in feature_views:
-                    feature_views[node] = feature_views[source_node]
+                if source_node in alias_views:
+                    alias_views[node] = alias_views[source_node]
                 continue
             start = sum(sizes[:index])
-            base, offset, _ = feature_views.get(source_node, (source, 0, sum(sizes)))
-            feature_views[node] = (base, offset + start, sizes[index])
+            add_alias(node, source_node, ("feature", start, sizes[index]))
             operation = [4, source, start, sizes[index], sum(sizes)]
         elif (node.target is operator.getitem and len(node.args) == 2 and not node.kwargs and
               isinstance(node.args[1], torch.fx.Node)) or node.target in index_select_targets:
@@ -355,9 +369,9 @@ def _program_backend(graph_module, example_inputs):
         operations.append(operation)
     if output is None or any(value not in ids for value in output):
         raise RuntimeError("GaudiRT FX: unsupported program output")
-    output_ids = [feature_views[value][0] if value in feature_views else ids[value] for value in output]
+    output_ids = [alias_views[value][0] if value in alias_views else ids[value] for value in output]
     computed_ids = list(dict.fromkeys(value for value in output_ids if value >= len(tensor_indices)))
-    if operations and not computed_ids and any(operation[0] != 4 for operation in operations):
+    if operations and not computed_ids and any(operation[0] not in (4, 17) for operation in operations):
         raise RuntimeError("GaudiRT FX: program operations have no output")
     program = _C.BucketProgram(roles, operations, computed_ids) if computed_ids else None
     if program is None and (computed_ids or validated_token_bindings):
@@ -378,8 +392,15 @@ def _program_backend(graph_module, example_inputs):
         computed = dict(zip(computed_ids, program.run([args[index] for index in tensor_indices]))) if program else {}
         result = tuple(args[tensor_indices[value]] if value < len(tensor_indices) else computed[value]
                        for value in output_ids)
-        result = tuple(_C._feature_view(tensor, feature_views[node][1], feature_views[node][2])
-                       if node in feature_views else tensor for node, tensor in zip(output, result))
+        def apply_views(node, tensor):
+            for operation in alias_views.get(node, (None, ()))[1]:
+                if operation[0] == "feature":
+                    tensor = _C._feature_view(tensor, operation[1], operation[2])
+                else:
+                    tensor = _C._reshape_view(tensor, operation[1])
+            return tensor
+
+        result = tuple(apply_views(node, tensor) for node, tensor in zip(output, result))
         return result[0] if single_output else result
 
     return execute
