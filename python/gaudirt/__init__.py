@@ -67,6 +67,22 @@ def initialize(module_id=0, hbm_bytes=256 * 1024 * 1024, pinned_bytes=8 * 1024 *
     _C.initialize(module_id, hbm_bytes, pinned_bytes)
 
 
+def is_initialized():
+    return _C.is_initialized()
+
+
+def mem_get_info(device=None):
+    if device not in (None, 0, "gaudirt:0", torch.device("gaudirt:0")):
+        raise ValueError("GaudiRT: invalid device")
+    return _C.memory_info()
+
+
+def physical_mem_get_info(device=None):
+    if device not in (None, 0, "gaudirt:0", torch.device("gaudirt:0")):
+        raise ValueError("GaudiRT: invalid device")
+    return _C.physical_memory_info()
+
+
 def shutdown():
     _C.shutdown()
 

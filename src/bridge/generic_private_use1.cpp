@@ -277,6 +277,22 @@ void initialize(uint32_t module, uint64_t hbm_bytes, uint64_t pinned_bytes) {
   TORCH_CHECK(!context, "GaudiRT: device already initialized");
   context = std::make_shared<Context>(module, hbm_bytes, pinned_bytes);
 }
+bool is_initialized() {
+  std::lock_guard lock(context_mutex);
+  return static_cast<bool>(context);
+}
+std::tuple<uint64_t, uint64_t> memory_info() {
+  auto ctx = current();
+  const auto capacity = ctx->allocator.capacity_bytes();
+  return {capacity - ctx->allocator.memory_allocated(), capacity};
+}
+std::tuple<uint64_t, uint64_t> physical_memory_info() {
+  auto ctx = current();
+  uint64_t free = 0, total = 0;
+  TORCH_CHECK(synDeviceGetMemoryInfo(ctx->device.device_id(), &free, &total) == synSuccess,
+              "GaudiRT: physical device memory query failed");
+  return {free, total};
+}
 void shutdown() {
   std::shared_ptr<Context> old;
   {
@@ -3504,6 +3520,9 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   gaudirt::generic::register_backend();
   m.def("initialize", &gaudirt::generic::initialize);
+  m.def("is_initialized", &gaudirt::generic::is_initialized);
+  m.def("memory_info", &gaudirt::generic::memory_info);
+  m.def("physical_memory_info", &gaudirt::generic::physical_memory_info);
   m.def("shutdown", &gaudirt::generic::shutdown);
   m.def("_shutdown_at_exit", &gaudirt::generic::shutdown_at_exit);
   m.def("synchronize", &gaudirt::generic::synchronize);
