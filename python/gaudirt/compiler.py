@@ -25,10 +25,11 @@ def _program_backend(graph_module, example_inputs):
             raise RuntimeError("GaudiRT FX: only the outer token dimension may be dynamic")
         ids[node] = len(tensor_indices)
         tensor_indices.append(index)
-        roles.append(int(bool(dynamic)))
+        roles.append(int(node.meta.get("gaudirt_dynamic", bool(dynamic))))
     if not any(roles):
         raise RuntimeError("GaudiRT FX: mark each dynamic token input before capture")
     operations, transposes, splits, fused_norms, rotations, index_casts = [], {}, {}, {}, {}, {}
+    views = {}
     validated_token_bindings = []
     linear_targets = (torch.nn.functional.linear, torch.ops.aten.linear.default)
     mm_targets = (torch.mm, torch.ops.aten.mm.default, torch.matmul,
@@ -54,12 +55,14 @@ def _program_backend(graph_module, example_inputs):
             raise RuntimeError("GaudiRT FX: GEMM weight must be transposed")
         return tensor_id(transposes[value])
 
-    output = None
+    output, single_output = None, False
     for node in nodes:
         if node.op == "placeholder":
             continue
         if node.op == "output":
             returned = node.args[0]
+            if isinstance(returned, torch.fx.Node):
+                returned, single_output = (returned,), True
             if not isinstance(returned, (tuple, list)) or not returned:
                 raise RuntimeError("GaudiRT FX: program output must be a nonempty tensor sequence")
             output = returned
@@ -69,6 +72,20 @@ def _program_backend(graph_module, example_inputs):
             continue
         if node.op == "call_method" and node.target == "long" and len(node.args) == 1 and not node.kwargs:
             index_casts[node] = node.args[0]
+            continue
+        if node.op == "call_method" and node.target in ("view", "reshape") and not node.kwargs:
+            source = views.get(node.args[0], node.args[0])
+            if source not in ids or ids[source] < len(tensor_indices):
+                raise RuntimeError("GaudiRT FX: view requires a contiguous computed tensor")
+            views[node] = source
+            original = source.meta.get("example_value")
+            result = node.meta.get("example_value")
+            if not isinstance(original, torch.Tensor) or not isinstance(result, torch.Tensor):
+                raise RuntimeError("GaudiRT FX: missing view shape metadata")
+            if not result.is_contiguous():
+                raise RuntimeError("GaudiRT FX: view must preserve contiguous layout")
+            if original.shape == result.shape:
+                ids[node] = ids[source]
             continue
         if ((node.op == "call_method" and node.target == "split") or
                 (node.op == "call_function" and node.target in split_targets)):
@@ -197,12 +214,15 @@ def _program_backend(graph_module, example_inputs):
             raise RuntimeError(f"GaudiRT FX: unsupported program operation {node.target}")
         ids[node] = len(tensor_indices) + len(operations)
         operations.append(operation)
-    if not operations or output is None or any(value not in ids for value in output):
+    if output is None or any(value not in ids for value in output):
         raise RuntimeError("GaudiRT FX: unsupported program output")
     output_ids = [ids[value] for value in output]
-    if any(value < len(tensor_indices) for value in output_ids) or len(set(output_ids)) != len(output_ids):
-        raise RuntimeError("GaudiRT FX: outputs must be distinct program operations")
-    program = _C.BucketProgram(roles, operations, output_ids)
+    computed_ids = list(dict.fromkeys(value for value in output_ids if value >= len(tensor_indices)))
+    if operations and not computed_ids:
+        raise RuntimeError("GaudiRT FX: program operations have no output")
+    program = _C.BucketProgram(roles, operations, computed_ids) if operations else None
+    if program is None and (computed_ids or validated_token_bindings):
+        raise RuntimeError("GaudiRT FX: unsupported identity graph")
 
     def execute(*args):
         for index_id, weight_id_value in validated_token_bindings:
@@ -211,13 +231,78 @@ def _program_backend(graph_module, example_inputs):
             vocabulary = getattr(index, "_gaudirt_validated_vocab", None)
             if not isinstance(vocabulary, int) or vocabulary <= 0 or vocabulary > weight.shape[0]:
                 raise RuntimeError("GaudiRT FX: embedding token IDs must pass batch metadata validation")
-        return tuple(program.run([args[index] for index in tensor_indices]))
+        computed = dict(zip(computed_ids, program.run([args[index] for index in tensor_indices]))) if program else {}
+        result = tuple(args[tensor_indices[value]] if value < len(tensor_indices) else computed[value]
+                       for value in output_ids)
+        return result[0] if single_output else result
 
     return execute
 
 
+def _partition_backend(graph_module, example_inputs):
+    """Split a fully captured graph only at the stateful paged-attention operator."""
+    from torch.fx.passes.split_module import split_module
+
+    nodes = tuple(graph_module.graph.nodes)
+    placeholders = [node for node in nodes if node.op == "placeholder"]
+    if len(placeholders) != len(example_inputs):
+        raise RuntimeError("GaudiRT FX: placeholder count mismatch")
+    extents = set()
+    for node, value in zip(placeholders, example_inputs):
+        if not isinstance(value, torch.Tensor):
+            continue
+        dynamic = getattr(value, "_dynamo_dynamic_indices", set()) or set()
+        if dynamic and dynamic != {0}:
+            raise RuntimeError("GaudiRT FX: only the outer token dimension may be dynamic")
+        example = node.meta.get("example_value")
+        if dynamic:
+            if not isinstance(example, torch.Tensor) or example.ndim == 0:
+                raise RuntimeError("GaudiRT FX: missing dynamic input shape")
+            extents.add(str(example.shape[0]))
+    if not extents:
+        raise RuntimeError("GaudiRT FX: mark each dynamic token input before capture")
+    for node in nodes:
+        example = node.meta.get("example_value")
+        if isinstance(example, torch.Tensor) and example.ndim:
+            node.meta["gaudirt_dynamic"] = str(example.shape[0]) in extents
+
+    paged = (torch.ops.gaudirt._paged_attn_validated, torch.ops.gaudirt._paged_attn_validated.default)
+    partitions, partition = {}, 0
+    for node in nodes:
+        if node.op in ("placeholder", "output"):
+            continue
+        if node.op == "call_function" and node.target in paged:
+            partition += 1
+            partitions[node] = partition
+            partition += 1
+        else:
+            partitions[node] = partition
+    split = split_module(graph_module, graph_module, lambda node: partitions[node], keep_original_order=True)
+    for _, segment in split.named_children():
+        segment_nodes = tuple(segment.graph.nodes)
+        stateful = [node for node in segment_nodes if node.op == "call_function" and node.target in paged]
+        if stateful:
+            if len(stateful) != 1 or any(node.op not in ("placeholder", "output") and node is not stateful[0]
+                                         for node in segment_nodes):
+                raise RuntimeError("GaudiRT FX: invalid paged-attention partition")
+            continue
+        compiled = []
+
+        def execute(*args, _segment=segment, _compiled=compiled):
+            if not _compiled:
+                _compiled.append(_program_backend(_segment, args))
+            return _compiled[0](*args)
+
+        segment.forward = execute
+    return split.forward
+
+
 def gaudirt_backend(graph_module, example_inputs):
     nodes = tuple(graph_module.graph.nodes)
+    if any(node.op == "call_function" and node.target in (
+        torch.ops.gaudirt._paged_attn_validated, torch.ops.gaudirt._paged_attn_validated.default
+    ) for node in nodes):
+        return _partition_backend(graph_module, example_inputs)
     placeholders = tuple(node for node in nodes if node.op == "placeholder")
     outputs = tuple(node for node in nodes if node.op == "output")
     if len(outputs) != 1:
@@ -300,8 +385,10 @@ def compile(module, dynamic_arg_indices=(0,)):
     def execute(*args, **kwargs):
         for index in dynamic_arg_indices:
             torch._dynamo.mark_dynamic(args[index], 0, min=1, max=4096)
-        with torch._dynamo.config.patch(specialize_float=True), \
-             torch.fx.experimental._config.patch(backed_size_oblivious=True, use_duck_shape=False):
+        with torch._dynamo.config.patch(specialize_float=True, suppress_errors=False,
+                                       fail_on_recompile_limit_hit=True), \
+             torch.fx.experimental._config.patch(backed_size_oblivious=True, use_duck_shape=False), \
+             torch._dynamo.error_on_graph_break(True):
             return compiled(*args, **kwargs)
 
     return execute
