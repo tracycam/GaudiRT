@@ -28,7 +28,7 @@ def _program_backend(graph_module, example_inputs):
         roles.append(int(bool(dynamic)))
     if not any(roles):
         raise RuntimeError("GaudiRT FX: mark each dynamic token input before capture")
-    operations, transposes, splits, fused_norms = [], {}, {}, {}
+    operations, transposes, splits, fused_norms, rotations = [], {}, {}, {}, {}
     linear_targets = (torch.nn.functional.linear, torch.ops.aten.linear.default)
     mm_targets = (torch.mm, torch.ops.aten.mm.default, torch.matmul,
                   torch.ops.aten.matmul.default, operator.matmul)
@@ -38,6 +38,8 @@ def _program_backend(graph_module, example_inputs):
     fused_norm_targets = (torch.ops.gaudirt.fused_add_rms_norm,
                           torch.ops.gaudirt.fused_add_rms_norm.default)
     silu_targets = (torch.ops.gaudirt.silu_and_mul, torch.ops.gaudirt.silu_and_mul.default)
+    rotary_targets = (torch.ops.gaudirt._rotary_embedding_validated,
+                      torch.ops.gaudirt._rotary_embedding_validated.default)
     split_targets = (torch.split, torch.ops.aten.split_with_sizes.default)
 
     def tensor_id(value):
@@ -79,6 +81,32 @@ def _program_backend(graph_module, example_inputs):
             continue
         if node.op != "call_function":
             raise RuntimeError(f"GaudiRT FX: unsupported program node {node.op}: {node.target}")
+        if node.target in rotary_targets:
+            if len(node.args) != 9 or node.kwargs:
+                raise RuntimeError("GaudiRT FX: unsupported rotary arguments")
+            context, head_dim, rotary_dim, is_neox = node.args[5:]
+            if (any(not isinstance(value, int) or isinstance(value, bool) or value <= 0
+                    for value in (context, head_dim, rotary_dim)) or not isinstance(is_neox, bool)):
+                raise RuntimeError("GaudiRT FX: invalid rotary configuration")
+            producer = len(tensor_indices) + len(operations)
+            operations.append([7, *(tensor_id(value) for value in node.args[:5]),
+                               context, head_dim, rotary_dim, int(is_neox)])
+            rotations[node] = [producer, None]
+            continue
+        if node.target is operator.getitem and len(node.args) == 2 and node.args[0] in rotations:
+            producer, key_output = rotations[node.args[0]]
+            index = node.args[1]
+            if node.kwargs or index not in (0, 1):
+                raise RuntimeError("GaudiRT FX: invalid rotary output index")
+            if index == 0:
+                ids[node] = producer
+                continue
+            if key_output is None:
+                key_output = len(tensor_indices) + len(operations)
+                rotations[node.args[0]][1] = key_output
+                operations.append([8, producer, 0, -1])
+            ids[node] = key_output
+            continue
         if node.target in fused_norm_targets:
             if len(node.args) != 4 or node.kwargs:
                 raise RuntimeError("GaudiRT FX: unsupported fused RMSNorm arguments")
