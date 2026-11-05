@@ -3035,6 +3035,7 @@ class BucketProgram {
                     op.size() == static_cast<size_t>(op[2] + 2) &&
                     std::all_of(op.begin() + 3, op.end(), [](int64_t size) { return size > 0; })) ||
                    (op[0] == 18 && op.size() == 4 && op[2] == 1 && op[3] == 2) ||
+                   (op[0] == 19 && op.size() == 4 && op[2] == 0 && op[3] == -1) ||
                    (op[0] == 15 && std::all_of(op.begin() + 1, op.end(),
                                                [upper](int64_t id) { return id >= 0 && id < upper; }))),
                   "GaudiRT FX: invalid normalized node");
@@ -3102,6 +3103,14 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
   }
   for (const auto& op : operations_) {
     const auto& a = specs[op[1]];
+    if (op[0] == 19) {
+      TORCH_CHECK(a.dynamic && a.sizes.size() == 2 &&
+                  (a.dtype == at::kBFloat16 || a.dtype == at::kFloat),
+                  "GaudiRT FX: copy requires a dynamic rank-two BF16 or FP32 input");
+      specs.push_back(a);
+      normalized << "n" << op[0] << ":" << op[1] << ":" << op[2] << ":" << op[3] << ";";
+      continue;
+    }
     if (op[0] == 18) {
       TORCH_CHECK(a.dynamic && a.sizes.size() == 3,
                   "GaudiRT FX: feature transpose requires a dynamic rank-three input");
@@ -3360,7 +3369,7 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
         node({values[op[1]]}, values[id], &params, sizeof(params), "transpose");
         continue;
       }
-      if (op[0] == 17) {
+      if (op[0] == 17 || op[0] == 19) {
         node({values[op[1]]}, values[id], nullptr, 0, "reshape");
         continue;
       }
