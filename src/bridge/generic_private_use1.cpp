@@ -3224,9 +3224,16 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
                   a.sizes[2] == b.sizes[1], "GaudiRT FX: invalid batch GEMM geometry");
       specs.push_back({a.dtype, {-1, a.sizes[1], b.sizes[2]}, true});
     } else if (op[0] == 1 || (op[0] >= 12 && op[0] <= 14)) {
-      TORCH_CHECK(a.dynamic && b.dynamic && a.sizes.size() == 2 && a.sizes == b.sizes,
-                  "GaudiRT FX: elementwise operation requires equal rank-2 dynamic shapes");
-      specs.push_back(a);
+      const auto compatible = [](const FxValueSpec& dynamic, const FxValueSpec& other) {
+        return dynamic.dynamic && dynamic.sizes.size() == 2 &&
+               ((other.dynamic && other.sizes == dynamic.sizes) ||
+                (!other.dynamic && ((other.sizes.size() == 1 && other.sizes[0] == dynamic.sizes[1]) ||
+                                    (other.sizes.size() == 2 && other.sizes[0] == 1 &&
+                                     other.sizes[1] == dynamic.sizes[1]))));
+      };
+      TORCH_CHECK(compatible(a, b) || compatible(b, a),
+                  "GaudiRT FX: unsupported elementwise broadcast geometry");
+      specs.push_back(a.dynamic ? a : b);
     } else if (op[0] == 2) {
       const float epsilon = std::bit_cast<float>(static_cast<uint32_t>(op[3]));
       TORCH_CHECK(a.dtype == at::kBFloat16 && a.dynamic && a.sizes.size() == 2 &&
@@ -3424,28 +3431,44 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
                             "split", name.c_str(), nullptr, nullptr), "program feature split failed");
         continue;
       }
-      if (op[0] == 1) {
-        const auto guid = spec.dtype == at::kBFloat16 ? std::string("gk_add_bf16_v1") :
-                          "add_fwd_" + std::string(type.name);
-        node({values[op[1]], values[op[2]]}, values[id], nullptr, 0, guid.c_str());
-        continue;
-      }
-      if (op[0] >= 12 && op[0] <= 14) {
+      if (op[0] == 1 || (op[0] >= 12 && op[0] <= 14)) {
+        auto expand = [&](int64_t input_id) {
+          const auto& input = specs_[input_id];
+          if (input.dynamic) return values[input_id];
+          auto source = values[input_id];
+          if (input.sizes.size() == 1) {
+            auto reshaped = tensor(type.syn, width, 1, -1);
+            node({source}, reshaped, nullptr, 0, "reshape");
+            source = reshaped;
+          }
+          auto expanded = tensor(type.syn, width, bucket, -1);
+          ns_BroadcastNonFcd::Params params{1};
+          const auto broadcast = "broadcast_non_fcd_" + std::string(type.name);
+          node({source}, expanded, &params, sizeof(params), broadcast.c_str());
+          return expanded;
+        };
+        auto left = expand(op[1]), right = expand(op[2]);
+        if (op[0] == 1) {
+          const auto guid = spec.dtype == at::kBFloat16 ? std::string("gk_add_bf16_v1") :
+                            "add_fwd_" + std::string(type.name);
+          node({left, right}, values[id], nullptr, 0, guid.c_str());
+          continue;
+        }
         if (op[0] == 14 && spec.dtype == at::kBFloat16) {
           auto numerator = tensor(syn_type_float, width, rows, -1);
           auto denominator = tensor(syn_type_float, width, rows, -1);
           auto quotient = tensor(syn_type_float, width, rows, -1);
           ns_CastKernel::ParamsV3 params{};
           params.round_mode = CAST_ROUND_HALF_NE;
-          node({values[op[1]]}, numerator, &params, sizeof(params), "cast_bf16_to_f32");
-          node({values[op[2]]}, denominator, &params, sizeof(params), "cast_bf16_to_f32");
+          node({left}, numerator, &params, sizeof(params), "cast_bf16_to_f32");
+          node({right}, denominator, &params, sizeof(params), "cast_bf16_to_f32");
           node({numerator, denominator}, quotient, nullptr, 0, "div_fwd_f32");
           node({quotient}, values[id], nullptr, 0, "gk_cast_f32_to_bf16_v1");
           continue;
         }
         const auto operation = op[0] == 12 ? "sub_fwd_" : (op[0] == 13 ? "mult_fwd_" : "div_fwd_");
         const auto guid = std::string(operation) + type.name;
-        node({values[op[1]], values[op[2]]}, values[id], nullptr, 0, guid.c_str());
+        node({left, right}, values[id], nullptr, 0, guid.c_str());
         continue;
       }
       if (op[0] == 2) {
