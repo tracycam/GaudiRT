@@ -28,13 +28,15 @@ def _program_backend(graph_module, example_inputs):
         roles.append(int(bool(dynamic)))
     if not any(roles):
         raise RuntimeError("GaudiRT FX: mark each dynamic token input before capture")
-    operations, transposes, splits = [], {}, {}
+    operations, transposes, splits, fused_norms = [], {}, {}, {}
     linear_targets = (torch.nn.functional.linear, torch.ops.aten.linear.default)
     mm_targets = (torch.mm, torch.ops.aten.mm.default, torch.matmul,
                   torch.ops.aten.matmul.default, operator.matmul)
     addmm_targets = (torch.addmm, torch.ops.aten.addmm.default)
     add_targets = (operator.add, torch.add, torch.ops.aten.add.Tensor)
     norm_targets = (torch.ops.gaudirt.rms_norm, torch.ops.gaudirt.rms_norm.default)
+    fused_norm_targets = (torch.ops.gaudirt.fused_add_rms_norm,
+                          torch.ops.gaudirt.fused_add_rms_norm.default)
     silu_targets = (torch.ops.gaudirt.silu_and_mul, torch.ops.gaudirt.silu_and_mul.default)
     split_targets = (torch.split, torch.ops.aten.split_with_sizes.default)
 
@@ -77,7 +79,31 @@ def _program_backend(graph_module, example_inputs):
             continue
         if node.op != "call_function":
             raise RuntimeError(f"GaudiRT FX: unsupported program node {node.op}: {node.target}")
-        if node.target is operator.getitem and len(node.args) == 2 and node.args[0] in splits:
+        if node.target in fused_norm_targets:
+            if len(node.args) != 4 or node.kwargs:
+                raise RuntimeError("GaudiRT FX: unsupported fused RMSNorm arguments")
+            epsilon = node.args[3]
+            if not isinstance(epsilon, (int, float)) or not math.isfinite(epsilon) or epsilon <= 0:
+                raise RuntimeError("GaudiRT FX: fused RMSNorm epsilon must be positive and finite")
+            bits = struct.unpack("<I", struct.pack("<f", epsilon))[0]
+            producer = len(tensor_indices) + len(operations)
+            operations.append([5, tensor_id(node.args[0]), tensor_id(node.args[1]), tensor_id(node.args[2]), bits])
+            fused_norms[node] = [producer, None]
+            continue
+        if node.target is operator.getitem and len(node.args) == 2 and node.args[0] in fused_norms:
+            producer, residual = fused_norms[node.args[0]]
+            index = node.args[1]
+            if node.kwargs or index not in (0, 1):
+                raise RuntimeError("GaudiRT FX: invalid fused RMSNorm output index")
+            if index == 0:
+                ids[node] = producer
+                continue
+            if residual is not None:
+                ids[node] = residual
+                continue
+            fused_norms[node.args[0]][1] = len(tensor_indices) + len(operations)
+            operation = [6, producer, 0, -1]
+        elif node.target is operator.getitem and len(node.args) == 2 and node.args[0] in splits:
             source, sizes = splits[node.args[0]]
             index = node.args[1]
             if node.kwargs or not isinstance(index, int) or index < 0 or index >= len(sizes):

@@ -2397,7 +2397,7 @@ struct FxValueSpec {
 };
 
 // An FX program is described by external input roles and normalized nodes.
-// Node 0 is linear, 1 is add, 2 is BF16 RMSNorm, 3 is SiLU/multiply, and 4 is a feature split.
+// Nodes 0..4 are linear, add, RMSNorm, SiLU/multiply and split; 5/6 are fused norm outputs.
 // A node's output ID is input_count + its index in the program.
 class BucketProgram {
  public:
@@ -2411,18 +2411,28 @@ class BucketProgram {
       has_dynamic |= role == 1;
     }
     TORCH_CHECK(has_dynamic, "GaudiRT FX: no dynamic token input");
+    std::vector<int64_t> residual_producers;
     for (size_t i = 0; i < operations_.size(); ++i) {
       const auto& op = operations_[i];
       const int64_t upper = roles_.size() + i;
-      TORCH_CHECK((op.size() == 4 || (op.size() == 5 && op[0] == 4)) &&
+      TORCH_CHECK((op.size() == 4 || (op.size() == 5 && (op[0] == 4 || op[0] == 5))) &&
                   op[1] >= 0 && op[1] < upper && op[2] >= 0 &&
                   ((op[0] == 0 && op[2] < upper && (op[3] == -1 || (op[3] >= 0 && op[3] < upper))) ||
                    (op[0] == 1 && op[2] < upper && op[3] == -1) ||
                    (op[0] == 2 && op[2] < upper && op[3] >= 0 &&
                     static_cast<uint64_t>(op[3]) <= UINT32_MAX) ||
                    (op[0] == 3 && op[1] == op[2] && op[3] == -1) ||
-                   (op[0] == 4 && op.size() == 5 && op[3] > 0 && op[4] > 0)),
+                   (op[0] == 4 && op.size() == 5 && op[3] > 0 && op[4] > 0) ||
+                   (op[0] == 5 && op.size() == 5 && op[2] < upper && op[3] >= 0 && op[3] < upper &&
+                    op[4] >= 0 && static_cast<uint64_t>(op[4]) <= UINT32_MAX) ||
+                   (op[0] == 6 && op.size() == 4 && op[1] >= static_cast<int64_t>(roles_.size()) &&
+                    operations_[op[1] - roles_.size()][0] == 5 && op[2] == 0 && op[3] == -1)),
                   "GaudiRT FX: invalid normalized node");
+      if (op[0] == 6) {
+        TORCH_CHECK(std::find(residual_producers.begin(), residual_producers.end(), op[1]) == residual_producers.end(),
+                    "GaudiRT FX: duplicate fused residual output");
+        residual_producers.push_back(op[1]);
+      }
     }
     if (outputs_.empty()) outputs_.push_back(roles_.size() + operations_.size() - 1);
     std::vector<int64_t> unique_outputs = outputs_;
@@ -2454,7 +2464,7 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
   std::vector<FxValueSpec> specs;
   specs.reserve(inputs.size() + operations_.size());
   std::ostringstream normalized;
-  normalized << "fx_program_v7;";
+  normalized << "fx_program_v8;";
   for (size_t i = 0; i < inputs.size(); ++i) {
     const auto& tensor = inputs[i];
     TORCH_CHECK(tensor.device().type() == c10::kPrivateUse1 && tensor.device().index() == 0 &&
@@ -2473,6 +2483,11 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
   }
   for (const auto& op : operations_) {
     const auto& a = specs[op[1]];
+    if (op[0] == 6) {
+      specs.push_back(a);
+      normalized << "n" << op[0] << ":" << op[1] << ":" << op[2] << ":" << op[3] << ";";
+      continue;
+    }
     if (op[0] == 4) {
       TORCH_CHECK(a.dynamic && a.sizes.size() == 2 && op[4] == a.sizes[1] && op[2] < a.sizes[1] &&
                   op[3] <= a.sizes[1] - op[2] && (op[2] > 0 || op[3] < a.sizes[1]),
@@ -2483,6 +2498,17 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
     }
     const auto& b = specs[op[2]];
     TORCH_CHECK(a.dtype == b.dtype, "GaudiRT FX: input dtype mismatch");
+    if (op[0] == 5) {
+      const auto& weight = specs[op[3]];
+      const float epsilon = std::bit_cast<float>(static_cast<uint32_t>(op[4]));
+      TORCH_CHECK(a.dtype == at::kBFloat16 && a.dynamic && b.dynamic && a.sizes.size() == 2 &&
+                  a.sizes == b.sizes && a.sizes[1] <= 8192 && !weight.dynamic &&
+                  weight.dtype == a.dtype && weight.sizes.size() == 1 && weight.sizes[0] == a.sizes[1] &&
+                  std::isfinite(epsilon) && epsilon > 0, "GaudiRT FX: invalid fused RMSNorm geometry or epsilon");
+      specs.push_back(a);
+      normalized << "n" << op[0] << ":" << op[1] << ":" << op[2] << ":" << op[3] << ":" << op[4] << ";";
+      continue;
+    }
     if (op[0] == 0) {
       TORCH_CHECK(a.dynamic && a.sizes.size() == 2 && !b.dynamic && b.sizes.size() == 2 &&
                   a.sizes[1] == b.sizes[1], "GaudiRT FX: invalid linear geometry");
@@ -2581,6 +2607,10 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
     for (size_t i = 0; i < operations_.size(); ++i) {
       const auto& op = operations_[i];
       const auto id = roles_.size() + i;
+      if (op[0] == 6) {
+        TORCH_CHECK(values[id], "GaudiRT FX: missing fused residual tensor");
+        continue;
+      }
       const auto& spec = specs_[id];
       const auto type = cast_type(spec.dtype);
       const uint64_t width = spec.sizes[1];
@@ -2588,6 +2618,25 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
       const int slot = output == outputs_.end() ? -1 :
           static_cast<int>(roles_.size() + std::distance(outputs_.begin(), output));
       values[id] = tensor(type.syn, width, bucket, slot);
+      if (op[0] == 5) {
+        size_t residual_id = specs_.size();
+        for (size_t j = i + 1; j < operations_.size(); ++j)
+          if (operations_[j][0] == 6 && operations_[j][1] == static_cast<int64_t>(id))
+            residual_id = roles_.size() + j;
+        const auto residual_output = std::find(outputs_.begin(), outputs_.end(), static_cast<int64_t>(residual_id));
+        const int residual_slot = residual_output == outputs_.end() ? -1 :
+            static_cast<int>(roles_.size() + std::distance(outputs_.begin(), residual_output));
+        auto residual = tensor(type.syn, width, bucket, residual_slot);
+        if (residual_id < values.size()) values[residual_id] = residual;
+        const float epsilon = std::bit_cast<float>(static_cast<uint32_t>(op[4]));
+        const std::array<synTensor, 3> inputs{values[op[1]], values[op[2]], values[op[3]]};
+        std::array<synTensor, 2> outputs{residual, values[id]};
+        const auto name = prefix + "_n" + std::to_string(next_node++);
+        check(synNodeCreate(graph, inputs.data(), outputs.data(), inputs.size(), outputs.size(),
+                            &epsilon, sizeof(epsilon), "gk_fused_add_rms_norm_bf16_v1", name.c_str(),
+                            nullptr, nullptr), "program fused RMSNorm failed");
+        continue;
+      }
       if (op[0] == 4) {
         const auto total = specs_[op[1]].sizes[1];
         std::vector<synTensor> parts;
@@ -2744,6 +2793,17 @@ at::Tensor bucket_rms_norm(const at::Tensor& input, const at::Tensor& weight, do
   const auto bits = std::bit_cast<uint32_t>(eps);
   BucketProgram program({1, 0}, {{2, 0, 1, static_cast<int64_t>(bits)}});
   return program.run({input, weight})[0];
+}
+
+std::tuple<at::Tensor, at::Tensor> bucket_fused_add_rms_norm(
+    const at::Tensor& input, const at::Tensor& residual, const at::Tensor& weight, double epsilon) {
+  const float eps = static_cast<float>(epsilon);
+  TORCH_CHECK(std::isfinite(epsilon) && std::isfinite(eps) && eps > 0,
+              "GaudiRT: fused RMSNorm epsilon must be a positive finite FP32 value");
+  const auto bits = std::bit_cast<uint32_t>(eps);
+  BucketProgram program({1, 1, 0}, {{5, 0, 1, 2, static_cast<int64_t>(bits)}, {6, 3, 0, -1}}, {3, 4});
+  auto result = program.run({input, residual, weight});
+  return {result[0], result[1]};
 }
 
 at::Tensor bucket_silu_and_mul(const at::Tensor& input) {
@@ -3178,6 +3238,7 @@ TORCH_LIBRARY(gaudirt, m) {
       .def("rows", &gaudirt::generic::PagedMetadata::rows)
       .def("slots", &gaudirt::generic::PagedMetadata::slots);
   m.def("rms_norm(Tensor input, Tensor weight, float epsilon) -> Tensor");
+  m.def("fused_add_rms_norm(Tensor input, Tensor residual, Tensor weight, float epsilon) -> (Tensor, Tensor)");
   m.def("silu_and_mul(Tensor input) -> Tensor");
   m.def("paged_attn(Tensor query, Tensor key, Tensor value, Tensor(a!) key_pool, Tensor(b!) value_pool, "
         "__torch__.torch.classes.gaudirt.PagedMetadata metadata, int head_dim, float scale) -> Tensor");
@@ -3188,6 +3249,7 @@ TORCH_LIBRARY(gaudirt, m) {
 
 TORCH_LIBRARY_IMPL(gaudirt, PrivateUse1, m) {
   m.impl("rms_norm", TORCH_FN(gaudirt::generic::bucket_rms_norm));
+  m.impl("fused_add_rms_norm", TORCH_FN(gaudirt::generic::bucket_fused_add_rms_norm));
   m.impl("silu_and_mul", TORCH_FN(gaudirt::generic::bucket_silu_and_mul));
   m.impl("paged_attn", TORCH_FN(gaudirt::generic::paged_attn));
   m.impl("rotary_embedding", TORCH_FN(gaudirt::generic::rotary_embedding));
