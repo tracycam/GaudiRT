@@ -26,6 +26,10 @@ import torch
 import _gaudirt_C as _C
 _audit_legacy_bridge()
 
+# SGLang uses the device module's Stream type in runtime annotations. The
+# generic PyTorch type preserves the backend's own stream support checks.
+Stream = torch.Stream
+
 
 @torch.library.register_fake("gaudirt::rms_norm")
 def _fake_rms_norm(input, weight, epsilon):
