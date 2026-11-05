@@ -2583,7 +2583,8 @@ struct FxValueSpec {
 };
 
 // An FX program is described by external input roles and normalized nodes.
-// Nodes 0..4 are linear, add, RMSNorm, SiLU/multiply and split; 5/6 are fused norm outputs.
+// Nodes 0..4 are linear, add, RMSNorm, SiLU/multiply and split; 5/6 are fused norm outputs,
+// and 7/8 are validated rotary query/key outputs.
 // A node's output ID is input_count + its index in the program.
 class BucketProgram {
  public:
@@ -2597,11 +2598,12 @@ class BucketProgram {
       has_dynamic |= role == 1;
     }
     TORCH_CHECK(has_dynamic, "GaudiRT FX: no dynamic token input");
-    std::vector<int64_t> residual_producers;
+    std::vector<int64_t> residual_producers, rotary_producers;
     for (size_t i = 0; i < operations_.size(); ++i) {
       const auto& op = operations_[i];
       const int64_t upper = roles_.size() + i;
-      TORCH_CHECK((op.size() == 4 || (op.size() == 5 && (op[0] == 4 || op[0] == 5))) &&
+      TORCH_CHECK((op.size() == 4 || (op.size() == 5 && (op[0] == 4 || op[0] == 5)) ||
+                   (op.size() == 10 && op[0] == 7)) &&
                   op[1] >= 0 && op[1] < upper && op[2] >= 0 &&
                   ((op[0] == 0 && op[2] < upper && (op[3] == -1 || (op[3] >= 0 && op[3] < upper))) ||
                    (op[0] == 1 && op[2] < upper && op[3] == -1) ||
@@ -2612,12 +2614,23 @@ class BucketProgram {
                    (op[0] == 5 && op.size() == 5 && op[2] < upper && op[3] >= 0 && op[3] < upper &&
                     op[4] >= 0 && static_cast<uint64_t>(op[4]) <= UINT32_MAX) ||
                    (op[0] == 6 && op.size() == 4 && op[1] >= static_cast<int64_t>(roles_.size()) &&
-                    operations_[op[1] - roles_.size()][0] == 5 && op[2] == 0 && op[3] == -1)),
+                    operations_[op[1] - roles_.size()][0] == 5 && op[2] == 0 && op[3] == -1) ||
+                   (op[0] == 7 && op.size() == 10 && op[2] < upper &&
+                    op[3] >= 0 && op[3] < upper && op[4] >= 0 && op[4] < upper &&
+                    op[5] >= 0 && op[5] < upper && op[6] > 0 && op[7] > 0 && op[8] > 0 &&
+                    (op[9] == 0 || op[9] == 1)) ||
+                   (op[0] == 8 && op.size() == 4 && op[1] >= static_cast<int64_t>(roles_.size()) &&
+                    operations_[op[1] - roles_.size()][0] == 7 && op[2] == 0 && op[3] == -1)),
                   "GaudiRT FX: invalid normalized node");
       if (op[0] == 6) {
         TORCH_CHECK(std::find(residual_producers.begin(), residual_producers.end(), op[1]) == residual_producers.end(),
                     "GaudiRT FX: duplicate fused residual output");
         residual_producers.push_back(op[1]);
+      }
+      if (op[0] == 8) {
+        TORCH_CHECK(std::find(rotary_producers.begin(), rotary_producers.end(), op[1]) == rotary_producers.end(),
+                    "GaudiRT FX: duplicate rotary key output");
+        rotary_producers.push_back(op[1]);
       }
     }
     if (outputs_.empty()) outputs_.push_back(roles_.size() + operations_.size() - 1);
@@ -2653,11 +2666,13 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
   normalized << "fx_program_v8;";
   for (size_t i = 0; i < inputs.size(); ++i) {
     const auto& tensor = inputs[i];
+    const bool floating = tensor.scalar_type() == at::kBFloat16 || tensor.scalar_type() == at::kFloat;
+    const bool integer_vector = tensor.scalar_type() == at::kInt && tensor.dim() == 1;
     TORCH_CHECK(tensor.device().type() == c10::kPrivateUse1 && tensor.device().index() == 0 &&
-                (tensor.scalar_type() == at::kBFloat16 || tensor.scalar_type() == at::kFloat),
+                (floating || integer_vector),
                 "GaudiRT FX: unsupported input device or dtype");
-    TORCH_CHECK((roles_[i] && tensor.dim() == 2) ||
-                (!roles_[i] && (tensor.dim() == 1 || tensor.dim() == 2)),
+    TORCH_CHECK((roles_[i] && ((floating && tensor.dim() == 2) || integer_vector)) ||
+                (!roles_[i] && ((floating && (tensor.dim() == 1 || tensor.dim() == 2)) || integer_vector)),
                 "GaudiRT FX: unsupported input rank");
     std::vector<int64_t> sizes(tensor.sizes().begin(), tensor.sizes().end());
     for (auto size : sizes) TORCH_CHECK(size > 0, "GaudiRT FX: empty input dimension");
@@ -2669,6 +2684,31 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
   }
   for (const auto& op : operations_) {
     const auto& a = specs[op[1]];
+    if (op[0] == 8) {
+      specs.push_back(specs[operations_[op[1] - roles_.size()][2]]);
+      normalized << "n" << op[0] << ":" << op[1] << ":" << op[2] << ":" << op[3] << ";";
+      continue;
+    }
+    if (op[0] == 7) {
+      const auto& key = specs[op[2]];
+      const auto& cache = specs[op[3]];
+      const auto& positions = specs[op[4]];
+      const auto& header = specs[op[5]];
+      TORCH_CHECK(a.dtype == at::kBFloat16 && a.dynamic && a.sizes.size() == 2 &&
+                  key.dtype == a.dtype && key.dynamic && key.sizes.size() == 2 &&
+                  !cache.dynamic && cache.dtype == a.dtype && cache.sizes.size() == 2 &&
+                  cache.sizes[0] >= op[6] && cache.sizes[1] == op[8] &&
+                  positions.dtype == at::kInt && positions.dynamic && positions.sizes.size() == 1 &&
+                  header.dtype == at::kInt && !header.dynamic && header.sizes == std::vector<int64_t>{1} &&
+                  op[7] <= INT32_MAX && op[8] <= op[7] && op[8] % 2 == 0 &&
+                  a.sizes[1] % op[7] == 0 && key.sizes[1] % op[7] == 0,
+                  "GaudiRT FX: invalid rotary geometry or validated metadata");
+      specs.push_back(a);
+      normalized << "n" << op[0];
+      for (size_t i = 1; i < op.size(); ++i) normalized << ":" << op[i];
+      normalized << ";";
+      continue;
+    }
     if (op[0] == 6) {
       specs.push_back(a);
       normalized << "n" << op[0] << ":" << op[1] << ":" << op[2] << ":" << op[3] << ";";
@@ -2786,15 +2826,15 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
     };
     for (size_t i = 0; i < roles_.size(); ++i) {
       const auto& spec = specs_[i];
-      const uint64_t fcd = spec.sizes.back();
-      const uint64_t rows = spec.dynamic ? bucket : (spec.sizes.size() == 1 ? 1 : spec.sizes[0]);
+      const uint64_t fcd = spec.dynamic && spec.sizes.size() == 1 ? bucket : spec.sizes.back();
+      const uint64_t rows = spec.sizes.size() == 1 ? 1 : (spec.dynamic ? bucket : spec.sizes[0]);
       values[i] = tensor(cast_type(spec.dtype).syn, fcd, rows, i, spec.sizes.size());
     }
     for (size_t i = 0; i < operations_.size(); ++i) {
       const auto& op = operations_[i];
       const auto id = roles_.size() + i;
-      if (op[0] == 6) {
-        TORCH_CHECK(values[id], "GaudiRT FX: missing fused residual tensor");
+      if (op[0] == 6 || op[0] == 8) {
+        TORCH_CHECK(values[id], "GaudiRT FX: missing second result tensor");
         continue;
       }
       const auto& spec = specs_[id];
@@ -2804,6 +2844,27 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
       const int slot = output == outputs_.end() ? -1 :
           static_cast<int>(roles_.size() + std::distance(outputs_.begin(), output));
       values[id] = tensor(type.syn, width, bucket, slot);
+      if (op[0] == 7) {
+        size_t key_id = specs_.size();
+        for (size_t j = i + 1; j < operations_.size(); ++j)
+          if (operations_[j][0] == 8 && operations_[j][1] == static_cast<int64_t>(id))
+            key_id = roles_.size() + j;
+        const auto key_output = std::find(outputs_.begin(), outputs_.end(), static_cast<int64_t>(key_id));
+        const int key_slot = key_output == outputs_.end() ? -1 :
+            static_cast<int>(roles_.size() + std::distance(outputs_.begin(), key_output));
+        auto key = tensor(type.syn, specs_[op[2]].sizes[1], bucket, key_slot);
+        if (key_id < values.size()) values[key_id] = key;
+        struct Params { int32_t head_dim, rotary_dim, is_neox; } params{
+            static_cast<int32_t>(op[7]), static_cast<int32_t>(op[8]), static_cast<int32_t>(op[9])};
+        const std::array<synTensor, 5> inputs{
+            values[op[1]], values[op[2]], values[op[4]], values[op[3]], values[op[5]]};
+        const std::array<synTensor, 2> outputs{values[id], key};
+        const auto name = prefix + "_n" + std::to_string(next_node++);
+        check(synNodeCreate(graph, inputs.data(), outputs.data(), inputs.size(), outputs.size(),
+                            &params, sizeof(params), "gk_rotary_bf16_v1", name.c_str(),
+                            nullptr, nullptr), "program rotary failed");
+        continue;
+      }
       if (op[0] == 5) {
         size_t residual_id = specs_.size();
         for (size_t j = i + 1; j < operations_.size(); ++j)
@@ -2891,7 +2952,8 @@ std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs
   size_t dynamic_input = 0;
   for (size_t i = 0; i < inputs.size(); ++i) {
     if (!roles_[i]) continue;
-    TORCH_CHECK(inputs[i].dim() == 2, "GaudiRT FX: dynamic input must have rank two");
+    TORCH_CHECK(inputs[i].dim() == 1 || inputs[i].dim() == 2,
+                "GaudiRT FX: dynamic input must have rank one or two");
     if (m < 0) {
       m = inputs[i].size(0);
       dynamic_input = i;
@@ -2938,9 +3000,10 @@ std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs
     const auto& input = inputs[i];
     const auto& spec = specs_[i];
     const uint64_t item = input.element_size();
-    TORCH_CHECK(!spec.dynamic || static_cast<uint64_t>(spec.sizes[1]) <= UINT64_MAX / bucket / item,
+    const uint64_t dynamic_width = spec.sizes.size() == 1 ? 1 : static_cast<uint64_t>(spec.sizes[1]);
+    TORCH_CHECK(!spec.dynamic || dynamic_width <= UINT64_MAX / bucket / item,
                 "GaudiRT FX: input allocation size overflow");
-    const uint64_t bytes = spec.dynamic ? static_cast<uint64_t>(bucket) * spec.sizes[1] * item : input.nbytes();
+    const uint64_t bytes = spec.dynamic ? static_cast<uint64_t>(bucket) * dynamic_width * item : input.nbytes();
     const uint64_t address = address_of(input, *ctx);
     ctx->allocator.record_stream(address, stream);
     const uint64_t offset = static_cast<uint64_t>(input.storage_offset()) * item;
