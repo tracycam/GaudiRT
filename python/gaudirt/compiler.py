@@ -35,6 +35,7 @@ def _program_backend(graph_module, example_inputs):
     linear_targets = (torch.nn.functional.linear, torch.ops.aten.linear.default)
     mm_targets = (torch.mm, torch.ops.aten.mm.default, torch.matmul,
                   torch.ops.aten.matmul.default, operator.matmul)
+    bmm_targets = (torch.bmm, torch.ops.aten.bmm.default)
     addmm_targets = (torch.addmm, torch.ops.aten.addmm.default)
     add_targets = (operator.add, torch.add, torch.ops.aten.add.Tensor)
     sub_targets = (operator.sub, torch.sub, torch.ops.aten.sub.Tensor)
@@ -281,8 +282,16 @@ def _program_backend(graph_module, example_inputs):
             bias = node.args[2] if len(node.args) == 3 else node.kwargs.get("bias")
             operation = [0, tensor_id(node.args[0]), tensor_id(node.args[1]),
                          -1 if bias is None else tensor_id(bias)]
+        elif node.target in bmm_targets and len(node.args) == 2 and not node.kwargs:
+            operation = [16, tensor_id(node.args[0]), tensor_id(node.args[1]), -1]
         elif node.target in mm_targets and len(node.args) == 2 and not node.kwargs:
-            operation = [0, tensor_id(node.args[0]), weight_id(node.args[1]), -1]
+            left = node.args[0].meta.get("example_value")
+            right = node.args[1].meta.get("example_value")
+            if (isinstance(left, torch.Tensor) and isinstance(right, torch.Tensor) and
+                    left.ndim == right.ndim == 3):
+                operation = [16, tensor_id(node.args[0]), tensor_id(node.args[1]), -1]
+            else:
+                operation = [0, tensor_id(node.args[0]), weight_id(node.args[1]), -1]
         elif node.target in addmm_targets and len(node.args) == 3:
             if set(node.kwargs) - {"alpha", "beta"} or any(
                 not isinstance(value, (int, float)) or value != 1 for value in node.kwargs.values()
@@ -447,6 +456,11 @@ def gaudirt_backend(graph_module, example_inputs):
         if gemm.kwargs:
             raise RuntimeError("GaudiRT FX: unsupported GEMM arguments")
         input_node, transposed = gemm.args
+        left = input_node.meta.get("example_value")
+        right = transposed.meta.get("example_value")
+        if (isinstance(left, torch.Tensor) and isinstance(right, torch.Tensor) and
+                left.ndim == right.ndim == 3):
+            return _program_backend(graph_module, example_inputs)
         weight_node = transposed_weight(transposed)
     elif gemm.target in addmm_targets and len(gemm.args) == 3:
         if set(gemm.kwargs) - {"alpha", "beta"} or any(

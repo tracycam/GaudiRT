@@ -2883,7 +2883,7 @@ struct FxValueSpec {
 // Nodes 0..4 are linear, add, RMSNorm, SiLU/multiply and split; 5/6 are fused norm outputs,
 // 7/8 are validated rotary query/key outputs, 9 is validated embedding,
 // 10 gathers validated last-token rows, 11 casts BF16/FP32, 12..14 are sub/mul/div,
-// and 15 concatenates dynamic feature tensors.
+// 15 concatenates dynamic feature tensors, and 16 is batch GEMM.
 // A node's output ID is input_count + its index in the program.
 class BucketProgram {
  public:
@@ -2927,6 +2927,7 @@ class BucketProgram {
                     op[3] == -1) ||
                    (op[0] == 11 && op.size() == 4 && op[2] <= 1 && op[3] == -1) ||
                    (op[0] >= 12 && op[0] <= 14 && op.size() == 4 && op[2] < upper && op[3] == -1) ||
+                   (op[0] == 16 && op.size() == 4 && op[2] < upper && op[3] == -1) ||
                    (op[0] == 15 && std::all_of(op.begin() + 1, op.end(),
                                                [upper](int64_t id) { return id >= 0 && id < upper; }))),
                   "GaudiRT FX: invalid normalized node");
@@ -2981,7 +2982,7 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
     TORCH_CHECK(tensor.device().type() == c10::kPrivateUse1 && tensor.device().index() == 0 &&
                 (floating || integer_vector),
                 "GaudiRT FX: unsupported input device or dtype");
-    TORCH_CHECK((roles_[i] && ((floating && tensor.dim() == 2) || integer_vector)) ||
+    TORCH_CHECK((roles_[i] && ((floating && (tensor.dim() == 2 || tensor.dim() == 3)) || integer_vector)) ||
                 (!roles_[i] && ((floating && (tensor.dim() == 1 || tensor.dim() == 2)) || integer_vector)),
                 "GaudiRT FX: unsupported input rank");
     std::vector<int64_t> sizes(tensor.sizes().begin(), tensor.sizes().end());
@@ -3096,9 +3097,13 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
                     bias.dtype == a.dtype, "GaudiRT FX: invalid linear bias");
       }
       specs.push_back({a.dtype, {a.sizes[0], b.sizes[0]}, a.dynamic});
+    } else if (op[0] == 16) {
+      TORCH_CHECK(a.dynamic && b.dynamic && a.sizes.size() == 3 && b.sizes.size() == 3 &&
+                  a.sizes[2] == b.sizes[1], "GaudiRT FX: invalid batch GEMM geometry");
+      specs.push_back({a.dtype, {-1, a.sizes[1], b.sizes[2]}, true});
     } else if (op[0] == 1 || (op[0] >= 12 && op[0] <= 14)) {
-      TORCH_CHECK(a.dynamic && b.dynamic && a.sizes == b.sizes,
-                  "GaudiRT FX: elementwise operation requires equal dynamic shapes");
+      TORCH_CHECK(a.dynamic && b.dynamic && a.sizes.size() == 2 && a.sizes == b.sizes,
+                  "GaudiRT FX: elementwise operation requires equal rank-2 dynamic shapes");
       specs.push_back(a);
     } else if (op[0] == 2) {
       const float epsilon = std::bit_cast<float>(static_cast<uint32_t>(op[3]));
@@ -3144,7 +3149,8 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
   };
   try {
     check(synGraphCreate(&graph, synDeviceGaudi2), "program graph creation failed");
-    auto tensor = [&](synDataType type, uint64_t fcd, uint64_t rows, int slot, uint32_t rank = 2) {
+    auto tensor = [&](synDataType type, uint64_t fcd, uint64_t rows, int slot,
+                      uint32_t rank = 2, uint64_t depth = 1) {
       tensor_names.push_back(prefix + "_t" + std::to_string(next_tensor++));
       synSectionHandle section = nullptr;
       if (slot >= 0) {
@@ -3158,7 +3164,8 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
       desc.m_dataType = type;
       desc.m_dims = rank;
       desc.m_sizes[0] = desc.m_minSizes[0] = fcd;
-      if (rank == 2) desc.m_sizes[1] = desc.m_minSizes[1] = rows;
+      if (rank >= 2) desc.m_sizes[1] = desc.m_minSizes[1] = rows;
+      if (rank == 3) desc.m_sizes[2] = desc.m_minSizes[2] = depth;
       synTensor handle = nullptr;
       check(synTensorCreate(&handle, &desc, section, 0), "program tensor creation failed");
       created.push_back(handle);
@@ -3166,7 +3173,8 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
         compiled->tensors[slot].tensorName = compiled->names[slot].c_str();
         compiled->tensors[slot].tensorType = DATA_TENSOR;
         compiled->tensors[slot].tensorSize[0] = fcd;
-        if (rank == 2) compiled->tensors[slot].tensorSize[1] = rows;
+        if (rank >= 2) compiled->tensors[slot].tensorSize[1] = rows;
+        if (rank == 3) compiled->tensors[slot].tensorSize[2] = depth;
       }
       return handle;
     };
@@ -3179,8 +3187,10 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
     for (size_t i = 0; i < roles_.size(); ++i) {
       const auto& spec = specs_[i];
       const uint64_t fcd = spec.dynamic && spec.sizes.size() == 1 ? bucket : spec.sizes.back();
-      const uint64_t rows = spec.sizes.size() == 1 ? 1 : (spec.dynamic ? bucket : spec.sizes[0]);
-      values[i] = tensor(cast_type(spec.dtype).syn, fcd, rows, i, spec.sizes.size());
+      const uint64_t rows = spec.sizes.size() == 1 ? 1 : spec.sizes.size() == 3 ? spec.sizes[1] :
+                            (spec.dynamic ? bucket : spec.sizes[0]);
+      const uint64_t depth = spec.sizes.size() == 3 ? (spec.dynamic ? bucket : spec.sizes[0]) : 1;
+      values[i] = tensor(cast_type(spec.dtype).syn, fcd, rows, i, spec.sizes.size(), depth);
     }
     for (size_t i = 0; i < operations_.size(); ++i) {
       const auto& op = operations_[i];
@@ -3191,12 +3201,19 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
       }
       const auto& spec = specs_[id];
       const auto type = cast_type(spec.dtype);
-      const uint64_t width = spec.sizes[1];
-      const uint64_t rows = spec.dynamic ? bucket : spec.sizes[0];
+      const uint64_t width = spec.sizes.back();
+      const uint64_t rows = spec.sizes.size() == 3 ? spec.sizes[1] :
+                            (spec.dynamic ? bucket : spec.sizes[0]);
       const auto output = std::find(outputs_.begin(), outputs_.end(), static_cast<int64_t>(id));
       const int slot = output == outputs_.end() ? -1 :
           static_cast<int>(roles_.size() + std::distance(outputs_.begin(), output));
-      values[id] = tensor(type.syn, width, rows, slot);
+      values[id] = tensor(type.syn, width, rows, slot, spec.sizes.size(),
+                          spec.sizes.size() == 3 ? bucket : 1);
+      if (op[0] == 16) {
+        synGEMMParams params{false, false};
+        node({values[op[1]], values[op[2]]}, values[id], &params, sizeof(params), "batch_gemm");
+        continue;
+      }
       if (op[0] == 10) {
         ns_GatherKernel::ParamsV2 params{};
         params.axis = 1;
@@ -3355,8 +3372,8 @@ std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs
   size_t dynamic_input = 0;
   for (size_t i = 0; i < inputs.size(); ++i) {
     if (!roles_[i]) continue;
-    TORCH_CHECK(inputs[i].dim() == 1 || inputs[i].dim() == 2,
-                "GaudiRT FX: dynamic input must have rank one or two");
+    TORCH_CHECK(inputs[i].dim() >= 1 && inputs[i].dim() <= 3,
+                "GaudiRT FX: dynamic input must have rank one through three");
     if (m < 0) {
       m = inputs[i].size(0);
       dynamic_input = i;
@@ -3384,8 +3401,14 @@ std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs
   results.reserve(outputs_.size());
   for (auto id : outputs_) {
     const auto& spec = specs_[id];
-    results.push_back(spec.dynamic ? bucket_output(inputs[dynamic_input], spec.dtype, bucket, m, spec.sizes[1]) :
-                      at::empty(spec.sizes, inputs[dynamic_input].options().dtype(spec.dtype)));
+    if (spec.dynamic && spec.sizes.size() == 3) {
+      TORCH_CHECK(spec.sizes[1] <= INT64_MAX / spec.sizes[2], "GaudiRT FX: output size overflow");
+      results.push_back(bucket_output(inputs[dynamic_input], spec.dtype, bucket, m,
+                                      spec.sizes[1] * spec.sizes[2]).view({m, spec.sizes[1], spec.sizes[2]}));
+    } else {
+      results.push_back(spec.dynamic ? bucket_output(inputs[dynamic_input], spec.dtype, bucket, m, spec.sizes[1]) :
+                        at::empty(spec.sizes, inputs[dynamic_input].options().dtype(spec.dtype)));
+    }
   }
   std::lock_guard recipe_lock(ctx->cold_mutex);
   auto& compiled = recipe(*ctx, bucket);
@@ -3404,7 +3427,12 @@ std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs
     const auto& input = inputs[i];
     const auto& spec = specs_[i];
     const uint64_t item = input.element_size();
-    const uint64_t dynamic_width = spec.sizes.size() == 1 ? 1 : static_cast<uint64_t>(spec.sizes[1]);
+    uint64_t dynamic_width = 1;
+    for (size_t dim = 1; dim < spec.sizes.size(); ++dim) {
+      TORCH_CHECK(dynamic_width <= UINT64_MAX / static_cast<uint64_t>(spec.sizes[dim]),
+                  "GaudiRT FX: input allocation size overflow");
+      dynamic_width *= static_cast<uint64_t>(spec.sizes[dim]);
+    }
     TORCH_CHECK(!spec.dynamic || dynamic_width <= UINT64_MAX / bucket / item,
                 "GaudiRT FX: input allocation size overflow");
     const uint64_t bytes = spec.dynamic ? static_cast<uint64_t>(bucket) * dynamic_width * item : input.nbytes();
