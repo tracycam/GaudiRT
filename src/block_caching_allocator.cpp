@@ -185,6 +185,16 @@ uint64_t BlockCachingAllocator::max_memory_allocated() const {
   std::lock_guard lock(mutex_);
   return peak_;
 }
+uint64_t BlockCachingAllocator::largest_free_block() const {
+  std::lock_guard lock(mutex_);
+  if (!base_) return capacity_;
+  uint64_t largest = 0;
+  for (const auto& [address, block] : blocks_) {
+    (void)address;
+    if (!block.allocated) largest = std::max(largest, block.bytes);
+  }
+  return largest;
+}
 bool BlockCachingAllocator::contains_live_range(uint64_t address, uint64_t bytes) const {
   std::lock_guard lock(mutex_);
   auto it = blocks_.upper_bound(address);
@@ -209,8 +219,67 @@ GraphPool::GraphPool(BlockCachingAllocator& parent, uint64_t bytes, synStreamHan
   }
 }
 GraphPool::~GraphPool() {
+  for (auto& region : extra_regions_) {
+    region.pool.reset();
+    parent_.free(region.reservation);
+  }
+  extra_regions_.clear();
   pool_.reset();
   if (reservation_) parent_.free(reservation_);
+}
+
+uint64_t GraphPool::allocate(uint64_t bytes, synStreamHandle stream) {
+  const uint64_t size = aligned(bytes);
+  std::lock_guard lock(mutex_);
+  BlockCachingAllocator* best = nullptr;
+  uint64_t best_free = std::numeric_limits<uint64_t>::max();
+  const auto consider = [&](BlockCachingAllocator& pool) {
+    const auto available = pool.largest_free_block();
+    if (available >= size && available < best_free) {
+      best = &pool;
+      best_free = available;
+    }
+  };
+  consider(*pool_);
+  for (auto& region : extra_regions_) consider(*region.pool);
+  if (!best) {
+    const auto available = parent_.largest_free_block();
+    if (available < size) throw std::runtime_error("GraphPool: out of HBM for graph temporaries");
+    const auto region_bytes = std::min(available, std::max(size, pool_->capacity_bytes()));
+    const auto reservation = parent_.allocate(region_bytes, stream);
+    try {
+      auto pool = std::unique_ptr<BlockCachingAllocator>(new BlockCachingAllocator(
+          parent_.device_, reservation, region_bytes, BlockCachingAllocator::BorrowedSlab{}));
+      extra_regions_.push_back(Region{reservation, std::move(pool)});
+      best = extra_regions_.back().pool.get();
+    } catch (...) {
+      parent_.free(reservation);
+      throw;
+    }
+  }
+  return best->allocate(size, stream);
+}
+
+void GraphPool::free(uint64_t address) {
+  std::lock_guard lock(mutex_);
+  if (pool_->contains_live_range(address, 1)) return pool_->free(address);
+  for (auto& region : extra_regions_)
+    if (region.pool->contains_live_range(address, 1)) return region.pool->free(address);
+  throw std::invalid_argument("GraphPool: unknown or freed allocation");
+}
+
+uint64_t GraphPool::capacity_bytes() const {
+  std::lock_guard lock(mutex_);
+  uint64_t total = pool_->capacity_bytes();
+  for (const auto& region : extra_regions_) total += region.pool->capacity_bytes();
+  return total;
+}
+
+uint64_t GraphPool::memory_allocated() const {
+  std::lock_guard lock(mutex_);
+  uint64_t total = pool_->memory_allocated();
+  for (const auto& region : extra_regions_) total += region.pool->memory_allocated();
+  return total;
 }
 
 }  // namespace gaudirt::runtime
