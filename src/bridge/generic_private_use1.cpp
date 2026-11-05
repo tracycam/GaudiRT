@@ -3013,6 +3013,9 @@ class PagedMetadata : public torch::CustomClassHolder {
   }
   int64_t rows() const { return rows_; }
   int64_t slots() const { return slots_; }
+  int64_t context() const { return context_; }
+  at::Tensor rotary_positions() const { return positions_.narrow(0, 0, rows_); }
+  at::Tensor rotary_header() const { return header_; }
 
   int64_t rows_ = 0, slots_ = 0, request_count_ = 0, context_ = 0;
   uint32_t bucket_ = 0;
@@ -3487,20 +3490,19 @@ at::Tensor paged_attn(const at::Tensor& query, const at::Tensor& key, const at::
   return result;
 }
 
-ColdRecipe& rotary_recipe(Context& ctx, const PagedMetadata& metadata, uint64_t q_width,
+ColdRecipe& rotary_recipe(Context& ctx, uint32_t bucket, uint64_t q_width,
                           uint64_t k_width, uint64_t cache_rows, int32_t head_dim,
                           int32_t rotary_dim, bool is_neox) {
   std::ostringstream signature;
-  signature << "rotary_v1;" << metadata.bucket_ << ":" << q_width << ":" << k_width << ":"
+  signature << "rotary_v1;" << bucket << ":" << q_width << ":" << k_width << ":"
             << cache_rows << ":" << head_dim << ":" << rotary_dim << ":" << is_neox;
   const auto structure = signature.str();
   const auto digest = common::sha256_bytes(reinterpret_cast<const uint8_t*>(structure.data()), structure.size());
-  const auto prefix = "g" + digest.substr(0, 12) + "_b" + std::to_string(metadata.bucket_);
+  const auto prefix = "g" + digest.substr(0, 12) + "_b" + std::to_string(bucket);
   const auto key = "rotary_" + digest;
   auto found = ctx.cold_recipes.find(key);
   if (found != ctx.cold_recipes.end()) return *found->second;
   struct TensorShape { synDataType type; std::vector<uint64_t> dims; };
-  const uint64_t bucket = metadata.bucket_;
   const std::array<TensorShape, 7> shapes{{
       {syn_type_bf16, {q_width, bucket}}, {syn_type_bf16, {k_width, bucket}},
       {syn_type_int32, {bucket}}, {syn_type_bf16, {static_cast<uint64_t>(rotary_dim), cache_rows}},
@@ -3552,22 +3554,32 @@ ColdRecipe& rotary_recipe(Context& ctx, const PagedMetadata& metadata, uint64_t 
   return *it->second;
 }
 
-std::tuple<at::Tensor, at::Tensor> rotary_embedding(const at::Tensor& query, const at::Tensor& key,
-    const at::Tensor& cache, c10::intrusive_ptr<PagedMetadata> metadata,
+std::tuple<at::Tensor, at::Tensor> rotary_embedding_validated(const at::Tensor& query, const at::Tensor& key,
+    const at::Tensor& cache, const at::Tensor& positions, const at::Tensor& header, int64_t context,
     int64_t head_dim, int64_t rotary_dim, bool is_neox) {
-  TORCH_CHECK(metadata, "GaudiRT rotary: metadata is required");
   TORCH_CHECK(head_dim > 0 && head_dim <= INT32_MAX && rotary_dim > 0 && rotary_dim <= head_dim &&
               rotary_dim % 2 == 0, "GaudiRT rotary: invalid head or rotary dimension");
   for (const auto& tensor : {query, key, cache})
     TORCH_CHECK(tensor.device().type() == c10::kPrivateUse1 && tensor.device().index() == 0 &&
                 tensor.scalar_type() == at::kBFloat16, "GaudiRT rotary: expected gaudirt BF16 tensors");
-  TORCH_CHECK(query.dim() == 2 && key.dim() == 2 && query.size(0) == metadata->rows_ &&
-              key.size(0) == metadata->rows_ && query.size(1) > 0 && key.size(1) > 0 &&
+  TORCH_CHECK(query.dim() == 2 && key.dim() == 2 && query.size(0) > 0 && query.size(0) <= 4096 &&
+              key.size(0) == query.size(0) && query.size(1) > 0 && key.size(1) > 0 &&
               query.size(1) <= INT32_MAX && key.size(1) <= INT32_MAX &&
               query.size(1) % head_dim == 0 && key.size(1) % head_dim == 0,
               "GaudiRT rotary: invalid query or key geometry");
-  TORCH_CHECK(cache.dim() == 2 && cache.size(0) >= metadata->context_ && cache.size(0) <= INT32_MAX &&
+  TORCH_CHECK(cache.dim() == 2 && context > 0 && cache.size(0) >= context && cache.size(0) <= INT32_MAX &&
               cache.size(1) == rotary_dim, "GaudiRT rotary: cache does not cover validated positions");
+  const auto rows = query.size(0);
+  const auto bucket = std::bit_ceil(static_cast<uint32_t>(rows));
+  TORCH_CHECK(positions.device() == query.device() && positions.scalar_type() == at::kInt &&
+              positions.dim() == 1 && positions.size(0) == rows && positions.is_contiguous() &&
+              positions.storage_offset() >= 0 &&
+              static_cast<uint64_t>(positions.storage_offset()) * sizeof(int32_t) <= positions.storage().nbytes() &&
+              static_cast<uint64_t>(bucket) * sizeof(int32_t) <= positions.storage().nbytes() -
+                  static_cast<uint64_t>(positions.storage_offset()) * sizeof(int32_t) &&
+              header.device() == query.device() && header.scalar_type() == at::kInt &&
+              header.dim() == 1 && header.size(0) == 1 && header.is_contiguous(),
+              "GaudiRT rotary: invalid validated metadata tensors");
   auto ctx = current();
   auto stream = ctx->stream();
   auto cache_value = cache;
@@ -3577,11 +3589,11 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding(const at::Tensor& query, con
     copy(cache_value, cache, true);
     cache_address = address_of(cache_value, *ctx);
   }
-  auto q_out = bucket_output(query, at::kBFloat16, metadata->bucket_, metadata->rows_, query.size(1));
-  auto k_out = bucket_output(key, at::kBFloat16, metadata->bucket_, metadata->rows_, key.size(1));
+  auto q_out = bucket_output(query, at::kBFloat16, bucket, rows, query.size(1));
+  auto k_out = bucket_output(key, at::kBFloat16, bucket, rows, key.size(1));
   const auto q_out_address = address_of(q_out, *ctx), k_out_address = address_of(k_out, *ctx);
   std::lock_guard lock(ctx->cold_mutex);
-  auto& recipe = rotary_recipe(*ctx, *metadata, query.size(1), key.size(1), cache.size(0),
+  auto& recipe = rotary_recipe(*ctx, bucket, query.size(1), key.size(1), cache.size(0),
                                static_cast<int32_t>(head_dim), static_cast<int32_t>(rotary_dim), is_neox);
   auto graph_pool = [&]() -> GraphPool& {
     if (!ctx->graph_pool) {
@@ -3596,7 +3608,7 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding(const at::Tensor& query, con
   auto bind_input = [&](const at::Tensor& input) {
     const auto address = address_of(input, *ctx);
     ctx->allocator.record_stream(address, stream);
-    const uint64_t bytes = static_cast<uint64_t>(metadata->bucket_) * input.size(1) * sizeof(uint16_t);
+    const uint64_t bytes = static_cast<uint64_t>(bucket) * input.size(1) * sizeof(uint16_t);
     const uint64_t offset = static_cast<uint64_t>(input.storage_offset()) * input.element_size();
     const uint64_t storage = input.storage().nbytes();
     bool direct = input.is_contiguous() && address % BlockCachingAllocator::kAlignment == 0 &&
@@ -3615,8 +3627,11 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding(const at::Tensor& query, con
     return binding;
   };
   const auto q_address = bind_input(query), k_address = bind_input(key);
-  const auto positions_address = address_of(metadata->positions_, *ctx);
-  const auto header_address = address_of(metadata->header_, *ctx);
+  const auto positions_address = address_of(positions, *ctx);
+  const auto header_address = address_of(header, *ctx);
+  TORCH_CHECK(positions_address % BlockCachingAllocator::kAlignment == 0 &&
+              header_address % BlockCachingAllocator::kAlignment == 0,
+              "GaudiRT rotary: validated metadata must be aligned");
   for (auto address : {cache_address, positions_address, header_address, q_out_address, k_out_address})
     ctx->allocator.record_stream(address, stream);
   std::unique_ptr<GraphTemporary> workspace;
@@ -3629,6 +3644,15 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding(const at::Tensor& query, con
                         recipe.recipe, 0) == synSuccess, "GaudiRT rotary: launch failed");
   return {q_out, k_out};
 }
+
+std::tuple<at::Tensor, at::Tensor> rotary_embedding(const at::Tensor& query, const at::Tensor& key,
+    const at::Tensor& cache, c10::intrusive_ptr<PagedMetadata> metadata,
+    int64_t head_dim, int64_t rotary_dim, bool is_neox) {
+  TORCH_CHECK(metadata, "GaudiRT rotary: metadata is required");
+  return rotary_embedding_validated(query, key, cache, metadata->rotary_positions(),
+                                    metadata->rotary_header(), metadata->context_,
+                                    head_dim, rotary_dim, is_neox);
+}
 }  // namespace gaudirt::generic
 
 TORCH_LIBRARY(gaudirt, m) {
@@ -3636,7 +3660,10 @@ TORCH_LIBRARY(gaudirt, m) {
       .def(torch::init<at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t>())
       .def_static("from_device", &gaudirt::generic::PagedMetadata::from_device)
       .def("rows", &gaudirt::generic::PagedMetadata::rows)
-      .def("slots", &gaudirt::generic::PagedMetadata::slots);
+      .def("slots", &gaudirt::generic::PagedMetadata::slots)
+      .def("context", &gaudirt::generic::PagedMetadata::context)
+      .def("rotary_positions", &gaudirt::generic::PagedMetadata::rotary_positions)
+      .def("rotary_header", &gaudirt::generic::PagedMetadata::rotary_header);
   m.def("rms_norm(Tensor input, Tensor weight, float epsilon) -> Tensor");
   m.def("fused_add_rms_norm(Tensor input, Tensor residual, Tensor weight, float epsilon) -> (Tensor, Tensor)");
   m.def("silu_and_mul(Tensor input) -> Tensor");
@@ -3645,6 +3672,8 @@ TORCH_LIBRARY(gaudirt, m) {
   m.def("rotary_embedding(Tensor query, Tensor key, Tensor cache, "
         "__torch__.torch.classes.gaudirt.PagedMetadata metadata, int head_dim, int rotary_dim, bool is_neox) "
         "-> (Tensor, Tensor)");
+  m.def("_rotary_embedding_validated(Tensor query, Tensor key, Tensor cache, Tensor positions, "
+        "Tensor header, int context, int head_dim, int rotary_dim, bool is_neox) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(gaudirt, PrivateUse1, m) {
@@ -3653,6 +3682,7 @@ TORCH_LIBRARY_IMPL(gaudirt, PrivateUse1, m) {
   m.impl("silu_and_mul", TORCH_FN(gaudirt::generic::bucket_silu_and_mul));
   m.impl("paged_attn", TORCH_FN(gaudirt::generic::paged_attn));
   m.impl("rotary_embedding", TORCH_FN(gaudirt::generic::rotary_embedding));
+  m.impl("_rotary_embedding_validated", TORCH_FN(gaudirt::generic::rotary_embedding_validated));
 }
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
