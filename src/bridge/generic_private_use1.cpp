@@ -3835,7 +3835,8 @@ ColdRecipe& device_metadata_recipe(Context& ctx, uint32_t bucket, uint64_t reque
                                    int32_t slots, const std::array<int, 4>& lanes, int32_t vocabulary,
                                    bool scheduler_owned) {
   std::ostringstream signature;
-  signature << "device_metadata_v1;" << bucket << ":" << requests << ":" << context << ":" << slots;
+  signature << "device_metadata_v2;" << bucket;
+  if (!scheduler_owned) signature << ":" << requests << ":" << context << ":" << slots;
   for (auto lane : lanes) signature << ":" << lane;
   signature << ":" << vocabulary << ":" << scheduler_owned;
   const auto structure = signature.str();
@@ -3846,17 +3847,23 @@ ColdRecipe& device_metadata_recipe(Context& ctx, uint32_t bucket, uint64_t reque
   if (found != ctx.cold_recipes.end()) return *found->second;
   std::vector<std::vector<uint64_t>> shapes{
       {static_cast<uint64_t>(lanes[0]), bucket}, {static_cast<uint64_t>(lanes[1]), bucket},
-      {static_cast<uint64_t>(lanes[2]), bucket}, {context, requests}, {1}, {1 + 4 * bucket},
+      {static_cast<uint64_t>(lanes[2]), bucket},
+      scheduler_owned ? std::vector<uint64_t>{1, 1} : std::vector<uint64_t>{context, requests},
+      {1}, {1 + 4 * bucket},
       {bucket}, {bucket}, {bucket}, {bucket}};
   if (vocabulary) {
     shapes.push_back({static_cast<uint64_t>(lanes[3]), bucket});
     shapes.push_back({bucket});
     shapes.push_back({bucket});
   }
-  auto compiled = std::make_unique<ColdRecipe>(shapes.size());
+  auto compiled = std::make_unique<ColdRecipe>(shapes.size() - static_cast<size_t>(scheduler_owned));
   synGraphHandle graph = nullptr;
   std::vector<synSectionHandle> sections(shapes.size(), nullptr);
   std::vector<synTensor> tensors(shapes.size(), nullptr);
+  const auto binding_index = [scheduler_owned](size_t index) {
+    return index - static_cast<size_t>(scheduler_owned && index > 3);
+  };
+  const auto dummy_name = prefix + "_t" + std::to_string(shapes.size());
   const auto check = [](synStatus status, const char* message) {
     TORCH_CHECK(status == synSuccess, "GaudiRT device metadata: ", message,
                 " status=", static_cast<int>(status));
@@ -3869,29 +3876,42 @@ ColdRecipe& device_metadata_recipe(Context& ctx, uint32_t bucket, uint64_t reque
   try {
     check(synGraphCreate(&graph, synDeviceGaudi2), "graph creation failed");
     for (size_t i = 0; i < shapes.size(); ++i) {
-      compiled->names[i] = prefix + "_t" + std::to_string(i);
-      check(synSectionCreate(&sections[i], 0, graph), "section creation failed");
-      check(synSectionSetPersistent(sections[i], true), "section setup failed");
+      const bool dummy = scheduler_owned && i == 3;
+      const auto slot = binding_index(i);
+      if (!dummy) {
+        compiled->names[slot] = prefix + "_t" + std::to_string(i);
+        check(synSectionCreate(&sections[i], 0, graph), "section creation failed");
+        check(synSectionSetPersistent(sections[i], true), "section setup failed");
+      }
       synTensorDescriptor desc{};
-      desc.m_name = compiled->names[i].c_str();
+      desc.m_name = dummy ? dummy_name.c_str() : compiled->names[slot].c_str();
       desc.m_dataType = syn_type_int32;
       desc.m_dims = shapes[i].size();
       for (size_t dim = 0; dim < shapes[i].size(); ++dim) {
         desc.m_sizes[dim] = desc.m_minSizes[dim] = shapes[i][dim];
-        compiled->tensors[i].tensorSize[dim] = shapes[i][dim];
+        if (!dummy) compiled->tensors[slot].tensorSize[dim] = shapes[i][dim];
       }
       check(synTensorCreate(&tensors[i], &desc, sections[i], 0), "tensor creation failed");
-      compiled->tensors[i].tensorName = compiled->names[i].c_str();
-      compiled->tensors[i].tensorType = DATA_TENSOR;
+      if (!dummy) {
+        compiled->tensors[slot].tensorName = compiled->names[slot].c_str();
+        compiled->tensors[slot].tensorType = DATA_TENSOR;
+      }
     }
-    const auto node = prefix + "_n0";
-    check(synNodeCreate(graph, tensors.data(), tensors.data() + 6, 6, 4, &slots, sizeof(slots),
+    unsigned next_node = 0;
+    if (scheduler_owned) {
+      const auto reshape = prefix + "_n" + std::to_string(next_node++);
+      check(synNodeCreate(graph, &tensors[4], &tensors[3], 1, 1, nullptr, 0,
+                          "reshape", reshape.c_str(), nullptr, nullptr), "metadata reshape failed");
+    }
+    const auto node = prefix + "_n" + std::to_string(next_node++);
+    const int32_t kernel_slots = scheduler_owned ? 1 : slots;
+    check(synNodeCreate(graph, tensors.data(), tensors.data() + 6, 6, 4, &kernel_slots, sizeof(kernel_slots),
                         scheduler_owned ? "gk_scheduler_metadata_i32_v1" : "gk_paged_metadata_i32_v1",
                         node.c_str(), nullptr, nullptr), "node creation failed");
     if (vocabulary) {
       const std::array<synTensor, 2> token_inputs{tensors[10], tensors[4]};
       const std::array<synTensor, 2> token_outputs{tensors[11], tensors[12]};
-      const auto token_node = prefix + "_n1";
+      const auto token_node = prefix + "_n" + std::to_string(next_node++);
       check(synNodeCreate(graph, token_inputs.data(), token_outputs.data(), token_inputs.size(), token_outputs.size(),
                           &vocabulary, sizeof(vocabulary),
                           scheduler_owned ? "gk_scheduler_tokens_i32_v1" : "gk_token_indices_i32_v1",
@@ -4063,8 +4083,8 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
     token_ids_ = at::empty({bucket}, options);
     token_status = at::empty({bucket}, options);
   }
-  const auto mapping_address = address_of(mapping_, *ctx);
-  TORCH_CHECK(mapping_address % BlockCachingAllocator::kAlignment == 0,
+  const auto mapping_address = scheduler_owned ? 0 : address_of(mapping_, *ctx);
+  TORCH_CHECK(scheduler_owned || mapping_address % BlockCachingAllocator::kAlignment == 0,
               "GaudiRT device metadata: request map must be 256-byte aligned");
   const auto header_address = address_of(header_, *ctx), info_address = address_of(device_info, *ctx);
   const auto last_token_address = address_of(last_token_indices_, *ctx);
@@ -4111,7 +4131,8 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
       }
       return *ctx->graph_pool;
     };
-    std::vector<std::pair<uint64_t, uint64_t>> reserved{{mapping_address, mapping_.nbytes()}};
+    std::vector<std::pair<uint64_t, uint64_t>> reserved;
+    if (!scheduler_owned) reserved.emplace_back(mapping_address, mapping_.nbytes());
     std::array<uint64_t, 4> input_addresses{};
     for (size_t i = 0; i < (has_tokens ? sources.size() : sources.size() - 1); ++i) {
       const auto& input = sources[i];
@@ -4135,7 +4156,8 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
       }
       reserved.emplace_back(input_addresses[i], bytes);
     }
-    for (const auto address : {mapping_address, header_address, info_address, location_address,
+    if (!scheduler_owned) ctx->allocator.record_stream(mapping_address, compute);
+    for (const auto address : {header_address, info_address, location_address,
                                request_address, position_address, status_address})
       ctx->allocator.record_stream(address, compute);
     if (recipe.workspace) workspace = std::make_unique<GraphTemporary>(graph_pool(), compute, recipe.workspace);
@@ -4143,15 +4165,21 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
     const uint64_t addresses[] = {input_addresses[0], input_addresses[1], input_addresses[2], mapping_address,
                                   header_address, info_address, location_address, request_address,
                                   position_address, status_address};
-    for (size_t i = 0; i < std::size(addresses); ++i) bindings[i].pTensorAddress = addresses[i];
+    const auto binding_index = [scheduler_owned](size_t index) {
+      return index - static_cast<size_t>(scheduler_owned && index > 3);
+    };
+    for (size_t i = 0; i < std::size(addresses); ++i) {
+      if (scheduler_owned && i == 3) continue;
+      bindings[binding_index(i)].pTensorAddress = addresses[i];
+    }
     if (has_tokens) {
       const auto token_address = address_of(token_ids_, *ctx);
       const auto token_status_address = address_of(token_status, *ctx);
       ctx->allocator.record_stream(token_address, compute);
       ctx->allocator.record_stream(token_status_address, compute);
-      bindings[10].pTensorAddress = input_addresses[3];
-      bindings[11].pTensorAddress = token_address;
-      bindings[12].pTensorAddress = token_status_address;
+      bindings[binding_index(10)].pTensorAddress = input_addresses[3];
+      bindings[binding_index(11)].pTensorAddress = token_address;
+      bindings[binding_index(12)].pTensorAddress = token_status_address;
     }
     TORCH_CHECK(synLaunch(compute, bindings.data(), bindings.size(), workspace ? workspace->address : 0,
                           recipe.recipe, 0) == synSuccess, "GaudiRT device metadata: validation launch failed");
