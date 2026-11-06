@@ -16,7 +16,7 @@ def main():
     torch.set_num_threads(4)
     torch.random.default_generator.manual_seed(7012)
     gaudirt.initialize(hbm_bytes=512 * 1024 * 1024, pinned_bytes=4 * 1024 * 1024)
-    payload, errors, floors, absolutes = bytearray(), [], [], []
+    payload, errors, floors, absolutes, tiled_errors = bytearray(), [], [], [], []
     for rows in (1, 7, 137, 513):
         metadata, locations, requests, positions, mapping = reference.metadata(rows)
         query_cpu, key_cpu, value_cpu = [torch.randn(rows, width, dtype=torch.bfloat16)
@@ -37,6 +37,7 @@ def main():
         for actual, expected in ((result, old[11]), (key_pool, old[7]), (value_pool, old[8])):
             assert torch.equal(actual.cpu().view(torch.int16), expected.cpu().view(torch.int16))
         payload.extend(old[0]); errors.append(old[1]); floors.append(old[2]); absolutes.append(old[3])
+        tiled_errors.append(old[12])
         print("tensor paged metadata rows", rows, "stats", before, flush=True)
     counts = gaudirt.recipe_cache_stats()
     if os.environ.get("GAUDIRT_TEST_CACHE") == "cold":
@@ -46,7 +47,8 @@ def main():
     if path := os.environ.get("GAUDIRT_TEST_OUTPUT"):
         with open(path, "wb") as output:
             output.write(payload)
-    print("tensor paged metadata stats", counts, "max row error", max(errors), "FP32 floor", max(floors),
+    print("tensor paged metadata stats", counts, "max row error", max(errors),
+          "max tiled BF16-PV error", max(tiled_errors), "FP32 floor diagnostic", max(floors),
           "max abs", max(absolutes), "sha256", hashlib.sha256(payload).hexdigest(), flush=True)
 
 

@@ -10,6 +10,7 @@ assert "habana_frameworks" not in sys.modules
 
 import torch
 from fp64_reference import direct_bf16
+from paged_attention_reference import device_kv_tile, isolated_errors, tiled_bf16_pv
 import gaudirt
 
 torch.set_num_threads(4)
@@ -34,8 +35,7 @@ def metadata(rows):
     return prepared, locations, requests, positions, mapping
 
 
-def expected(query, key_pool, value_pool, requests, positions, mapping, fp64):
-    dtype = torch.float64 if fp64 else torch.float32
+def expected_unrounded(query, key_pool, value_pool, requests, positions, mapping, dtype):
     query = query.reshape(-1, HEADS, DIM).to(dtype)
     key_pool, value_pool = key_pool.to(dtype), value_pool.to(dtype)
     head_map = torch.arange(HEADS) // (HEADS // KV_HEADS)
@@ -46,7 +46,12 @@ def expected(query, key_pool, value_pool, requests, positions, mapping, fp64):
         values = value_pool[loc][:, head_map, :]
         scores = torch.einsum("hd,thd->ht", query[row], keys) * SCALE_FP32
         rows.append(torch.einsum("ht,thd->hd", torch.softmax(scores, dim=-1), values))
-    output = torch.stack(rows).reshape(query.size(0), Q_WIDTH)
+    return torch.stack(rows).reshape(query.size(0), Q_WIDTH)
+
+
+def expected(query, key_pool, value_pool, requests, positions, mapping, fp64):
+    dtype = torch.float64 if fp64 else torch.float32
+    output = expected_unrounded(query, key_pool, value_pool, requests, positions, mapping, dtype)
     return direct_bf16(output) if fp64 else output.to(torch.bfloat16).double()
 
 
@@ -79,21 +84,22 @@ def run_layer(query_cpu, key_cpu, value_cpu, key_base, value_base, prepared,
     actual = output.cpu().double()
     ref64 = expected(query_cpu, expected_key, expected_value, requests, positions, mapping, True)
     ref32 = expected(query_cpu, expected_key, expected_value, requests, positions, mapping, False)
-    assert torch.isfinite(actual).all() and torch.isfinite(ref64).all() and torch.isfinite(ref32).all()
+    tiled = tiled_bf16_pv(query_cpu, expected_key, expected_value, requests, positions, mapping,
+                          HEADS, KV_HEADS, DIM, SCALE_FP32, device_kv_tile(query_cpu.size(0)))
+    assert torch.isfinite(ref32).all()
     denominator = torch.linalg.vector_norm(ref64, dim=-1).clamp_min(1e-30)
-    error = (torch.linalg.vector_norm(actual - ref64, dim=-1) / denominator).max().item()
+    error, tiled_error = isolated_errors(actual, ref64, tiled)
     floor = (torch.linalg.vector_norm(ref32 - ref64, dim=-1) / denominator).max().item()
     absolute = (actual - ref64).abs().max().item()
-    assert error <= max(3e-3, 2 * floor) and error <= 1e-2, (query_cpu.size(0), error, floor, absolute)
     payload = b"".join(value.view(torch.int16).numpy().tobytes()
                        for value in (output.cpu(), actual_key, actual_value))
     return (payload, error, floor, absolute, query, key, value, key_pool, value_pool,
-            key_storage, value_storage, output)
+            key_storage, value_storage, output, tiled_error)
 
 
 def main():
     gaudirt.initialize(hbm_bytes=256 * 1024 * 1024, pinned_bytes=4 * 1024 * 1024)
-    payload, errors, floors, absolutes = bytearray(), [], [], []
+    payload, errors, floors, absolutes, tiled_errors = bytearray(), [], [], [], []
     for rows in ROWS:
         prepared, locations, requests, positions, mapping = metadata(rows)
         query_cpu, key_cpu, value_cpu = [
@@ -109,7 +115,8 @@ def main():
                            locations, requests, positions, mapping, sliced=rows in (17, 137))
         assert gaudirt.recipe_cache_stats() == before_second, "same-geometry layer recompiled"
         print("rows", rows, "recipe stats", before_second, "relative_l2", max(first[1], second[1]),
-              "cpu_fp32_floor", max(first[2], second[2]), flush=True)
+              "tiled_bf16_pv_error", max(first[12], second[12]),
+              "cpu_fp32_floor_diagnostic", max(first[2], second[2]), flush=True)
         if rows == 3:
             before_pool = first[7].cpu()
             try:
@@ -129,6 +136,7 @@ def main():
                 raise AssertionError("unsupported head dimension was accepted")
         for result in (first, second):
             payload.extend(result[0]); errors.append(result[1]); floors.append(result[2]); absolutes.append(result[3])
+            tiled_errors.append(result[12])
         del result
         if rows == 137:
             one = torch.classes.gaudirt.PagedMetadata(locations[-1:].contiguous(), requests[-1:].contiguous(),
@@ -144,7 +152,8 @@ def main():
     elif os.environ.get("GAUDIRT_TEST_CACHE") == "warm":
         assert counts[:2] == [2 * len(ROWS), 0], counts
     print("paged attention cache stats:", counts, "max_row_relative_l2:", max(errors),
-          "max_cpu_fp32_floor:", max(floors), "max_abs:", max(absolutes),
+          "max_tiled_bf16_pv_error:", max(tiled_errors),
+          "max_cpu_fp32_floor_diagnostic:", max(floors), "max_abs:", max(absolutes),
           "output and KV sha256:", hashlib.sha256(payload).hexdigest(), flush=True)
     if path := os.environ.get("GAUDIRT_TEST_OUTPUT"):
         with open(path, "wb") as output:

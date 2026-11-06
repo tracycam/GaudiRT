@@ -76,7 +76,7 @@ def rejected(values, code):
 def main():
     gaudirt.initialize(hbm_bytes=(256 if GEOMETRY == "small" else 512) * 1024 * 1024,
                        pinned_bytes=4 * 1024 * 1024)
-    payload, errors, floors, absolutes = bytearray(), [], [], []
+    payload, errors, floors, absolutes, tiled_errors = bytearray(), [], [], [], []
     for rows in ROWS:
         locations, requests, positions, mapping, prefixes, lengths, row_requests = data(rows)
         if rows in (33, 1025):
@@ -101,6 +101,7 @@ def main():
             assert gaudirt.recipe_cache_stats() == before_second, "same-geometry layer recompiled"
             for result in (first, second):
                 payload.extend(result[0]); errors.append(result[1]); floors.append(result[2]); absolutes.append(result[3])
+                tiled_errors.append(result[12])
             del first, second, result
         print("device metadata rows", rows, "recipe stats", gaudirt.recipe_cache_stats(), flush=True)
         del prepared, keep, indices
@@ -135,7 +136,8 @@ def main():
     elif os.environ.get("GAUDIRT_TEST_CACHE") == "warm":
         assert counts[0] > 0 and counts[1] == 0, counts
     print("device metadata stats:", counts, "max_row_relative_l2:", max(errors),
-          "max_cpu_fp32_floor:", max(floors), "max_abs:", max(absolutes),
+          "max_tiled_bf16_pv_error:", max(tiled_errors),
+          "max_cpu_fp32_floor_diagnostic:", max(floors), "max_abs:", max(absolutes),
           "output and KV sha256:", hashlib.sha256(payload).hexdigest(), flush=True)
     if path := os.environ.get("GAUDIRT_TEST_OUTPUT"):
         with open(path, "wb") as output:
