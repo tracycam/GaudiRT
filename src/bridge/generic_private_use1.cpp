@@ -37,7 +37,6 @@
 namespace gaudirt::generic {
 using namespace runtime;
 
-struct AllocationLease;
 struct Context;
 struct EventState {
   Context* owner;
@@ -138,12 +137,9 @@ struct Context {
   RecipeCache cache;
   std::mutex cold_mutex;
   std::unordered_map<std::string, std::unique_ptr<ColdRecipe>> cold_recipes;
-  std::mutex leases_mutex;
-  std::unordered_map<uint64_t, std::shared_ptr<AllocationLease>> leases;
+  std::mutex metadata_mutex;
   std::unordered_map<uint64_t, int64_t> paged_max_positions;
   std::unordered_set<EventState*> events;
-  uint64_t next_lease = 1;
-  bool closing = false;
 };
 
 void invalidate_events(Context& ctx) {
@@ -156,47 +152,50 @@ void invalidate_events(Context& ctx) {
   ctx.events.clear();
 }
 
-struct AllocationLease {
-  AllocationLease(std::shared_ptr<Context> owner, uint64_t address, bool pinned, bool graph)
-      : owner(std::move(owner)), address(address), pinned(pinned), graph(graph) {}
-  ~AllocationLease() { release(); }
-  void release() {
-    std::lock_guard lock(mutex);
-    auto ctx = owner;
-    if (!ctx) return;
-    if (graph) ctx->graph_pool->free(address);
-    else if (pinned) ctx->pinned.free(reinterpret_cast<void*>(address));
-    else ctx->allocator.free(address);
-    {
-      std::lock_guard leases_lock(ctx->leases_mutex);
-      ctx->leases.erase(id);
-    }
-    owner.reset();
-  }
-  std::mutex mutex;
-  std::shared_ptr<Context> owner;
+enum class AllocationKind { device, pinned, graph, metadata_header };
+
+struct AllocationContext {
+  std::weak_ptr<Context> owner;
   uint64_t address;
-  uint64_t id = 0;
-  bool pinned;
-  bool graph;
+  AllocationKind kind;
 };
 
-std::shared_ptr<AllocationLease> make_lease(const std::shared_ptr<Context>& ctx,
-                                             uint64_t address, bool pinned, bool graph = false) {
-  std::shared_ptr<AllocationLease> lease;
+void free_allocation(Context& ctx, uint64_t address, AllocationKind kind) {
+  if (kind == AllocationKind::metadata_header) {
+    std::lock_guard lock(ctx.metadata_mutex);
+    ctx.paged_max_positions.erase(address);
+  }
+  if (kind == AllocationKind::graph) ctx.graph_pool->free(address);
+  else if (kind == AllocationKind::pinned) ctx.pinned.free(reinterpret_cast<void*>(address));
+  else ctx.allocator.free(address);
+}
+
+void release_allocation(void* pointer) {
+  std::unique_ptr<AllocationContext> allocation(static_cast<AllocationContext*>(pointer));
+  if (auto ctx = allocation->owner.lock()) free_allocation(*ctx, allocation->address, allocation->kind);
+}
+
+c10::DataPtr allocation_data_ptr(const std::shared_ptr<Context>& ctx, uint64_t address,
+                                 AllocationKind kind) {
+  AllocationContext* allocation = nullptr;
   try {
-    lease = std::make_shared<AllocationLease>(ctx, address, pinned, graph);
+    allocation = new AllocationContext{ctx, address, kind};
   } catch (...) {
-    if (graph) ctx->graph_pool->free(address);
-    else if (pinned) ctx->pinned.free(reinterpret_cast<void*>(address));
-    else ctx->allocator.free(address);
+    free_allocation(*ctx, address, kind);
     throw;
   }
-  std::lock_guard lock(ctx->leases_mutex);
-  TORCH_CHECK(!ctx->closing, "GaudiRT: device is shutting down");
-  lease->id = ctx->next_lease++;
-  ctx->leases.emplace(lease->id, lease);
-  return lease;
+  const auto device = kind == AllocationKind::pinned ? c10::Device(c10::kCPU) :
+                                                      c10::Device(c10::kPrivateUse1, 0);
+  return {reinterpret_cast<void*>(address), allocation, release_allocation, device};
+}
+
+at::Tensor tensor_from_allocation(c10::DataPtr data, uint64_t bytes, at::IntArrayRef shape,
+                                  const at::TensorOptions& options) {
+  c10::Storage storage(c10::Storage::use_byte_size_t{}, bytes, std::move(data), nullptr, false);
+  auto result = at::detail::make_tensor<c10::TensorImpl>(
+      std::move(storage), c10::DispatchKey::PrivateUse1, options.dtype());
+  result.unsafeGetTensorImpl()->set_sizes_contiguous(shape);
+  return result;
 }
 
 std::mutex context_mutex;
@@ -274,15 +273,7 @@ class Allocator final : public c10::Allocator {
     auto ctx = current();
     if (!bytes) return {nullptr, c10::Device(c10::kPrivateUse1, 0)};
     const uint64_t address = ctx->allocator.allocate(bytes, ctx->stream());
-    auto lease = make_lease(ctx, address, false);
-    try {
-      return c10::InefficientStdFunctionContext::makeDataPtr(
-          reinterpret_cast<void*>(address), [lease](void*) { lease->release(); },
-          c10::Device(c10::kPrivateUse1, 0));
-    } catch (...) {
-      lease->release();
-      throw;
-    }
+    return allocation_data_ptr(ctx, address, AllocationKind::device);
   }
   void copy_data(void* dst, const void* src, size_t bytes) const override {
     if (!bytes) return;
@@ -300,14 +291,7 @@ class PinnedAllocator final : public c10::Allocator {
     auto ctx = current();
     if (!bytes) return {nullptr, c10::Device(c10::kCPU)};
     void* address = ctx->pinned.allocate(bytes);
-    auto lease = make_lease(ctx, reinterpret_cast<uint64_t>(address), true);
-    try {
-      return c10::InefficientStdFunctionContext::makeDataPtr(
-          address, [lease](void*) { lease->release(); }, c10::Device(c10::kCPU));
-    } catch (...) {
-      lease->release();
-      throw;
-    }
+    return allocation_data_ptr(ctx, reinterpret_cast<uint64_t>(address), AllocationKind::pinned);
   }
   void copy_data(void* dst, const void* src, size_t bytes) const override {
     std::memcpy(dst, src, bytes);
@@ -513,17 +497,7 @@ void shutdown_at_exit() {
     old = std::move(context);
   }
   if (!old) return;
-  std::vector<std::shared_ptr<AllocationLease>> live;
-  {
-    std::lock_guard lock(old->leases_mutex);
-    old->closing = true;
-    for (const auto& [id, lease] : old->leases) {
-      (void)id;
-      live.push_back(lease);
-    }
-  }
   old->synchronize_all();
-  for (const auto& lease : live) lease->release();
   old.reset();
 }
 uint64_t memory_allocated() { return current()->allocator.memory_allocated(); }
@@ -2775,7 +2749,7 @@ std::optional<at::Tensor> prepare_strided_input(const at::Tensor& input) {
   auto ctx = current();
   auto stream = ctx->stream();
   const auto source = address_of(input, *ctx);
-  std::shared_ptr<AllocationLease> lease;
+  c10::DataPtr allocation;
   uint64_t destination = 0;
   {
     std::lock_guard lock(ctx->cold_mutex);
@@ -2785,7 +2759,7 @@ std::optional<at::Tensor> prepare_strided_input(const at::Tensor& input) {
       ctx->graph_pool = std::make_unique<GraphPool>(ctx->allocator, budget, stream);
     }
     destination = ctx->graph_pool->allocate(bytes, stream);
-    lease = make_lease(ctx, destination, false, true);
+    allocation = allocation_data_ptr(ctx, destination, AllocationKind::graph);
     if (ctx->graph_pool->contains_live_range(source, 1)) ctx->graph_pool->record_stream(source, stream);
     ctx->allocator.record_stream(source, stream);
   }
@@ -2798,8 +2772,7 @@ std::optional<at::Tensor> prepare_strided_input(const at::Tensor& input) {
   dma_copy(destination, nullptr, source, &layout, 0, input.numel(), item, stream, DRAM_TO_DRAM);
   std::vector<int64_t> shape(input.sizes().begin(), input.sizes().end());
   shape[0] = bucket;
-  auto staged = at::from_blob(reinterpret_cast<void*>(destination), shape,
-                              [lease](void*) { lease->release(); }, input.options());
+  auto staged = tensor_from_allocation(std::move(allocation), bytes, shape, input.options());
   return staged.narrow(0, 0, rows);
 }
 
@@ -3836,28 +3809,12 @@ class PagedMetadata : public torch::CustomClassHolder {
 at::Tensor paged_header(const std::shared_ptr<Context>& ctx, int64_t max_position,
                         const at::TensorOptions& options) {
   const auto address = ctx->allocator.allocate(sizeof(int32_t), ctx->stream());
-  auto lease = make_lease(ctx, address, false);
-  try {
-    {
-      std::lock_guard lock(ctx->leases_mutex);
-      ctx->paged_max_positions.emplace(address, max_position);
-    }
-    std::weak_ptr<Context> weak = ctx;
-    return at::from_blob(reinterpret_cast<void*>(address), {1}, [lease, weak, address](void*) {
-      if (auto owner = weak.lock()) {
-        std::lock_guard lock(owner->leases_mutex);
-        owner->paged_max_positions.erase(address);
-      }
-      lease->release();
-    }, options);
-  } catch (...) {
-    {
-      std::lock_guard lock(ctx->leases_mutex);
-      ctx->paged_max_positions.erase(address);
-    }
-    lease->release();
-    throw;
+  auto allocation = allocation_data_ptr(ctx, address, AllocationKind::metadata_header);
+  {
+    std::lock_guard lock(ctx->metadata_mutex);
+    ctx->paged_max_positions.emplace(address, max_position);
   }
+  return tensor_from_allocation(std::move(allocation), sizeof(int32_t), {1}, options);
 }
 
 ColdRecipe& device_metadata_recipe(Context& ctx, uint32_t bucket, uint64_t requests, uint64_t context,
@@ -4398,7 +4355,7 @@ at::Tensor paged_attn_validated(const at::Tensor& query, const at::Tensor& key, 
   const auto header_address = address_of(header, *ctx);
   int64_t max_position;
   {
-    std::lock_guard lock(ctx->leases_mutex);
+    std::lock_guard lock(ctx->metadata_mutex);
     const auto hint = ctx->paged_max_positions.find(header_address);
     TORCH_CHECK(hint != ctx->paged_max_positions.end(), "GaudiRT paged attention: expected validated header");
     max_position = hint->second;
