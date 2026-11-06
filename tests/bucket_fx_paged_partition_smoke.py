@@ -30,13 +30,13 @@ def reference(x, qkv_weight, out_weight, key_pool, value_pool, locations, reques
               positions, mapping, fp64):
     dtype = torch.float64 if fp64 else torch.float32
     rounded = direct_bf16 if fp64 else lambda value: value.to(torch.bfloat16).float()
-    query, key, value = rounded(x.to(dtype) @ qkv_weight.to(dtype).t()).split([256, 128, 128], dim=-1)
+    query, key, value = (x.to(dtype) @ qkv_weight.to(dtype).t()).split([256, 128, 128], dim=-1)
     key_pool = key_pool.to(dtype).clone()
     value_pool = value_pool.to(dtype).clone()
     key_pool[locations] = key.reshape(-1, 2, 64)
     value_pool[locations] = value.reshape(-1, 2, 64)
-    attention = attention_ref.expected(query, key_pool, value_pool, requests, positions, mapping, fp64)
-    return rounded(attention.to(dtype) @ out_weight.to(dtype).t()).double()
+    attention = attention_ref.expected_unrounded(query, key_pool, value_pool, requests, positions, mapping, dtype)
+    return rounded(attention @ out_weight.to(dtype).t()).double()
 
 
 def main():
