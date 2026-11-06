@@ -4,6 +4,8 @@
 #include "gaudirt/runtime/pinned_host_pool.hpp"
 #include "gaudirt/runtime/recipe_registry.hpp"
 #include "gaudirt/common/sha256.hpp"
+#include "cold_recipe.hpp"
+#include "graph_builder.hpp"
 #include "tensor_spec.hpp"
 
 #include <ATen/EmptyTensor.h>
@@ -105,15 +107,6 @@ class StreamRegistry {
   StreamState* primary_ = nullptr;
   std::mutex mutex_;
   std::vector<std::unique_ptr<StreamState>> streams_;
-};
-
-struct ColdRecipe {
-  explicit ColdRecipe(size_t count = 2) : names(count), tensors(count) {}
-  synRecipeHandle recipe = nullptr;
-  uint64_t workspace = 0;
-  std::vector<std::string> names;
-  std::vector<synLaunchTensorInfo> tensors;
-  ~ColdRecipe() { if (recipe) synRecipeDestroy(recipe); }
 };
 
 std::atomic<uint64_t> next_context_generation{1};
@@ -3370,47 +3363,11 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
   auto found = ctx.cold_recipes.find(key);
   if (found != ctx.cold_recipes.end()) return *found->second;
   auto compiled = std::make_unique<ColdRecipe>(roles_.size() + outputs_.size());
-  synGraphHandle graph = nullptr;
-  std::vector<synSectionHandle> sections;
-  std::vector<synTensor> created;
-  std::vector<synTensor> values(specs_.size(), nullptr);
-  std::deque<std::string> tensor_names;
-  size_t next_tensor = 0, next_node = 0;
-  const auto check = [](synStatus status, const char* message) {
-    TORCH_CHECK(status == synSuccess, "GaudiRT FX: ", message, " status=", static_cast<int>(status));
-  };
-  auto cleanup = [&] {
-    if (graph) synGraphDestroy(graph);
-    for (auto tensor : created) synTensorDestroy(tensor);
-    for (auto section : sections) synSectionDestroy(section);
-  };
-  try {
-    check(synGraphCreate(&graph, synDeviceGaudi2), "program graph creation failed");
+  {
+    SynapseGraphBuilder builder(prefix, *compiled);
+    std::vector<synTensor> values(specs_.size(), nullptr);
     auto tensor_nd = [&](synDataType type, const std::vector<uint64_t>& dims, int slot) {
-      tensor_names.push_back(prefix + "_t" + std::to_string(next_tensor++));
-      synSectionHandle section = nullptr;
-      if (slot >= 0) {
-        check(synSectionCreate(&section, 0, graph), "program section creation failed");
-        sections.push_back(section);
-        check(synSectionSetPersistent(section, true), "program section setup failed");
-        compiled->names[slot] = tensor_names.back();
-      }
-      synTensorDescriptor desc{};
-      desc.m_name = slot >= 0 ? compiled->names[slot].c_str() : tensor_names.back().c_str();
-      desc.m_dataType = type;
-      desc.m_dims = dims.size();
-      for (size_t dim = 0; dim < dims.size(); ++dim)
-        desc.m_sizes[dim] = desc.m_minSizes[dim] = dims[dim];
-      synTensor handle = nullptr;
-      check(synTensorCreate(&handle, &desc, section, 0), "program tensor creation failed");
-      created.push_back(handle);
-      if (slot >= 0) {
-        compiled->tensors[slot].tensorName = compiled->names[slot].c_str();
-        compiled->tensors[slot].tensorType = DATA_TENSOR;
-        for (size_t dim = 0; dim < dims.size(); ++dim)
-          compiled->tensors[slot].tensorSize[dim] = dims[dim];
-      }
-      return handle;
+      return builder.tensor(type, dims, slot);
     };
     auto tensor = [&](synDataType type, uint64_t fcd, uint64_t rows, int slot,
                       uint32_t rank = 2, uint64_t depth = 1) {
@@ -3422,11 +3379,9 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
     auto tensor_from_spec = [&](const TensorSpec& spec, int slot) {
       return tensor_nd(cast_type(spec.dtype).syn, spec.synapse_sizes(bucket), slot);
     };
-    auto node = [&](const std::vector<synTensor>& in, synTensor out, const void* params,
-                    size_t params_size, const char* guid) {
-      const auto name = prefix + "_n" + std::to_string(next_node++);
-      check(synNodeCreate(graph, in.data(), &out, in.size(), 1, params, params_size,
-                          guid, name.c_str(), nullptr, nullptr), "program node creation failed");
+    auto node = [&](std::vector<synTensor> in, synTensor out, NodeParameters params,
+                    std::string guid) {
+      builder.node(NodeSpec{std::move(guid), std::move(in), {out}, std::move(params)});
     };
     for (size_t i = 0; i < roles_.size(); ++i) {
       const auto& spec = specs_[i];
@@ -3456,16 +3411,16 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
           params.permutation[dim] = static_cast<TransposePermutationDim>(dim);
         std::swap(params.permutation[params.tensorDim - 1 - op[2]],
                   params.permutation[params.tensorDim - 1 - op[3]]);
-        node({values[op[1]]}, values[id], &params, sizeof(params), "transpose");
+        node({values[op[1]]}, values[id], params, "transpose");
         continue;
       }
       if (op[0] == 17 || op[0] == 19) {
-        node({values[op[1]]}, values[id], nullptr, 0, "reshape");
+        node({values[op[1]]}, values[id], std::monostate{}, "reshape");
         continue;
       }
       if (op[0] == 16) {
         synGEMMParams params{false, false};
-        node({values[op[1]], values[op[2]]}, values[id], &params, sizeof(params), "batch_gemm");
+        node({values[op[1]], values[op[2]]}, values[id], params, "batch_gemm");
         continue;
       }
       if (op[0] == 10) {
@@ -3473,23 +3428,23 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
         params.axis = 1;
         params.batchDims = 0;
         const auto guid = "gather_fwd_" + std::string(type.name);
-        node({values[op[1]], values[op[2]]}, values[id], &params, sizeof(params), guid.c_str());
+        node({values[op[1]], values[op[2]]}, values[id], params, guid.c_str());
         continue;
       }
       if (op[0] == 11) {
         ns_CastKernel::ParamsV3 params{};
         params.round_mode = CAST_ROUND_HALF_NE;
         if (spec.dtype == at::kFloat)
-          node({values[op[1]]}, values[id], &params, sizeof(params), "cast_bf16_to_f32");
+          node({values[op[1]]}, values[id], params, "cast_bf16_to_f32");
         else
-          node({values[op[1]]}, values[id], nullptr, 0, "gk_cast_f32_to_bf16_v1");
+          node({values[op[1]]}, values[id], std::monostate{}, "gk_cast_f32_to_bf16_v1");
         continue;
       }
       if (op[0] == 15) {
         std::vector<synTensor> inputs;
         for (size_t j = 1; j < op.size(); ++j) inputs.push_back(values[op[j]]);
         synConcatenateParams params{0};
-        node(inputs, values[id], &params, sizeof(params), "concat");
+        node(inputs, values[id], params, "concat");
         continue;
       }
       if (op[0] == 9) {
@@ -3497,7 +3452,7 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
         params.axis = 1;
         params.batchDims = 0;
         const auto guid = "gather_fwd_" + std::string(type.name);
-        node({values[op[2]], values[op[1]]}, values[id], &params, sizeof(params), guid.c_str());
+        node({values[op[2]], values[op[1]]}, values[id], params, guid.c_str());
         continue;
       }
       if (op[0] == 7) {
@@ -3510,15 +3465,11 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
             static_cast<int>(roles_.size() + std::distance(outputs_.begin(), key_output));
         auto key = tensor(type.syn, specs_[op[2]].sizes[1], bucket, key_slot);
         if (key_id < values.size()) values[key_id] = key;
-        struct Params { int32_t head_dim, rotary_dim, is_neox; } params{
+        RotaryParameters params{
             static_cast<int32_t>(op[7]), static_cast<int32_t>(op[8]), static_cast<int32_t>(op[9])};
-        const std::array<synTensor, 5> inputs{
-            values[op[1]], values[op[2]], values[op[4]], values[op[3]], values[op[5]]};
-        const std::array<synTensor, 2> outputs{values[id], key};
-        const auto name = prefix + "_n" + std::to_string(next_node++);
-        check(synNodeCreate(graph, inputs.data(), outputs.data(), inputs.size(), outputs.size(),
-                            &params, sizeof(params), "gk_rotary_bf16_v1", name.c_str(),
-                            nullptr, nullptr), "program rotary failed");
+        builder.node(NodeSpec{"gk_rotary_bf16_v1",
+                              {values[op[1]], values[op[2]], values[op[4]], values[op[3]], values[op[5]]},
+                              {values[id], key}, params});
         continue;
       }
       if (op[0] == 5) {
@@ -3532,12 +3483,9 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
         auto residual = tensor(type.syn, width, bucket, residual_slot);
         if (residual_id < values.size()) values[residual_id] = residual;
         const float epsilon = std::bit_cast<float>(static_cast<uint32_t>(op[4]));
-        const std::array<synTensor, 3> inputs{values[op[1]], values[op[2]], values[op[3]]};
-        std::array<synTensor, 2> outputs{residual, values[id]};
-        const auto name = prefix + "_n" + std::to_string(next_node++);
-        check(synNodeCreate(graph, inputs.data(), outputs.data(), inputs.size(), outputs.size(),
-                            &epsilon, sizeof(epsilon), "gk_fused_add_rms_norm_bf16_v1", name.c_str(),
-                            nullptr, nullptr), "program fused RMSNorm failed");
+        builder.node(NodeSpec{"gk_fused_add_rms_norm_bf16_v1",
+                              {values[op[1]], values[op[2]], values[op[3]]},
+                              {residual, values[id]}, epsilon});
         continue;
       }
       if (op[0] == 4) {
@@ -3570,9 +3518,7 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
         }
         if (offset < total) parts.push_back(tensor(type.syn, total - offset, bucket, -1));
         synSplitParams params{0};
-        const auto name = prefix + "_n" + std::to_string(next_node++);
-        check(synNodeCreate(graph, &values[op[1]], parts.data(), 1, parts.size(), &params, sizeof(params),
-                            "split", name.c_str(), nullptr, nullptr), "program feature split failed");
+        builder.node(NodeSpec{"split", {values[op[1]]}, std::move(parts), params});
         continue;
       }
       if (op[0] >= 20 && op[0] <= 23) {
@@ -3585,14 +3531,14 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
         cast.round_mode = CAST_ROUND_HALF_NE;
         if (wide) {
           input = tensor(syn_type_float, width, rows, -1);
-          node({values[op[1]]}, input, &cast, sizeof(cast), "cast_bf16_to_f32");
+          node({values[op[1]]}, input, cast, "cast_bf16_to_f32");
         }
         auto constant = [&](float value) {
           auto result = tensor(arithmetic_type, width, rows, -1);
           ns_ConstantKernel::ParamsV3 params{};
           params.constant.f = value;
           const auto guid = "constant_" + arithmetic_name;
-          node({}, result, &params, sizeof(params), guid.c_str());
+          node({}, result, params, guid.c_str());
           return result;
         };
         const auto scalar = constant(std::bit_cast<float>(static_cast<uint32_t>(op[2])));
@@ -3603,8 +3549,8 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
         const auto guid = op[0] == 20 && bf16 ? std::string("gk_add_bf16_v1") :
             std::string(op[0] == 20 ? "add_fwd_" : op[0] == 21 ? "sub_fwd_" :
                         op[0] == 22 ? "mult_fwd_" : "div_fwd_") + arithmetic_name;
-        node({left, right}, result, nullptr, 0, guid.c_str());
-        if (wide) node({result}, values[id], nullptr, 0, "gk_cast_f32_to_bf16_v1");
+        node({left, right}, result, std::monostate{}, guid.c_str());
+        if (wide) node({result}, values[id], std::monostate{}, "gk_cast_f32_to_bf16_v1");
         continue;
       }
       if (op[0] == 1 || (op[0] >= 12 && op[0] <= 14)) {
@@ -3614,20 +3560,20 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
           auto source = values[input_id];
           if (input.sizes.size() == 1) {
             auto reshaped = tensor(type.syn, width, 1, -1);
-            node({source}, reshaped, nullptr, 0, "reshape");
+            node({source}, reshaped, std::monostate{}, "reshape");
             source = reshaped;
           }
           auto expanded = tensor(type.syn, width, bucket, -1);
           ns_BroadcastNonFcd::Params params{1};
           const auto broadcast = "broadcast_non_fcd_" + std::string(type.name);
-          node({source}, expanded, &params, sizeof(params), broadcast.c_str());
+          node({source}, expanded, params, broadcast.c_str());
           return expanded;
         };
         auto left = expand(op[1]), right = expand(op[2]);
         if (op[0] == 1) {
           const auto guid = spec.dtype == at::kBFloat16 ? std::string("gk_add_bf16_v1") :
                             "add_fwd_" + std::string(type.name);
-          node({left, right}, values[id], nullptr, 0, guid.c_str());
+          node({left, right}, values[id], std::monostate{}, guid.c_str());
           continue;
         }
         if (op[0] == 14 && spec.dtype == at::kBFloat16) {
@@ -3636,54 +3582,48 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
           auto quotient = tensor(syn_type_float, width, rows, -1);
           ns_CastKernel::ParamsV3 params{};
           params.round_mode = CAST_ROUND_HALF_NE;
-          node({left}, numerator, &params, sizeof(params), "cast_bf16_to_f32");
-          node({right}, denominator, &params, sizeof(params), "cast_bf16_to_f32");
-          node({numerator, denominator}, quotient, nullptr, 0, "div_fwd_f32");
-          node({quotient}, values[id], nullptr, 0, "gk_cast_f32_to_bf16_v1");
+          node({left}, numerator, params, "cast_bf16_to_f32");
+          node({right}, denominator, params, "cast_bf16_to_f32");
+          node({numerator, denominator}, quotient, std::monostate{}, "div_fwd_f32");
+          node({quotient}, values[id], std::monostate{}, "gk_cast_f32_to_bf16_v1");
           continue;
         }
         const auto operation = op[0] == 12 ? "sub_fwd_" : (op[0] == 13 ? "mult_fwd_" : "div_fwd_");
         const auto guid = std::string(operation) + type.name;
-        node({left, right}, values[id], nullptr, 0, guid.c_str());
+        node({left, right}, values[id], std::monostate{}, guid.c_str());
         continue;
       }
       if (op[0] == 2) {
         const float epsilon = std::bit_cast<float>(static_cast<uint32_t>(op[3]));
-        node({values[op[1]], values[op[2]]}, values[id], &epsilon, sizeof(epsilon),
+        node({values[op[1]], values[op[2]]}, values[id], epsilon,
              "gk_rms_norm_bf16_v1");
         continue;
       }
       if (op[0] == 3) {
-        node({values[op[1]]}, values[id], nullptr, 0, "gk_silu_and_mul_bf16_v1");
+        node({values[op[1]]}, values[id], std::monostate{}, "gk_silu_and_mul_bf16_v1");
         continue;
       }
       synGEMMParams gemm{false, op[0] == 0};
       if (op[3] < 0) {
-        node({values[op[1]], values[op[2]]}, values[id], &gemm, sizeof(gemm), "gemm");
+        node({values[op[1]], values[op[2]]}, values[id], gemm, "gemm");
         continue;
       }
       auto product = tensor(syn_type_float, width, rows, -1);
-      node({values[op[1]], values[op[2]]}, product, &gemm, sizeof(gemm), "gemm");
+      node({values[op[1]], values[op[2]]}, product, gemm, "gemm");
       const bool bf16 = spec.dtype == at::kBFloat16;
       auto bias = values[op[3]];
       ns_CastKernel::ParamsV3 cast{};
       cast.round_mode = CAST_ROUND_HALF_NE;
       if (bf16) {
         auto wide_bias = tensor(syn_type_float, width, 1, -1, 1);
-        node({bias}, wide_bias, &cast, sizeof(cast), "cast_bf16_to_f32");
+        node({bias}, wide_bias, cast, "cast_bf16_to_f32");
         bias = wide_bias;
       }
       auto sum = bf16 ? tensor(syn_type_float, width, rows, -1) : values[id];
-      node({product, bias}, sum, nullptr, 0, "add_fwd_f32");
-      if (bf16) node({sum}, values[id], &cast, sizeof(cast), "cast_f32_to_bf16");
+      node({product, bias}, sum, std::monostate{}, "add_fwd_f32");
+      if (bf16) node({sum}, values[id], cast, "cast_f32_to_bf16");
     }
-    compiled->recipe = compile_cached(graph, prefix, key, &ctx.cache);
-    check(synWorkspaceGetSize(&compiled->workspace, compiled->recipe), "program workspace query failed");
-    initialize_launch_tensor_ids(compiled->recipe, compiled->tensors.data(), compiled->tensors.size());
-    cleanup();
-  } catch (...) {
-    cleanup();
-    throw;
+    builder.compile(ctx.cache, key);
   }
   auto [it, inserted] = ctx.cold_recipes.emplace(key, std::move(compiled));
   TORCH_CHECK(inserted, "GaudiRT FX: duplicate program recipe");
