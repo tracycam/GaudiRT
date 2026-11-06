@@ -37,7 +37,8 @@ if(GAUDIRT_BUILD_TORCH)
     find_package(Torch REQUIRED)
     find_library(TORCH_PYTHON_LIBRARY torch_python PATHS "${TORCH_INSTALL_PREFIX}/lib" REQUIRED NO_DEFAULT_PATH)
     add_library(_gaudirt_C MODULE src/bridge/generic_private_use1.cpp
-        src/bridge/context.cpp src/bridge/layout_copy.cpp src/bridge/tensor_spec.cpp src/bridge/fx_node.cpp
+        src/bridge/context.cpp src/bridge/layout_copy.cpp src/bridge/bucket_program.cpp
+        src/bridge/tensor_spec.cpp src/bridge/fx_node.cpp
         src/bridge/fx_geometry.cpp src/bridge/graph_builder.cpp)
     target_compile_definitions(_gaudirt_C PRIVATE TORCH_EXTENSION_NAME=_gaudirt_C)
     target_compile_options(_gaudirt_C PRIVATE ${TORCH_CXX_FLAGS})
