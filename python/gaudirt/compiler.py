@@ -637,9 +637,11 @@ def gaudirt_backend(graph_module, example_inputs):
 def compile(module, dynamic_arg_indices=(0,)):
     """Capture once with unpadded token tensors and dispatch the supported FX graph."""
     compiled = torch.compile(module, backend=gaudirt_backend, dynamic=True, fullgraph=True)
+    capturing = True
 
     @functools.wraps(module)
     def execute(*args, **kwargs):
+        nonlocal capturing
         prepared_args = list(args)
         staged_inputs = {}
         replacements = []
@@ -661,10 +663,14 @@ def compile(module, dynamic_arg_indices=(0,)):
             if prepared_args[index].ndim > 1:
                 torch._dynamo.mark_static(prepared_args[index], list(range(1, prepared_args[index].ndim)))
             torch._dynamo.mark_dynamic(prepared_args[index], 0, min=1, max=4096)
-        with torch._dynamo.config.patch(specialize_float=True, suppress_errors=False,
-                                       fail_on_recompile_limit_hit=True), \
-             torch.fx.experimental._config.patch(backed_size_oblivious=True, use_duck_shape=False), \
-             torch._dynamo.error_on_graph_break(True):
+        if capturing:
+            with torch._dynamo.config.patch(specialize_float=True, suppress_errors=False,
+                                           fail_on_recompile_limit_hit=True), \
+                 torch.fx.experimental._config.patch(backed_size_oblivious=True, use_duck_shape=False), \
+                 torch._dynamo.error_on_graph_break(True):
+                result = compiled(*prepared_args, **kwargs)
+            capturing = False
+        else:
             result = compiled(*prepared_args, **kwargs)
 
         return _restore_staged_outputs(result, replacements) if replacements else result
