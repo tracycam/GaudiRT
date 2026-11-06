@@ -17,7 +17,7 @@ def main():
     probe = ctypes.CDLL(None)
     probe.gaudirt_test_launch_gate_passed.restype = ctypes.c_bool
     gaudirt.initialize(hbm_bytes=256 * 1024**2, pinned_bytes=8 * 1024**2)
-    program = gaudirt._C.BucketProgram([1, 1], [[1, 0, 1, -1]], [2])
+    program = gaudirt._C.BucketProgram([1, 1], [gaudirt._C.FxNode.binary(gaudirt._C.FxOp.add, 0, 1)], [2])
     streams = [gaudirt.Stream(), gaudirt.Stream()]
     host = [torch.full((4, 64), i + 1, dtype=torch.bfloat16) for i in range(2)]
     inputs = [(x.to("gaudirt:0"), (x + 2).to("gaudirt:0")) for x in host]

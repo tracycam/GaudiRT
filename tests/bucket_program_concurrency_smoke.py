@@ -14,7 +14,7 @@ import gaudirt
 
 def main():
     gaudirt.initialize(hbm_bytes=256 * 1024**2, pinned_bytes=8 * 1024**2)
-    program = gaudirt._C.BucketProgram([1, 1], [[1, 0, 1, -1]], [2])
+    program = gaudirt._C.BucketProgram([1, 1], [gaudirt._C.FxNode.binary(gaudirt._C.FxOp.add, 0, 1)], [2])
     streams = [gaudirt.Stream() for _ in range(4)]
     inputs = []
     for worker, rows in enumerate((3, 17, 3, 17)):

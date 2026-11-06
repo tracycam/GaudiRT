@@ -108,7 +108,7 @@ def main():
     if path := os.environ.get("GAUDIRT_TEST_OUTPUT"):
         with open(path, "wb") as output:
             output.write(payload)
-    invalid = gaudirt._C.BucketProgram([1], [[4, 0, 0, 4, 9]], [1])
+    invalid = gaudirt._C.BucketProgram([1], [gaudirt._C.FxNode.slice(0, 0, 4, 9)], [1])
     invalid_input = torch.empty((3, 8), dtype=torch.bfloat16, device="gaudirt:0")
     try:
         invalid.run([invalid_input])
