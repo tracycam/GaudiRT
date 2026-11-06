@@ -124,7 +124,7 @@ def main():
     elif os.environ.get("GAUDIRT_TEST_CACHE") == "warm":
         assert stats[:2] == [12, 0], stats
     assert captures == 14, captures
-    bad = gaudirt._C.BucketProgram([1], [[17, 0, 3, 4, 5]], [1])
+    bad = gaudirt._C.BucketProgram([1], [gaudirt._C.FxNode.reshape(0, [4, 5])], [1])
     try:
         bad.run([torch.empty((3, 21), dtype=torch.float32, device="gaudirt:0")])
     except RuntimeError as error:

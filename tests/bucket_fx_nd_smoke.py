@@ -41,7 +41,9 @@ def main():
     payload = bytearray()
     worst = worst_floor = 0.0
     for dtype in (torch.float32, torch.bfloat16):
-        vector_program = gaudirt._C.BucketProgram([1], [[17, 0, 2, 1], [17, 1, 1]], [2])
+        vector_program = gaudirt._C.BucketProgram(
+            [1], [gaudirt._C.FxNode.reshape(0, [1]), gaudirt._C.FxNode.reshape(1, [])], [2]
+        )
         for rows in (1, 3, 17):
             for fn, left_shape, right_shape in (
                 (compiled[0], (rows, 3, 4, 5), (rows, 3, 4, 6)),

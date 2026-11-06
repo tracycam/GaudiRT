@@ -11,7 +11,7 @@ import gaudirt
 
 
 def main():
-    program = gaudirt._C.BucketProgram([1, 1], [[1, 0, 1, -1]], [2])
+    program = gaudirt._C.BucketProgram([1, 1], [gaudirt._C.FxNode.binary(gaudirt._C.FxOp.add, 0, 1)], [2])
     for generation in range(2):
         gaudirt.initialize(hbm_bytes=256 * 1024**2, pinned_bytes=8 * 1024**2)
         for rows in (3, 17):

@@ -12,6 +12,16 @@ import torch.fx.experimental._config
 from . import _C
 
 
+def _finite_float32(value):
+    try:
+        result = struct.unpack("<f", struct.pack("<f", value))[0]
+    except (OverflowError, struct.error) as error:
+        raise RuntimeError("GaudiRT FX: scalar is outside FP32 range") from error
+    if not math.isfinite(result):
+        raise RuntimeError("GaudiRT FX: scalar must be finite")
+    return result
+
+
 def _restore_staged_outputs(value, replacements):
     if isinstance(value, torch.Tensor):
         for original, staged in replacements:
@@ -46,6 +56,7 @@ def _program_backend(graph_module, example_inputs):
     if not any(roles):
         raise RuntimeError("GaudiRT FX: mark each dynamic token input before capture")
     operations, transposes, splits, fused_norms, rotations, index_casts = [], {}, {}, {}, {}, {}
+    Node, Op = _C.FxNode, _C.FxOp
     alias_views = {}
     validated_token_bindings, validated_row_bindings = [], []
     linear_targets = (torch.nn.functional.linear, torch.ops.aten.linear.default)
@@ -81,22 +92,16 @@ def _program_backend(graph_module, example_inputs):
             raise RuntimeError("GaudiRT FX: GEMM weight must be transposed")
         return tensor_id(transposes[value])
 
-    def binary_operation(args, tensor_opcode, scalar_opcode):
+    def binary_operation(args, tensor_op, scalar_op):
         first, second = args
         first_scalar = isinstance(first, (int, float))
         second_scalar = isinstance(second, (int, float))
         if not first_scalar and not second_scalar:
-            return [tensor_opcode, tensor_id(first), tensor_id(second), -1]
+            return Node.binary(tensor_op, tensor_id(first), tensor_id(second))
         if first_scalar == second_scalar:
             raise RuntimeError("GaudiRT FX: binary operation needs a tensor input")
         scalar, tensor = (first, second) if first_scalar else (second, first)
-        try:
-            bits = struct.unpack("<I", struct.pack("<f", scalar))[0]
-        except (OverflowError, struct.error) as error:
-            raise RuntimeError("GaudiRT FX: scalar is outside FP32 range") from error
-        if not math.isfinite(struct.unpack("<f", struct.pack("<I", bits))[0]):
-            raise RuntimeError("GaudiRT FX: scalar must be finite")
-        return [scalar_opcode, tensor_id(tensor), bits, int(first_scalar)]
+        return Node.scalar(scalar_op, tensor_id(tensor), _finite_float32(scalar), first_scalar)
 
     def add_alias(node, source, operation):
         source_id = tensor_id(source)
@@ -121,7 +126,7 @@ def _program_backend(graph_module, example_inputs):
                 alias_views[node] = alias_views[source]
         else:
             ids[node] = len(tensor_indices) + len(operations)
-            operations.append([4, source_id, start, stop - start, example.shape[1]])
+            operations.append(Node.slice(source_id, start, stop - start, example.shape[1]))
             add_alias(node, source, ("feature", start, stop - start))
 
     output, single_output = None, False
@@ -167,7 +172,7 @@ def _program_backend(graph_module, example_inputs):
                     ids[node] = source_id
                 else:
                     ids[node] = len(tensor_indices) + len(operations)
-                    operations.append([18, source_id, dim0, dim1])
+                    operations.append(Node.transpose(source_id, dim0, dim1))
             else:
                 raise RuntimeError("GaudiRT FX: transpose must keep the outer token dimension")
             continue
@@ -196,7 +201,7 @@ def _program_backend(graph_module, example_inputs):
                 ids[node] = source_id
             else:
                 ids[node] = len(tensor_indices) + len(operations)
-                operations.append([17, source_id, result.ndim, *shape[1:]])
+                operations.append(Node.reshape(source_id, list(shape[1:])))
             continue
         if ((node.op == "call_method" and node.target in ("to", "float")) or
                 (node.op == "call_function" and node.target is torch.ops.aten._to_copy.default)):
@@ -225,14 +230,14 @@ def _program_backend(graph_module, example_inputs):
             if example.dtype == dtype:
                 if explicit_copy:
                     ids[node] = len(tensor_indices) + len(operations)
-                    operations.append([19, tensor_id(source), 0, -1])
+                    operations.append(Node.unary(Op.copy, tensor_id(source)))
                 else:
                     ids[node] = tensor_id(source)
                     if source in alias_views:
                         alias_views[node] = alias_views[source]
             else:
                 ids[node] = len(tensor_indices) + len(operations)
-                operations.append([11, tensor_id(source), int(dtype == torch.float32), -1])
+                operations.append(Node.cast(tensor_id(source), dtype == torch.float32))
             continue
         if ((node.op == "call_method" and node.target == "split") or
                 (node.op == "call_function" and node.target in split_targets)):
@@ -264,7 +269,7 @@ def _program_backend(graph_module, example_inputs):
             if not isinstance(tensors, (tuple, list)) or len(tensors) < 2 or dim not in (-1, 1):
                 raise RuntimeError("GaudiRT FX: cat requires at least two feature tensors")
             ids[node] = len(tensor_indices) + len(operations)
-            operations.append([15, *(tensor_id(value) for value in tensors)])
+            operations.append(Node.concat([tensor_id(value) for value in tensors]))
             continue
         if (node.target is operator.getitem and len(node.args) == 2 and not node.kwargs and
                 isinstance(node.args[1], tuple)):
@@ -310,7 +315,7 @@ def _program_backend(graph_module, example_inputs):
                 raise RuntimeError("GaudiRT FX: embedding requires validated external IDs and weights")
             validated_token_bindings.append((index_id, weight_id_value))
             ids[node] = len(tensor_indices) + len(operations)
-            operations.append([9, index_id, weight_id_value, -1])
+            operations.append(Node.binary(Op.embedding, index_id, weight_id_value))
             continue
         if node.target in rotary_targets:
             if len(node.args) != 9 or node.kwargs:
@@ -320,8 +325,8 @@ def _program_backend(graph_module, example_inputs):
                     for value in (context, head_dim, rotary_dim)) or not isinstance(is_neox, bool)):
                 raise RuntimeError("GaudiRT FX: invalid rotary configuration")
             producer = len(tensor_indices) + len(operations)
-            operations.append([7, *(tensor_id(value) for value in node.args[:5]),
-                               context, head_dim, rotary_dim, int(is_neox)])
+            operations.append(Node.rotary(*(tensor_id(value) for value in node.args[:5]),
+                                          context, head_dim, rotary_dim, is_neox))
             rotations[node] = [producer, None]
             continue
         if node.target is operator.getitem and len(node.args) == 2 and node.args[0] in rotations:
@@ -335,7 +340,7 @@ def _program_backend(graph_module, example_inputs):
             if key_output is None:
                 key_output = len(tensor_indices) + len(operations)
                 rotations[node.args[0]][1] = key_output
-                operations.append([8, producer, 0, -1])
+                operations.append(Node.unary(Op.rotary_key, producer))
             ids[node] = key_output
             continue
         if node.target in fused_norm_targets:
@@ -344,9 +349,9 @@ def _program_backend(graph_module, example_inputs):
             epsilon = node.args[3]
             if not isinstance(epsilon, (int, float)) or not math.isfinite(epsilon) or epsilon <= 0:
                 raise RuntimeError("GaudiRT FX: fused RMSNorm epsilon must be positive and finite")
-            bits = struct.unpack("<I", struct.pack("<f", epsilon))[0]
             producer = len(tensor_indices) + len(operations)
-            operations.append([5, tensor_id(node.args[0]), tensor_id(node.args[1]), tensor_id(node.args[2]), bits])
+            operations.append(Node.fused_norm(tensor_id(node.args[0]), tensor_id(node.args[1]),
+                                              tensor_id(node.args[2]), _finite_float32(epsilon)))
             fused_norms[node] = [producer, None]
             continue
         if node.target is operator.getitem and len(node.args) == 2 and node.args[0] in fused_norms:
@@ -361,7 +366,7 @@ def _program_backend(graph_module, example_inputs):
                 ids[node] = residual
                 continue
             fused_norms[node.args[0]][1] = len(tensor_indices) + len(operations)
-            operation = [6, producer, 0, -1]
+            operation = Node.unary(Op.fused_residual, producer)
         elif node.target is operator.getitem and len(node.args) == 2 and node.args[0] in splits:
             source, sizes, source_node = splits[node.args[0]]
             index = node.args[1]
@@ -374,7 +379,7 @@ def _program_backend(graph_module, example_inputs):
                 continue
             start = sum(sizes[:index])
             add_alias(node, source_node, ("feature", start, sizes[index]))
-            operation = [4, source, start, sizes[index], sum(sizes)]
+            operation = Node.slice(source, start, sizes[index], sum(sizes))
         elif (node.target is operator.getitem and len(node.args) == 2 and not node.kwargs and
               isinstance(node.args[1], torch.fx.Node)) or node.target in index_select_targets:
             if node.target in index_select_targets:
@@ -387,55 +392,56 @@ def _program_backend(graph_module, example_inputs):
             if index_id >= len(tensor_indices) or roles[index_id]:
                 raise RuntimeError("GaudiRT FX: row gather requires external validated indices")
             validated_row_bindings.append(index_id)
-            operation = [10, tensor_id(source), index_id, -1]
+            operation = Node.binary(Op.gather_rows, tensor_id(source), index_id)
         elif node.target in linear_targets and len(node.args) in (2, 3):
             if set(node.kwargs) - {"bias"} or (len(node.args) == 3 and "bias" in node.kwargs):
                 raise RuntimeError("GaudiRT FX: unsupported linear arguments")
             bias = node.args[2] if len(node.args) == 3 else node.kwargs.get("bias")
-            operation = [0, tensor_id(node.args[0]), tensor_id(node.args[1]),
-                         -1 if bias is None else tensor_id(bias)]
+            operation = Node.linear(tensor_id(node.args[0]), tensor_id(node.args[1]),
+                                    None if bias is None else tensor_id(bias), True)
         elif node.target in bmm_targets and len(node.args) == 2 and not node.kwargs:
-            operation = [16, tensor_id(node.args[0]), tensor_id(node.args[1]), -1]
+            operation = Node.binary(Op.bmm, tensor_id(node.args[0]), tensor_id(node.args[1]))
         elif node.target in mm_targets and len(node.args) == 2 and not node.kwargs:
             left = node.args[0].meta.get("example_value")
             right = node.args[1].meta.get("example_value")
             if (isinstance(left, torch.Tensor) and isinstance(right, torch.Tensor) and
                     left.ndim == right.ndim and 3 <= left.ndim <= 5):
-                operation = [16, tensor_id(node.args[0]), tensor_id(node.args[1]), -1]
+                operation = Node.binary(Op.bmm, tensor_id(node.args[0]), tensor_id(node.args[1]))
             elif node.args[1] in transposes:
-                operation = [0, tensor_id(node.args[0]), weight_id(node.args[1]), -1]
+                operation = Node.linear(tensor_id(node.args[0]), weight_id(node.args[1]), None, True)
             else:
-                operation = [24, tensor_id(node.args[0]), tensor_id(node.args[1]), -1]
+                operation = Node.linear(tensor_id(node.args[0]), tensor_id(node.args[1]), None, False)
         elif node.target in addmm_targets and len(node.args) == 3:
             if set(node.kwargs) - {"alpha", "beta"} or any(
                 not isinstance(value, (int, float)) or value != 1 for value in node.kwargs.values()
             ):
                 raise RuntimeError("GaudiRT FX: addmm requires alpha=beta=1")
             if node.args[2] in transposes:
-                operation = [0, tensor_id(node.args[1]), weight_id(node.args[2]), tensor_id(node.args[0])]
+                operation = Node.linear(tensor_id(node.args[1]), weight_id(node.args[2]),
+                                        tensor_id(node.args[0]), True)
             else:
-                operation = [24, tensor_id(node.args[1]), tensor_id(node.args[2]), tensor_id(node.args[0])]
+                operation = Node.linear(tensor_id(node.args[1]), tensor_id(node.args[2]),
+                                        tensor_id(node.args[0]), False)
         elif node.target in add_targets and len(node.args) == 2:
             if set(node.kwargs) - {"alpha"} or node.kwargs.get("alpha", 1) != 1:
                 raise RuntimeError("GaudiRT FX: add requires alpha=1")
-            operation = binary_operation(node.args, 1, 20)
+            operation = binary_operation(node.args, Op.add, Op.scalar_add)
         elif node.target in sub_targets and len(node.args) == 2:
             if set(node.kwargs) - {"alpha"} or node.kwargs.get("alpha", 1) != 1:
                 raise RuntimeError("GaudiRT FX: sub requires alpha=1")
-            operation = binary_operation(node.args, 12, 21)
+            operation = binary_operation(node.args, Op.sub, Op.scalar_sub)
         elif node.target in mul_targets and len(node.args) == 2 and not node.kwargs:
-            operation = binary_operation(node.args, 13, 22)
+            operation = binary_operation(node.args, Op.mul, Op.scalar_mul)
         elif node.target in div_targets and len(node.args) == 2 and not node.kwargs:
-            operation = binary_operation(node.args, 14, 23)
+            operation = binary_operation(node.args, Op.div, Op.scalar_div)
         elif node.target in norm_targets and len(node.args) == 3 and not node.kwargs:
             epsilon = node.args[2]
             if not isinstance(epsilon, (int, float)) or not math.isfinite(epsilon) or epsilon <= 0:
                 raise RuntimeError("GaudiRT FX: RMSNorm epsilon must be positive and finite")
-            bits = struct.unpack("<I", struct.pack("<f", epsilon))[0]
-            operation = [2, tensor_id(node.args[0]), tensor_id(node.args[1]), bits]
+            operation = Node.norm(tensor_id(node.args[0]), tensor_id(node.args[1]), _finite_float32(epsilon))
         elif node.target in silu_targets and len(node.args) == 1 and not node.kwargs:
             source = tensor_id(node.args[0])
-            operation = [3, source, source, -1]
+            operation = Node.unary(Op.silu_and_mul, source)
         else:
             raise RuntimeError(f"GaudiRT FX: unsupported program operation {node.target}")
         ids[node] = len(tensor_indices) + len(operations)
@@ -444,7 +450,9 @@ def _program_backend(graph_module, example_inputs):
         raise RuntimeError("GaudiRT FX: unsupported program output")
     output_ids = [alias_views[value][0] if value in alias_views else ids[value] for value in output]
     computed_ids = list(dict.fromkeys(value for value in output_ids if value >= len(tensor_indices)))
-    if operations and not computed_ids and any(operation[0] not in (4, 17, 18) for operation in operations):
+    if operations and not computed_ids and any(
+        operation.op not in (Op.feature_slice, Op.reshape, Op.transpose) for operation in operations
+    ):
         raise RuntimeError("GaudiRT FX: program operations have no output")
     program = _C.BucketProgram(roles, operations, computed_ids) if computed_ids else None
     if program is None and (computed_ids or validated_token_bindings):

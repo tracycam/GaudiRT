@@ -16,8 +16,10 @@ def main():
     counter.restype = ctypes.c_uint64
     torch.random.default_generator.manual_seed(824)
     gaudirt.initialize(hbm_bytes=256 * 1024**2, pinned_bytes=4 * 1024**2)
+    node = gaudirt._C.FxNode
     program = gaudirt._C.BucketProgram(
-        [1], [[4, 0, 0, 4, 16], [4, 0, 4, 6, 16], [4, 0, 10, 6, 16], [15, 1, 2, 3]], [4]
+        [1], [node.slice(0, 0, 4, 16), node.slice(0, 4, 6, 16),
+              node.slice(0, 10, 6, 16), node.concat([1, 2, 3])], [4]
     )
     for rows, expected_nodes in ((3, 1), (3, 0), (17, 1)):
         value = torch.randn(rows, 16, dtype=torch.bfloat16)
@@ -27,7 +29,7 @@ def main():
         assert counter() - before == expected_nodes, (rows, counter() - before)
 
     overlapping = gaudirt._C.BucketProgram(
-        [1], [[4, 0, 0, 8, 16], [4, 0, 4, 8, 16], [15, 1, 2]], [3]
+        [1], [node.slice(0, 0, 8, 16), node.slice(0, 4, 8, 16), node.concat([1, 2])], [3]
     )
     value = torch.randn(3, 16, dtype=torch.bfloat16)
     before = counter()
