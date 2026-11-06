@@ -40,7 +40,7 @@ class BucketProgram {
   std::vector<int64_t> roles_;
   std::vector<FxNode> operations_;
   std::vector<int64_t> outputs_;
-  std::vector<bool> embedding_inputs_;
+  bool has_embedding_ = false;
   std::vector<TensorSpec> specs_;
   std::string digest_;
   std::once_flag geometry_once_;

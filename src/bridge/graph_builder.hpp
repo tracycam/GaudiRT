@@ -23,7 +23,7 @@ struct RotaryParameters {
 
 using NodeParameters = std::variant<std::monostate, synTransposeParams, synGEMMParams,
                                     ns_GatherKernel::ParamsV2, ns_CastKernel::ParamsV3,
-                                    synAxisParams, RotaryParameters, float,
+                                    synAxisParams, RotaryParameters, float, int32_t,
                                     ns_ConstantKernel::ParamsV3, ns_BroadcastNonFcd::Params>;
 
 struct NodeSpec {

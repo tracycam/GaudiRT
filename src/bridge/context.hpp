@@ -58,6 +58,8 @@ struct Context {
   synStreamHandle stream();
   void synchronize_stream();
   void synchronize_all();
+  uint64_t row_count_address(uint32_t rows);
+  static constexpr uint64_t kRowCountTableBytes = 4096 * 256;
   static std::filesystem::path cache_path();
   static runtime::DeviceRuntime::Config config(uint32_t module);
 
@@ -67,6 +69,8 @@ struct Context {
   runtime::BlockCachingAllocator allocator;
   std::unique_ptr<runtime::GraphPool> graph_pool;
   runtime::PinnedHostPool pinned;
+  std::once_flag row_count_once;
+  uint64_t row_count_table = 0;
   runtime::RecipeCache cache;
   std::mutex cold_mutex;
   std::unordered_map<std::string, std::unique_ptr<ColdRecipe>> cold_recipes;

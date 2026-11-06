@@ -34,7 +34,6 @@ BucketProgram::BucketProgram(std::vector<int64_t> roles, std::vector<FxNode> ope
     has_dynamic |= role == 1;
   }
   TORCH_CHECK(has_dynamic, "GaudiRT FX: no dynamic token input");
-  embedding_inputs_.resize(roles_.size(), false);
   std::vector<int64_t> residual_producers, rotary_producers;
   for (size_t i = 0; i < operations_.size(); ++i) {
     const auto& op = operations_[i];
@@ -54,7 +53,7 @@ BucketProgram::BucketProgram(std::vector<int64_t> roles, std::vector<FxNode> ope
       case FxOp::embedding:
         valid = op.inputs.size() == 2 && no_params && op.inputs[0] < static_cast<int64_t>(roles_.size()) &&
                 op.inputs[1] < static_cast<int64_t>(roles_.size());
-        if (valid) embedding_inputs_[op.inputs[0]] = true;
+        if (valid) has_embedding_ = true;
         break;
       case FxOp::gather_rows:
         valid = op.inputs.size() == 2 && no_params && op.inputs[1] < static_cast<int64_t>(roles_.size());
@@ -177,7 +176,8 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
   const auto key = "fx_program_" + digest_ + "_b" + std::to_string(bucket);
   auto found = ctx.cold_recipes.find(key);
   if (found != ctx.cold_recipes.end()) return *found->second;
-  auto compiled = std::make_unique<ColdRecipe>(roles_.size() + outputs_.size());
+  const auto row_count_slot = roles_.size() + outputs_.size();
+  auto compiled = std::make_unique<ColdRecipe>(row_count_slot + static_cast<size_t>(has_embedding_));
   {
     SynapseGraphBuilder builder(prefix, *compiled);
     std::vector<synTensor> values(specs_.size(), nullptr);
@@ -202,6 +202,8 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
       const auto& spec = specs_[i];
       values[i] = tensor_from_spec(spec, i);
     }
+    const auto row_count = has_embedding_ ?
+        tensor_nd(syn_type_int32, {1}, static_cast<int>(row_count_slot)) : nullptr;
     for (size_t i = 0; i < operations_.size(); ++i) {
       const auto& op = operations_[i];
       const auto id = roles_.size() + i;
@@ -264,11 +266,19 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
         continue;
       }
       if (op.op == FxOp::embedding) {
+        // Token values were validated at the FX boundary. Mask only the
+        // unused bucket rows before gather; the external input stays bound.
+        auto input = tensor_nd(syn_type_int32, {1, bucket}, -1);
+        auto masked = tensor_nd(syn_type_int32, {bucket}, -1);
+        auto status = tensor_nd(syn_type_int32, {bucket}, -1);
+        node({values[op.inputs[0]]}, input, std::monostate{}, "reshape");
+        builder.node(NodeSpec{"gk_scheduler_tokens_i32_v1", {input, row_count},
+                              {masked, status}, int32_t{1}});
         ns_GatherKernel::ParamsV2 params{};
         params.axis = 1;
         params.batchDims = 0;
         const auto guid = "gather_fwd_" + std::string(type.name);
-        node({values[op.inputs[1]], values[op.inputs[0]]}, values[id], params, guid.c_str());
+        node({values[op.inputs[1]], masked}, values[id], params, guid.c_str());
         continue;
       }
       if (op.op == FxOp::rotary) {
@@ -566,9 +576,6 @@ std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs
     uint64_t binding = address;
     if (!direct) {
       const auto temp = temporaries.allocate(bytes);
-      if (embedding_inputs_[i] && m < bucket)
-        TORCH_CHECK(synMemsetD32Async(temp, 0, bucket, stream) == synSuccess,
-                    "GaudiRT FX: index tail zeroing failed");
       const Layout layout(input);
       dma_copy(temp, nullptr, address, &layout, 0, input.numel(), item, stream, DRAM_TO_DRAM);
       binding = temp;
@@ -579,6 +586,8 @@ std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs
   for (size_t i = 0; i < results.size(); ++i) {
     bindings[roles_.size() + i].pTensorAddress = reinterpret_cast<uint64_t>(results[i].data_ptr());
   }
+  if (has_embedding_)
+    bindings[roles_.size() + outputs_.size()].pTensorAddress = ctx->row_count_address(static_cast<uint32_t>(m));
   const uint64_t workspace = compiled.workspace ? temporaries.allocate(compiled.workspace) : 0;
   TORCH_CHECK(synLaunch(stream, bindings.data(), bindings.size(), workspace,
                         compiled.recipe, 0) == synSuccess, "GaudiRT FX: program launch failed");

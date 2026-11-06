@@ -12,6 +12,7 @@
 
 namespace {
 std::atomic<uint64_t> split_nodes{0};
+std::atomic<uint64_t> d2d_copies{0};
 std::atomic<uint64_t> event_creates{0};
 std::atomic<uint64_t> event_destroys{0};
 std::atomic<uint64_t> event_synchronizes{0};
@@ -24,6 +25,7 @@ bool launch_gate_timed_out = false;
 }
 
 extern "C" uint64_t gaudirt_test_split_node_count() { return split_nodes.load(); }
+extern "C" uint64_t gaudirt_test_d2d_copy_count() { return d2d_copies.load(); }
 extern "C" uint64_t gaudirt_test_event_create_count() { return event_creates.load(); }
 extern "C" uint64_t gaudirt_test_event_destroy_count() { return event_destroys.load(); }
 extern "C" uint64_t gaudirt_test_event_synchronize_count() { return event_synchronizes.load(); }
@@ -65,6 +67,20 @@ extern "C" synStatus SYN_API_CALL synLaunch(
     }
   }
   return real(stream, tensors, count, workspace, recipe, flags);
+}
+
+extern "C" synStatus SYN_API_CALL synMemCopyAsync(
+    synStreamHandle stream, uint64_t source, uint64_t bytes, uint64_t destination, synDmaDir direction) {
+  using Function = decltype(&synMemCopyAsync);
+  static const auto real = [] {
+    void* library = dlopen("libSynapse.so", RTLD_NOW | RTLD_NOLOAD);
+    if (!library) std::abort();
+    auto function = reinterpret_cast<Function>(dlsym(library, "synMemCopyAsync"));
+    if (!function) std::abort();
+    return function;
+  }();
+  if (direction == DRAM_TO_DRAM) ++d2d_copies;
+  return real(stream, source, bytes, destination, direction);
 }
 
 extern "C" synStatus SYN_API_CALL synEventCreate(synEventHandle* event, synDeviceId device, uint32_t flags) {
