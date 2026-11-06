@@ -39,6 +39,7 @@ if(GAUDIRT_BUILD_TORCH)
     add_library(_gaudirt_C MODULE src/bridge/generic_private_use1.cpp
         src/bridge/context.cpp src/bridge/context_allocator.cpp src/bridge/layout_copy.cpp
         src/bridge/paged_metadata.cpp src/bridge/eager_copy.cpp src/bridge/eager_ops.cpp
+        src/bridge/eager_index.cpp
         src/bridge/bucket_program.cpp
         src/bridge/tensor_spec.cpp src/bridge/fx_node.cpp
         src/bridge/fx_geometry.cpp src/bridge/graph_builder.cpp)
