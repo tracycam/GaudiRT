@@ -102,6 +102,8 @@ target_link_libraries(mimo_grouped_moe_real_weight_test PRIVATE mimo_layer_verti
 
 add_executable(pinned_host_dma_device_test tests/pinned_host_dma_device_test.cpp)
 target_link_libraries(pinned_host_dma_device_test PRIVATE gaudirt)
+add_executable(pinned_host_fence_coalescing_device_test tests/pinned_host_fence_coalescing_device_test.cpp)
+target_link_libraries(pinned_host_fence_coalescing_device_test PRIVATE gaudirt ${CMAKE_DL_LIBS})
 
 add_executable(block_allocator_device_test tests/block_allocator_device_test.cpp)
 target_link_libraries(block_allocator_device_test PRIVATE gaudirt)
