@@ -58,9 +58,9 @@ int main() {
       const auto p = pool.allocate(256, stream(1));
       pool.free(p);
     }
-    // The unused remainder retains the previous fence while a split block is
-    // freed, so two records are sufficient for the repeated split/merge case.
-    assert(waited.size() == 999 && live_events == 2 && created_events == 2);
+    // A producer stream uses one persistent event, including when a split
+    // remainder and the freed block both retain its most recent record.
+    assert(waited.size() == 999 && live_events == 1 && created_events == 1);
     for (uint64_t i = 0; i < waited.size(); ++i)
       assert(waited[i].stream == stream(1) && waited[i].ordinal == i + 1);
   }
@@ -76,6 +76,25 @@ int main() {
     const auto merged = pool.allocate(512, stream(2));
     assert(waited.size() == 1 && waited[0].stream == stream(1) && waited[0].ordinal == 2);
     pool.free(merged);
+  }
+  reset();
+  {
+    BlockCachingAllocator pool(0, 4096);
+    const auto a = pool.allocate(256, stream(1));
+    const auto gap = pool.allocate(256, stream(1));
+    const auto b = pool.allocate(256, stream(1));
+    const auto guard = pool.allocate(256, stream(1));
+    pool.free(a);
+    pool.free(b);
+    assert(created_events == 1);
+    waited.clear();
+    const auto reused = pool.allocate(256, stream(2));
+    assert(reused == a && waited.size() == 1 && waited[0].stream == stream(1));
+    assert(waited[0].ordinal == 2);
+    pool.free(gap);  // Record the same producer event again.
+    assert(waited[0].ordinal == 2);  // A submitted wait captured its own state.
+    pool.free(reused);
+    pool.free(guard);
   }
   reset();
   {

@@ -88,7 +88,7 @@ void PinnedHostPool::free(void* address) {
   std::vector<Fence> events;
   events.reserve(it->second.streams.size());
   for (auto stream : it->second.streams) {
-    auto event = events_.acquire();
+    auto event = events_.acquire(stream);
     check(synEventRecord(event.get(), stream), "event record failed");
     events.push_back({stream, ++next_fence_sequence_, std::move(event)});
   }
