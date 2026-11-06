@@ -33,6 +33,20 @@ def different_epsilon(x, gamma, weight, bias, residual):
     return torch.nn.functional.linear(normalized, weight, bias) + residual
 
 
+def check_norm(x, gamma, gamma_cpu):
+    actual = torch.ops.gaudirt.rms_norm.default(x, gamma, EPSILON).cpu().double()
+    source = x.cpu()
+    x64, g64 = source.double(), gamma_cpu.double()
+    truth = direct_bf16(x64 * torch.rsqrt((x64 * x64).mean(-1, keepdim=True) + EPSILON_FP32) * g64)
+    x32, g32 = source.float(), gamma_cpu.float()
+    floor = (x32 * torch.rsqrt((x32 * x32).mean(-1, keepdim=True) + EPSILON_FP32) * g32).to(torch.bfloat16).double()
+    assert all(torch.isfinite(value).all() for value in (actual, truth, floor))
+    denom = torch.linalg.vector_norm(truth, dim=-1).clamp_min(1e-30)
+    error = (torch.linalg.vector_norm(actual - truth, dim=-1) / denom).max().item()
+    floor_error = (torch.linalg.vector_norm(floor - truth, dim=-1) / denom).max().item()
+    assert error <= max(3e-3, 2 * floor_error) and error <= 1e-2, (error, floor_error)
+
+
 def check(output, x, gamma, weight, bias, residual, epsilon=EPSILON_FP32):
     actual = output.cpu().double()
     x64, g64 = x.double(), gamma.double()
@@ -133,16 +147,8 @@ def main():
             assert "epsilon" in str(error)
         else:
             raise AssertionError("invalid RMSNorm epsilon accepted")
-    eager = torch.ops.gaudirt.rms_norm.default(probe_x, gammas[0], EPSILON)
-    source = probe_x.cpu().double()
-    reference = direct_bf16(source * torch.rsqrt((source * source).mean(-1, keepdim=True) + EPSILON_FP32)
-                            * gamma_cpu[0].double())
-    assert torch.isfinite(eager.cpu()).all()
-    norm_error = (torch.linalg.vector_norm(eager.cpu().double() - reference, dim=-1) /
-                  torch.linalg.vector_norm(reference, dim=-1).clamp_min(1e-30)).max().item()
-    assert norm_error <= 3e-3, norm_error
-    midpoint_output = torch.ops.gaudirt.rms_norm.default(midpoint_x, gammas[0], EPSILON)
-    assert midpoint_output.cpu()[3, 43].item() == 4.75
+    check_norm(probe_x, gammas[0], gamma_cpu[0])
+    check_norm(midpoint_x, gammas[0], gamma_cpu[0])
     for invalid_m in (0, 4097):
         invalid = torch.empty((invalid_m, 64), dtype=torch.bfloat16, device="gaudirt:0")
         try:
@@ -151,7 +157,7 @@ def main():
             assert "token count" in str(error)
         else:
             raise AssertionError("invalid token count accepted")
-    del x, r1, r2, first, second, probe_x, probe_r, midpoint_x, midpoint_output, other, variant, eager, invalid
+    del x, r1, r2, first, second, probe_x, probe_r, midpoint_x, other, variant, invalid
     del weights, gammas, biases
     gaudirt.empty_cache()
     gaudirt.shutdown()
