@@ -157,6 +157,8 @@ enum class AllocationKind { device, pinned, graph, metadata_header };
 struct AllocationContext {
   std::weak_ptr<Context> owner;
   uint64_t address;
+  uint64_t bytes;
+  synStreamHandle stream;
   AllocationKind kind;
 };
 
@@ -176,10 +178,10 @@ void release_allocation(void* pointer) {
 }
 
 c10::DataPtr allocation_data_ptr(const std::shared_ptr<Context>& ctx, uint64_t address,
-                                 AllocationKind kind) {
+                                 uint64_t bytes, synStreamHandle stream, AllocationKind kind) {
   AllocationContext* allocation = nullptr;
   try {
-    allocation = new AllocationContext{ctx, address, kind};
+    allocation = new AllocationContext{ctx, address, bytes, stream, kind};
   } catch (...) {
     free_allocation(*ctx, address, kind);
     throw;
@@ -231,6 +233,21 @@ uint64_t address_of(const at::Tensor& tensor, const Context& ctx) {
   return address;
 }
 
+const AllocationContext& validated_program_input(const at::Tensor& tensor, const Context& ctx) {
+  const auto& storage = tensor.storage();
+  const auto* allocation = storage.data_ptr().cast_context<AllocationContext>(release_allocation);
+  TORCH_CHECK(allocation && allocation->kind != AllocationKind::pinned &&
+              allocation->owner.lock().get() == &ctx,
+              "GaudiRT FX: tensor must belong to the active allocator");
+  const auto base = reinterpret_cast<uint64_t>(storage.data());
+  const auto address = reinterpret_cast<uint64_t>(tensor.data_ptr());
+  const auto bytes = storage.nbytes();
+  TORCH_CHECK(base == allocation->address && bytes <= allocation->bytes && address >= base &&
+              address - base <= bytes && span_bytes(tensor) <= bytes - (address - base),
+              "GaudiRT FX: tensor is outside its storage");
+  return *allocation;
+}
+
 void record_stream(at::Tensor& tensor, c10::Stream stream) {
   auto ctx = current();
   TORCH_CHECK(stream.device_type() == c10::kPrivateUse1 && stream.device_index() == 0,
@@ -272,8 +289,9 @@ class Allocator final : public c10::Allocator {
   c10::DataPtr allocate(size_t bytes) override {
     auto ctx = current();
     if (!bytes) return {nullptr, c10::Device(c10::kPrivateUse1, 0)};
-    const uint64_t address = ctx->allocator.allocate(bytes, ctx->stream());
-    return allocation_data_ptr(ctx, address, AllocationKind::device);
+    const auto stream = ctx->stream();
+    const uint64_t address = ctx->allocator.allocate(bytes, stream);
+    return allocation_data_ptr(ctx, address, bytes, stream, AllocationKind::device);
   }
   void copy_data(void* dst, const void* src, size_t bytes) const override {
     if (!bytes) return;
@@ -291,7 +309,7 @@ class PinnedAllocator final : public c10::Allocator {
     auto ctx = current();
     if (!bytes) return {nullptr, c10::Device(c10::kCPU)};
     void* address = ctx->pinned.allocate(bytes);
-    return allocation_data_ptr(ctx, reinterpret_cast<uint64_t>(address), AllocationKind::pinned);
+    return allocation_data_ptr(ctx, reinterpret_cast<uint64_t>(address), bytes, nullptr, AllocationKind::pinned);
   }
   void copy_data(void* dst, const void* src, size_t bytes) const override {
     std::memcpy(dst, src, bytes);
@@ -2759,7 +2777,7 @@ std::optional<at::Tensor> prepare_strided_input(const at::Tensor& input) {
       ctx->graph_pool = std::make_unique<GraphPool>(ctx->allocator, budget, stream);
     }
     destination = ctx->graph_pool->allocate(bytes, stream);
-    allocation = allocation_data_ptr(ctx, destination, AllocationKind::graph);
+    allocation = allocation_data_ptr(ctx, destination, bytes, stream, AllocationKind::graph);
     if (ctx->graph_pool->contains_live_range(source, 1)) ctx->graph_pool->record_stream(source, stream);
     ctx->allocator.record_stream(source, stream);
   }
@@ -3686,8 +3704,12 @@ std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs
     TORCH_CHECK(!spec.dynamic() || dynamic_width <= UINT64_MAX / bucket / item,
                 "GaudiRT FX: input allocation size overflow");
     const uint64_t bytes = spec.dynamic() ? static_cast<uint64_t>(bucket) * dynamic_width * item : input.nbytes();
-    const uint64_t address = address_of(input, *ctx);
-    ctx->allocator.record_stream(address, stream);
+    const auto& allocation = validated_program_input(input, *ctx);
+    const uint64_t address = reinterpret_cast<uint64_t>(input.data_ptr());
+    if (allocation.stream != stream) {
+      if (allocation.kind == AllocationKind::graph) ctx->graph_pool->record_stream(address, stream);
+      else ctx->allocator.record_stream(address, stream);
+    }
     const uint64_t offset = static_cast<uint64_t>(input.storage_offset()) * item;
     const uint64_t storage = input.storage().nbytes();
     bool direct = input.is_contiguous() && address % BlockCachingAllocator::kAlignment == 0 &&
@@ -3709,9 +3731,7 @@ std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs
     bindings[i].pTensorAddress = binding;
   }
   for (size_t i = 0; i < results.size(); ++i) {
-    const auto address = address_of(results[i], *ctx);
-    ctx->allocator.record_stream(address, stream);
-    bindings[roles_.size() + i].pTensorAddress = address;
+    bindings[roles_.size() + i].pTensorAddress = reinterpret_cast<uint64_t>(results[i].data_ptr());
   }
   std::unique_ptr<GraphTemporary> workspace;
   if (compiled.workspace) workspace = std::make_unique<GraphTemporary>(graph_pool(), stream, compiled.workspace);
@@ -3808,8 +3828,9 @@ class PagedMetadata : public torch::CustomClassHolder {
 // the PagedMetadata object when the stateful operation is captured by FX.
 at::Tensor paged_header(const std::shared_ptr<Context>& ctx, int64_t max_position,
                         const at::TensorOptions& options) {
-  const auto address = ctx->allocator.allocate(sizeof(int32_t), ctx->stream());
-  auto allocation = allocation_data_ptr(ctx, address, AllocationKind::metadata_header);
+  const auto stream = ctx->stream();
+  const auto address = ctx->allocator.allocate(sizeof(int32_t), stream);
+  auto allocation = allocation_data_ptr(ctx, address, sizeof(int32_t), stream, AllocationKind::metadata_header);
   {
     std::lock_guard lock(ctx->metadata_mutex);
     ctx->paged_max_positions.emplace(address, max_position);
