@@ -21,7 +21,7 @@ def main():
     gaudirt.initialize(hbm_bytes=256 * 1024**2, pinned_bytes=8 * 1024**2)
     streams = [gaudirt.Stream(), gaudirt.Stream()]
     cases = []
-    for index in range(2):
+    for index in range(4):
         cpu = torch.arange(13 * 19, dtype=torch.float32).reshape(13, 19) + index * 1000
         pinned_in = torch.empty_like(cpu, pin_memory=True)
         pinned_in.copy_(cpu)
@@ -42,8 +42,8 @@ def main():
         device.copy_(cpu, non_blocking=True)
         host_out.copy_(device, non_blocking=False)
 
-    for index, stream in enumerate(streams):
-        with gaudirt.stream(stream):
+    for index in range(len(cases)):
+        with gaudirt.stream(streams[index % len(streams)]):
             exercise(index)
     gaudirt.synchronize()
     before_create, before_destroy = created(), destroyed()
@@ -58,27 +58,32 @@ def main():
         assert torch.equal(cpu, pinned_out)
         assert torch.equal(cpu, host_out)
 
-    def concurrent_round(steps):
-        gate = threading.Barrier(2)
+    def concurrent_round(steps, mixed_streams):
+        gate = threading.Barrier(len(cases))
 
         def worker(index):
-            with gaudirt.stream(streams[0]):
+            with gaudirt.stream(streams[index % len(streams) if mixed_streams else 0]):
                 gate.wait(timeout=30)
                 for _ in range(steps):
                     exercise(index)
                     assert torch.equal(cases[index][0], cases[index][3])
 
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            list(executor.map(worker, range(2)))
+        with ThreadPoolExecutor(max_workers=len(cases)) as executor:
+            list(executor.map(worker, range(len(cases))))
 
-    concurrent_round(2)
+    for mixed_streams in (False, True):
+        concurrent_round(2, mixed_streams)
     gaudirt.synchronize()
     before_create, before_destroy = created(), destroyed()
-    concurrent_round(32)
+    for mixed_streams in (False, True):
+        concurrent_round(32, mixed_streams)
     gaudirt.synchronize()
     assert created() == before_create, (before_create, created())
     assert destroyed() == before_destroy, (before_destroy, destroyed())
-    print("copy steps 32 and two-thread same-stream steps 64, pinned/pageable contiguous/strided H2D/D2H,",
+    for cpu, _, pinned_out, host_out, _, _ in cases:
+        assert torch.equal(cpu, pinned_out)
+        assert torch.equal(cpu, host_out)
+    print("four-thread same-stream and mixed-stream copies: 256 steps; pinned/pageable, contiguous/strided;",
           "event creations 0 destructions 0", flush=True)
 
 
