@@ -4194,9 +4194,9 @@ struct PagedGeometry {
 };
 
 ColdRecipe& paged_recipe(Context& ctx, const PagedGeometry& metadata, uint64_t q_width,
-                         uint64_t kv_width, int32_t head_dim, float scale, bool store, bool use_mme = false) {
+                         uint64_t kv_width, int32_t head_dim, float scale, bool store) {
   std::ostringstream signature;
-  signature << (store ? "paged_store_v1;" : use_mme ? "paged_gqa_mme_v1;" : "paged_gqa_v1;")
+  signature << (store ? "paged_store_v1;" : "paged_gqa_mme_v2;")
             << metadata.bucket_ << ":"
             << kv_width << ":" << metadata.slots_;
   if (!store)
@@ -4255,7 +4255,7 @@ ColdRecipe& paged_recipe(Context& ctx, const PagedGeometry& metadata, uint64_t q
       compiled->tensors[i].tensorName = compiled->names[i].c_str();
       compiled->tensors[i].tensorType = DATA_TENSOR;
     }
-    if (use_mme) {
+    if (!store) {
       const auto intermediate = [&](synDataType type, std::initializer_list<uint64_t> dims) {
         intermediate_names.push_back(prefix + "_t" + std::to_string(shapes.size() + intermediates.size()));
         synTensorDescriptor desc{};
@@ -4290,10 +4290,7 @@ ColdRecipe& paged_recipe(Context& ctx, const PagedGeometry& metadata, uint64_t q
       auto query3 = intermediate(syn_type_bf16, {dimension, ratio, groups});
       auto scores = intermediate(syn_type_float, {context, ratio, groups});
       auto probability = intermediate(syn_type_bf16, {context, ratio, groups});
-      auto correction = intermediate(syn_type_bf16, {context, ratio, groups});
       auto main_context = intermediate(syn_type_float, {dimension, ratio, groups});
-      auto correction_context = intermediate(syn_type_float, {dimension, ratio, groups});
-      auto sum_context = intermediate(syn_type_float, {dimension, ratio, groups});
       auto flat_context = intermediate(syn_type_float, {q_width, bucket});
       append({tensors[1], tensors[2], tensors[3], tensors[4], tensors[5], tensors[6]},
              {key4, value4}, &head_dim, sizeof(head_dim), "gk_paged_gqa_mme_gather_bf16_v1");
@@ -4303,22 +4300,16 @@ ColdRecipe& paged_recipe(Context& ctx, const PagedGeometry& metadata, uint64_t q
       const synGEMMParams qk{false, true};
       append({query3, key3}, {scores}, &qk, sizeof(qk), "batch_gemm");
       struct SoftmaxParams { int32_t kv_heads; float scale; } softmax{static_cast<int32_t>(kv_heads), scale};
-      append({scores, tensors[4], tensors[6]}, {probability, correction},
+      append({scores, tensors[4], tensors[6]}, {probability},
              &softmax, sizeof(softmax), "gk_paged_gqa_mme_softmax_bf16_v1");
       const synGEMMParams pv{false, false};
       append({probability, value3}, {main_context}, &pv, sizeof(pv), "batch_gemm");
-      append({correction, value3}, {correction_context}, &pv, sizeof(pv), "batch_gemm");
-      append({main_context, correction_context}, {sum_context}, nullptr, 0, "add_fwd_f32");
-      append({sum_context}, {flat_context}, nullptr, 0, "reshape");
+      append({main_context}, {flat_context}, nullptr, 0, "reshape");
       append({flat_context}, {tensors[7]}, nullptr, 0, "gk_cast_f32_to_bf16_v1");
     } else {
-      struct Params { int32_t head_dim; float scale; } params{head_dim, scale};
       const auto node = prefix + "_n0";
-      const auto input_count = store ? 4u : 7u;
-      const auto output_count = store ? 2u : 1u;
-      const auto guid = store ? "gk_kv_store_bf16_v1" : "gk_paged_gqa_bf16_v1";
-      check(synNodeCreate(graph, tensors.data(), tensors.data() + input_count, input_count, output_count,
-                          store ? nullptr : &params, store ? 0 : sizeof(params), guid, node.c_str(), nullptr, nullptr),
+      check(synNodeCreate(graph, tensors.data(), tensors.data() + 4, 4, 2,
+                          nullptr, 0, "gk_kv_store_bf16_v1", node.c_str(), nullptr, nullptr),
             "node creation failed");
     }
     compiled->recipe = compile_cached(graph, prefix, key, &ctx.cache);
@@ -4382,11 +4373,10 @@ at::Tensor paged_attn_validated(const at::Tensor& query, const at::Tensor& key, 
     TORCH_CHECK(hint != ctx->paged_max_positions.end(), "GaudiRT paged attention: expected validated header");
     max_position = hint->second;
   }
-  // Measured crossover for decode on 32+ query heads; other geometries keep
-  // the online TPC implementation until they have a measured crossover.
   const auto q_heads = q_width / head_dim;
-  const bool use_mme = geometry.rows_ == 1 && q_heads >= 32 && geometry.context_ <= 4224 &&
-      max_position + 1 >= std::max<int64_t>(256, (geometry.context_ + 7) / 8);
+  TORCH_CHECK(geometry.rows_ == 1 && q_heads >= 32 && geometry.context_ <= 4224 &&
+              max_position + 1 >= std::max<int64_t>(256, (geometry.context_ + 7) / 8),
+              "GaudiRT paged attention: this geometry requires tiled MME attention, which is not yet implemented");
   const auto k_pool_address = address_of(key_pool, *ctx), v_pool_address = address_of(value_pool, *ctx);
   const uint64_t pool_bytes = key_pool.nbytes();
   TORCH_CHECK(k_pool_address % BlockCachingAllocator::kAlignment == 0 &&
@@ -4398,7 +4388,7 @@ at::Tensor paged_attn_validated(const at::Tensor& query, const at::Tensor& key, 
   std::lock_guard lock(ctx->cold_mutex);
   auto& write_recipe = paged_recipe(*ctx, geometry, q_width, kv_width, head_dim, static_cast<float>(scale), true);
   auto& attention_recipe = paged_recipe(*ctx, geometry, q_width, kv_width, head_dim,
-                                        static_cast<float>(scale), false, use_mme);
+                                        static_cast<float>(scale), false);
   auto graph_pool = [&]() -> GraphPool& {
     if (!ctx->graph_pool) {
       const uint64_t budget = std::min<uint64_t>(ctx->allocator.capacity_bytes() / 8, uint64_t{1} << 30);
