@@ -10,11 +10,13 @@
 namespace {
 std::atomic<uint64_t> split_nodes{0};
 std::atomic<uint64_t> event_creates{0};
+std::atomic<uint64_t> event_destroys{0};
 std::atomic<uint64_t> stream_event_creates{0};
 }
 
 extern "C" uint64_t gaudirt_test_split_node_count() { return split_nodes.load(); }
 extern "C" uint64_t gaudirt_test_event_create_count() { return event_creates.load(); }
+extern "C" uint64_t gaudirt_test_event_destroy_count() { return event_destroys.load(); }
 extern "C" uint64_t gaudirt_test_stream_event_create_count() { return stream_event_creates.load(); }
 
 extern "C" synStatus SYN_API_CALL synEventCreate(synEventHandle* event, synDeviceId device, uint32_t flags) {
@@ -31,6 +33,19 @@ extern "C" synStatus SYN_API_CALL synEventCreate(synEventHandle* event, synDevic
       std::strstr(caller.dli_sname, "11StreamEventC")) ++stream_event_creates;
   ++event_creates;
   return real(event, device, flags);
+}
+
+extern "C" synStatus SYN_API_CALL synEventDestroy(synEventHandle event) {
+  using Function = decltype(&synEventDestroy);
+  static const auto real = [] {
+    void* library = dlopen("libSynapse.so", RTLD_NOW | RTLD_NOLOAD);
+    if (!library) std::abort();
+    auto function = reinterpret_cast<Function>(dlsym(library, "synEventDestroy"));
+    if (!function) std::abort();
+    return function;
+  }();
+  ++event_destroys;
+  return real(event);
 }
 
 extern "C" synStatus SYN_API_CALL synNodeCreate(

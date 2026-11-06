@@ -12,8 +12,9 @@ struct RecordedEvent { synStreamHandle stream = nullptr; uint64_t ordinal = 0; }
 std::map<synStreamHandle, uint64_t> recorded;
 std::vector<RecordedEvent> waited;
 uint64_t live_events = 0;
+uint64_t created_events = 0;
 auto stream(unsigned id) { return reinterpret_cast<synStreamHandle>(uintptr_t{id}); }
-void reset() { assert(live_events == 0); recorded.clear(); waited.clear(); }
+void reset() { assert(live_events == 0); created_events = 0; recorded.clear(); waited.clear(); }
 }
 
 extern "C" {
@@ -29,6 +30,7 @@ synStatus synDeviceFree(synDeviceId, uint64_t, uint32_t) { return synSuccess; }
 synStatus synEventCreate(synEventHandle* p, synDeviceId, uint32_t) {
   *p = new RecordedEvent;
   ++live_events;
+  ++created_events;
   return synSuccess;
 }
 synStatus synEventDestroy(synEventHandle p) {
@@ -56,7 +58,9 @@ int main() {
       const auto p = pool.allocate(256, stream(1));
       pool.free(p);
     }
-    assert(waited.size() == 999 && live_events == 1);
+    // The unused remainder retains the previous fence while a split block is
+    // freed, so two records are sufficient for the repeated split/merge case.
+    assert(waited.size() == 999 && live_events == 2 && created_events == 2);
     for (uint64_t i = 0; i < waited.size(); ++i)
       assert(waited[i].stream == stream(1) && waited[i].ordinal == i + 1);
   }

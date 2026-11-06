@@ -3,6 +3,8 @@
 
 #include <synapse_api.h>
 
+#include "gaudirt/runtime/event_pool.hpp"
+
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -41,8 +43,7 @@ class BlockCachingAllocator {
   struct BorrowedSlab {};
   BlockCachingAllocator(synDeviceId device, uint64_t address, uint64_t bytes,
                         BorrowedSlab);
-  struct EventDeleter { void operator()(void* event) const noexcept; };
-  using Event = std::shared_ptr<void>;
+  using Event = EventPool::Event;
   struct Fence {
     synStreamHandle stream;
     uint64_t sequence;
@@ -65,6 +66,7 @@ class BlockCachingAllocator {
   uint64_t peak_ = 0;
   uint64_t next_fence_sequence_ = 0;
   bool owns_slab_ = true;
+  EventPool events_;
   Blocks blocks_;
   mutable std::mutex mutex_;
 };

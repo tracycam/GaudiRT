@@ -20,19 +20,15 @@ void check(synStatus status, const char* action) {
 }
 }  // namespace
 
-void BlockCachingAllocator::EventDeleter::operator()(void* event) const noexcept {
-  if (event) synEventDestroy(static_cast<synEventHandle>(event));
-}
-
 BlockCachingAllocator::BlockCachingAllocator(synDeviceId device, uint64_t budget_bytes)
-    : device_(device), capacity_(budget_bytes & ~uint64_t{255}) {
+    : device_(device), capacity_(budget_bytes & ~uint64_t{255}), events_(device) {
   if (!capacity_) throw std::invalid_argument("BlockCachingAllocator: budget below 256 bytes");
   reserve_slab();
 }
 
 BlockCachingAllocator::BlockCachingAllocator(synDeviceId device, uint64_t address,
                                              uint64_t bytes, BorrowedSlab)
-    : device_(device), capacity_(bytes), base_(address), owns_slab_(false) {
+    : device_(device), capacity_(bytes), base_(address), owns_slab_(false), events_(device) {
   if (!address || address % kAlignment || !bytes || bytes % kAlignment)
     throw std::invalid_argument("BlockCachingAllocator: invalid graph pool region");
   blocks_.emplace(base_, Block{capacity_, false, {}, {}});
@@ -156,10 +152,8 @@ void BlockCachingAllocator::free(uint64_t address) {
   std::vector<Fence> events;
   events.reserve(it->second.streams.size());
   for (auto stream : it->second.streams) {
-    synEventHandle raw = nullptr;
-    check(synEventCreate(&raw, device_, 0), "event creation failed");
-    Event event(raw, EventDeleter{});
-    check(synEventRecord(raw, stream), "event record failed");
+    auto event = events_.acquire();
+    check(synEventRecord(event.get(), stream), "event record failed");
     events.push_back({stream, ++next_fence_sequence_, std::move(event)});
   }
   allocated_ -= it->second.bytes;

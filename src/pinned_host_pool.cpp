@@ -38,11 +38,8 @@ void StreamEvent::wait(synStreamHandle stream) const {
 }
 void StreamEvent::synchronize() const { check(synEventSynchronize(event_), "event wait failed"); }
 
-void PinnedHostPool::EventDeleter::operator()(void* event) const noexcept {
-  if (event) synEventDestroy(static_cast<synEventHandle>(event));
-}
 PinnedHostPool::PinnedHostPool(synDeviceId device, uint64_t bytes)
-    : device_(device), capacity_(bytes & ~uint64_t{255}) {
+    : device_(device), capacity_(bytes & ~uint64_t{255}), events_(device) {
   if (!capacity_) throw std::invalid_argument("PinnedHostPool: budget below 256 bytes");
   check(synHostMalloc(device_, capacity_, 0, &base_), "host allocation failed");
   try {
@@ -90,10 +87,8 @@ void PinnedHostPool::free(void* address) {
     throw std::invalid_argument("PinnedHostPool: unknown or freed allocation");
   std::vector<Event> events;
   for (auto stream : it->second.streams) {
-    synEventHandle raw = nullptr;
-    check(synEventCreate(&raw, device_, 0), "event creation failed");
-    Event event(raw, EventDeleter{});
-    check(synEventRecord(raw, stream), "event record failed");
+    auto event = events_.acquire();
+    check(synEventRecord(event.get(), stream), "event record failed");
     events.push_back(std::move(event));
   }
   it->second.allocated = false;
