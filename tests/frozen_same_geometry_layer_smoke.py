@@ -43,25 +43,25 @@ def second_layer(x, gamma1, gamma2, qkv_weight, out_weight, up_weight, down_weig
                  key_pool, value_pool, locations, requests, positions, mapping, header, rope_cache)
 
 
-def reference(x, weights, fp64):
+def reference(x, weights, fp64, heads=56, kv_heads=8, head_dim=128):
     dtype = torch.float64 if fp64 else torch.float32
-    rounded = direct_bf16 if fp64 else lambda value: value.to(torch.bfloat16).float()
+    assert heads % kv_heads == 0
     x = x.to(dtype)
     g1, g2, key_weight, value_weight, out_weight, gate_weight, up_weight, down_weight = weights
-    norm = rounded(x * torch.rsqrt((x * x).mean(-1, keepdim=True) + EPS32) * g1.to(dtype))
-    key = rounded(norm @ key_weight.to(dtype).t())
-    value = rounded(norm @ value_weight.to(dtype).t())
-    attention = value.reshape(1, 8, 128).repeat_interleave(7, dim=1).reshape(1, 7168)
-    projected = rounded(attention @ out_weight.to(dtype).t())
-    residual = rounded(projected + x)
-    norm = rounded(residual * torch.rsqrt((residual * residual).mean(-1, keepdim=True) + EPS32)
-                   * g2.to(dtype))
-    gate = rounded(norm @ gate_weight.to(dtype).t())
-    up = rounded(norm @ up_weight.to(dtype).t())
-    activated = rounded(rounded(gate / (1 + torch.exp(-gate))) * up)
-    output = rounded(activated @ down_weight.to(dtype).t())
-    final = rounded(output + residual)
-    return tuple(value.double() for value in (output, residual, final, key, value))
+    norm = x * torch.rsqrt((x * x).mean(-1, keepdim=True) + EPS32) * g1.to(dtype)
+    key = norm @ key_weight.to(dtype).t()
+    value = norm @ value_weight.to(dtype).t()
+    attention = value.reshape(1, kv_heads, head_dim).repeat_interleave(heads // kv_heads, dim=1).reshape(1, -1)
+    projected = attention @ out_weight.to(dtype).t()
+    residual = projected + x
+    norm = residual * torch.rsqrt((residual * residual).mean(-1, keepdim=True) + EPS32) * g2.to(dtype)
+    gate = norm @ gate_weight.to(dtype).t()
+    up = norm @ up_weight.to(dtype).t()
+    activated = (gate / (1 + torch.exp(-gate))) * up
+    output = activated @ down_weight.to(dtype).t()
+    final = output + residual
+    rounded = direct_bf16 if fp64 else lambda result: result.to(torch.bfloat16).double()
+    return tuple(rounded(result) for result in (output, residual, final, key, value))
 
 
 def main():
