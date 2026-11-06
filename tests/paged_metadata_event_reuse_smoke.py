@@ -21,7 +21,7 @@ def main():
     initial = stream_events()
     gaudirt.initialize(hbm_bytes=256 * 1024**2, pinned_bytes=8 * 1024**2)
     streams = [gaudirt.Stream(), gaudirt.Stream()]
-    assert stream_events() - initial >= 6, "event interposer did not observe stream setup"
+    assert stream_events() - initial >= 24, "event interposer did not observe stream setup"
     mapping = torch.arange(1, 129, dtype=torch.int32).reshape(2, 64)
     device_mapping = mapping.to("gaudirt:0")
     cases = []
@@ -34,26 +34,30 @@ def main():
         device = [tensor.to("gaudirt:0") for tensor in (locations, batch_requests, positions, token_ids)]
         cases.append((locations, requests, positions, prefix, device))
 
-    def construct(index, scheduler):
+    def construct(index, mode):
         locations, requests, positions, prefix, device = cases[index]
-        if scheduler:
+        if mode == "scheduler":
             return torch.classes.gaudirt.PagedMetadata._from_scheduler(
+                device[0], device[1], device[2], device_mapping, [prefix], [3], 129, device[3], 32000
+            )
+        if mode == "checked":
+            return torch.classes.gaudirt.PagedMetadata.from_device_with_tokens(
                 device[0], device[1], device[2], device_mapping, [prefix], [3], 129, device[3], 32000
             )
         return torch.classes.gaudirt.PagedMetadata(locations, requests, positions, mapping, 129)
 
     for index, stream in enumerate(streams):
         with gaudirt.StreamContext(stream):
-            construct(index, False)
-            construct(index, True)
+            for mode in ("cpu", "scheduler", "checked"):
+                construct(index, mode)
     gaudirt.synchronize()
     before_stream, before_all, before_destroyed = stream_events(), all_events(), destroyed_events()
     pending = []
-    for iteration in range(32):
+    for iteration in range(24):
         index = iteration % 2
         with gaudirt.StreamContext(streams[index]):
-            pending.append((index, construct(index, False)))
-            pending.append((index, construct(index, True)))
+            for mode in ("cpu", "scheduler", "checked"):
+                pending.append((index, construct(index, mode)))
     gaudirt.synchronize()
     assert stream_events() == before_stream, (before_stream, stream_events())
     assert all_events() == before_all, (before_all, all_events())
