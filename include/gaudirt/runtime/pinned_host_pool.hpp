@@ -52,11 +52,16 @@ class PinnedHostPool {
 
  private:
   using Event = EventPool::Event;
+  struct Fence {
+    synStreamHandle stream;
+    uint64_t sequence;
+    Event event;
+  };
   struct Block {
     uint64_t bytes = 0;
     bool allocated = false;
     std::vector<synStreamHandle> streams;
-    std::vector<Event> fences;
+    std::vector<Fence> fences;
   };
   void copy(void* host, uint64_t device, uint64_t bytes, synStreamHandle stream,
             bool non_blocking, synDmaDir direction);
@@ -64,6 +69,7 @@ class PinnedHostPool {
   uint64_t capacity_;
   void* base_ = nullptr;
   uint64_t allocated_ = 0;
+  uint64_t next_fence_sequence_ = 0;
   EventPool events_;
   std::map<uint64_t, Block> blocks_;
   mutable std::mutex mutex_;

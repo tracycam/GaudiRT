@@ -54,8 +54,8 @@ PinnedHostPool::~PinnedHostPool() {
   for (auto& [address, block] : blocks_) {
     (void)address;
     for (auto stream : block.streams) synStreamSynchronize(stream);
-    for (const auto& event : block.fences)
-      synEventSynchronize(static_cast<synEventHandle>(event.get()));
+    for (const auto& fence : block.fences)
+      synEventSynchronize(static_cast<synEventHandle>(fence.event.get()));
   }
   blocks_.clear();
   if (base_) synHostFree(device_, base_, 0);
@@ -69,8 +69,8 @@ void* PinnedHostPool::allocate(uint64_t bytes) {
         (best == blocks_.end() || it->second.bytes < best->second.bytes)) best = it;
   if (best == blocks_.end()) throw std::runtime_error("PinnedHostPool: out of pinned memory");
   // A host pointer can be dereferenced immediately, so a stream wait is not enough.
-  for (const auto& event : best->second.fences)
-    check(synEventSynchronize(static_cast<synEventHandle>(event.get())), "reuse wait failed");
+  for (const auto& fence : best->second.fences)
+    check(synEventSynchronize(static_cast<synEventHandle>(fence.event.get())), "reuse wait failed");
   const uint64_t address = best->first;
   if (best->second.bytes > size)
     blocks_.emplace(address + size, Block{best->second.bytes - size, false, {}, {}});
@@ -85,31 +85,38 @@ void PinnedHostPool::free(void* address) {
   auto it = blocks_.find(reinterpret_cast<uint64_t>(address));
   if (it == blocks_.end() || !it->second.allocated)
     throw std::invalid_argument("PinnedHostPool: unknown or freed allocation");
-  std::vector<Event> events;
+  std::vector<Fence> events;
+  events.reserve(it->second.streams.size());
   for (auto stream : it->second.streams) {
     auto event = events_.acquire();
     check(synEventRecord(event.get(), stream), "event record failed");
-    events.push_back(std::move(event));
+    events.push_back({stream, ++next_fence_sequence_, std::move(event)});
   }
   it->second.allocated = false;
   allocated_ -= it->second.bytes;
   it->second.streams.clear();
   it->second.fences = std::move(events);
-  const auto append_unique = [](auto& to, const auto& from) {
-    for (const auto& event : from)
-      if (std::find(to.begin(), to.end(), event) == to.end()) to.push_back(event);
+  // A later record on the same stream includes every earlier transfer.
+  const auto retain_latest_per_stream = [](auto& to, const auto& from) {
+    for (const auto& fence : from) {
+      const auto previous = std::find_if(to.begin(), to.end(), [&](const auto& candidate) {
+        return candidate.stream == fence.stream;
+      });
+      if (previous == to.end()) to.push_back(fence);
+      else if (previous->sequence < fence.sequence) *previous = fence;
+    }
   };
   auto next = std::next(it);
   if (next != blocks_.end() && !next->second.allocated) {
     it->second.bytes += next->second.bytes;
-    append_unique(it->second.fences, next->second.fences);
+    retain_latest_per_stream(it->second.fences, next->second.fences);
     blocks_.erase(next);
   }
   if (it != blocks_.begin()) {
     auto prev = std::prev(it);
     if (!prev->second.allocated) {
       prev->second.bytes += it->second.bytes;
-      append_unique(prev->second.fences, it->second.fences);
+      retain_latest_per_stream(prev->second.fences, it->second.fences);
       blocks_.erase(it);
     }
   }

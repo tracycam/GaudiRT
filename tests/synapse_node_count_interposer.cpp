@@ -14,6 +14,7 @@ namespace {
 std::atomic<uint64_t> split_nodes{0};
 std::atomic<uint64_t> event_creates{0};
 std::atomic<uint64_t> event_destroys{0};
+std::atomic<uint64_t> event_synchronizes{0};
 std::atomic<uint64_t> stream_event_creates{0};
 std::atomic<bool> launch_gate_enabled{false};
 std::mutex launch_gate_mutex;
@@ -25,6 +26,7 @@ bool launch_gate_timed_out = false;
 extern "C" uint64_t gaudirt_test_split_node_count() { return split_nodes.load(); }
 extern "C" uint64_t gaudirt_test_event_create_count() { return event_creates.load(); }
 extern "C" uint64_t gaudirt_test_event_destroy_count() { return event_destroys.load(); }
+extern "C" uint64_t gaudirt_test_event_synchronize_count() { return event_synchronizes.load(); }
 extern "C" uint64_t gaudirt_test_stream_event_create_count() { return stream_event_creates.load(); }
 extern "C" void gaudirt_test_launch_gate_arm() {
   std::lock_guard lock(launch_gate_mutex);
@@ -91,6 +93,19 @@ extern "C" synStatus SYN_API_CALL synEventDestroy(synEventHandle event) {
     return function;
   }();
   ++event_destroys;
+  return real(event);
+}
+
+extern "C" synStatus SYN_API_CALL synEventSynchronize(synEventHandle event) {
+  using Function = decltype(&synEventSynchronize);
+  static const auto real = [] {
+    void* library = dlopen("libSynapse.so", RTLD_NOW | RTLD_NOLOAD);
+    if (!library) std::abort();
+    auto function = reinterpret_cast<Function>(dlsym(library, "synEventSynchronize"));
+    if (!function) std::abort();
+    return function;
+  }();
+  ++event_synchronizes;
   return real(event);
 }
 
