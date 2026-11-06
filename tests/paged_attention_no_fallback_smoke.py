@@ -40,6 +40,7 @@ def reject(rows, context, positions):
 def main():
     gaudirt.initialize(hbm_bytes=256 * 1024**2, pinned_bytes=8 * 1024**2)
     reject(3, 32, [0, 1, 2])
+    reject(1, 4096, [4095])
     reject(1, 4608, [4607])
 
 
