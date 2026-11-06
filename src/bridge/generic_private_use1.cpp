@@ -50,11 +50,21 @@ thread_local c10::StreamId active_stream_id = 0;
 
 class StreamRegistry {
  public:
-  StreamRegistry(synDeviceId device, synStreamHandle primary) : device_(device), streams_{primary} {}
+  struct StreamState {
+    StreamState(synDeviceId device, synStreamHandle stream)
+        : handle(stream), metadata_reusable(device), metadata_ready(device) {}
+    synStreamHandle handle;
+    StreamEvent metadata_reusable;
+    StreamEvent metadata_ready;
+  };
+
+  StreamRegistry(synDeviceId device, synStreamHandle primary) : device_(device) {
+    streams_.push_back(std::make_unique<StreamState>(device_, primary));
+  }
   ~StreamRegistry() {
     for (size_t i = 1; i < streams_.size(); ++i) {
-      synStreamSynchronize(streams_[i]);
-      synStreamDestroy(streams_[i]);
+      synStreamSynchronize(streams_[i]->handle);
+      synStreamDestroy(streams_[i]->handle);
     }
   }
   c10::StreamId create() {
@@ -62,24 +72,27 @@ class StreamRegistry {
     TORCH_CHECK(synStreamCreateGeneric(&stream, device_, 0) == synSuccess,
                 "GaudiRT: stream creation failed");
     std::lock_guard lock(mutex_);
-    try { streams_.push_back(stream); }
+    try { streams_.push_back(std::make_unique<StreamState>(device_, stream)); }
     catch (...) { synStreamDestroy(stream); throw; }
     return static_cast<c10::StreamId>(streams_.size() - 1);
   }
   synStreamHandle get(c10::StreamId id) {
+    return state(id).handle;
+  }
+  StreamState& state(c10::StreamId id) {
     std::lock_guard lock(mutex_);
     TORCH_CHECK(id >= 0 && static_cast<size_t>(id) < streams_.size(), "GaudiRT: invalid stream");
-    return streams_[static_cast<size_t>(id)];
+    return *streams_[static_cast<size_t>(id)];
   }
   void synchronize() {
     std::lock_guard lock(mutex_);
-    for (auto stream : streams_)
-      TORCH_CHECK(synStreamSynchronize(stream) == synSuccess, "GaudiRT: stream synchronization failed");
+    for (const auto& stream : streams_)
+      TORCH_CHECK(synStreamSynchronize(stream->handle) == synSuccess, "GaudiRT: stream synchronization failed");
   }
  private:
   synDeviceId device_;
   std::mutex mutex_;
-  std::vector<synStreamHandle> streams_;
+  std::vector<std::unique_ptr<StreamState>> streams_;
 };
 
 struct ColdRecipe {
@@ -3993,9 +4006,11 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& requ
   const std::array<at::Tensor*, 5> destinations{&locations_, &requests_, &positions_, &mapping_, &header_};
   TemporaryHost staging(*ctx, total);
   auto* host = static_cast<uint8_t*>(staging.address);
-  auto compute = ctx->stream();
+  auto& stream_state = ctx->streams.state(active_stream_id);
+  auto compute = stream_state.handle;
   auto stream = ctx->device.h2d_stream();
-  StreamEvent reusable(ctx->device.device_id()), ready(ctx->device.device_id());
+  auto& reusable = stream_state.metadata_reusable;
+  auto& ready = stream_state.metadata_ready;
   reusable.record(compute);
   reusable.wait(stream);
   uint64_t offset = 0;
@@ -4061,7 +4076,8 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
   }
   TORCH_CHECK(cursor == m, "GaudiRT device metadata: sequence lengths do not cover token rows");
   auto ctx = current();
-  auto compute = ctx->stream();
+  auto& stream_state = ctx->streams.state(active_stream_id);
+  auto compute = stream_state.handle;
   auto h2d = ctx->device.h2d_stream();
   const auto options = at::TensorOptions().device(c10::Device(c10::kPrivateUse1, 0)).dtype(at::kInt);
   locations_ = at::empty({bucket}, options);
@@ -4091,7 +4107,8 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
     host[0] = static_cast<int32_t>(m);
     std::memcpy(host + 1, info.data(), info.size() * sizeof(int32_t));
     std::memcpy(host + 1 + info.size(), last_token_indices.data(), last_token_indices.size() * sizeof(int32_t));
-    StreamEvent reusable(ctx->device.device_id()), ready(ctx->device.device_id());
+    auto& reusable = stream_state.metadata_reusable;
+    auto& ready = stream_state.metadata_ready;
     reusable.record(compute);
     reusable.wait(h2d);
     for (const auto address : {header_address, info_address, last_token_address}) {
