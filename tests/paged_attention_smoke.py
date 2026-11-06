@@ -45,10 +45,7 @@ def expected(query, key_pool, value_pool, requests, positions, mapping, fp64):
         keys = key_pool[loc][:, head_map, :]
         values = value_pool[loc][:, head_map, :]
         scores = torch.einsum("hd,thd->ht", query[row], keys) * SCALE_FP32
-        probabilities = torch.softmax(scores, dim=-1)
-        if not fp64:
-            probabilities = probabilities.to(torch.bfloat16).float()
-        rows.append(torch.einsum("ht,thd->hd", probabilities, values))
+        rows.append(torch.einsum("ht,thd->hd", torch.softmax(scores, dim=-1), values))
     output = torch.stack(rows).reshape(query.size(0), Q_WIDTH)
     return direct_bf16(output) if fp64 else output.to(torch.bfloat16).double()
 
