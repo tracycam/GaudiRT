@@ -58,6 +58,11 @@ target_link_libraries(recipe_cache_fingerprint_test PRIVATE gaudirt)
 add_executable(dynamic_pool_descriptor_device_test tests/dynamic_pool_descriptor_device_test.cpp)
 target_link_libraries(dynamic_pool_descriptor_device_test PRIVATE gaudirt)
 
+add_executable(stream_event_reuse_device_test tests/stream_event_reuse_device_test.cpp)
+target_link_libraries(stream_event_reuse_device_test PRIVATE gaudirt)
+add_library(gaudirt_synapse_call_counter SHARED tests/synapse_node_count_interposer.cpp)
+target_link_libraries(gaudirt_synapse_call_counter PRIVATE ${CMAKE_DL_LIBS})
+
 add_library(mimo_layer_vertical STATIC
     models/mimo/mimo_attention.cpp
     models/mimo/mimo_full_attention.cpp
