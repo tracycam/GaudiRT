@@ -114,7 +114,9 @@ struct Context {
     synStreamSynchronize(device.d2h_stream());
     invalidate_events(*this);
   }
-  synStreamHandle stream() { return streams.get(active_stream_id); }
+  synStreamHandle stream() {
+    return active_stream_id == 0 ? device.compute_stream() : streams.get(active_stream_id);
+  }
   void synchronize_stream() {
     TORCH_CHECK(synStreamSynchronize(stream()) == synSuccess, "GaudiRT: stream synchronization failed");
   }
@@ -3075,7 +3077,7 @@ class BucketProgram {
   std::vector<bool> embedding_inputs_;
   std::vector<TensorSpec> specs_;
   std::string digest_;
-  std::mutex mutex_;
+  std::once_flag geometry_once_;
 };
 
 void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
@@ -3624,7 +3626,6 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
 }
 
 std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs) {
-  std::lock_guard program_lock(mutex_);
   TORCH_CHECK(inputs.size() == roles_.size(), "GaudiRT FX: wrong input count");
   int64_t m = -1;
   size_t dynamic_input = 0;
@@ -3640,7 +3641,7 @@ std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs
     }
   }
   TORCH_CHECK(m > 0 && m <= 4096, "GaudiRT FX: token count outside 1..4096");
-  if (specs_.empty()) initialize_geometry(inputs);
+  std::call_once(geometry_once_, [&] { initialize_geometry(inputs); });
   for (size_t i = 0; i < inputs.size(); ++i) {
     const auto& input = inputs[i];
     const auto& spec = specs_[i];
@@ -4463,5 +4464,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("input"), pybind11::arg("weight"), pybind11::arg("bias") = pybind11::none());
   pybind11::class_<gaudirt::generic::BucketProgram>(m, "BucketProgram")
       .def(pybind11::init<std::vector<int64_t>, std::vector<std::vector<int64_t>>, std::vector<int64_t>>())
-      .def("run", &gaudirt::generic::BucketProgram::run);
+      .def("run", &gaudirt::generic::BucketProgram::run,
+           pybind11::call_guard<pybind11::gil_scoped_release>());
 }
