@@ -51,14 +51,23 @@ class StreamRegistry {
  public:
   struct StreamState {
     StreamState(synDeviceId device, synStreamHandle stream)
-        : handle(stream), metadata_reusable(device), metadata_ready(device) {}
+        : handle(stream), metadata_reusable(device), metadata_ready(device),
+          validation_ready(device), validation_completed(device),
+          h2d_reusable(device), h2d_ready(device), d2h_reusable(device), d2h_ready(device) {}
     synStreamHandle handle;
     StreamEvent metadata_reusable;
     StreamEvent metadata_ready;
+    StreamEvent validation_ready;
+    StreamEvent validation_completed;
+    StreamEvent h2d_reusable;
+    StreamEvent h2d_ready;
+    StreamEvent d2h_reusable;
+    StreamEvent d2h_ready;
   };
 
   StreamRegistry(synDeviceId device, synStreamHandle primary) : device_(device) {
     streams_.push_back(std::make_unique<StreamState>(device_, primary));
+    primary_ = streams_.front().get();
   }
   ~StreamRegistry() {
     for (size_t i = 1; i < streams_.size(); ++i) {
@@ -79,6 +88,7 @@ class StreamRegistry {
     return state(id).handle;
   }
   StreamState& state(c10::StreamId id) {
+    if (id == 0) return *primary_;
     std::lock_guard lock(mutex_);
     TORCH_CHECK(id >= 0 && static_cast<size_t>(id) < streams_.size(), "GaudiRT: invalid stream");
     return *streams_[static_cast<size_t>(id)];
@@ -90,6 +100,7 @@ class StreamRegistry {
   }
  private:
   synDeviceId device_;
+  StreamState* primary_ = nullptr;
   std::mutex mutex_;
   std::vector<std::unique_ptr<StreamState>> streams_;
 };
@@ -915,11 +926,11 @@ at::Tensor& fill(at::Tensor& tensor, const at::Scalar& scalar) {
   TemporaryHost host(*ctx, scalar_bytes);
   std::memcpy(host.address, &pattern, scalar_bytes);
   ctx->allocator.record_stream(value.address, h2d);
-  StreamEvent reusable(ctx->device.device_id());
+  auto& reusable = ctx->streams.state(active_stream_id).h2d_reusable;
   reusable.record(compute);
   reusable.wait(h2d);
   ctx->pinned.copy_h2d(value.address, host.address, scalar_bytes, h2d, true);
-  StreamEvent ready(ctx->device.device_id());
+  auto& ready = ctx->streams.state(active_stream_id).h2d_ready;
   ready.record(h2d);
   ready.wait(compute);
   std::unique_ptr<TemporaryDevice> output;
@@ -1163,21 +1174,23 @@ at::Tensor& copy(at::Tensor& dst, const at::Tensor& src, bool non_blocking) {
     TORCH_CHECK(available >= item, "GaudiRT: pinned pool has no staging space");
     return available / item;
   };
+  auto& stream_state = ctx->streams.state(active_stream_id);
   if (dst_device) {
     auto stream = ctx->device.h2d_stream();
+    auto& reusable = stream_state.h2d_reusable;
+    auto& ready = stream_state.h2d_ready;
     const Layout dl(dst);
     if (ctx->pinned.contains_live_range(src.data_ptr(), span_bytes(src))) {
       const Layout sl(src);
       ctx->pinned.record_stream(src.data_ptr(), stream);
       ctx->allocator.record_stream(device, stream);
-      StreamEvent ready(ctx->device.device_id()), done(ctx->device.device_id());
-      ready.record(compute);
-      ready.wait(stream);
+      reusable.record(compute);
+      reusable.wait(stream);
       dma_copy(device, &dl, reinterpret_cast<uint64_t>(src.data_ptr()), &sl,
                0, elements, item, stream, HOST_TO_DRAM);
-      done.record(stream);
-      done.wait(compute);
-      if (!non_blocking) done.synchronize();
+      ready.record(stream);
+      ready.wait(compute);
+      if (!non_blocking) ready.synchronize();
       return dst;
     }
     const uint64_t chunk_elements = staging_elements();
@@ -1189,31 +1202,31 @@ at::Tensor& copy(at::Tensor& dst, const at::Tensor& src, bool non_blocking) {
     } else {
       ctx->allocator.record_stream(device, stream);
     }
-    StreamEvent loaded(ctx->device.device_id()), consumed(ctx->device.device_id());
-    consumed.record(compute);
-    consumed.wait(stream);
+    reusable.record(compute);
+    reusable.wait(stream);
     for (uint64_t start = 0; start < elements; start += chunk_elements) {
       const auto count = std::min(chunk_elements, elements - start);
       TemporaryHost host(*ctx, count * item);
       host_copy(static_cast<uint8_t*>(host.address), src, start, count, true);
-      if (temporary && start) consumed.wait(stream);
+      if (temporary && start) reusable.wait(stream);
       const auto target = temporary ? temporary->address : device + start * item;
       ctx->pinned.copy_h2d(target, host.address, count * item, stream, true);
       if (temporary) {
-        loaded.record(stream);
-        loaded.wait(compute);
+        ready.record(stream);
+        ready.wait(compute);
         dma_copy(device, &dl, temporary->address, nullptr, start, count, item, compute, DRAM_TO_DRAM);
-        consumed.record(compute);
+        reusable.record(compute);
       }
     }
     if (!temporary) {
-      loaded.record(stream);
-      loaded.wait(compute);
+      ready.record(stream);
+      ready.wait(compute);
     }
     if (!non_blocking) ctx->synchronize_stream();
   } else {
     auto stream = ctx->device.d2h_stream();
-    StreamEvent ready(ctx->device.device_id());
+    auto& ready = stream_state.d2h_reusable;
+    auto& done = stream_state.d2h_ready;
     const Layout sl(src);
     if (ctx->pinned.contains_live_range(dst.data_ptr(), span_bytes(dst))) {
       const Layout dl(dst);
@@ -1223,7 +1236,6 @@ at::Tensor& copy(at::Tensor& dst, const at::Tensor& src, bool non_blocking) {
       ready.wait(stream);
       dma_copy(reinterpret_cast<uint64_t>(dst.data_ptr()), &dl, device, &sl,
                0, elements, item, stream, DRAM_TO_HOST);
-      StreamEvent done(ctx->device.device_id());
       done.record(stream);
       done.wait(compute);
       if (!non_blocking) done.synchronize();
@@ -1720,11 +1732,11 @@ at::Tensor& arange_out(const at::Scalar& start_value, const at::Scalar& end_valu
   }
   auto h2d = ctx->device.h2d_stream();
   ctx->allocator.record_stream(scalars.address, h2d);
-  StreamEvent reusable(ctx->device.device_id());
+  auto& reusable = ctx->streams.state(active_stream_id).h2d_reusable;
   reusable.record(stream);
   reusable.wait(h2d);
   ctx->pinned.copy_h2d(scalars.address, host.address, 512, h2d, true);
-  StreamEvent ready(ctx->device.device_id());
+  auto& ready = ctx->streams.state(active_stream_id).h2d_ready;
   ready.record(h2d);
   ready.wait(stream);
   std::unique_ptr<TemporaryDevice> output, workspace;
@@ -2117,7 +2129,7 @@ void validate_indices(const at::Tensor& index, int64_t upper) {
                         workspace ? workspace->address : 0, recipe.recipe, 0) == synSuccess,
               "GaudiRT: index check launch failed");
   auto d2h = ctx->device.d2h_stream();
-  StreamEvent ready(ctx->device.device_id());
+  auto& ready = ctx->streams.state(active_stream_id).d2h_reusable;
   ready.record(stream);
   ready.wait(d2h);
   ctx->allocator.record_stream(result.address, d2h);
@@ -4146,7 +4158,8 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
   }
   if (!scheduler_owned) {
     auto d2h = ctx->device.d2h_stream();
-    StreamEvent ready(ctx->device.device_id()), completed(ctx->device.device_id());
+    auto& ready = stream_state.validation_ready;
+    auto& completed = stream_state.validation_completed;
     ready.record(compute);
     ready.wait(d2h);
     ctx->allocator.record_stream(status_address, d2h);
