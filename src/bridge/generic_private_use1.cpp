@@ -5,6 +5,7 @@
 #include "gaudirt/runtime/recipe_registry.hpp"
 #include "gaudirt/common/sha256.hpp"
 #include "cold_recipe.hpp"
+#include "context.hpp"
 #include "fx_geometry.hpp"
 #include "fx_node.hpp"
 #include "graph_builder.hpp"
@@ -42,126 +43,6 @@
 
 namespace gaudirt::generic {
 using namespace runtime;
-
-struct Context;
-struct EventState {
-  Context* owner;
-  synEventHandle handle;
-  bool timing;
-};
-std::mutex event_mutex;
-void invalidate_events(Context& ctx);
-thread_local c10::StreamId active_stream_id = 0;
-
-class StreamRegistry {
- public:
-  struct StreamState {
-    StreamState(synDeviceId device, synStreamHandle stream)
-        : handle(stream), metadata_reusable(device), metadata_ready(device),
-          validation_ready(device), validation_completed(device),
-          h2d_reusable(device), h2d_ready(device), d2h_reusable(device), d2h_ready(device) {}
-    synStreamHandle handle;
-    StreamEvent metadata_reusable;
-    StreamEvent metadata_ready;
-    StreamEvent validation_ready;
-    StreamEvent validation_completed;
-    StreamEvent h2d_reusable;
-    StreamEvent h2d_ready;
-    StreamEvent d2h_reusable;
-    StreamEvent d2h_ready;
-  };
-
-  StreamRegistry(synDeviceId device, synStreamHandle primary) : device_(device) {
-    streams_.push_back(std::make_unique<StreamState>(device_, primary));
-    primary_ = streams_.front().get();
-  }
-  ~StreamRegistry() {
-    for (size_t i = 1; i < streams_.size(); ++i) {
-      synStreamSynchronize(streams_[i]->handle);
-      synStreamDestroy(streams_[i]->handle);
-    }
-  }
-  c10::StreamId create() {
-    synStreamHandle stream = nullptr;
-    TORCH_CHECK(synStreamCreateGeneric(&stream, device_, 0) == synSuccess,
-                "GaudiRT: stream creation failed");
-    std::lock_guard lock(mutex_);
-    try { streams_.push_back(std::make_unique<StreamState>(device_, stream)); }
-    catch (...) { synStreamDestroy(stream); throw; }
-    return static_cast<c10::StreamId>(streams_.size() - 1);
-  }
-  synStreamHandle get(c10::StreamId id) {
-    return state(id).handle;
-  }
-  StreamState& state(c10::StreamId id) {
-    if (id == 0) return *primary_;
-    std::lock_guard lock(mutex_);
-    TORCH_CHECK(id >= 0 && static_cast<size_t>(id) < streams_.size(), "GaudiRT: invalid stream");
-    return *streams_[static_cast<size_t>(id)];
-  }
-  void synchronize() {
-    std::lock_guard lock(mutex_);
-    for (const auto& stream : streams_)
-      TORCH_CHECK(synStreamSynchronize(stream->handle) == synSuccess, "GaudiRT: stream synchronization failed");
-  }
- private:
-  synDeviceId device_;
-  StreamState* primary_ = nullptr;
-  std::mutex mutex_;
-  std::vector<std::unique_ptr<StreamState>> streams_;
-};
-
-std::atomic<uint64_t> next_context_generation{1};
-
-struct Context {
-  Context(uint32_t module, uint64_t hbm_bytes, uint64_t pinned_bytes)
-      : device(config(module)), streams(device.device_id(), device.compute_stream()),
-        allocator(device.device_id(), hbm_bytes),
-        pinned(device.device_id(), pinned_bytes), cache(cache_path()) {}
-  ~Context() {
-    try { streams.synchronize(); } catch (...) {}
-    synStreamSynchronize(device.h2d_stream());
-    synStreamSynchronize(device.d2h_stream());
-    invalidate_events(*this);
-  }
-  synStreamHandle stream() {
-    return active_stream_id == 0 ? device.compute_stream() : streams.get(active_stream_id);
-  }
-  void synchronize_stream() {
-    TORCH_CHECK(synStreamSynchronize(stream()) == synSuccess, "GaudiRT: stream synchronization failed");
-  }
-  void synchronize_all() { streams.synchronize(); device.synchronize_all(); }
-  static std::filesystem::path cache_path() {
-    const char* path = std::getenv("GAUDIRT_RECIPE_CACHE");
-    return path ? std::filesystem::path(path) : std::filesystem::path{};
-  }
-  static DeviceRuntime::Config config(uint32_t module) {
-    DeviceRuntime::Config cfg{};
-    cfg.module_id = module;
-    cfg.uclamp_min = 0;
-    return cfg;
-  }
-  const uint64_t generation = next_context_generation.fetch_add(1, std::memory_order_relaxed);
-  DeviceRuntime device;
-  StreamRegistry streams;
-  BlockCachingAllocator allocator;
-  std::unique_ptr<GraphPool> graph_pool;
-  PinnedHostPool pinned;
-  RecipeCache cache;
-  std::mutex cold_mutex;
-  std::unordered_map<std::string, std::unique_ptr<ColdRecipe>> cold_recipes;
-  std::unordered_set<EventState*> events;
-};
-
-void invalidate_events(Context& ctx) {
-  std::lock_guard lock(event_mutex);
-  for (auto* event : ctx.events) {
-    if (event->handle) synEventDestroy(event->handle);
-    event->handle = nullptr;
-    event->owner = nullptr;
-  }
-  ctx.events.clear();
-}
 
 enum class AllocationKind { device, pinned, graph };
 
