@@ -55,6 +55,9 @@ target_compile_options(block_allocator_fences_unit_test PRIVATE -UNDEBUG)
 add_executable(recipe_cache_fingerprint_test tests/recipe_cache_fingerprint_test.cpp)
 target_link_libraries(recipe_cache_fingerprint_test PRIVATE gaudirt)
 
+add_executable(dynamic_pool_descriptor_device_test tests/dynamic_pool_descriptor_device_test.cpp)
+target_link_libraries(dynamic_pool_descriptor_device_test PRIVATE gaudirt)
+
 add_library(mimo_layer_vertical STATIC
     models/mimo/mimo_attention.cpp
     models/mimo/mimo_full_attention.cpp
