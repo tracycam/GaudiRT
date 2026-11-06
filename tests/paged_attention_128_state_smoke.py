@@ -12,6 +12,7 @@ import torch
 
 import gaudirt
 from fp64_reference import direct_bf16
+from paged_attention_reference import device_kv_tile, isolated_errors, tiled_bf16_pv
 
 
 def main():
@@ -36,7 +37,8 @@ def main():
     head_map = torch.arange(heads) // (heads // kv_heads)
     audit = os.environ.get("GAUDIRT_STATE_AUDIT") == "1"
     payload = bytearray()
-    worst, worst_floor, worst_absolute = 0.0, 0.0, 0.0
+    worst, worst_floor, worst_absolute, worst_tiled = 0.0, 0.0, 0.0, 0.0
+    kv_tile = None
     for step in range(steps):
         location = torch.tensor([prefix + step + 1], dtype=torch.int64)
         requests = torch.tensor([0], dtype=torch.int64)
@@ -63,13 +65,17 @@ def main():
 
         truth = direct_bf16(reference(torch.float64))
         floor = reference(torch.float32).to(torch.bfloat16).double()
-        assert torch.isfinite(actual).all() and torch.isfinite(truth).all() and torch.isfinite(floor).all()
+        if kv_tile is None:
+            kv_tile = device_kv_tile(1)
+        tiled = tiled_bf16_pv(queries[step:step + 1], expected_key, expected_value,
+                              requests, position, mapping, heads, kv_heads, head_dim, scale32, kv_tile)
+        assert torch.isfinite(floor).all()
+        error, tiled_error = isolated_errors(actual.reshape(1, -1), truth.reshape(1, -1), tiled)
         denom = torch.linalg.vector_norm(truth.reshape(-1)).clamp_min(1e-30)
-        error = (torch.linalg.vector_norm((actual - truth).reshape(-1)) / denom).item()
         floor_error = (torch.linalg.vector_norm((floor - truth).reshape(-1)) / denom).item()
         absolute = (actual - truth).abs().max().item()
-        assert error <= max(3e-3, 2 * floor_error) and error <= 1e-2, (step, error, floor_error)
         worst, worst_floor, worst_absolute = max(worst, error), max(worst_floor, floor_error), max(worst_absolute, absolute)
+        worst_tiled = max(worst_tiled, tiled_error)
         payload.extend(actual_bf16.contiguous().view(torch.uint8).numpy().tobytes())
     actual_key, actual_value = key_pool.cpu(), value_pool.cpu()
     assert torch.equal(actual_key.view(torch.int16), expected_key.view(torch.int16))
@@ -85,7 +91,8 @@ def main():
     elif os.environ.get("GAUDIRT_TEST_CACHE") == "warm":
         assert stats[0] > 0 and stats[1] == 0, stats
     print("128-step paged GQA", "prefix", prefix, "audit", audit, "stats", stats,
-          "max_row_relative_l2", worst, "max_fp32_floor", worst_floor, "max_abs", worst_absolute,
+          "max_row_relative_l2", worst, "max_tiled_bf16_pv_error", worst_tiled,
+          "max_fp32_floor_diagnostic", worst_floor, "max_abs", worst_absolute,
           "output_and_kv_sha256", hashlib.sha256(payload).hexdigest(), flush=True)
 
 

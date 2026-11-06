@@ -18,7 +18,7 @@ def main():
     torch.random.default_generator.manual_seed(4439)
     gaudirt.initialize(hbm_bytes=512 * 1024**2, pinned_bytes=8 * 1024**2)
     digest = hashlib.sha256()
-    errors, floors, absolutes = [], [], []
+    errors, floors, absolutes, tiled_errors = [], [], [], []
 
     for dimension in (64, 128):
         attention.HEADS, attention.KV_HEADS, attention.DIM = 32, 8, dimension
@@ -55,6 +55,7 @@ def main():
                     assert gaudirt.recipe_cache_stats() == before, "same-geometry layer recompiled"
                 digest.update(result[0])
                 errors.append(result[1]); floors.append(result[2]); absolutes.append(result[3])
+                tiled_errors.append(result[12])
                 del result
             print("geometry", 32, 8, dimension, "rows", rows, "position", position,
                   "cache", gaudirt.recipe_cache_stats(), flush=True)
@@ -66,7 +67,8 @@ def main():
     elif os.environ.get("GAUDIRT_TEST_CACHE") == "warm":
         assert stats[0] > 0 and stats[1] == 0, stats
     print("32:8 GQA audit", "cache", stats, "max_row_relative_l2", max(errors),
-          "max_cpu_fp32_floor", max(floors), "max_abs", max(absolutes),
+          "max_tiled_bf16_pv_error", max(tiled_errors), "max_cpu_fp32_floor_diagnostic", max(floors),
+          "max_abs", max(absolutes),
           "output_and_kv_sha256", digest.hexdigest(), flush=True)
     gaudirt.empty_cache()
     gaudirt.shutdown()

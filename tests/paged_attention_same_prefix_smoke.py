@@ -11,6 +11,7 @@ import torch
 
 import gaudirt
 import paged_attention_smoke as reference
+from paged_attention_reference import device_kv_tile, isolated_errors, tiled_bf16_pv
 
 
 def main():
@@ -64,20 +65,26 @@ def main():
                                positions[-1:], mapping, True)
     floor = reference.expected(query[-1:], key_after, value_after, requests[-1:],
                                positions[-1:], mapping, False)
-    assert all(torch.isfinite(t).all() for t in (many_last, one, truth, floor))
+    tiled_args = (query[-1:], key_after, value_after, requests[-1:], positions[-1:], mapping,
+                  reference.HEADS, reference.KV_HEADS, reference.DIM, reference.SCALE_FP32)
+    many_tiled = tiled_bf16_pv(*tiled_args, device_kv_tile(rows))
+    one_tiled = tiled_bf16_pv(*tiled_args, device_kv_tile(1))
+    assert torch.isfinite(floor).all()
+    many_error, many_tile_error = isolated_errors(many_last, truth, many_tiled)
+    one_error, one_tile_error = isolated_errors(one, truth, one_tiled)
     denom = torch.linalg.vector_norm(truth, dim=-1).clamp_min(1e-30)
-    errors = [(torch.linalg.vector_norm(t - truth, dim=-1) / denom).max().item()
-              for t in (many_last, one, floor)]
+    floor_error = (torch.linalg.vector_norm(floor - truth, dim=-1) / denom).max().item()
     delta = (torch.linalg.vector_norm(many_last - one, dim=-1) / denom).max().item()
-    threshold = max(3e-3, 2 * errors[2])
-    assert max(errors[:2] + [delta]) <= threshold and max(errors[:2] + [delta]) <= 1e-2
+    threshold = max(3e-3, 2 * floor_error)
+    assert delta <= threshold and delta <= 1e-2
     counts = gaudirt.recipe_cache_stats()
     if os.environ.get("GAUDIRT_TEST_CACHE") == "cold":
         assert counts == [0, 4, 4], counts
     elif os.environ.get("GAUDIRT_TEST_CACHE") == "warm":
         assert counts == [4, 0, 4], counts
-    print("same-prefix attention", "many_error", errors[0], "single_error", errors[1],
-          "cpu_fp32_floor", errors[2], "row_difference", delta,
+    print("same-prefix attention", "many_error", many_error, "single_error", one_error,
+          "many_tiled_error", many_tile_error, "single_tiled_error", one_tile_error,
+          "cpu_fp32_floor", floor_error, "row_difference", delta,
           "max_abs_between", (many_last - one).abs().max().item(),
           "threshold", threshold, "cache", counts, flush=True)
 
