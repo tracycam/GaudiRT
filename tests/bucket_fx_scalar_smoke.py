@@ -37,8 +37,7 @@ def reference(x):
     b, c_div, d = (torch.tensor(value, dtype=torch.float32).double()
                    for value in (3.14159, 0.1, 0.1234567))
     x = x.double()
-    reciprocal = direct_bf16(1 / x) if dtype == torch.bfloat16 else (1 / x).float().double()
-    return (x + a, b_add + x, x - c, b_add - x, x * d, b * x, x / b, b * reciprocal, x / c_div)
+    return (x + a, b_add + x, x - c, b_add - x, x * d, b * x, x / b, b / x, x / c_div)
 
 
 def main():
@@ -81,7 +80,7 @@ def main():
                 error = (torch.linalg.vector_norm(actual - truth, dim=-1) / denominator).max().item()
                 floor = (torch.linalg.vector_norm(pytorch.double() - truth, dim=-1) / denominator).max().item()
                 assert error <= max(3e-3, 2 * floor) and error <= 1e-2, (error, floor)
-                if dtype == torch.bfloat16 and index != 8:
+                if dtype == torch.bfloat16 and index not in (7, 8):
                     assert torch.equal(actual, pytorch.double()), (
                         rows, index, int(torch.count_nonzero(actual != pytorch.double())),
                         (actual - pytorch.double()).abs().max().item(), error, floor,

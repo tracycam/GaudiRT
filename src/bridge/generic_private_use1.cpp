@@ -3087,7 +3087,7 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
   std::vector<FxValueSpec> specs;
   specs.reserve(inputs.size() + operations_.size());
   std::ostringstream normalized;
-  normalized << "fx_program_v11;";
+  normalized << "fx_program_v12;";
   for (size_t i = 0; i < inputs.size(); ++i) {
     const auto& tensor = inputs[i];
     const bool floating = tensor.scalar_type() == at::kBFloat16 || tensor.scalar_type() == at::kFloat;
@@ -3350,15 +3350,6 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
       check(synNodeCreate(graph, in.data(), &out, in.size(), 1, params, params_size,
                           guid, name.c_str(), nullptr, nullptr), "program node creation failed");
     };
-    auto rotary_source = [&](int64_t value, int64_t source) {
-      while (value >= static_cast<int64_t>(roles_.size())) {
-        if (value == source) return true;
-        const auto& producer = operations_[value - roles_.size()];
-        if (producer[0] != 4 && producer[0] != 17 && producer[0] != 18 && producer[0] != 19) break;
-        value = producer[1];
-      }
-      return false;
-    };
     for (size_t i = 0; i < roles_.size(); ++i) {
       const auto& spec = specs_[i];
       const uint64_t fcd = spec.dynamic && spec.sizes.size() == 1 ? bucket : spec.sizes.back();
@@ -3508,21 +3499,6 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
         };
         const auto scalar = constant(std::bit_cast<float>(static_cast<uint32_t>(op[2])));
         const bool reversed = op[3] != 0;
-        if (op[0] == 23 && reversed) {
-          const auto one = constant(1.f);
-          auto reciprocal = tensor(syn_type_float, width, rows, -1);
-          node({one, input}, reciprocal, nullptr, 0, "div_fwd_f32");
-          if (bf16) {
-            auto rounded = tensor(syn_type_bf16, width, rows, -1);
-            node({reciprocal}, rounded, nullptr, 0, "gk_cast_f32_to_bf16_v1");
-            reciprocal = tensor(syn_type_float, width, rows, -1);
-            node({rounded}, reciprocal, &cast, sizeof(cast), "cast_bf16_to_f32");
-          }
-          auto result = bf16 ? tensor(syn_type_float, width, rows, -1) : values[id];
-          node({reciprocal, scalar}, result, nullptr, 0, "mult_fwd_f32");
-          if (bf16) node({result}, values[id], nullptr, 0, "gk_cast_f32_to_bf16_v1");
-          continue;
-        }
         const auto left = reversed ? scalar : input;
         const auto right = reversed ? input : scalar;
         auto result = wide ? tensor(syn_type_float, width, rows, -1) : values[id];
@@ -3584,44 +3560,6 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
         continue;
       }
       synGEMMParams gemm{false, op[0] == 0};
-      const auto input_width = specs_[op[1]].sizes.back();
-      const bool rotary_projection = spec.dynamic && spec.dtype == at::kBFloat16 && op[0] == 0 &&
-          op[3] < 0 && input_width % 256 == 0 &&
-          std::any_of(operations_.begin(), operations_.end(), [&](const auto& candidate) {
-            return candidate[0] == 7 &&
-                (rotary_source(candidate[1], static_cast<int64_t>(id)) ||
-                 rotary_source(candidate[2], static_cast<int64_t>(id)));
-          });
-      if (rotary_projection) {
-        auto full = tensor(syn_type_float, width, rows, -1);
-        auto x0 = tensor(syn_type_bf16, input_width / 2, rows, -1);
-        auto x1 = tensor(syn_type_bf16, input_width / 2, rows, -1);
-        auto w0 = tensor(syn_type_bf16, input_width / 2, width, -1);
-        auto w1 = tensor(syn_type_bf16, input_width / 2, width, -1);
-        auto p0 = tensor(syn_type_float, width, rows, -1);
-        auto p1 = tensor(syn_type_float, width, rows, -1);
-        auto sum = tensor(syn_type_float, width, rows, -1);
-        auto first = tensor(syn_type_bf16, width, rows, -1);
-        auto second = tensor(syn_type_bf16, width, rows, -1);
-        node({values[op[1]], values[op[2]]}, full, &gemm, sizeof(gemm), "gemm");
-        synSplitParams split{0};
-        const auto split_tensor = [&](synTensor source, synTensor left, synTensor right) {
-          const std::array<synTensor, 2> outputs{left, right};
-          const auto name = prefix + "_n" + std::to_string(next_node++);
-          check(synNodeCreate(graph, &source, outputs.data(), 1, outputs.size(), &split, sizeof(split),
-                              "split", name.c_str(), nullptr, nullptr), "program K split failed");
-        };
-        split_tensor(values[op[1]], x0, x1);
-        split_tensor(values[op[2]], w0, w1);
-        node({x0, w0}, p0, &gemm, sizeof(gemm), "gemm");
-        node({x1, w1}, p1, &gemm, sizeof(gemm), "gemm");
-        node({p0, p1}, sum, nullptr, 0, "add_fwd_f32");
-        node({full}, first, nullptr, 0, "gk_cast_f32_to_bf16_v1");
-        node({sum}, second, nullptr, 0, "gk_cast_f32_to_bf16_v1");
-        node({values[op[1]], values[op[2]], first, second, full, sum}, values[id], nullptr, 0,
-             "gk_linear_refine_bf16_v2");
-        continue;
-      }
       if (op[3] < 0) {
         node({values[op[1]], values[op[2]]}, values[id], &gemm, sizeof(gemm), "gemm");
         continue;
