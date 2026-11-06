@@ -14,7 +14,7 @@ import gaudirt.compiler as compiler
 from fp64_reference import direct_bf16
 from rotary_runtime_smoke import reference as rotary_reference
 
-INPUT_WIDTH = 256 if os.environ.get("GAUDIRT_TEST_REFINED") == "1" else 128
+INPUT_WIDTH = 256
 
 
 def metadata(rows):
