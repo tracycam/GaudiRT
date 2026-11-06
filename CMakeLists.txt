@@ -60,6 +60,8 @@ target_link_libraries(dynamic_pool_descriptor_device_test PRIVATE gaudirt)
 
 add_executable(stream_event_reuse_device_test tests/stream_event_reuse_device_test.cpp)
 target_link_libraries(stream_event_reuse_device_test PRIVATE gaudirt)
+add_executable(allocator_event_reuse_device_test tests/allocator_event_reuse_device_test.cpp)
+target_link_libraries(allocator_event_reuse_device_test PRIVATE gaudirt)
 add_library(gaudirt_synapse_call_counter SHARED tests/synapse_node_count_interposer.cpp)
 target_link_libraries(gaudirt_synapse_call_counter PRIVATE ${CMAKE_DL_LIBS})
 

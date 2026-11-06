@@ -3,6 +3,8 @@
 
 #include <synapse_api.h>
 
+#include "gaudirt/runtime/event_pool.hpp"
+
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -49,8 +51,7 @@ class PinnedHostPool {
                        synStreamHandle stream, bool non_blocking);
 
  private:
-  struct EventDeleter { void operator()(void* event) const noexcept; };
-  using Event = std::shared_ptr<void>;
+  using Event = EventPool::Event;
   struct Block {
     uint64_t bytes = 0;
     bool allocated = false;
@@ -63,6 +64,7 @@ class PinnedHostPool {
   uint64_t capacity_;
   void* base_ = nullptr;
   uint64_t allocated_ = 0;
+  EventPool events_;
   std::map<uint64_t, Block> blocks_;
   mutable std::mutex mutex_;
 };

@@ -16,6 +16,8 @@ def main():
     stream_events.restype = ctypes.c_uint64
     all_events = ctypes.CDLL(None).gaudirt_test_event_create_count
     all_events.restype = ctypes.c_uint64
+    destroyed_events = ctypes.CDLL(None).gaudirt_test_event_destroy_count
+    destroyed_events.restype = ctypes.c_uint64
     initial = stream_events()
     gaudirt.initialize(hbm_bytes=256 * 1024**2, pinned_bytes=8 * 1024**2)
     streams = [gaudirt.Stream(), gaudirt.Stream()]
@@ -45,7 +47,7 @@ def main():
             construct(index, False)
             construct(index, True)
     gaudirt.synchronize()
-    before_stream, before_all = stream_events(), all_events()
+    before_stream, before_all, before_destroyed = stream_events(), all_events(), destroyed_events()
     pending = []
     for iteration in range(32):
         index = iteration % 2
@@ -54,14 +56,14 @@ def main():
             pending.append((index, construct(index, True)))
     gaudirt.synchronize()
     assert stream_events() == before_stream, (before_stream, stream_events())
-    other_events = all_events() - before_all
+    assert all_events() == before_all, (before_all, all_events())
+    assert destroyed_events() == before_destroyed, (before_destroyed, destroyed_events())
     for index, metadata in pending:
         locations, requests, positions, _, _ = cases[index]
         assert torch.equal(metadata.row_locations().cpu().long(), locations)
         assert torch.equal(metadata.row_requests().cpu().long(), requests)
         assert torch.equal(metadata.rotary_positions().cpu().long(), positions)
-    print("metadata constructions", len(pending), "new StreamEvent objects 0",
-          "other event creations", other_events, flush=True)
+    print("metadata constructions", len(pending), "event creations 0 event destructions 0", flush=True)
 
 
 if __name__ == "__main__":
