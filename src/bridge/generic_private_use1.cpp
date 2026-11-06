@@ -3087,7 +3087,7 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
   std::vector<FxValueSpec> specs;
   specs.reserve(inputs.size() + operations_.size());
   std::ostringstream normalized;
-  normalized << "fx_program_v12;";
+  normalized << "fx_program_v13;";
   for (size_t i = 0; i < inputs.size(); ++i) {
     const auto& tensor = inputs[i];
     const bool floating = tensor.scalar_type() == at::kBFloat16 || tensor.scalar_type() == at::kFloat;
@@ -3365,6 +3365,7 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
         TORCH_CHECK(values[id], "GaudiRT FX: missing second result tensor");
         continue;
       }
+      if (op[0] == 4 && values[id]) continue;
       const auto& spec = specs_[id];
       const auto type = cast_type(spec.dtype);
       const uint64_t width = spec.sizes.back();
@@ -3467,10 +3468,33 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
       }
       if (op[0] == 4) {
         const auto total = specs_[op[1]].sizes[1];
+        struct FeaturePart { int64_t start, width; size_t id; };
+        std::vector<FeaturePart> selected{{op[2], op[3], id}};
+        for (size_t j = i + 1; j < operations_.size(); ++j) {
+          const auto& candidate = operations_[j];
+          if (candidate[0] != 4 || candidate[1] != op[1] || values[roles_.size() + j]) continue;
+          const auto overlaps = std::any_of(selected.begin(), selected.end(), [&](const FeaturePart& part) {
+            return candidate[2] < part.start + part.width && part.start < candidate[2] + candidate[3];
+          });
+          if (!overlaps) selected.push_back({candidate[2], candidate[3], roles_.size() + j});
+        }
+        std::sort(selected.begin(), selected.end(), [](const FeaturePart& a, const FeaturePart& b) {
+          return a.start < b.start;
+        });
         std::vector<synTensor> parts;
-        if (op[2]) parts.push_back(tensor(type.syn, op[2], bucket, -1));
-        parts.push_back(values[id]);
-        if (op[2] + op[3] < total) parts.push_back(tensor(type.syn, total - op[2] - op[3], bucket, -1));
+        int64_t offset = 0;
+        for (const auto& part : selected) {
+          if (part.start > offset) parts.push_back(tensor(type.syn, part.start - offset, bucket, -1));
+          if (!values[part.id]) {
+            const auto output = std::find(outputs_.begin(), outputs_.end(), static_cast<int64_t>(part.id));
+            const int slot = output == outputs_.end() ? -1 :
+                static_cast<int>(roles_.size() + std::distance(outputs_.begin(), output));
+            values[part.id] = tensor(type.syn, part.width, bucket, slot);
+          }
+          parts.push_back(values[part.id]);
+          offset = part.start + part.width;
+        }
+        if (offset < total) parts.push_back(tensor(type.syn, total - offset, bucket, -1));
         synSplitParams params{0};
         const auto name = prefix + "_n" + std::to_string(next_node++);
         check(synNodeCreate(graph, &values[op[1]], parts.data(), 1, parts.size(), &params, sizeof(params),
