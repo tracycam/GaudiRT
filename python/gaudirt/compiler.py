@@ -160,14 +160,14 @@ def _program_backend(graph_module, example_inputs):
                     alias_views[node] = alias_views[source]
             elif example.ndim == 2:
                 transposes[node] = source
-            elif example.ndim == 3 and {dim0, dim1} == {1, 2}:
+            elif 3 <= example.ndim <= 5 and dim0 != 0 and dim1 != 0:
                 source_id = tensor_id(source)
-                add_alias(node, source, ("transpose",))
+                add_alias(node, source, ("transpose", dim0, dim1))
                 if all(user.op == "output" for user in node.users):
                     ids[node] = source_id
                 else:
                     ids[node] = len(tensor_indices) + len(operations)
-                    operations.append([18, source_id, 1, 2])
+                    operations.append([18, source_id, dim0, dim1])
             else:
                 raise RuntimeError("GaudiRT FX: transpose must keep the outer token dimension")
             continue
@@ -181,7 +181,7 @@ def _program_backend(graph_module, example_inputs):
             result = node.meta.get("example_value")
             if not isinstance(original, torch.Tensor) or not isinstance(result, torch.Tensor):
                 raise RuntimeError("GaudiRT FX: missing view shape metadata")
-            if (original.ndim not in (2, 3) or result.ndim not in (2, 3) or
+            if (not 1 <= original.ndim <= 5 or not 1 <= result.ndim <= 5 or
                     original.dtype != result.dtype or not result.is_contiguous() or
                     str(original.shape[0]) != str(result.shape[0]) or
                     any(not isinstance(size, int) or size <= 0 for size in result.shape[1:])):
@@ -400,7 +400,7 @@ def _program_backend(graph_module, example_inputs):
             left = node.args[0].meta.get("example_value")
             right = node.args[1].meta.get("example_value")
             if (isinstance(left, torch.Tensor) and isinstance(right, torch.Tensor) and
-                    left.ndim == right.ndim == 3):
+                    left.ndim == right.ndim and 3 <= left.ndim <= 5):
                 operation = [16, tensor_id(node.args[0]), tensor_id(node.args[1]), -1]
             elif node.args[1] in transposes:
                 operation = [0, tensor_id(node.args[0]), weight_id(node.args[1]), -1]
@@ -472,7 +472,7 @@ def _program_backend(graph_module, example_inputs):
                 elif operation[0] == "reshape":
                     tensor = _C._reshape_view(tensor, operation[1])
                 else:
-                    tensor = _C._transpose_feature_view(tensor)
+                    tensor = _C._transpose_feature_view(tensor, operation[1], operation[2])
             return tensor
 
         result = tuple(apply_views(node, tensor) for node, tensor in zip(output, result))

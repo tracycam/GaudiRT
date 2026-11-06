@@ -4,6 +4,7 @@
 #include "gaudirt/runtime/pinned_host_pool.hpp"
 #include "gaudirt/runtime/recipe_registry.hpp"
 #include "gaudirt/common/sha256.hpp"
+#include "tensor_spec.hpp"
 
 #include <ATen/EmptyTensor.h>
 #include <ATen/MemoryOverlap.h>
@@ -2731,7 +2732,7 @@ struct GraphTemporary {
 
 std::optional<at::Tensor> prepare_strided_input(const at::Tensor& input) {
   TORCH_CHECK(input.device().type() == c10::kPrivateUse1 && input.device().index() == 0 &&
-              input.dim() >= 1 && input.dim() <= 3 && input.size(0) > 0 && input.size(0) <= 4096,
+              input.dim() >= 1 && input.dim() <= 5 && input.size(0) > 0 && input.size(0) <= 4096,
               "GaudiRT FX: invalid dynamic input");
   if (input.is_contiguous()) {
     std::vector<int64_t> strides(input.dim());
@@ -2869,15 +2870,17 @@ at::Tensor feature_view(const at::Tensor& tensor, int64_t start, int64_t length)
 }
 
 at::Tensor reshape_view(const at::Tensor& tensor, const std::vector<int64_t>& shape) {
-  TORCH_CHECK((shape.size() == 2 || shape.size() == 3) && shape[0] == -1 &&
+  TORCH_CHECK(!shape.empty() && shape.size() <= 5 && shape[0] == -1 &&
               std::all_of(shape.begin() + 1, shape.end(), [](int64_t size) { return size > 0; }),
               "GaudiRT FX: invalid reshape view");
   return tensor.view(shape);
 }
 
-at::Tensor transpose_feature_view(const at::Tensor& tensor) {
-  TORCH_CHECK(tensor.dim() == 3, "GaudiRT FX: invalid feature transpose view");
-  return tensor.transpose(1, 2);
+at::Tensor transpose_feature_view(const at::Tensor& tensor, int64_t dim0, int64_t dim1) {
+  TORCH_CHECK(tensor.dim() >= 3 && tensor.dim() <= 5 && dim0 > 0 && dim1 > 0 &&
+              dim0 < tensor.dim() && dim1 < tensor.dim() && dim0 != dim1,
+              "GaudiRT FX: invalid feature transpose view");
+  return tensor.transpose(dim0, dim1);
 }
 
 at::Tensor bucket_output(const at::Tensor& reference, at::ScalarType dtype,
@@ -2977,12 +2980,6 @@ at::Tensor bucket_linear(const at::Tensor& input, const at::Tensor& weight,
   return result;
 }
 
-struct FxValueSpec {
-  at::ScalarType dtype;
-  std::vector<int64_t> sizes;
-  bool dynamic;
-};
-
 // An FX program is described by external input roles and normalized nodes.
 // Nodes 0..4 are linear, add, RMSNorm, SiLU/multiply and split; 5/6 are fused norm outputs,
 // 7/8 are validated rotary query/key outputs, 9 is validated embedding,
@@ -3006,7 +3003,8 @@ class BucketProgram {
     for (size_t i = 0; i < operations_.size(); ++i) {
       const auto& op = operations_[i];
       const int64_t upper = roles_.size() + i;
-      TORCH_CHECK((op.size() == 4 || (op.size() == 5 && (op[0] == 4 || op[0] == 5 || op[0] == 17)) ||
+      TORCH_CHECK((op.size() == 4 || (op.size() == 5 && (op[0] == 4 || op[0] == 5)) ||
+                   (op.size() >= 3 && op.size() <= 7 && op[0] == 17) ||
                    (op.size() == 10 && op[0] == 7) || (op.size() >= 3 && op[0] == 15)) &&
                   op[1] >= 0 && op[1] < upper && op[2] >= 0 &&
                   ((op[0] == 0 && op[2] < upper && (op[3] == -1 || (op[3] >= 0 && op[3] < upper))) ||
@@ -3032,10 +3030,10 @@ class BucketProgram {
                    (op[0] == 11 && op.size() == 4 && op[2] <= 1 && op[3] == -1) ||
                    (op[0] >= 12 && op[0] <= 14 && op.size() == 4 && op[2] < upper && op[3] == -1) ||
                    (op[0] == 16 && op.size() == 4 && op[2] < upper && op[3] == -1) ||
-                   (op[0] == 17 && (op[2] == 2 || op[2] == 3) &&
+                   (op[0] == 17 && op[2] >= 1 && op[2] <= 5 &&
                     op.size() == static_cast<size_t>(op[2] + 2) &&
                     std::all_of(op.begin() + 3, op.end(), [](int64_t size) { return size > 0; })) ||
-                   (op[0] == 18 && op.size() == 4 && op[2] == 1 && op[3] == 2) ||
+                   (op[0] == 18 && op.size() == 4 && op[2] > 0 && op[3] > 0 && op[2] != op[3]) ||
                    (op[0] == 19 && op.size() == 4 && op[2] == 0 && op[3] == -1) ||
                    (op[0] >= 20 && op[0] <= 23 && op.size() == 4 &&
                     static_cast<uint64_t>(op[2]) <= UINT32_MAX && (op[3] == 0 || op[3] == 1)) ||
@@ -3077,17 +3075,17 @@ class BucketProgram {
   std::vector<std::vector<int64_t>> operations_;
   std::vector<int64_t> outputs_;
   std::vector<bool> embedding_inputs_;
-  std::vector<FxValueSpec> specs_;
+  std::vector<TensorSpec> specs_;
   std::string digest_;
   std::mutex mutex_;
 };
 
 void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
   TORCH_CHECK(inputs.size() == roles_.size(), "GaudiRT FX: wrong input count");
-  std::vector<FxValueSpec> specs;
+  std::vector<TensorSpec> specs;
   specs.reserve(inputs.size() + operations_.size());
   std::ostringstream normalized;
-  normalized << "fx_program_v13;";
+  normalized << "fx_program_v14;";
   for (size_t i = 0; i < inputs.size(); ++i) {
     const auto& tensor = inputs[i];
     const bool floating = tensor.scalar_type() == at::kBFloat16 || tensor.scalar_type() == at::kFloat;
@@ -3095,8 +3093,7 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
     TORCH_CHECK(tensor.device().type() == c10::kPrivateUse1 && tensor.device().index() == 0 &&
                 (floating || integer_vector),
                 "GaudiRT FX: unsupported input device or dtype");
-    TORCH_CHECK((roles_[i] && ((floating && (tensor.dim() == 2 || tensor.dim() == 3)) || integer_vector)) ||
-                (!roles_[i] && ((floating && (tensor.dim() == 1 || tensor.dim() == 2)) || integer_vector)),
+    TORCH_CHECK((floating && tensor.dim() >= 1 && tensor.dim() <= 5) || integer_vector,
                 "GaudiRT FX: unsupported input rank");
     std::vector<int64_t> sizes(tensor.sizes().begin(), tensor.sizes().end());
     for (auto size : sizes) TORCH_CHECK(size > 0, "GaudiRT FX: empty input dimension");
@@ -3109,7 +3106,7 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
   for (const auto& op : operations_) {
     const auto& a = specs[op[1]];
     if (op[0] >= 20 && op[0] <= 23) {
-      TORCH_CHECK(a.dynamic && a.sizes.size() == 2 &&
+      TORCH_CHECK(a.dynamic() && a.sizes.size() == 2 &&
                   (a.dtype == at::kBFloat16 || a.dtype == at::kFloat) &&
                   std::isfinite(std::bit_cast<float>(static_cast<uint32_t>(op[2]))),
                   "GaudiRT FX: scalar arithmetic requires a finite FP32 scalar and rank-two input");
@@ -3118,7 +3115,7 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
       continue;
     }
     if (op[0] == 19) {
-      TORCH_CHECK(a.dynamic && a.sizes.size() == 2 &&
+      TORCH_CHECK(a.dynamic() && a.sizes.size() == 2 &&
                   (a.dtype == at::kBFloat16 || a.dtype == at::kFloat),
                   "GaudiRT FX: copy requires a dynamic rank-two BF16 or FP32 input");
       specs.push_back(a);
@@ -3126,14 +3123,18 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
       continue;
     }
     if (op[0] == 18) {
-      TORCH_CHECK(a.dynamic && a.sizes.size() == 3,
-                  "GaudiRT FX: feature transpose requires a dynamic rank-three input");
-      specs.push_back({a.dtype, {-1, a.sizes[2], a.sizes[1]}, true});
+      TORCH_CHECK(a.dynamic() && a.sizes.size() >= 3 && a.sizes.size() <= 5 &&
+                  op[2] < static_cast<int64_t>(a.sizes.size()) &&
+                  op[3] < static_cast<int64_t>(a.sizes.size()),
+                  "GaudiRT FX: feature transpose requires a dynamic rank-three through rank-five input");
+      auto sizes = a.sizes;
+      std::swap(sizes[op[2]], sizes[op[3]]);
+      specs.push_back({a.dtype, std::move(sizes), true});
       normalized << "n" << op[0] << ":" << op[1] << ":" << op[2] << ":" << op[3] << ";";
       continue;
     }
     if (op[0] == 17) {
-      TORCH_CHECK(a.dynamic && (a.sizes.size() == 2 || a.sizes.size() == 3),
+      TORCH_CHECK(a.dynamic() && !a.sizes.empty() && a.sizes.size() <= 5,
                   "GaudiRT FX: invalid reshape input");
       int64_t source_width = 1, target_width = 1;
       for (size_t i = 1; i < a.sizes.size(); ++i) {
@@ -3154,11 +3155,11 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
       continue;
     }
     if (op[0] == 15) {
-      TORCH_CHECK(a.dynamic && a.sizes.size() == 2, "GaudiRT FX: invalid cat input");
+      TORCH_CHECK(a.dynamic() && a.sizes.size() == 2, "GaudiRT FX: invalid cat input");
       int64_t width = 0;
       for (size_t i = 1; i < op.size(); ++i) {
         const auto& input = specs[op[i]];
-        TORCH_CHECK(input.dynamic && input.dtype == a.dtype && input.sizes.size() == 2 &&
+        TORCH_CHECK(input.dynamic() && input.dtype == a.dtype && input.sizes.size() == 2 &&
                     input.sizes[1] <= INT64_MAX - width, "GaudiRT FX: invalid cat input geometry");
         width += input.sizes[1];
       }
@@ -3170,7 +3171,7 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
     }
     if (op[0] == 10) {
       const auto& index = specs[op[2]];
-      TORCH_CHECK(a.dynamic && a.sizes.size() == 2 && !index.dynamic && index.dtype == at::kInt &&
+      TORCH_CHECK(a.dynamic() && a.sizes.size() == 2 && !index.dynamic() && index.dtype == at::kInt &&
                   index.sizes.size() == 1 && index.sizes[0] > 0 && index.sizes[0] <= 4096,
                   "GaudiRT FX: invalid validated row gather geometry");
       specs.push_back({a.dtype, {index.sizes[0], a.sizes[1]}, false});
@@ -3181,15 +3182,15 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
       const auto dtype = op[2] == 0 ? at::kBFloat16 : at::kFloat;
       TORCH_CHECK(a.sizes.size() == 2 && (a.dtype == at::kBFloat16 || a.dtype == at::kFloat) &&
                   a.dtype != dtype, "GaudiRT FX: invalid BF16/FP32 cast");
-      specs.push_back({dtype, a.sizes, a.dynamic});
+      specs.push_back({dtype, a.sizes, a.dynamic()});
       normalized << "n" << op[0] << ":" << op[1] << ":" << op[2] << ":" << op[3] << ";";
       continue;
     }
     if (op[0] == 9) {
       const auto& weight = specs[op[2]];
-      TORCH_CHECK(a.dtype == at::kInt && a.dynamic && a.sizes.size() == 1 &&
+      TORCH_CHECK(a.dtype == at::kInt && a.dynamic() && a.sizes.size() == 1 &&
                   (weight.dtype == at::kBFloat16 || weight.dtype == at::kFloat) &&
-                  !weight.dynamic && weight.sizes.size() == 2,
+                  !weight.dynamic() && weight.sizes.size() == 2,
                   "GaudiRT FX: invalid validated embedding geometry");
       specs.push_back({weight.dtype, {-1, weight.sizes[1]}, true});
       normalized << "n" << op[0] << ":" << op[1] << ":" << op[2] << ":" << op[3] << ";";
@@ -3205,12 +3206,12 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
       const auto& cache = specs[op[3]];
       const auto& positions = specs[op[4]];
       const auto& header = specs[op[5]];
-      TORCH_CHECK(a.dtype == at::kBFloat16 && a.dynamic && a.sizes.size() == 2 &&
-                  key.dtype == a.dtype && key.dynamic && key.sizes.size() == 2 &&
-                  !cache.dynamic && cache.dtype == a.dtype && cache.sizes.size() == 2 &&
+      TORCH_CHECK(a.dtype == at::kBFloat16 && a.dynamic() && a.sizes.size() == 2 &&
+                  key.dtype == a.dtype && key.dynamic() && key.sizes.size() == 2 &&
+                  !cache.dynamic() && cache.dtype == a.dtype && cache.sizes.size() == 2 &&
                   cache.sizes[0] >= op[6] && cache.sizes[1] == op[8] &&
-                  positions.dtype == at::kInt && positions.dynamic && positions.sizes.size() == 1 &&
-                  header.dtype == at::kInt && !header.dynamic && header.sizes == std::vector<int64_t>{1} &&
+                  positions.dtype == at::kInt && positions.dynamic() && positions.sizes.size() == 1 &&
+                  header.dtype == at::kInt && !header.dynamic() && header.sizes == std::vector<int64_t>{1} &&
                   op[7] <= INT32_MAX && op[8] <= op[7] && op[8] % 2 == 0 &&
                   a.sizes[1] % op[7] == 0 && key.sizes[1] % op[7] == 0,
                   "GaudiRT FX: invalid rotary geometry or validated metadata");
@@ -3226,7 +3227,7 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
       continue;
     }
     if (op[0] == 4) {
-      TORCH_CHECK(a.dynamic && a.sizes.size() == 2 && op[4] == a.sizes[1] && op[2] < a.sizes[1] &&
+      TORCH_CHECK(a.dynamic() && a.sizes.size() == 2 && op[4] == a.sizes[1] && op[2] < a.sizes[1] &&
                   op[3] <= a.sizes[1] - op[2] && (op[2] > 0 || op[3] < a.sizes[1]),
                   "GaudiRT FX: invalid feature split geometry");
       specs.push_back({a.dtype, {-1, op[3]}, true});
@@ -3238,8 +3239,8 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
     if (op[0] == 5) {
       const auto& weight = specs[op[3]];
       const float epsilon = std::bit_cast<float>(static_cast<uint32_t>(op[4]));
-      TORCH_CHECK(a.dtype == at::kBFloat16 && a.dynamic && b.dynamic && a.sizes.size() == 2 &&
-                  a.sizes == b.sizes && a.sizes[1] <= 8192 && !weight.dynamic &&
+      TORCH_CHECK(a.dtype == at::kBFloat16 && a.dynamic() && b.dynamic() && a.sizes.size() == 2 &&
+                  a.sizes == b.sizes && a.sizes[1] <= 8192 && !weight.dynamic() &&
                   weight.dtype == a.dtype && weight.sizes.size() == 1 && weight.sizes[0] == a.sizes[1] &&
                   std::isfinite(epsilon) && epsilon > 0, "GaudiRT FX: invalid fused RMSNorm geometry or epsilon");
       specs.push_back(a);
@@ -3247,39 +3248,44 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
       continue;
     }
     if (op[0] == 0 || op[0] == 24) {
-      TORCH_CHECK(a.sizes.size() == 2 && !b.dynamic && b.sizes.size() == 2 &&
+      TORCH_CHECK(a.sizes.size() == 2 && !b.dynamic() && b.sizes.size() == 2 &&
                   a.sizes[1] == b.sizes[op[0] == 0 ? 1 : 0], "GaudiRT FX: invalid linear geometry");
       const auto output_width = b.sizes[op[0] == 0 ? 0 : 1];
       if (op[3] >= 0) {
         const auto& bias = specs[op[3]];
-        TORCH_CHECK(!bias.dynamic && bias.sizes.size() == 1 && bias.sizes[0] == output_width &&
+        TORCH_CHECK(!bias.dynamic() && bias.sizes.size() == 1 && bias.sizes[0] == output_width &&
                     bias.dtype == a.dtype, "GaudiRT FX: invalid linear bias");
       }
-      specs.push_back({a.dtype, {a.sizes[0], output_width}, a.dynamic});
+      specs.push_back({a.dtype, {a.sizes[0], output_width}, a.dynamic()});
     } else if (op[0] == 16) {
-      TORCH_CHECK(a.dynamic && b.dynamic && a.sizes.size() == 3 && b.sizes.size() == 3 &&
-                  a.sizes[2] == b.sizes[1], "GaudiRT FX: invalid batch GEMM geometry");
-      specs.push_back({a.dtype, {-1, a.sizes[1], b.sizes[2]}, true});
+      TORCH_CHECK(a.dynamic() && b.dynamic() && a.sizes.size() >= 3 && a.sizes.size() <= 5 &&
+                  b.sizes.size() == a.sizes.size() &&
+                  std::equal(a.sizes.begin(), a.sizes.end() - 2, b.sizes.begin()) &&
+                  a.sizes.back() == b.sizes[b.sizes.size() - 2],
+                  "GaudiRT FX: invalid batch GEMM geometry");
+      auto sizes = a.sizes;
+      sizes.back() = b.sizes.back();
+      specs.push_back({a.dtype, std::move(sizes), true});
     } else if (op[0] == 1 || (op[0] >= 12 && op[0] <= 14)) {
-      const auto compatible = [](const FxValueSpec& dynamic, const FxValueSpec& other) {
-        return dynamic.dynamic && dynamic.sizes.size() == 2 &&
-               ((other.dynamic && other.sizes == dynamic.sizes) ||
-                (!other.dynamic && ((other.sizes.size() == 1 && other.sizes[0] == dynamic.sizes[1]) ||
+      const auto compatible = [](const TensorSpec& dynamic, const TensorSpec& other) {
+        return dynamic.dynamic() && dynamic.sizes.size() == 2 &&
+               ((other.dynamic() && other.sizes == dynamic.sizes) ||
+                (!other.dynamic() && ((other.sizes.size() == 1 && other.sizes[0] == dynamic.sizes[1]) ||
                                     (other.sizes.size() == 2 && other.sizes[0] == 1 &&
                                      other.sizes[1] == dynamic.sizes[1]))));
       };
       TORCH_CHECK(compatible(a, b) || compatible(b, a),
                   "GaudiRT FX: unsupported elementwise broadcast geometry");
-      specs.push_back(a.dynamic ? a : b);
+      specs.push_back(a.dynamic() ? a : b);
     } else if (op[0] == 2) {
       const float epsilon = std::bit_cast<float>(static_cast<uint32_t>(op[3]));
-      TORCH_CHECK(a.dtype == at::kBFloat16 && a.dynamic && a.sizes.size() == 2 &&
-                  a.sizes[1] <= 8192 && !b.dynamic && b.sizes.size() == 1 &&
+      TORCH_CHECK(a.dtype == at::kBFloat16 && a.dynamic() && a.sizes.size() == 2 &&
+                  a.sizes[1] <= 8192 && !b.dynamic() && b.sizes.size() == 1 &&
                   b.sizes[0] == a.sizes[1] && std::isfinite(epsilon) && epsilon > 0,
                   "GaudiRT FX: invalid BF16 RMSNorm geometry or epsilon");
       specs.push_back(a);
     } else {
-      TORCH_CHECK(a.dtype == at::kBFloat16 && a.dynamic && a.sizes.size() == 2 &&
+      TORCH_CHECK(a.dtype == at::kBFloat16 && a.dynamic() && a.sizes.size() == 2 &&
                   a.sizes[1] % 2 == 0, "GaudiRT FX: invalid BF16 SiLU/multiply geometry");
       specs.push_back({a.dtype, {-1, a.sizes[1] / 2}, true});
     }
@@ -3315,8 +3321,7 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
   };
   try {
     check(synGraphCreate(&graph, synDeviceGaudi2), "program graph creation failed");
-    auto tensor = [&](synDataType type, uint64_t fcd, uint64_t rows, int slot,
-                      uint32_t rank = 2, uint64_t depth = 1) {
+    auto tensor_nd = [&](synDataType type, const std::vector<uint64_t>& dims, int slot) {
       tensor_names.push_back(prefix + "_t" + std::to_string(next_tensor++));
       synSectionHandle section = nullptr;
       if (slot >= 0) {
@@ -3328,21 +3333,29 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
       synTensorDescriptor desc{};
       desc.m_name = slot >= 0 ? compiled->names[slot].c_str() : tensor_names.back().c_str();
       desc.m_dataType = type;
-      desc.m_dims = rank;
-      desc.m_sizes[0] = desc.m_minSizes[0] = fcd;
-      if (rank >= 2) desc.m_sizes[1] = desc.m_minSizes[1] = rows;
-      if (rank == 3) desc.m_sizes[2] = desc.m_minSizes[2] = depth;
+      desc.m_dims = dims.size();
+      for (size_t dim = 0; dim < dims.size(); ++dim)
+        desc.m_sizes[dim] = desc.m_minSizes[dim] = dims[dim];
       synTensor handle = nullptr;
       check(synTensorCreate(&handle, &desc, section, 0), "program tensor creation failed");
       created.push_back(handle);
       if (slot >= 0) {
         compiled->tensors[slot].tensorName = compiled->names[slot].c_str();
         compiled->tensors[slot].tensorType = DATA_TENSOR;
-        compiled->tensors[slot].tensorSize[0] = fcd;
-        if (rank >= 2) compiled->tensors[slot].tensorSize[1] = rows;
-        if (rank == 3) compiled->tensors[slot].tensorSize[2] = depth;
+        for (size_t dim = 0; dim < dims.size(); ++dim)
+          compiled->tensors[slot].tensorSize[dim] = dims[dim];
       }
       return handle;
+    };
+    auto tensor = [&](synDataType type, uint64_t fcd, uint64_t rows, int slot,
+                      uint32_t rank = 2, uint64_t depth = 1) {
+      std::vector<uint64_t> dims{fcd};
+      if (rank >= 2) dims.push_back(rows);
+      if (rank == 3) dims.push_back(depth);
+      return tensor_nd(type, dims, slot);
+    };
+    auto tensor_from_spec = [&](const TensorSpec& spec, int slot) {
+      return tensor_nd(cast_type(spec.dtype).syn, spec.synapse_sizes(bucket), slot);
     };
     auto node = [&](const std::vector<synTensor>& in, synTensor out, const void* params,
                     size_t params_size, const char* guid) {
@@ -3352,11 +3365,7 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
     };
     for (size_t i = 0; i < roles_.size(); ++i) {
       const auto& spec = specs_[i];
-      const uint64_t fcd = spec.dynamic && spec.sizes.size() == 1 ? bucket : spec.sizes.back();
-      const uint64_t rows = spec.sizes.size() == 1 ? 1 : spec.sizes.size() == 3 ? spec.sizes[1] :
-                            (spec.dynamic ? bucket : spec.sizes[0]);
-      const uint64_t depth = spec.sizes.size() == 3 ? (spec.dynamic ? bucket : spec.sizes[0]) : 1;
-      values[i] = tensor(cast_type(spec.dtype).syn, fcd, rows, i, spec.sizes.size(), depth);
+      values[i] = tensor_from_spec(spec, i);
     }
     for (size_t i = 0; i < operations_.size(); ++i) {
       const auto& op = operations_[i];
@@ -3370,18 +3379,18 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
       const auto type = cast_type(spec.dtype);
       const uint64_t width = spec.sizes.back();
       const uint64_t rows = spec.sizes.size() == 3 ? spec.sizes[1] :
-                            (spec.dynamic ? bucket : spec.sizes[0]);
+                            (spec.dynamic() ? bucket : spec.sizes[0]);
       const auto output = std::find(outputs_.begin(), outputs_.end(), static_cast<int64_t>(id));
       const int slot = output == outputs_.end() ? -1 :
           static_cast<int>(roles_.size() + std::distance(outputs_.begin(), output));
-      values[id] = tensor(type.syn, width, rows, slot, spec.sizes.size(),
-                          spec.sizes.size() == 3 ? bucket : 1);
+      values[id] = tensor_from_spec(spec, slot);
       if (op[0] == 18) {
         synTransposeParams params{};
-        params.tensorDim = 3;
-        params.permutation[0] = TPD_Width;
-        params.permutation[1] = TPD_Channel;
-        params.permutation[2] = TPD_Height;
+        params.tensorDim = spec.sizes.size();
+        for (unsigned dim = 0; dim < params.tensorDim; ++dim)
+          params.permutation[dim] = static_cast<TransposePermutationDim>(dim);
+        std::swap(params.permutation[params.tensorDim - 1 - op[2]],
+                  params.permutation[params.tensorDim - 1 - op[3]]);
         node({values[op[1]]}, values[id], &params, sizeof(params), "transpose");
         continue;
       }
@@ -3536,7 +3545,7 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
       if (op[0] == 1 || (op[0] >= 12 && op[0] <= 14)) {
         auto expand = [&](int64_t input_id) {
           const auto& input = specs_[input_id];
-          if (input.dynamic) return values[input_id];
+          if (input.dynamic()) return values[input_id];
           auto source = values[input_id];
           if (input.sizes.size() == 1) {
             auto reshaped = tensor(type.syn, width, 1, -1);
@@ -3623,8 +3632,8 @@ std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs
   size_t dynamic_input = 0;
   for (size_t i = 0; i < inputs.size(); ++i) {
     if (!roles_[i]) continue;
-    TORCH_CHECK(inputs[i].dim() >= 1 && inputs[i].dim() <= 3,
-                "GaudiRT FX: dynamic input must have rank one through three");
+    TORCH_CHECK(inputs[i].dim() >= 1 && inputs[i].dim() <= 5,
+                "GaudiRT FX: dynamic input must have rank one through five");
     if (m < 0) {
       m = inputs[i].size(0);
       dynamic_input = i;
@@ -3641,7 +3650,7 @@ std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs
                 input.scalar_type() == spec.dtype && input.dim() == static_cast<int64_t>(spec.sizes.size()),
                 "GaudiRT FX: input device, dtype or rank changed");
     for (int64_t dim = 0; dim < input.dim(); ++dim) {
-      const auto expected = spec.dynamic && dim == 0 ? m : spec.sizes[dim];
+      const auto expected = spec.dynamic() && dim == 0 ? m : spec.sizes[dim];
       TORCH_CHECK(input.size(dim) == expected, "GaudiRT FX: input geometry changed");
     }
   }
@@ -3652,13 +3661,17 @@ std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs
   results.reserve(outputs_.size());
   for (auto id : outputs_) {
     const auto& spec = specs_[id];
-    if (spec.dynamic && spec.sizes.size() == 3) {
-      TORCH_CHECK(spec.sizes[1] <= INT64_MAX / spec.sizes[2], "GaudiRT FX: output size overflow");
-      results.push_back(bucket_output(inputs[dynamic_input], spec.dtype, bucket, m,
-                                      spec.sizes[1] * spec.sizes[2]).view({m, spec.sizes[1], spec.sizes[2]}));
+    if (spec.dynamic()) {
+      int64_t width = 1;
+      auto sizes = spec.sizes;
+      sizes[0] = m;
+      for (size_t dim = 1; dim < sizes.size(); ++dim) {
+        TORCH_CHECK(width <= INT64_MAX / sizes[dim], "GaudiRT FX: output size overflow");
+        width *= sizes[dim];
+      }
+      results.push_back(bucket_output(inputs[dynamic_input], spec.dtype, bucket, m, width).view(sizes));
     } else {
-      results.push_back(spec.dynamic ? bucket_output(inputs[dynamic_input], spec.dtype, bucket, m, spec.sizes[1]) :
-                        at::empty(spec.sizes, inputs[dynamic_input].options().dtype(spec.dtype)));
+      results.push_back(at::empty(spec.sizes, inputs[dynamic_input].options().dtype(spec.dtype)));
     }
   }
   std::lock_guard recipe_lock(ctx->cold_mutex);
@@ -3684,9 +3697,9 @@ std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs
                   "GaudiRT FX: input allocation size overflow");
       dynamic_width *= static_cast<uint64_t>(spec.sizes[dim]);
     }
-    TORCH_CHECK(!spec.dynamic || dynamic_width <= UINT64_MAX / bucket / item,
+    TORCH_CHECK(!spec.dynamic() || dynamic_width <= UINT64_MAX / bucket / item,
                 "GaudiRT FX: input allocation size overflow");
-    const uint64_t bytes = spec.dynamic ? static_cast<uint64_t>(bucket) * dynamic_width * item : input.nbytes();
+    const uint64_t bytes = spec.dynamic() ? static_cast<uint64_t>(bucket) * dynamic_width * item : input.nbytes();
     const uint64_t address = address_of(input, *ctx);
     ctx->allocator.record_stream(address, stream);
     const uint64_t offset = static_cast<uint64_t>(input.storage_offset()) * item;
