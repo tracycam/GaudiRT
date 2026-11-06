@@ -3,8 +3,10 @@
 
 #include <c10/util/Exception.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
 
 namespace gaudirt::generic {
 namespace {
@@ -82,6 +84,39 @@ void Context::synchronize_stream() {
 }
 
 void Context::synchronize_all() { streams.synchronize(); device.synchronize_all(); }
+
+uint64_t Context::row_count_address(uint32_t rows) {
+  // Every value has a 256-byte-aligned address, so warm launches bind an
+  // immutable count without copying metadata or synchronizing a stream.
+  std::call_once(row_count_once, [&] {
+    auto h2d = device.h2d_stream();
+    const auto address = allocator.allocate(kRowCountTableBytes, h2d);
+    try {
+      const auto chunk_bytes = std::min(kRowCountTableBytes, pinned.largest_free_block()) & ~uint64_t{255};
+      TORCH_CHECK(chunk_bytes >= 256, "GaudiRT: no pinned memory for row counts");
+      void* staging = pinned.allocate(chunk_bytes);
+      try {
+        for (uint64_t offset = 0; offset < kRowCountTableBytes; offset += chunk_bytes) {
+          const auto bytes = std::min(chunk_bytes, kRowCountTableBytes - offset);
+          std::memset(staging, 0, bytes);
+          auto* values = static_cast<int32_t*>(staging);
+          for (uint64_t item = 0; item < bytes; item += 256)
+            values[item / sizeof(int32_t)] = static_cast<int32_t>((offset + item) / 256 + 1);
+          pinned.copy_h2d(address + offset, staging, bytes, h2d, false);
+        }
+      } catch (...) {
+        pinned.free(staging);
+        throw;
+      }
+      pinned.free(staging);
+    } catch (...) {
+      allocator.free(address);
+      throw;
+    }
+    row_count_table = address;
+  });
+  return row_count_table + static_cast<uint64_t>(rows - 1) * 256;
+}
 
 std::filesystem::path Context::cache_path() {
   const char* path = std::getenv("GAUDIRT_RECIPE_CACHE");
