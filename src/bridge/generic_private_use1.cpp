@@ -15,11 +15,13 @@
 #include <perf_lib_layer_params.h>
 #include <c10/core/Allocator.h>
 #include <c10/core/impl/DeviceGuardImplInterface.h>
+#include <c10/util/SmallVector.h>
 #include <torch/extension.h>
 #include <torch/custom_class.h>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstdlib>
@@ -114,6 +116,8 @@ struct ColdRecipe {
   ~ColdRecipe() { if (recipe) synRecipeDestroy(recipe); }
 };
 
+std::atomic<uint64_t> next_context_generation{1};
+
 struct Context {
   Context(uint32_t module, uint64_t hbm_bytes, uint64_t pinned_bytes)
       : device(config(module)), streams(device.device_id(), device.compute_stream()),
@@ -142,6 +146,7 @@ struct Context {
     cfg.uclamp_min = 0;
     return cfg;
   }
+  const uint64_t generation = next_context_generation.fetch_add(1, std::memory_order_relaxed);
   DeviceRuntime device;
   StreamRegistry streams;
   BlockCachingAllocator allocator;
@@ -3077,11 +3082,28 @@ class BucketProgram {
                   "GaudiRT FX: output must be a program operation");
   }
 
+  ~BucketProgram() {
+    auto* cache = cached_contexts_.load(std::memory_order_relaxed);
+    while (cache) {
+      auto* next = cache->next;
+      delete cache;
+      cache = next;
+    }
+  }
+
   std::vector<at::Tensor> run(const std::vector<at::Tensor>& inputs);
 
  private:
+  struct CachedContext {
+    explicit CachedContext(uint64_t id) : generation(id) {}
+    uint64_t generation;
+    CachedContext* next = nullptr;
+    std::array<std::atomic<ColdRecipe*>, 13> recipes{};
+  };
+
   void initialize_geometry(const std::vector<at::Tensor>& inputs);
   ColdRecipe& recipe(Context& ctx, uint32_t bucket);
+  ColdRecipe& cached_recipe(Context& ctx, uint32_t bucket);
 
   std::vector<int64_t> roles_;
   std::vector<std::vector<int64_t>> operations_;
@@ -3090,6 +3112,7 @@ class BucketProgram {
   std::vector<TensorSpec> specs_;
   std::string digest_;
   std::once_flag geometry_once_;
+  std::atomic<CachedContext*> cached_contexts_{nullptr};
 };
 
 void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
@@ -3309,6 +3332,36 @@ void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
       reinterpret_cast<const uint8_t*>(text.data()), text.size());
   specs_ = std::move(specs);
   digest_ = digest;
+}
+
+ColdRecipe& BucketProgram::cached_recipe(Context& ctx, uint32_t bucket) {
+  auto* head = cached_contexts_.load(std::memory_order_acquire);
+  CachedContext* cached = nullptr;
+  while (!cached) {
+    for (auto* item = head; item; item = item->next) {
+      if (item->generation == ctx.generation) {
+        cached = item;
+        break;
+      }
+    }
+    if (cached) break;
+    auto fresh = std::make_unique<CachedContext>(ctx.generation);
+    fresh->next = head;
+    if (cached_contexts_.compare_exchange_weak(head, fresh.get(), std::memory_order_acq_rel,
+                                                std::memory_order_acquire))
+      cached = fresh.release();
+  }
+  auto& slot = cached->recipes[std::countr_zero(bucket)];
+  auto* result = slot.load(std::memory_order_acquire);
+  if (!result) {
+    std::lock_guard lock(ctx.cold_mutex);
+    result = slot.load(std::memory_order_relaxed);
+    if (!result) {
+      result = &recipe(ctx, bucket);
+      slot.store(result, std::memory_order_release);
+    }
+  }
+  return *result;
 }
 
 ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
@@ -3637,6 +3690,38 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
   return *it->second;
 }
 
+// Temporary storage remains live until launch. Holding the cold lock while
+// acquiring and returning it also keeps empty_cache() from destroying its pool.
+class ProgramTemporaries {
+ public:
+  ProgramTemporaries(Context& ctx, synStreamHandle stream) : ctx_(ctx), stream_(stream) {}
+  ~ProgramTemporaries() {
+    if (addresses_.empty()) return;
+    std::lock_guard lock(ctx_.cold_mutex);
+    for (auto address : addresses_) ctx_.graph_pool->free(address);
+  }
+  uint64_t allocate(uint64_t bytes) {
+    std::lock_guard lock(ctx_.cold_mutex);
+    if (!ctx_.graph_pool) {
+      const uint64_t budget = std::min<uint64_t>(ctx_.allocator.capacity_bytes() / 8, uint64_t{1} << 30);
+      TORCH_CHECK(budget >= 256, "GaudiRT FX: HBM budget is too small for graph temporaries");
+      ctx_.graph_pool = std::make_unique<GraphPool>(ctx_.allocator, budget, stream_);
+    }
+    const auto address = ctx_.graph_pool->allocate(bytes, stream_);
+    try {
+      addresses_.push_back(address);
+    } catch (...) {
+      ctx_.graph_pool->free(address);
+      throw;
+    }
+    return address;
+  }
+ private:
+  Context& ctx_;
+  synStreamHandle stream_;
+  c10::SmallVector<uint64_t, 4> addresses_;
+};
+
 std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs) {
   TORCH_CHECK(inputs.size() == roles_.size(), "GaudiRT FX: wrong input count");
   int64_t m = -1;
@@ -3685,19 +3770,10 @@ std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs
       results.push_back(at::empty(spec.sizes, inputs[dynamic_input].options().dtype(spec.dtype)));
     }
   }
-  std::lock_guard recipe_lock(ctx->cold_mutex);
-  auto& compiled = recipe(*ctx, bucket);
-  auto graph_pool = [&]() -> GraphPool& {
-    if (!ctx->graph_pool) {
-      const uint64_t budget = std::min<uint64_t>(ctx->allocator.capacity_bytes() / 8, uint64_t{1} << 30);
-      TORCH_CHECK(budget >= 256, "GaudiRT FX: HBM budget is too small for graph temporaries");
-      ctx->graph_pool = std::make_unique<GraphPool>(ctx->allocator, budget, stream);
-    }
-    return *ctx->graph_pool;
-  };
-  std::vector<std::unique_ptr<GraphTemporary>> staged;
-  std::vector<std::pair<uint64_t, uint64_t>> regions;
-  auto bindings = compiled.tensors;
+  auto& compiled = cached_recipe(*ctx, bucket);
+  ProgramTemporaries temporaries(*ctx, stream);
+  c10::SmallVector<std::pair<uint64_t, uint64_t>, 8> regions;
+  c10::SmallVector<synLaunchTensorInfo, 16> bindings(compiled.tensors.begin(), compiled.tensors.end());
   for (size_t i = 0; i < inputs.size(); ++i) {
     const auto& input = inputs[i];
     const auto& spec = specs_[i];
@@ -3725,14 +3801,13 @@ std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs
       if (address < other + length && other < address + bytes) direct = false;
     uint64_t binding = address;
     if (!direct) {
-      auto temp = std::make_unique<GraphTemporary>(graph_pool(), stream, bytes);
+      const auto temp = temporaries.allocate(bytes);
       if (embedding_inputs_[i] && m < bucket)
-        TORCH_CHECK(synMemsetD32Async(temp->address, 0, bucket, stream) == synSuccess,
+        TORCH_CHECK(synMemsetD32Async(temp, 0, bucket, stream) == synSuccess,
                     "GaudiRT FX: index tail zeroing failed");
       const Layout layout(input);
-      dma_copy(temp->address, nullptr, address, &layout, 0, input.numel(), item, stream, DRAM_TO_DRAM);
-      binding = temp->address;
-      staged.push_back(std::move(temp));
+      dma_copy(temp, nullptr, address, &layout, 0, input.numel(), item, stream, DRAM_TO_DRAM);
+      binding = temp;
     }
     regions.emplace_back(binding, bytes);
     bindings[i].pTensorAddress = binding;
@@ -3740,9 +3815,8 @@ std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs
   for (size_t i = 0; i < results.size(); ++i) {
     bindings[roles_.size() + i].pTensorAddress = reinterpret_cast<uint64_t>(results[i].data_ptr());
   }
-  std::unique_ptr<GraphTemporary> workspace;
-  if (compiled.workspace) workspace = std::make_unique<GraphTemporary>(graph_pool(), stream, compiled.workspace);
-  TORCH_CHECK(synLaunch(stream, bindings.data(), bindings.size(), workspace ? workspace->address : 0,
+  const uint64_t workspace = compiled.workspace ? temporaries.allocate(compiled.workspace) : 0;
+  TORCH_CHECK(synLaunch(stream, bindings.data(), bindings.size(), workspace,
                         compiled.recipe, 0) == synSuccess, "GaudiRT FX: program launch failed");
   return results;
 }
