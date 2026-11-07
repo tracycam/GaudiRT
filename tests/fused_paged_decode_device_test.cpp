@@ -136,9 +136,10 @@ int main(int argc, char** argv) {
     const uint32_t rows = argc >= 12 ? std::stoul(argv[11]) : 1;
     const uint32_t valid = argc >= 13 ? std::stoul(argv[12]) : rows;
     constexpr uint32_t tiles = 1, query_blocks = 1;
-    // This isolated test backs the entire static descriptor. `slots` varies
-    // the logical pool only; it is not evidence for physical-capacity reuse.
-    constexpr uint32_t max_slots = 32768;
+    // Only the runtime-sized K/V suballocation is populated. Its wider fixed
+    // descriptor stays inside the preallocated slab and the other graph I/O
+    // is placed before it; this is not a service allocator test.
+    constexpr uint32_t max_slots = 131072;
     if (!effective_kv || effective_kv > kv || effective_kv < valid || (rows > 1 && kv > 512) ||
         (mode != "cold" && mode != "warm") || (d != 64 && d != 128) || !rows || rows > 256 ||
         !valid || valid > rows || !kv || kv > 4096 || kv % 128 || !kvh || heads % kvh || heads > 256 ||
@@ -161,6 +162,15 @@ int main(int argc, char** argv) {
           (1 + ((i / page) * 5) % (slots / page - 1)) * page + i % page;
       indices[i / kv][i % kv] = static_cast<int32_t>(slot);
     }
+    // Include the final physical page while retaining page-contiguous slots.
+    const uint32_t target_page = ((effective_kv - 1) / page) * page;
+    auto last_page = std::find(indices[0].begin(), indices[0].end(), static_cast<int32_t>(slots - page));
+    if (last_page == indices[0].end()) {
+      for (uint32_t i = 0; i < page; ++i) indices[0][target_page + i] = slots - page + i;
+    } else {
+      const auto old_page = static_cast<uint32_t>(last_page - indices[0].begin());
+      for (uint32_t i = 0; i < page; ++i) std::swap(indices[0][target_page + i], indices[0][old_page + i]);
+    }
     std::vector<uint16_t> key_pool(static_cast<size_t>(slots) * width, 0x3e80);
     std::vector<uint16_t> value_pool(static_cast<size_t>(slots) * width, 0x3f00);
     for (uint32_t i = 0; i < tiles * kv; ++i) {
@@ -177,16 +187,15 @@ int main(int argc, char** argv) {
       positions[row] = static_cast<int32_t>(prefix + row);
       if (row < total_valid) locations[row] = indices[positions[row] / kv][positions[row] % kv];
     }
-    std::vector<uint16_t> physical_key(uint64_t{max_slots} * width, 0x3e80);
-    std::vector<uint16_t> physical_value(uint64_t{max_slots} * width, 0x3f00);
+    std::vector<uint16_t> physical_pool(uint64_t{2} * slots * width, 0);
     for (uint32_t head = 0; head < kvh; ++head)
       for (uint32_t slot = 0; slot < slots; ++slot)
         for (uint32_t col = 0; col < d; ++col) {
-          physical_key[(uint64_t{head} * max_slots + slot) * d + col] = key_pool[uint64_t{slot} * width + head * d + col];
-          physical_value[(uint64_t{head} * max_slots + slot) * d + col] = value_pool[uint64_t{slot} * width + head * d + col];
+          physical_pool[(uint64_t{head} * slots + slot) * d + col] = key_pool[uint64_t{slot} * width + head * d + col];
+          physical_pool[(uint64_t{kvh + head} * slots + slot) * d + col] = value_pool[uint64_t{slot} * width + head * d + col];
         }
     auto expected_key = key_pool, expected_value = value_pool;
-    auto expected_physical_key = physical_key, expected_physical_value = physical_value;
+    auto expected_physical_pool = physical_pool;
     for (uint32_t row = 0; row < total_valid; ++row) {
       std::copy_n(key_new.begin() + static_cast<size_t>(row) * width, width,
                   expected_key.begin() + static_cast<size_t>(locations[row]) * width);
@@ -194,9 +203,9 @@ int main(int argc, char** argv) {
                   expected_value.begin() + static_cast<size_t>(locations[row]) * width);
       for (uint32_t head = 0; head < kvh; ++head)
         for (uint32_t col = 0; col < d; ++col) {
-          auto physical = (uint64_t{head} * max_slots + locations[row]) * d + col;
-          expected_physical_key[physical] = key_new[uint64_t{row} * width + head * d + col];
-          expected_physical_value[physical] = value_new[uint64_t{row} * width + head * d + col];
+          auto physical = (uint64_t{head} * slots + locations[row]) * d + col;
+          expected_physical_pool[physical] = key_new[uint64_t{row} * width + head * d + col];
+          expected_physical_pool[uint64_t{slots} * width + physical] = value_new[uint64_t{row} * width + head * d + col];
         }
     }
 
@@ -207,25 +216,26 @@ int main(int argc, char** argv) {
     const auto key_new_addr = arena.allocate(key_new.size() * 2);
     const auto value_new_addr = arena.allocate(value_new.size() * 2);
     const auto locations_addr = arena.allocate(locations.size() * 4);
-    const auto valid_addr = arena.allocate(4);
+    const auto valid_addr = arena.allocate(12);
     const uint64_t header_offset = (uint64_t{rows} * 4 + 255) & ~uint64_t{255};
     const uint64_t metadata_bytes = header_offset + 256;
-    const uint64_t index_bytes = uint64_t{tiles} * kv * 4;
+    const uint64_t index_bytes = uint64_t{2} * tiles * kv * kvh * 4;
     const uint64_t metadata_total_bytes = uint64_t{query_blocks} * tiles * metadata_bytes;
     const auto metadata_base = arena.allocate(index_bytes + metadata_total_bytes);
     std::vector<uint64_t> index_addr(tiles), metadata_addr(query_blocks * tiles);
-    for (uint32_t tile = 0; tile < tiles; ++tile) index_addr[tile] = metadata_base + uint64_t{tile} * kv * 4;
+    for (uint32_t tile = 0; tile < tiles; ++tile) index_addr[tile] = metadata_base + uint64_t{2} * tile * kv * kvh * 4;
     for (uint32_t block = 0; block < query_blocks; ++block)
       for (uint32_t tile = 0; tile < tiles; ++tile)
         metadata_addr[block * tiles + tile] = metadata_base + index_bytes +
             uint64_t{block * tiles + tile} * metadata_bytes;
     const auto output_addr = arena.allocate(uint64_t{d} * total_rows * heads * 2);
-    const auto guard_before_key = arena.allocate(256);
-    const auto key_addr = arena.allocate(physical_key.size() * 2);
-    const auto guard_after_key = arena.allocate(256);
-    const auto guard_before_value = arena.allocate(256);
-    const auto value_addr = arena.allocate(physical_value.size() * 2);
-    const auto guard_after_value = arena.allocate(256);
+    const auto guard_before_pool = arena.allocate(256);
+    const auto pool_addr = arena.allocate(physical_pool.size() * 2);
+    const auto guard_after_pool = arena.allocate(256);
+    const uint64_t descriptor_bytes = uint64_t{2} * max_slots * width * 2;
+    if (pool_addr < arena.base_addr() ||
+        descriptor_bytes > arena.capacity_bytes() - (pool_addr - arena.base_addr()))
+      throw std::runtime_error("fixed descriptor exceeds allocated slab");
 
     auto h2d = [&](const void* source, uint64_t dest, uint64_t bytes) {
       arena.copy_h2d_sync(runtime.h2d_stream(), source, dest, bytes);
@@ -234,16 +244,20 @@ int main(int argc, char** argv) {
     h2d(key_new.data(), key_new_addr, key_new.size() * 2);
     h2d(value_new.data(), value_new_addr, value_new.size() * 2);
     h2d(locations.data(), locations_addr, locations.size() * 4);
-    h2d(&total_valid, valid_addr, 4);
-    h2d(physical_key.data(), key_addr, physical_key.size() * 2);
-    h2d(physical_value.data(), value_addr, physical_value.size() * 2);
+    const uint32_t valid_and_slots[] = {total_valid, slots, kvh};
+    h2d(valid_and_slots, valid_addr, sizeof(valid_and_slots));
+    h2d(physical_pool.data(), pool_addr, physical_pool.size() * 2);
     std::array<uint16_t, 128> guard{};
     guard.fill(0x4110);
-    for (auto address : {guard_before_key, guard_after_key, guard_before_value, guard_after_value})
+    for (auto address : {guard_before_pool, guard_after_pool})
       h2d(guard.data(), address, sizeof(guard));
     std::vector<int32_t> packed_metadata((index_bytes + metadata_total_bytes) / 4);
     for (uint32_t tile = 0; tile < tiles; ++tile)
-      std::copy(indices[tile].begin(), indices[tile].end(), packed_metadata.begin() + uint64_t{tile} * kv);
+      for (uint32_t head = 0; head < kvh; ++head)
+        for (uint32_t i = 0; i < kv; ++i) {
+            packed_metadata[(uint64_t{2 * tile} * kvh + head) * kv + i] = head * slots + indices[tile][i];
+            packed_metadata[(uint64_t{2 * tile + 1} * kvh + head) * kv + i] = (kvh + head) * slots + indices[tile][i];
+          }
     for (uint32_t block = 0; block < query_blocks; ++block) {
       for (uint32_t tile = 0; tile < tiles; ++tile) {
         const auto offset = (index_bytes + uint64_t{block * tiles + tile} * metadata_bytes) / 4;
@@ -268,24 +282,23 @@ int main(int argc, char** argv) {
     const auto sk = fused.tensor({width, total_rows}, syn_type_bf16, key_new_addr);
     const auto sv = fused.tensor({width, total_rows}, syn_type_bf16, value_new_addr);
     const auto sl = fused.tensor({total_rows}, syn_type_int32, locations_addr);
-    const auto sh = fused.tensor({1}, syn_type_int32, valid_addr);
-    const auto old_spk = fused.tensor({d, max_slots, kvh}, syn_type_bf16, key_addr);
-    const auto old_spv = fused.tensor({d, max_slots, kvh}, syn_type_bf16, value_addr);
-    const auto spk = fused.tensor({d, max_slots, kvh}, syn_type_bf16, key_addr, old_spk);
-    const auto spv = fused.tensor({d, max_slots, kvh}, syn_type_bf16, value_addr, old_spv);
-    const auto ti = fused.tensor({kv}, syn_type_int32, index_addr[0]);
+    const auto sh = fused.tensor({3}, syn_type_int32, valid_addr);
+    const auto old_pool = fused.tensor({d, 2 * max_slots * kvh}, syn_type_bf16, pool_addr);
+    const auto pool = fused.tensor({d, 2 * max_slots * kvh}, syn_type_bf16, pool_addr, old_pool);
+    const auto ti = fused.tensor({kv * kvh}, syn_type_int32, index_addr[0]);
+    const auto vi = fused.tensor({kv * kvh}, syn_type_int32, index_addr[0] + uint64_t{kv} * kvh * 4, ti, uint64_t{kv} * kvh * 4);
     const auto tp = fused.tensor({rows}, syn_type_int32, metadata_addr[0]);
     const auto th = fused.tensor({3}, syn_type_int32, metadata_addr[0] + header_offset, tp, header_offset);
     const auto result = rows == 1 ? fused.tensor({d, heads, rows}, syn_type_bf16, output_addr) :
                                     fused.tensor({d, rows, group, kvh}, syn_type_bf16, output_addr);
     if (rows > 1) check(synTensorSetPermutation(fused.tensors[result], &head_major), "output memory permutation");
-    fused.node("gk_kv_store_head_major_bf16_v1", {sk, sv, sl, sh, old_spk, old_spv}, {spk, spv});
+    fused.node("gk_kv_store_head_major_bf16_v1", {sk, sv, sl, sh, old_pool}, {pool});
     ns_GatherKernel::ParamsV2 gather{}; gather.axis = 1;
     std::array<size_t,2> cache_tiles{};
     for (unsigned which=0; which<2; ++which) {
-      const auto gathered=fused.tensor({d,kv,kvh}, syn_type_bf16);
+      const auto gathered=fused.tensor({d,kv * kvh}, syn_type_bf16);
       cache_tiles[which]=fused.tensor({d,kv,1,kvh},syn_type_bf16);
-      fused.node("gather_fwd_bf16", {which ? spv : spk, ti}, {gathered}, &gather, sizeof(gather));
+      fused.node("gather_fwd_bf16", {pool, which ? vi : ti}, {gathered}, &gather, sizeof(gather));
       fused.node("reshape", {gathered}, {cache_tiles[which]});
     }
     const auto score4=fused.tensor({kv,rows,group,kvh},syn_type_float);
@@ -344,17 +357,16 @@ int main(int argc, char** argv) {
     check(synEventElapsedTime(&elapsed_ns, start_event, end_event), "elapsed time");
     check(synEventDestroy(start_event), "destroy start event");
     check(synEventDestroy(end_event), "destroy end event");
-    std::vector<uint16_t> actual_key(physical_key.size()), actual_value(physical_value.size());
+    std::vector<uint16_t> actual_pool(physical_pool.size());
     std::vector<uint16_t> output(uint64_t{d} * total_rows * heads);
-    arena.copy_d2h_sync(runtime.d2h_stream(), key_addr, actual_key.data(), actual_key.size() * 2);
-    arena.copy_d2h_sync(runtime.d2h_stream(), value_addr, actual_value.data(), actual_value.size() * 2);
+    arena.copy_d2h_sync(runtime.d2h_stream(), pool_addr, actual_pool.data(), actual_pool.size() * 2);
     arena.copy_d2h_sync(runtime.d2h_stream(), output_addr, output.data(), output.size() * 2);
-    if (actual_key != expected_physical_key || actual_value != expected_physical_value)
+    if (actual_pool != expected_physical_pool)
       throw std::runtime_error("KV write corrupted a target or untouched slot");
     if (std::any_of(output.begin(), output.end(), [](uint16_t value) { return !std::isfinite(widen(value)); }))
       throw std::runtime_error("nonfinite attention output");
     std::array<uint16_t, 128> observed{};
-    for (auto address : {guard_before_key, guard_after_key, guard_before_value, guard_after_value}) {
+    for (auto address : {guard_before_pool, guard_after_pool}) {
       arena.copy_d2h_sync(runtime.d2h_stream(), address, observed.data(), sizeof(observed));
       if (observed != guard) throw std::runtime_error("KV guard changed");
     }
@@ -448,7 +460,7 @@ int main(int argc, char** argv) {
     bytes.write(reinterpret_cast<const char*>(output.data()), output.size() * 2);
     if (!bytes) throw std::runtime_error("output write failed");
     std::cout << "rows " << rows << " valid_rows " << valid
-              << " logical_slots " << slots << " physical_slots " << max_slots
+              << " logical_slots " << slots << " physical_slots " << slots
               << " page " << page << " effective_kv " << effective_kv << " tiles " << tiles
               << " query_blocks " << query_blocks << " reference_rows " << checked_rows.size() << " sections "
               << fused.sections.size()
