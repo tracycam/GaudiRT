@@ -1,4 +1,4 @@
-// Fused KV write and single-bucket paged Decode, with CPU references and whole-pool checks.
+// Fused single-bucket paged attention, with CPU references and whole-pool checks.
 #include "gaudirt/runtime/device_runtime.hpp"
 #include "gaudirt/runtime/hbm_arena.hpp"
 #include "gaudirt/runtime/recipe_registry.hpp"
@@ -125,25 +125,26 @@ struct Graph {
 
 int main(int argc, char** argv) {
   try {
-    if (argc != 10 && argc != 11)
-      throw std::invalid_argument("expected cache mode output d kv_bucket q_heads kv_heads slots page_size [effective_kv]");
+    if (argc < 10 || argc > 13)
+      throw std::invalid_argument("expected cache mode output d kv_bucket q_heads kv_heads slots page_size "
+                                  "[effective_kv [rows [valid_rows]]]");
     const std::string mode = argv[2];
     const uint32_t d = std::stoul(argv[4]), kv = std::stoul(argv[5]);
     const uint32_t heads = std::stoul(argv[6]), kvh = std::stoul(argv[7]);
     const uint32_t slots = std::stoul(argv[8]), page = std::stoul(argv[9]);
-    const uint32_t effective_kv = argc == 11 ? std::stoul(argv[10]) : kv;
-    constexpr uint32_t rows = 1, valid = 1, tiles = 1, query_blocks = 1;
+    const uint32_t effective_kv = argc >= 11 ? std::stoul(argv[10]) : kv;
+    const uint32_t rows = argc >= 12 ? std::stoul(argv[11]) : 1;
+    const uint32_t valid = argc >= 13 ? std::stoul(argv[12]) : rows;
+    constexpr uint32_t tiles = 1, query_blocks = 1;
     // This isolated test backs the entire static descriptor. `slots` varies
     // the logical pool only; it is not evidence for physical-capacity reuse.
     constexpr uint32_t max_slots = 32768;
-    if (rows != 1 || valid != 1 || query_blocks != 1 || tiles != 1 || !effective_kv || effective_kv > kv ||
+    if (!effective_kv || effective_kv > kv || effective_kv < valid || (rows > 1 && kv > 512) ||
         (mode != "cold" && mode != "warm") || (d != 64 && d != 128) || !rows || rows > 256 ||
         !valid || valid > rows || !kv || kv > 4096 || kv % 128 || !kvh || heads % kvh || heads > 256 ||
         uint64_t{kv} * rows * heads > 4ULL * 1024 * 1024 || kvh * d % 128 ||
         slots < 2048 || slots > max_slots || (page != 1 && page != 16) || slots % page ||
-        !tiles || uint64_t{tiles} * kv + page >= slots || valid > kv - 7 || !query_blocks ||
-        uint64_t{query_blocks} * rows > 4096 || (query_blocks > 1 &&
-        (valid != rows || uint64_t{query_blocks} * rows > uint64_t{tiles} * kv)))
+        uint64_t{tiles} * kv + page >= slots)
       throw std::invalid_argument("unsupported geometry");
     const uint32_t group = heads / kvh, width = kvh * d, total_rows = rows * query_blocks;
     const float scale = 1.f / std::sqrt(static_cast<float>(d));
@@ -170,9 +171,8 @@ int main(int argc, char** argv) {
       }
     }
     std::vector<int32_t> positions(total_rows), locations(total_rows, slots);
-    const uint32_t last_tile_row_start = rows == 1 ? effective_kv - 1 : 0;
-    const uint32_t prefix = query_blocks > 1 ? tiles * kv - total_rows : (tiles - 1) * kv + last_tile_row_start;
-    const uint32_t total_valid = query_blocks > 1 ? total_rows : valid;
+    const uint32_t prefix = effective_kv - valid;
+    const uint32_t total_valid = valid;
     for (uint32_t row = 0; row < total_rows; ++row) {
       positions[row] = static_cast<int32_t>(prefix + row);
       if (row < total_valid) locations[row] = indices[positions[row] / kv][positions[row] % kv];
@@ -258,6 +258,13 @@ int main(int argc, char** argv) {
         std::to_string(kv) + "_h" + std::to_string(heads) + "_kh" + std::to_string(kvh);
     Graph fused("fused_decode" + shape);
     const auto tq = fused.tensor({d, rows, group, kvh}, syn_type_bf16, q_addr);
+    synTensorPermutation head_major{};
+    head_major.dims = 4;
+    head_major.permutation[0] = 0;
+    head_major.permutation[1] = 2;
+    head_major.permutation[2] = 3;
+    head_major.permutation[3] = 1;
+    if (rows > 1) check(synTensorSetPermutation(fused.tensors[tq], &head_major), "Q memory permutation");
     const auto sk = fused.tensor({width, total_rows}, syn_type_bf16, key_new_addr);
     const auto sv = fused.tensor({width, total_rows}, syn_type_bf16, value_new_addr);
     const auto sl = fused.tensor({total_rows}, syn_type_int32, locations_addr);
@@ -269,7 +276,9 @@ int main(int argc, char** argv) {
     const auto ti = fused.tensor({kv}, syn_type_int32, index_addr[0]);
     const auto tp = fused.tensor({rows}, syn_type_int32, metadata_addr[0]);
     const auto th = fused.tensor({3}, syn_type_int32, metadata_addr[0] + header_offset, tp, header_offset);
-    const auto result = fused.tensor({d, heads, rows}, syn_type_bf16, output_addr);
+    const auto result = rows == 1 ? fused.tensor({d, heads, rows}, syn_type_bf16, output_addr) :
+                                    fused.tensor({d, rows, group, kvh}, syn_type_bf16, output_addr);
+    if (rows > 1) check(synTensorSetPermutation(fused.tensors[result], &head_major), "output memory permutation");
     fused.node("gk_kv_store_head_major_bf16_v1", {sk, sv, sl, sh, old_spk, old_spv}, {spk, spv});
     ns_GatherKernel::ParamsV2 gather{}; gather.axis = 1;
     std::array<size_t,2> cache_tiles{};
@@ -295,9 +304,13 @@ int main(int argc, char** argv) {
       fused.node("gk_attn_decode_normalize_bf16_v1",{exponent,sum},{probability3});
     }
     fused.node("reshape",{probability3},{probability4});
-    const auto output4=fused.tensor({d,rows,group,kvh},syn_type_bf16);
-    fused.node("batch_gemm",{probability4,cache_tiles[1]},{output4},&pv,sizeof(pv));
-    fused.node("reshape",{output4},{result});
+    if (rows == 1) {
+      const auto output4=fused.tensor({d,rows,group,kvh},syn_type_bf16);
+      fused.node("batch_gemm",{probability4,cache_tiles[1]},{output4},&pv,sizeof(pv));
+      fused.node("reshape",{output4},{result});
+    } else {
+      fused.node("batch_gemm",{probability4,cache_tiles[1]},{result},&pv,sizeof(pv));
+    }
     fused.compile(cache);
     if (fused.sections.size() >= 12) throw std::runtime_error("fused graph exceeds section budget");
     const auto counts=cache.stats();
@@ -434,7 +447,8 @@ int main(int argc, char** argv) {
     std::ofstream bytes(argv[3], std::ios::binary);
     bytes.write(reinterpret_cast<const char*>(output.data()), output.size() * 2);
     if (!bytes) throw std::runtime_error("output write failed");
-    std::cout << "logical_slots " << slots << " physical_slots " << max_slots
+    std::cout << "rows " << rows << " valid_rows " << valid
+              << " logical_slots " << slots << " physical_slots " << max_slots
               << " page " << page << " effective_kv " << effective_kv << " tiles " << tiles
               << " query_blocks " << query_blocks << " reference_rows " << checked_rows.size() << " sections "
               << fused.sections.size()
