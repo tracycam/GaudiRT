@@ -36,12 +36,10 @@ int main() {
     StreamEvent reusable(runtime.device_id()), ready(runtime.device_id());
     const auto before = event_count();
     for (uint64_t step = 0; step < steps; ++step) {
-      reusable.record(runtime.compute_stream());
-      reusable.wait(runtime.h2d_stream());
+      reusable.record_and_wait(runtime.compute_stream(), runtime.h2d_stream());
       check(synMemCopyAsync(runtime.h2d_stream(), reinterpret_cast<uint64_t>(input + step * bytes), bytes,
                             device_input, HOST_TO_DRAM), "H2D");
-      ready.record(runtime.h2d_stream());
-      ready.wait(runtime.compute_stream());
+      ready.record_and_wait(runtime.h2d_stream(), runtime.compute_stream());
       check(synMemCopyAsync(runtime.compute_stream(), device_input, bytes,
                             device_output + step * bytes, DRAM_TO_DRAM), "D2D");
     }

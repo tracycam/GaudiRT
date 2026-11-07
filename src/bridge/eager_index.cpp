@@ -110,8 +110,7 @@ void validate_indices(const at::Tensor& index, int64_t upper) {
               "GaudiRT: index check launch failed");
   auto d2h = ctx->device.d2h_stream();
   auto& ready = ctx->streams.state(active_stream_id).d2h_reusable;
-  ready.record(stream);
-  ready.wait(d2h);
+  ready.record_and_wait(stream, d2h);
   ctx->allocator.record_stream(result.address, d2h);
   TemporaryHost host(*ctx, sizeof(float));
   ctx->pinned.copy_d2h(host.address, result.address, sizeof(float), d2h, false);

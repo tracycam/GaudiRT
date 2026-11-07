@@ -60,7 +60,7 @@ BlockCachingAllocator::~BlockCachingAllocator() {
     (void)address;
     for (auto stream : block.streams) synStreamSynchronize(stream);
     for (const auto& fence : block.fences)
-      synEventSynchronize(static_cast<synEventHandle>(fence.event.get()));
+      events_.synchronize(fence.event);
   }
   blocks_.clear();
   if (base_ && owns_slab_) synDeviceFree(device_, base_, 0);
@@ -82,8 +82,7 @@ uint64_t BlockCachingAllocator::allocate(uint64_t bytes, synStreamHandle stream)
                              std::to_string(allocated_) + ", capacity=" +
                              std::to_string(capacity_));
   for (const auto& fence : best->second.fences)
-    check(synStreamWaitEvent(stream, static_cast<synEventHandle>(fence.event.get()), 0),
-          "stream wait failed");
+    check(events_.wait(fence.event, stream), "stream wait failed");
   const uint64_t address = best->first;
   if (best->second.bytes > size) {
     Block remainder{best->second.bytes - size, false, {}, {}};
@@ -152,8 +151,7 @@ void BlockCachingAllocator::free(uint64_t address) {
   std::vector<Fence> events;
   events.reserve(it->second.streams.size());
   for (auto stream : it->second.streams) {
-    auto event = events_.acquire(stream);
-    check(synEventRecord(event.get(), stream), "event record failed");
+    auto event = events_.record(stream);
     events.push_back({stream, ++next_fence_sequence_, std::move(event)});
   }
   allocated_ -= it->second.bytes;
@@ -168,7 +166,7 @@ void BlockCachingAllocator::empty_cache() {
   for (auto& [address, block] : blocks_) {
     (void)address;
     for (const auto& fence : block.fences)
-      check(synEventSynchronize(static_cast<synEventHandle>(fence.event.get())), "event wait failed");
+      check(events_.synchronize(fence.event), "event wait failed");
     block.fences.clear();
   }
   if (base_ && owns_slab_ && allocated_ == 0) {

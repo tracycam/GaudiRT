@@ -28,15 +28,22 @@ StreamEvent::StreamEvent(synDeviceId device) {
   check(synEventCreate(&event_, device, 0), "event creation failed");
 }
 StreamEvent::~StreamEvent() { if (event_) synEventDestroy(event_); }
-void StreamEvent::record(synStreamHandle stream) {
+void StreamEvent::record_and_wait(synStreamHandle producer, synStreamHandle consumer) {
+  if (!producer || !consumer) throw std::invalid_argument("StreamEvent: null stream");
+  std::lock_guard lock(mutex_);
+  check(synEventRecord(event_, producer), "event record failed");
+  check(synStreamWaitEvent(consumer, event_, 0), "stream wait failed");
+}
+void StreamEvent::record_and_synchronize(synStreamHandle stream) {
   if (!stream) throw std::invalid_argument("StreamEvent: null stream");
+  std::lock_guard lock(mutex_);
   check(synEventRecord(event_, stream), "event record failed");
+  check(synEventSynchronize(event_), "event wait failed");
 }
-void StreamEvent::wait(synStreamHandle stream) const {
-  if (!stream) throw std::invalid_argument("StreamEvent: null stream");
-  check(synStreamWaitEvent(stream, event_, 0), "stream wait failed");
+void StreamEvent::synchronize() const {
+  std::lock_guard lock(mutex_);
+  check(synEventSynchronize(event_), "event wait failed");
 }
-void StreamEvent::synchronize() const { check(synEventSynchronize(event_), "event wait failed"); }
 
 PinnedHostPool::PinnedHostPool(synDeviceId device, uint64_t bytes)
     : device_(device), capacity_(bytes & ~uint64_t{255}), events_(device) {
@@ -55,7 +62,7 @@ PinnedHostPool::~PinnedHostPool() {
     (void)address;
     for (auto stream : block.streams) synStreamSynchronize(stream);
     for (const auto& fence : block.fences)
-      synEventSynchronize(static_cast<synEventHandle>(fence.event.get()));
+      events_.synchronize(fence.event);
   }
   blocks_.clear();
   if (base_) synHostFree(device_, base_, 0);
@@ -70,7 +77,7 @@ void* PinnedHostPool::allocate(uint64_t bytes) {
   if (best == blocks_.end()) throw std::runtime_error("PinnedHostPool: out of pinned memory");
   // A host pointer can be dereferenced immediately, so a stream wait is not enough.
   for (const auto& fence : best->second.fences)
-    check(synEventSynchronize(static_cast<synEventHandle>(fence.event.get())), "reuse wait failed");
+    check(events_.synchronize(fence.event), "reuse wait failed");
   const uint64_t address = best->first;
   if (best->second.bytes > size)
     blocks_.emplace(address + size, Block{best->second.bytes - size, false, {}, {}});
@@ -88,8 +95,7 @@ void PinnedHostPool::free(void* address) {
   std::vector<Fence> events;
   events.reserve(it->second.streams.size());
   for (auto stream : it->second.streams) {
-    auto event = events_.acquire(stream);
-    check(synEventRecord(event.get(), stream), "event record failed");
+    auto event = events_.record(stream);
     events.push_back({stream, ++next_fence_sequence_, std::move(event)});
   }
   it->second.allocated = false;

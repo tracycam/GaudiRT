@@ -19,11 +19,12 @@ class StreamEvent {
   ~StreamEvent();
   StreamEvent(const StreamEvent&) = delete;
   StreamEvent& operator=(const StreamEvent&) = delete;
-  void record(synStreamHandle stream);
-  void wait(synStreamHandle stream) const;
+  void record_and_wait(synStreamHandle producer, synStreamHandle consumer);
+  void record_and_synchronize(synStreamHandle stream);
   void synchronize() const;
  private:
   synEventHandle event_ = nullptr;
+  mutable std::mutex mutex_;
 };
 
 // Buffers come from one synHostMalloc allocation and are already DMA mapped.

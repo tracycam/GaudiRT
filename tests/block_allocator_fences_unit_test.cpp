@@ -8,7 +8,7 @@
 #include <vector>
 
 namespace {
-struct RecordedEvent { synStreamHandle stream = nullptr; uint64_t ordinal = 0; };
+struct RecordedEvent { synStreamHandle stream = nullptr; uint64_t ordinal = 0; bool needs_wait = false; };
 std::map<synStreamHandle, uint64_t> recorded;
 std::vector<RecordedEvent> waited;
 uint64_t live_events = 0;
@@ -39,12 +39,19 @@ synStatus synEventDestroy(synEventHandle p) {
   return synSuccess;
 }
 synStatus synEventRecord(synEventHandle p, synStreamHandle s) {
-  *static_cast<RecordedEvent*>(p) = {s, ++recorded[s]};
+  auto& event = *static_cast<RecordedEvent*>(p);
+  assert(!event.needs_wait && "recorded event was reused without a wait");
+  event = {s, ++recorded[s], true};
   return synSuccess;
 }
-synStatus synEventSynchronize(synEventHandle) { return synSuccess; }
+synStatus synEventSynchronize(synEventHandle p) {
+  static_cast<RecordedEvent*>(p)->needs_wait = false;
+  return synSuccess;
+}
 synStatus synStreamWaitEvent(synStreamHandle, synEventHandle p, uint32_t) {
-  waited.push_back(*static_cast<RecordedEvent*>(p));
+  auto& event = *static_cast<RecordedEvent*>(p);
+  waited.push_back(event);
+  event.needs_wait = false;
   return synSuccess;
 }
 synStatus synStreamSynchronize(synStreamHandle) { return synSuccess; }

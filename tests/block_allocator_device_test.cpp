@@ -94,12 +94,10 @@ int main() {
     auto dst = pool.allocate(bytes, s);
     StreamEvent h2d_done(rt.device_id()), d2d_done(rt.device_id());
     host.copy_h2d(src, in, bytes, rt.h2d_stream(), true);
-    h2d_done.record(rt.h2d_stream());
-    h2d_done.wait(s);
+    h2d_done.record_and_wait(rt.h2d_stream(), s);
     host.copy_d2d(dst, src, bytes, s, true);
     pool.record_stream(src, s);
-    d2d_done.record(s);
-    d2d_done.wait(rt.d2h_stream());
+    d2d_done.record_and_wait(s, rt.d2h_stream());
     host.copy_d2h(out, dst, bytes, rt.d2h_stream(), true);
     pool.record_stream(dst, rt.d2h_stream());
     pool.free(src);

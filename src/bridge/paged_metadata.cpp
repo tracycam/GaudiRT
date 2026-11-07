@@ -193,8 +193,7 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& requ
   auto stream = ctx->device.h2d_stream();
   auto& reusable = stream_state.metadata_reusable;
   auto& ready = stream_state.metadata_ready;
-  reusable.record(compute);
-  reusable.wait(stream);
+  reusable.record_and_wait(compute, stream);
   uint64_t offset = 0;
   for (size_t i = 0; i < sources.size(); ++i) {
     const uint64_t bytes = sources[i]->size() * sizeof(int32_t);
@@ -205,8 +204,7 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& requ
     ctx->pinned.copy_h2d(destination, host + offset, bytes, stream, true);
     offset += bytes;
   }
-  ready.record(stream);
-  ready.wait(compute);
+  ready.record_and_wait(stream, compute);
   rows_ = m;
   slots_ = slots;
   request_count_ = request_count;
@@ -290,8 +288,7 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
     std::memcpy(host + 1 + info.size(), last_token_indices.data(), last_token_indices.size() * sizeof(int32_t));
     auto& reusable = stream_state.metadata_reusable;
     auto& ready = stream_state.metadata_ready;
-    reusable.record(compute);
-    reusable.wait(h2d);
+    reusable.record_and_wait(compute, h2d);
     for (const auto address : {header_address, info_address, last_token_address}) {
       ctx->allocator.record_stream(address, h2d);
       ctx->allocator.record_stream(address, compute);
@@ -300,8 +297,7 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
     ctx->pinned.copy_h2d(info_address, host + 1, info.size() * sizeof(int32_t), h2d, true);
     ctx->pinned.copy_h2d(last_token_address, host + 1 + info.size(),
                          last_token_indices.size() * sizeof(int32_t), h2d, true);
-    ready.record(h2d);
-    ready.wait(compute);
+    ready.record_and_wait(h2d, compute);
   }
   const std::array<at::Tensor, 4> sources{locations, batch_requests, positions, token_ids};
   const std::array<int, 4> lanes{locations.element_size() == 8 ? 2 : 1,
@@ -379,8 +375,7 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
     auto d2h = ctx->device.d2h_stream();
     auto& ready = stream_state.validation_ready;
     auto& completed = stream_state.validation_completed;
-    ready.record(compute);
-    ready.wait(d2h);
+    ready.record_and_wait(compute, d2h);
     ctx->allocator.record_stream(status_address, d2h);
     TemporaryHost host_status(*ctx, static_cast<uint64_t>(m) * sizeof(int32_t) * (has_tokens ? 2 : 1));
     ctx->pinned.copy_d2h(host_status.address, status_address, static_cast<uint64_t>(m) * sizeof(int32_t), d2h, true);
@@ -390,8 +385,7 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
       ctx->pinned.copy_d2h(static_cast<int32_t*>(host_status.address) + m, token_status_address,
                            static_cast<uint64_t>(m) * sizeof(int32_t), d2h, true);
     }
-    completed.record(d2h);
-    completed.synchronize();
+    completed.record_and_synchronize(d2h);
     const auto* flags = static_cast<const int32_t*>(host_status.address);
     for (int64_t row = 0; row < m; ++row)
       TORCH_CHECK(flags[row] == 0, "GaudiRT device metadata: invalid scheduler metadata at row ", row,

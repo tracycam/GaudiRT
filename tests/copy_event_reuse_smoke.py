@@ -83,8 +83,15 @@ def main():
     for cpu, _, pinned_out, host_out, _, _ in cases:
         assert torch.equal(cpu, pinned_out)
         assert torch.equal(cpu, host_out)
+    # A strided copy larger than the staging limit must wait before reusing
+    # the temporary for each subsequent chunk, without leaving a final record.
+    large_cpu = torch.arange(33 * 65536, dtype=torch.float32).reshape(33, 65536)
+    large_storage = torch.empty((33, 65537), dtype=torch.float32, device="gaudirt:0")
+    large_device = large_storage[:, :65536]
+    large_device.copy_(large_cpu, non_blocking=False)
+    assert torch.equal(large_device.cpu(), large_cpu)
     print("four-thread same-stream and mixed-stream copies: 256 steps; pinned/pageable, contiguous/strided;",
-          "event creations 0 destructions 0", flush=True)
+          "event creations 0 destructions 0; multichunk strided copy passed", flush=True)
 
 
 if __name__ == "__main__":

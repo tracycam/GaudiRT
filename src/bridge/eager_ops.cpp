@@ -499,12 +499,10 @@ at::Tensor& arange_out(const at::Scalar& start_value, const at::Scalar& end_valu
   auto h2d = ctx->device.h2d_stream();
   ctx->allocator.record_stream(scalars.address, h2d);
   auto& reusable = ctx->streams.state(active_stream_id).h2d_reusable;
-  reusable.record(stream);
-  reusable.wait(h2d);
+  reusable.record_and_wait(stream, h2d);
   ctx->pinned.copy_h2d(scalars.address, host.address, 512, h2d, true);
   auto& ready = ctx->streams.state(active_stream_id).h2d_ready;
-  ready.record(h2d);
-  ready.wait(stream);
+  ready.record_and_wait(h2d, stream);
   std::unique_ptr<TemporaryDevice> output, workspace;
   if (!out.is_contiguous() || target % BlockCachingAllocator::kAlignment)
     output = std::make_unique<TemporaryDevice>(*ctx, out.nbytes());

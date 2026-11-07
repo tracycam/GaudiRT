@@ -326,12 +326,10 @@ at::Tensor& fill(at::Tensor& tensor, const at::Scalar& scalar) {
   std::memcpy(host.address, &pattern, scalar_bytes);
   ctx->allocator.record_stream(value.address, h2d);
   auto& reusable = ctx->streams.state(active_stream_id).h2d_reusable;
-  reusable.record(compute);
-  reusable.wait(h2d);
+  reusable.record_and_wait(compute, h2d);
   ctx->pinned.copy_h2d(value.address, host.address, scalar_bytes, h2d, true);
   auto& ready = ctx->streams.state(active_stream_id).h2d_ready;
-  ready.record(h2d);
-  ready.wait(compute);
+  ready.record_and_wait(h2d, compute);
   std::unique_ptr<TemporaryDevice> output;
   const uint64_t graph_bytes = width == 8 ? tensor.nbytes() : ((tensor.nbytes() + 3) & ~uint64_t{3});
   if (!tensor.is_contiguous() || address % BlockCachingAllocator::kAlignment ||
@@ -583,12 +581,10 @@ at::Tensor& copy(at::Tensor& dst, const at::Tensor& src, bool non_blocking) {
       const Layout sl(src);
       ctx->pinned.record_stream(src.data_ptr(), stream);
       ctx->allocator.record_stream(device, stream);
-      reusable.record(compute);
-      reusable.wait(stream);
+      reusable.record_and_wait(compute, stream);
       dma_copy(device, &dl, reinterpret_cast<uint64_t>(src.data_ptr()), &sl,
                0, elements, item, stream, HOST_TO_DRAM);
-      ready.record(stream);
-      ready.wait(compute);
+      ready.record_and_wait(stream, compute);
       if (!non_blocking) ready.synchronize();
       return dst;
     }
@@ -601,25 +597,23 @@ at::Tensor& copy(at::Tensor& dst, const at::Tensor& src, bool non_blocking) {
     } else {
       ctx->allocator.record_stream(device, stream);
     }
-    reusable.record(compute);
-    reusable.wait(stream);
+    reusable.record_and_wait(compute, stream);
     for (uint64_t start = 0; start < elements; start += chunk_elements) {
       const auto count = std::min(chunk_elements, elements - start);
       TemporaryHost host(*ctx, count * item);
       host_copy(static_cast<uint8_t*>(host.address), src, start, count, true);
-      if (temporary && start) reusable.wait(stream);
+      if (temporary && start) {
+        reusable.record_and_wait(compute, stream);
+      }
       const auto target = temporary ? temporary->address : device + start * item;
       ctx->pinned.copy_h2d(target, host.address, count * item, stream, true);
       if (temporary) {
-        ready.record(stream);
-        ready.wait(compute);
+        ready.record_and_wait(stream, compute);
         dma_copy(device, &dl, temporary->address, nullptr, start, count, item, compute, DRAM_TO_DRAM);
-        reusable.record(compute);
       }
     }
     if (!temporary) {
-      ready.record(stream);
-      ready.wait(compute);
+      ready.record_and_wait(stream, compute);
     }
     if (!non_blocking) ctx->synchronize_stream();
   } else {
@@ -631,12 +625,10 @@ at::Tensor& copy(at::Tensor& dst, const at::Tensor& src, bool non_blocking) {
       const Layout dl(dst);
       ctx->pinned.record_stream(dst.data_ptr(), stream);
       ctx->allocator.record_stream(device, stream);
-      ready.record(compute);
-      ready.wait(stream);
+      ready.record_and_wait(compute, stream);
       dma_copy(reinterpret_cast<uint64_t>(dst.data_ptr()), &dl, device, &sl,
                0, elements, item, stream, DRAM_TO_HOST);
-      done.record(stream);
-      done.wait(compute);
+      done.record_and_wait(stream, compute);
       if (!non_blocking) done.synchronize();
       return dst;
     }
@@ -655,8 +647,7 @@ at::Tensor& copy(at::Tensor& dst, const at::Tensor& src, bool non_blocking) {
       TemporaryHost host(*ctx, count * item);
       if (temporary)
         dma_copy(temporary->address, nullptr, device, &sl, start, count, item, compute, DRAM_TO_DRAM);
-      ready.record(compute);
-      ready.wait(stream);
+      ready.record_and_wait(compute, stream);
       const auto source = temporary ? temporary->address : device + start * item;
       ctx->pinned.copy_d2h(host.address, source, count * item, stream, false);
       host_copy(static_cast<uint8_t*>(host.address), dst, start, count, false);

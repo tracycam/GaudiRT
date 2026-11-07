@@ -48,9 +48,10 @@ int main() {
       check(synMemCopyAsync(consumer, reused, bytes, output + i * bytes, DRAM_TO_DRAM), "D2D");
       pool.free(reused);
     };
-    step(0);
+    // Prime all three producer streams before checking steady-state events.
+    for (uint64_t i = 0; i < streams.size(); ++i) step(i);
     const auto before_create = creates(), before_destroy = destroys();
-    for (uint64_t i = 1; i < steps; ++i) step(i);
+    for (uint64_t i = streams.size(); i < steps; ++i) step(i);
     if (creates() != before_create || destroys() != before_destroy)
       throw std::runtime_error("event created or destroyed after allocator warmup");
     for (const auto stream : streams) check(synStreamSynchronize(stream), "stream wait");
