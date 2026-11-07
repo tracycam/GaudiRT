@@ -1,4 +1,8 @@
-"""Two connected BF16 norm/linear/residual layers with dynamic token counts."""
+"""Check dynamic buckets against a reference rounded at each stored op boundary.
+
+This is a compiler and storage-boundary smoke test, not a full decoder-layer
+numerical gate: the latter requires pure FP32 or FP64 inside the entire layer.
+"""
 
 import hashlib
 import os
@@ -44,10 +48,10 @@ def check_norm(x, gamma, gamma_cpu):
     denom = torch.linalg.vector_norm(truth, dim=-1).clamp_min(1e-30)
     error = (torch.linalg.vector_norm(actual - truth, dim=-1) / denom).max().item()
     floor_error = (torch.linalg.vector_norm(floor - truth, dim=-1) / denom).max().item()
-    assert error <= max(3e-3, 2 * floor_error) and error <= 1e-2, (error, floor_error)
+    assert error <= max(3e-3, 2 * floor_error) and error <= 3e-3, (error, floor_error)
 
 
-def check(output, x, gamma, weight, bias, residual, epsilon=EPSILON_FP32):
+def check_stored_boundaries(output, x, gamma, weight, bias, residual, epsilon=EPSILON_FP32):
     actual = output.cpu().double()
     x64, g64 = x.double(), gamma.double()
     norm64 = direct_bf16(x64 * torch.rsqrt((x64 * x64).mean(-1, keepdim=True) + epsilon) * g64)
@@ -108,7 +112,7 @@ def main():
         first = compiled(x, gammas[0], weights[0], biases[0], r1)
         before_second = gaudirt.recipe_cache_stats()
         assert first.shape == (m, 64) and first.untyped_storage().nbytes() % 256 == 0
-        data, error, floor, absolute = check(first, x_cpu, gamma_cpu[0], weights_cpu[0], bias_cpu[0], r1_cpu)
+        data, error, floor, absolute = check_stored_boundaries(first, x_cpu, gamma_cpu[0], weights_cpu[0], bias_cpu[0], r1_cpu)
         payload.extend(data); errors.append(error); floors.append(floor); absolutes.append(absolute)
         if m == 17:
             probe_x, probe_r, probe_output = x, r1, first.cpu()
@@ -116,7 +120,7 @@ def main():
             midpoint_x = x
         second = compiled(first, gammas[1], weights[1], biases[1], r2)
         assert gaudirt.recipe_cache_stats() == before_second, "isomorphic layer recompiled"
-        data, error, floor, absolute = check(second, first.cpu(), gamma_cpu[1], weights_cpu[1], bias_cpu[1], r2_cpu)
+        data, error, floor, absolute = check_stored_boundaries(second, first.cpu(), gamma_cpu[1], weights_cpu[1], bias_cpu[1], r2_cpu)
         payload.extend(data); errors.append(error); floors.append(floor); absolutes.append(absolute)
     assert len(captures) == 1, captures
     before = gaudirt.recipe_cache_stats()
@@ -128,7 +132,7 @@ def main():
     elif os.environ.get("GAUDIRT_TEST_CACHE") == "warm":
         assert before[:2] == [8, 0], before
     print("norm program cache stats:", before, "max_row_relative_l2:", max(errors),
-          "max_cpu_fp32_floor:", max(floors), "max_abs:", max(absolutes),
+          "max_cpu_fp32_per_op_stored_boundary_error:", max(floors), "max_abs:", max(absolutes),
           "output sha256:", hashlib.sha256(payload).hexdigest(), flush=True)
     if path := os.environ.get("GAUDIRT_TEST_OUTPUT"):
         with open(path, "wb") as output:
@@ -139,7 +143,7 @@ def main():
     after_variant = gaudirt.recipe_cache_stats()
     assert after_variant[2] == before[2] + 1 and len(captures) == 3
     assert not torch.equal(variant.cpu().view(torch.int16), probe_output.view(torch.int16))
-    check(variant, probe_x.cpu(), gamma_cpu[0], weights_cpu[0], bias_cpu[0], probe_r.cpu(), epsilon=0.5)
+    check_stored_boundaries(variant, probe_x.cpu(), gamma_cpu[0], weights_cpu[0], bias_cpu[0], probe_r.cpu(), epsilon=0.5)
     for epsilon in (0.0, -1.0, float("inf"), float("nan")):
         try:
             torch.ops.gaudirt.rms_norm.default(probe_x, gammas[0], epsilon)
