@@ -34,8 +34,8 @@ def reference(input, cache, positions, head_dim, rotary_dim, neox, fp64):
     cosine, sine = cosine.unsqueeze(1), sine.unsqueeze(1)
     rotated, remainder = x[..., :rotary_dim], x[..., rotary_dim:]
     a, b = rotated.chunk(2, dim=-1) if neox else (rotated[..., ::2], rotated[..., 1::2])
-    first = rounded(rounded(a * cosine) - rounded(b * sine))
-    second = rounded(rounded(b * cosine) + rounded(a * sine))
+    first = rounded(a * cosine - b * sine)
+    second = rounded(b * cosine + a * sine)
     rotated = torch.cat((first, second), -1) if neox else torch.stack((first, second), -1).flatten(-2)
     return torch.cat((rotated, remainder), -1).reshape(input.shape).double()
 
