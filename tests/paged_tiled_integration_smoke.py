@@ -31,9 +31,10 @@ def main():
     kv_heads, dim = (2, 128) if heads == 4 else (8, 128)
     slots = int(os.environ.get("GAUDIRT_TEST_SLOTS", "2048"))
     context = int(os.environ.get("GAUDIRT_TEST_CONTEXT", "1024"))
-    assert slots > 1024 and context >= 1024
+    request_count = int(os.environ.get("GAUDIRT_TEST_REQUESTS", "1"))
+    assert slots > 1024 and context >= 1024 and 1 <= request_count <= 256
     gaudirt.initialize(hbm_bytes=1024 * 1024 * 1024, pinned_bytes=8 * 1024 * 1024)
-    mapping = (torch.arange(context, dtype=torch.int32) % (slots - 1) + 1).reshape(1, -1)
+    mapping = (torch.arange(context, dtype=torch.int32) % (slots - 1) + 1).reshape(1, -1).repeat(request_count, 1)
     head_map = torch.arange(heads) // (heads // kv_heads)
     scale = torch.tensor(1 / math.sqrt(dim), dtype=torch.float32).item()
     payload = bytearray()
@@ -90,7 +91,8 @@ def main():
             output.write(payload)
     gaudirt.empty_cache()
     gaudirt.shutdown()
-    print("cache", counts, "output sha256", hashlib.sha256(payload).hexdigest(), flush=True)
+    print("slots", slots, "context", context, "requests", request_count,
+          "cache", counts, "output sha256", hashlib.sha256(payload).hexdigest(), flush=True)
 
 
 if __name__ == "__main__":
