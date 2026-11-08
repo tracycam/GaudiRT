@@ -165,6 +165,10 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& requ
     host_locations[i] = static_cast<int32_t>(slot);
     host_requests[i] = static_cast<int32_t>(request);
     host_positions[i] = static_cast<int32_t>(position);
+    if (i == 0 || host_requests[i - 1] != request || host_positions[i - 1] + 1 != position)
+      sequences_.push_back({static_cast<int32_t>(i), 1, static_cast<int32_t>(position)});
+    else
+      ++sequences_.back().length;
     max_position[request] = std::max(max_position[request], static_cast<int32_t>(position));
   }
   for (int64_t request = 0; request < request_count; ++request) {
@@ -245,6 +249,8 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
     const auto prefix = prefixes[index], length = lengths[index];
     TORCH_CHECK(prefix >= 0 && prefix < context && length > 0 && length <= context - prefix &&
                 length <= m - cursor, "GaudiRT device metadata: invalid sequence lengths");
+    sequences_.push_back({static_cast<int32_t>(cursor), static_cast<int32_t>(length),
+                          static_cast<int32_t>(prefix)});
     info[1 + 2 * bucket + index] = static_cast<int32_t>(prefix);
     info[1 + 3 * bucket + index] = static_cast<int32_t>(length);
     for (int64_t offset = 0; offset < length; ++offset, ++cursor) {

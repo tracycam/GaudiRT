@@ -54,6 +54,7 @@ class PagedMetadata : public torch::CustomClassHolder {
   at::Tensor row_locations() const { return locations_.narrow(0, 0, rows_); }
   at::Tensor row_requests() const { return requests_.narrow(0, 0, rows_); }
   at::Tensor request_mapping() const { return mapping_; }
+  at::Tensor attention_plan(int64_t query_heads, int64_t kv_heads, int64_t head_dim);
   at::Tensor last_token_indices() const {
     TORCH_CHECK(last_token_indices_.defined(), "GaudiRT: last-token indices require batched metadata");
     return last_token_indices_;
@@ -67,6 +68,9 @@ class PagedMetadata : public torch::CustomClassHolder {
   int64_t rows_ = 0, slots_ = 0, request_count_ = 0, context_ = 0, vocabulary_ = 0;
   uint32_t bucket_ = 0;
   at::Tensor locations_, requests_, positions_, mapping_, header_, token_ids_, last_token_indices_;
+  struct Sequence { int32_t row, length, prefix; };
+  std::vector<Sequence> sequences_;
+  at::Tensor attention_plan_;
 };
 
 }  // namespace gaudirt::generic

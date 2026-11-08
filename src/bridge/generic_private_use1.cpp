@@ -610,6 +610,7 @@ TORCH_LIBRARY(gaudirt, m) {
       .def("row_locations", &gaudirt::generic::PagedMetadata::row_locations)
       .def("row_requests", &gaudirt::generic::PagedMetadata::row_requests)
       .def("request_mapping", &gaudirt::generic::PagedMetadata::request_mapping)
+      .def("attention_plan", &gaudirt::generic::PagedMetadata::attention_plan)
       .def("last_token_indices", &gaudirt::generic::PagedMetadata::last_token_indices)
       .def("token_ids", &gaudirt::generic::PagedMetadata::token_ids)
       .def("vocabulary", &gaudirt::generic::PagedMetadata::vocabulary);

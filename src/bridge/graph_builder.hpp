@@ -40,7 +40,9 @@ class SynapseGraphBuilder {
   SynapseGraphBuilder(const SynapseGraphBuilder&) = delete;
   SynapseGraphBuilder& operator=(const SynapseGraphBuilder&) = delete;
 
-  synTensor tensor(synDataType type, const std::vector<uint64_t>& dims, int slot);
+  synTensor tensor(synDataType type, const std::vector<uint64_t>& dims, int slot,
+                   int shared_slot = -1, uint64_t offset = 0, bool dynamic = false);
+  void permutation(synTensor tensor, const synTensorPermutation& permutation);
   void node(const NodeSpec& node);
   void compile(runtime::RecipeCache& cache, const std::string& key);
 
@@ -49,6 +51,7 @@ class SynapseGraphBuilder {
   ColdRecipe& recipe_;
   synGraphHandle graph_ = nullptr;
   std::vector<synSectionHandle> sections_;
+  std::vector<synSectionHandle> slot_sections_;
   std::vector<synTensor> tensors_;
   std::deque<std::string> tensor_names_;
   size_t next_node_ = 0;
