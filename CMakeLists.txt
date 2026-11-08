@@ -40,7 +40,7 @@ if(GAUDIRT_BUILD_TORCH)
         src/bridge/context.cpp src/bridge/context_allocator.cpp src/bridge/layout_copy.cpp
         src/bridge/paged_metadata.cpp src/bridge/attention_plan.cpp src/bridge/paged_attention.cpp
         src/bridge/paged_attention_tiles.cpp
-        src/bridge/paged_kv_pool.cpp src/bridge/eager_copy.cpp src/bridge/eager_ops.cpp
+        src/bridge/paged_kv_pool.cpp src/bridge/paged_slot_allocator.cpp src/bridge/eager_copy.cpp src/bridge/eager_ops.cpp
         src/bridge/eager_index.cpp
         src/bridge/bucket_program.cpp
         src/bridge/tensor_spec.cpp src/bridge/fx_node.cpp

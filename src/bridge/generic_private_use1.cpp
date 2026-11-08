@@ -14,6 +14,7 @@
 #include "paged_metadata.hpp"
 #include "paged_attention.hpp"
 #include "paged_kv_pool.hpp"
+#include "paged_slot_allocator.hpp"
 #include "temporaries.hpp"
 
 #include <perf_lib_layer_params.h>
@@ -653,6 +654,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("_recipe_cache_keys", &gaudirt::generic::recipe_cache_keys);
   m.def("_prepare_strided_input", &gaudirt::generic::prepare_strided_input);
   m.def("_allocate_paged_kv", &gaudirt::generic::allocate_paged_kv);
+  m.def("_allocate_paged_slots", &gaudirt::generic::allocate_paged_slots);
+  m.def("_release_paged_slots", &gaudirt::generic::release_paged_slots);
   m.def("_restore_staged_alias", &gaudirt::generic::restore_staged_alias);
   m.def("_feature_view", &gaudirt::generic::feature_view);
   m.def("_reshape_view", &gaudirt::generic::reshape_view);
