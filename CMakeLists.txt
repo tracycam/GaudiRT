@@ -72,6 +72,8 @@ target_link_libraries(fixed_tile_paged_attention_device_test PRIVATE gaudirt)
 
 add_executable(fused_paged_decode_device_test tests/fused_paged_decode_device_test.cpp)
 target_link_libraries(fused_paged_decode_device_test PRIVATE gaudirt)
+add_executable(attention_tile_indices_device_test tests/attention_tile_indices_device_test.cpp)
+target_link_libraries(attention_tile_indices_device_test PRIVATE gaudirt)
 add_executable(direct_softmax_device_test tests/direct_softmax_device_test.cpp)
 target_link_libraries(direct_softmax_device_test PRIVATE gaudirt)
 
