@@ -158,6 +158,7 @@ at::Tensor PagedMetadata::attention_plan(int64_t query_heads, int64_t kv_heads, 
   const uint64_t host_bytes = host.size() * sizeof(int32_t);
   plan->bytes = index_bytes + host_bytes;
   const auto compute = ctx->stream();
+  plan->stream = compute;
   plan->address = ctx->allocator.allocate(plan->bytes, compute);
   const auto address = plan->address;
   const auto bytes = plan->bytes;

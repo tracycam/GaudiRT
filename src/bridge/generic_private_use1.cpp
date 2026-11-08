@@ -12,6 +12,7 @@
 #include "layout_copy.hpp"
 #include "eager_copy.hpp"
 #include "paged_metadata.hpp"
+#include "paged_attention.hpp"
 #include "paged_kv_pool.hpp"
 #include "temporaries.hpp"
 
@@ -416,19 +417,16 @@ at::Tensor bucket_silu_and_mul(const at::Tensor& input) {
   return program.run({input})[0];
 }
 
-at::Tensor paged_attn_validated(const at::Tensor&, const at::Tensor&, const at::Tensor&,
-    const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
-    const at::Tensor&, const at::Tensor&, const at::Tensor&, int64_t, double) {
-  TORCH_CHECK(false, "GaudiRT paged attention: tiled MME attention is not yet implemented");
-}
-
 at::Tensor paged_attn(const at::Tensor& query, const at::Tensor& key, const at::Tensor& value,
                       const at::Tensor& key_pool, const at::Tensor& value_pool,
                       c10::intrusive_ptr<PagedMetadata> metadata, int64_t head_dim, double scale) {
   TORCH_CHECK(metadata, "GaudiRT paged attention: metadata is required");
+  TORCH_CHECK(query.dim() == 2 && key_pool.dim() == 3 && (head_dim == 64 || head_dim == 128),
+              "GaudiRT paged attention: invalid tensor ranks or head dimension");
   return paged_attn_validated(query, key, value, key_pool, value_pool,
                               metadata->row_locations(), metadata->row_requests(), metadata->rotary_positions(),
-                              metadata->request_mapping(), metadata->rotary_header(), head_dim, scale);
+                              metadata->attention_plan(query.size(1) / head_dim, key_pool.size(1), head_dim),
+                              metadata->rotary_header(), head_dim, scale);
 }
 
 ColdRecipe& rotary_recipe(Context& ctx, uint32_t bucket, uint64_t q_width,
