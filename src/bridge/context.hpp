@@ -74,6 +74,7 @@ struct Context {
   runtime::RecipeCache cache;
   std::mutex cold_mutex;
   std::unordered_map<std::string, std::unique_ptr<ColdRecipe>> cold_recipes;
+  std::unordered_map<std::string, std::pair<uint64_t, uint64_t>> attention_zero_states;
   std::unordered_set<EventState*> events;
 };
 

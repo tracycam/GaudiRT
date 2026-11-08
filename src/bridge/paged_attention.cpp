@@ -6,6 +6,7 @@
 #include "graph_builder.hpp"
 #include "layout_copy.hpp"
 #include "paged_kv_pool.hpp"
+#include "paged_attention_tiles.hpp"
 #include "temporaries.hpp"
 #include "gaudirt/common/sha256.hpp"
 
@@ -150,8 +151,6 @@ at::Tensor paged_attn_validated(const at::Tensor& query, const at::Tensor& key, 
               pool_address - storage_base <= pool_storage.nbytes() &&
               descriptor_bytes <= pool_storage.nbytes() - (pool_address - storage_base),
               "GaudiRT attention: KV pool descriptor is not backed by combined storage");
-  for (const auto& block : plan.blocks)
-    TORCH_CHECK(block.tiles.size() == 1, "GaudiRT attention: multi-tile execution is not yet implemented");
   for (const auto& input : {query, key, value, locations, key_pool}) record_if_needed(*ctx, input, stream);
   const auto output_bucket = std::bit_ceil(static_cast<uint32_t>(plan.rows));
   auto output = bucket_output(query, at::kBFloat16, output_bucket, plan.rows, query.size(1));
@@ -200,23 +199,29 @@ at::Tensor paged_attn_validated(const at::Tensor& query, const at::Tensor& key, 
       out_binding = staged->address;
       temporary.push_back(std::move(staged));
     }
-    ColdRecipe* recipe;
-    {
-      std::lock_guard lock(ctx->cold_mutex);
-      recipe = &fused_recipe(*ctx, plan, block, scale_f);
+    if (block.tiles.size() > 1) {
+      launch_tiled_attention(*ctx, plan, block,
+                             {q_address, k_address, v_address, locations_address, pool_address, out_binding},
+                             scale_f);
+    } else {
+      ColdRecipe* recipe;
+      {
+        std::lock_guard lock(ctx->cold_mutex);
+        recipe = &fused_recipe(*ctx, plan, block, scale_f);
+      }
+      auto bindings = recipe->tensors;
+      const uint64_t value_indices_offset = static_cast<uint64_t>(block.kv_bucket) * plan.kv_heads * sizeof(int32_t);
+      const std::array<uint64_t, kFusedSlots> addresses{
+          q_address, k_address, v_address, locations_address, plan.address + block.store_header_offset,
+          pool_address, pool_address, plan.address + tile.indices_offset,
+          plan.address + tile.indices_offset + value_indices_offset, plan.address + block.positions_offset,
+          plan.address + tile.header_offset, out_binding};
+      for (size_t i = 0; i < addresses.size(); ++i) bindings[i].pTensorAddress = addresses[i];
+      std::unique_ptr<TemporaryDevice> workspace;
+      if (recipe->workspace) workspace = std::make_unique<TemporaryDevice>(*ctx, recipe->workspace);
+      TORCH_CHECK(synLaunch(stream, bindings.data(), bindings.size(), workspace ? workspace->address : 0,
+                            recipe->recipe, 0) == synSuccess, "GaudiRT attention: fused launch failed");
     }
-    auto bindings = recipe->tensors;
-    const uint64_t value_indices_offset = static_cast<uint64_t>(block.kv_bucket) * plan.kv_heads * sizeof(int32_t);
-    const std::array<uint64_t, kFusedSlots> addresses{
-        q_address, k_address, v_address, locations_address, plan.address + block.store_header_offset,
-        pool_address, pool_address, plan.address + tile.indices_offset,
-        plan.address + tile.indices_offset + value_indices_offset, plan.address + block.positions_offset,
-        plan.address + tile.header_offset, out_binding};
-    for (size_t i = 0; i < addresses.size(); ++i) bindings[i].pTensorAddress = addresses[i];
-    std::unique_ptr<TemporaryDevice> workspace;
-    if (recipe->workspace) workspace = std::make_unique<TemporaryDevice>(*ctx, recipe->workspace);
-    TORCH_CHECK(synLaunch(stream, bindings.data(), bindings.size(), workspace ? workspace->address : 0,
-                          recipe->recipe, 0) == synSuccess, "GaudiRT attention: fused launch failed");
     if (!direct_out)
       TORCH_CHECK(synMemCopyAsync(stream, out_binding,
           static_cast<uint64_t>(block.valid_rows) * query.size(1) * sizeof(uint16_t), out, DRAM_TO_DRAM) == synSuccess,

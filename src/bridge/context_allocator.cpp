@@ -350,7 +350,12 @@ void shutdown() {
     TORCH_CHECK(!context->graph_pool || context->graph_pool->memory_allocated() == 0,
                 "GaudiRT: graph tensors must be destroyed before shutdown");
     const uint64_t row_counts = context->row_count_table ? Context::kRowCountTableBytes : 0;
-    TORCH_CHECK(context->allocator.memory_allocated() == graph_reservation + row_counts,
+    uint64_t attention_zero_bytes = 0;
+    for (const auto& [key, allocation] : context->attention_zero_states) {
+      (void)key;
+      attention_zero_bytes += allocation.second;
+    }
+    TORCH_CHECK(context->allocator.memory_allocated() == graph_reservation + row_counts + attention_zero_bytes,
                 "GaudiRT: device tensors must be destroyed before shutdown");
     TORCH_CHECK(context->pinned.memory_allocated() == 0,
                 "GaudiRT: pinned tensors must be destroyed before shutdown");

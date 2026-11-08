@@ -23,7 +23,8 @@ def tiled_bf16_pv(query, key_pool, value_pool, requests, positions, mapping,
             tile_sum = probabilities.sum(dim=-1)
             # This is a separate isolated-operator reference, not the pure
             # FP32 baseline used to determine a complete decoder-layer gate.
-            tile_output = torch.einsum("ht,thd->hd", probabilities.to(torch.bfloat16).float(), values)
+            normalized = (probabilities / tile_sum[:, None]).to(torch.bfloat16).float()
+            tile_output = torch.einsum("ht,thd->hd", normalized, values) * tile_sum[:, None]
             if running_max is None:
                 running_max, running_sum, running_output = tile_max, tile_sum, tile_output
                 continue

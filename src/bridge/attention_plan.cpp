@@ -156,7 +156,15 @@ at::Tensor PagedMetadata::attention_plan(int64_t query_heads, int64_t kv_heads, 
   }
   host.resize(align(host.size() * sizeof(int32_t)) / sizeof(int32_t), 0);
   const uint64_t host_bytes = host.size() * sizeof(int32_t);
-  plan->bytes = index_bytes + host_bytes;
+  plan->scratch_offset = index_bytes + host_bytes;
+  plan->scratch_bytes = 0;
+  for (const auto& block : plan->blocks) {
+    if (block.tiles.size() <= 1) continue;
+    const uint64_t stats = align(((block.query_bucket + 63) / 64 * 64) * query_heads * sizeof(float));
+    const uint64_t output = align(static_cast<uint64_t>(block.query_bucket) * query_heads * head_dim * sizeof(float));
+    plan->scratch_bytes = std::max(plan->scratch_bytes, 2 * (2 * stats + output));
+  }
+  plan->bytes = plan->scratch_offset + plan->scratch_bytes;
   const auto compute = ctx->stream();
   plan->stream = compute;
   plan->address = ctx->allocator.allocate(plan->bytes, compute);

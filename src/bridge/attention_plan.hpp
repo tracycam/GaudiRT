@@ -33,6 +33,8 @@ struct AttentionPlan {
   std::weak_ptr<Context> owner;
   uint64_t address;
   uint64_t bytes;
+  uint64_t scratch_offset;
+  uint64_t scratch_bytes;
   synStreamHandle stream;
   int64_t rows, slots, query_heads, kv_heads, head_dim;
   std::vector<AttentionBlock> blocks;
