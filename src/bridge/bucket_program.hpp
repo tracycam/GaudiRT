@@ -5,6 +5,8 @@
 #include "tensor_spec.hpp"
 
 #include <ATen/core/Tensor.h>
+#include <c10/util/intrusive_ptr.h>
+#include <synapse_api.h>
 
 #include <array>
 #include <atomic>
@@ -33,9 +35,28 @@ class BucketProgram {
     std::array<std::atomic<ColdRecipe*>, 13> recipes{};
   };
 
+  struct StaticInput {
+    size_t index;
+    c10::weak_intrusive_ptr<at::TensorImpl, at::UndefinedTensorImpl> tensor;
+    uint64_t address, bytes;
+    uint32_t version;
+    bool versioned;
+    std::vector<int64_t> strides;
+  };
+  struct StaticBindings {
+    uint64_t generation;
+    synStreamHandle stream;
+    std::vector<StaticInput> inputs;
+    StaticBindings* next = nullptr;
+  };
+
   void initialize_geometry(const std::vector<at::Tensor>& inputs);
   ColdRecipe& recipe(Context& ctx, uint32_t bucket);
   ColdRecipe& cached_recipe(Context& ctx, uint32_t bucket);
+  const StaticBindings* find_static_bindings(const std::vector<at::Tensor>& inputs,
+                                              const Context& ctx, synStreamHandle stream) const;
+  const StaticBindings* bind_static_inputs(const std::vector<at::Tensor>& inputs,
+                                           Context& ctx, synStreamHandle stream);
 
   std::vector<int64_t> roles_;
   std::vector<FxNode> operations_;
@@ -45,6 +66,9 @@ class BucketProgram {
   std::string digest_;
   std::once_flag geometry_once_;
   std::atomic<CachedContext*> cached_contexts_{nullptr};
+  std::vector<size_t> static_input_indices_;
+  std::atomic<StaticBindings*> static_bindings_{nullptr};
+  std::atomic<unsigned> static_binding_count_{0};
 };
 
 }  // namespace gaudirt::generic

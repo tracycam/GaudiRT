@@ -124,6 +124,27 @@ BucketProgram::BucketProgram(std::vector<int64_t> roles, std::vector<FxNode> ope
     TORCH_CHECK(id >= static_cast<int64_t>(roles_.size()) &&
                 id < static_cast<int64_t>(roles_.size() + operations_.size()),
                 "GaudiRT FX: output must be a program operation");
+  std::vector<bool> static_inputs(roles_.size(), false);
+  const auto mark_weight = [&](int64_t id) {
+    if (id >= 0 && id < static_cast<int64_t>(roles_.size()) && !roles_[id]) static_inputs[id] = true;
+  };
+  for (const auto& op : operations_) {
+    switch (op.op) {
+      case FxOp::linear:
+        mark_weight(op.inputs[1]);
+        if (op.inputs.size() == 3) mark_weight(op.inputs[2]);
+        break;
+      case FxOp::rms_norm: case FxOp::embedding:
+        mark_weight(op.inputs[1]);
+        break;
+      case FxOp::fused_add_rms_norm: case FxOp::rotary:
+        mark_weight(op.inputs[2]);
+        break;
+      default: break;
+    }
+  }
+  for (size_t i = 0; i < static_inputs.size(); ++i)
+    if (static_inputs[i]) static_input_indices_.push_back(i);
 }
 
 BucketProgram::~BucketProgram() {
@@ -133,12 +154,81 @@ BucketProgram::~BucketProgram() {
     delete cache;
     cache = next;
   }
+  auto* bindings = static_bindings_.load(std::memory_order_relaxed);
+  while (bindings) {
+    auto* next = bindings->next;
+    delete bindings;
+    bindings = next;
+  }
 }
 
 void BucketProgram::initialize_geometry(const std::vector<at::Tensor>& inputs) {
   auto geometry = infer_fx_geometry(inputs, roles_, operations_, outputs_);
   specs_ = std::move(geometry.specs);
   digest_ = std::move(geometry.digest);
+}
+
+const BucketProgram::StaticBindings* BucketProgram::find_static_bindings(
+    const std::vector<at::Tensor>& inputs, const Context& ctx, synStreamHandle stream) const {
+  for (auto* binding = static_bindings_.load(std::memory_order_acquire); binding; binding = binding->next) {
+    if (binding->generation != ctx.generation || binding->stream != stream) continue;
+    bool matches = true;
+    for (const auto& cached : binding->inputs) {
+      const auto& value = inputs[cached.index];
+      const auto* impl = value.unsafeGetTensorImpl();
+      if (impl != cached.tensor._unsafe_get_target() ||
+          reinterpret_cast<uint64_t>(value.data_ptr()) != cached.address) {
+        matches = false;
+        break;
+      }
+      const auto& version = impl->version_counter();
+      if (version.enabled() != cached.versioned ||
+          (cached.versioned && version.current_version() != cached.version) ||
+          (!cached.versioned && (value.sizes().vec() != specs_[cached.index].sizes ||
+                                 value.strides().vec() != cached.strides))) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches) return binding;
+  }
+  return nullptr;
+}
+
+const BucketProgram::StaticBindings* BucketProgram::bind_static_inputs(
+    const std::vector<at::Tensor>& inputs, Context& ctx, synStreamHandle stream) {
+  if (static_input_indices_.empty() || static_binding_count_.load(std::memory_order_relaxed) >= 64) return nullptr;
+  auto binding = std::make_unique<StaticBindings>();
+  binding->generation = ctx.generation;
+  binding->stream = stream;
+  binding->inputs.reserve(static_input_indices_.size());
+  for (const auto index : static_input_indices_) {
+    const auto& input = inputs[index];
+    const auto& allocation = validated_program_input(input, ctx);
+    const auto address = reinterpret_cast<uint64_t>(input.data_ptr());
+    const auto base = reinterpret_cast<uint64_t>(input.storage().data());
+    const auto bytes = input.nbytes(), storage = input.storage().nbytes();
+    if (!input.is_contiguous() || address % BlockCachingAllocator::kAlignment != 0 || address < base ||
+        address - base > storage || bytes > storage - (address - base)) return nullptr;
+    for (const auto& other : binding->inputs)
+      if (address < other.address + other.bytes && other.address < address + bytes) return nullptr;
+    if (allocation.stream != stream) {
+      if (allocation.kind == AllocationKind::graph) ctx.graph_pool->record_stream(address, stream);
+      else ctx.allocator.record_stream(address, stream);
+    }
+    const auto& version = input.unsafeGetTensorImpl()->version_counter();
+    binding->inputs.push_back({index,
+        c10::weak_intrusive_ptr<at::TensorImpl, at::UndefinedTensorImpl>(input.getIntrusivePtr()),
+        address, bytes, version.enabled() ? version.current_version() : 0, version.enabled(),
+        version.enabled() ? std::vector<int64_t>{} : input.strides().vec()});
+  }
+  auto* head = static_bindings_.load(std::memory_order_acquire);
+  do {
+    binding->next = head;
+  } while (!static_bindings_.compare_exchange_weak(head, binding.get(), std::memory_order_acq_rel,
+                                                    std::memory_order_acquire));
+  static_binding_count_.fetch_add(1, std::memory_order_relaxed);
+  return binding.release();
 }
 
 ColdRecipe& BucketProgram::cached_recipe(Context& ctx, uint32_t bucket) {
@@ -513,7 +603,16 @@ std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs
   }
   TORCH_CHECK(m > 0 && m <= 4096, "GaudiRT FX: token count outside 1..4096");
   std::call_once(geometry_once_, [&] { initialize_geometry(inputs); });
+  auto ctx = current();
+  auto stream = ctx->stream();
+  auto* static_binding = find_static_bindings(inputs, *ctx, stream);
+  size_t next_static = 0;
   for (size_t i = 0; i < inputs.size(); ++i) {
+    if (static_binding && next_static < static_binding->inputs.size() &&
+        static_binding->inputs[next_static].index == i) {
+      ++next_static;
+      continue;
+    }
     const auto& input = inputs[i];
     const auto& spec = specs_[i];
     TORCH_CHECK(input.device().type() == c10::kPrivateUse1 && input.device().index() == 0 &&
@@ -524,9 +623,8 @@ std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs
       TORCH_CHECK(input.size(dim) == expected, "GaudiRT FX: input geometry changed");
     }
   }
+  if (!static_binding) static_binding = bind_static_inputs(inputs, *ctx, stream);
   const uint32_t bucket = std::bit_ceil(static_cast<uint32_t>(m));
-  auto ctx = current();
-  auto stream = ctx->stream();
   std::vector<at::Tensor> results;
   results.reserve(outputs_.size());
   for (auto id : outputs_) {
@@ -548,7 +646,19 @@ std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs
   ProgramTemporaries temporaries(*ctx, stream);
   c10::SmallVector<std::pair<uint64_t, uint64_t>, 8> regions;
   c10::SmallVector<synLaunchTensorInfo, 16> bindings(compiled.tensors.begin(), compiled.tensors.end());
+  if (static_binding) {
+    for (const auto& cached : static_binding->inputs) {
+      regions.emplace_back(cached.address, cached.bytes);
+      bindings[cached.index].pTensorAddress = cached.address;
+    }
+  }
+  next_static = 0;
   for (size_t i = 0; i < inputs.size(); ++i) {
+    if (static_binding && next_static < static_binding->inputs.size() &&
+        static_binding->inputs[next_static].index == i) {
+      ++next_static;
+      continue;
+    }
     const auto& input = inputs[i];
     const auto& spec = specs_[i];
     const uint64_t item = input.element_size();
