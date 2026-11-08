@@ -55,9 +55,23 @@ def main():
         actual = fn(x_cpu.to("gaudirt:0"), weights[0]).cpu()
         assert torch.allclose(actual, F.linear(x_cpu, host[0]), atol=2e-4, rtol=2e-4)
         assert calls == [2, 1], calls
+        with torch.inference_mode():
+            host.append(torch.randn(64, 64, generator=rng))
+            weights.append(host[-1].to("gaudirt:0"))
+            calls.append(0)
+            for rows in (3, 17, 1):
+                x_cpu = torch.randn(rows, 64, generator=rng)
+                actual = fn(x_cpu.to("gaudirt:0"), weights[2]).cpu()
+                assert torch.allclose(actual, F.linear(x_cpu, host[2]), atol=2e-4, rtol=2e-4)
+            host[2].mul_(0.5)
+            weights[2].copy_(host[2])
+            x_cpu = torch.randn(3, 64, generator=rng)
+            actual = fn(x_cpu.to("gaudirt:0"), weights[2]).cpu()
+            assert torch.allclose(actual, F.linear(x_cpu, host[2]), atol=2e-4, rtol=2e-4)
+        assert calls == [2, 1, 1], calls
     finally:
         sys.setprofile(previous)
-    assert len(captures) == 1, captures
+    assert len(captures) == 2, captures
     print("static tensor signature evaluations", calls, "FX captures", len(captures), flush=True)
 
 

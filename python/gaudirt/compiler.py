@@ -601,8 +601,10 @@ def compile(module, dynamic_arg_indices=(0,)):
         try:
             version = value._version
         except RuntimeError:
-            torch._dynamo.mark_static(value)
-            return signature(value)
+            # Inference tensors have no version counter. Dynamo still guards
+            # their metadata; changing the storage address invalidates this
+            # token, while in-place value updates are consumed by the graph.
+            version = None
         address = value.data_ptr()
         while len(static_signatures) <= index:
             static_signatures.append([])
