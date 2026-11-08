@@ -54,7 +54,7 @@ def reference(x, residual, params, fp64):
     normalized = rounded(residual * torch.rsqrt((residual * residual).mean(-1, keepdim=True) + EPSILON_FP32)
                          * gamma2)
     gate, value = rounded(normalized @ up.t()).chunk(2, dim=-1)
-    activated = rounded(rounded(gate / (1 + torch.exp(-gate))) * value)
+    activated = rounded((gate / (1 + torch.exp(-gate))) * value)
     return rounded(activated @ down.t()).double(), residual.double()
 
 

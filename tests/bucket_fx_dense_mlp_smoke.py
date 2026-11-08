@@ -41,8 +41,7 @@ def reference(x, gamma, gate_weight, gate_bias, down_weight, down_bias, residual
     normalized = rounded(x * torch.rsqrt((x * x).mean(-1, keepdim=True) + EPSILON_FP32) * gamma)
     gate_up = rounded(normalized @ gate_weight.t() + gate_bias)
     gate, up = gate_up.chunk(2, dim=-1)
-    activated = rounded(gate / (1.0 + torch.exp(-gate)))
-    multiplied = rounded(activated * up)
+    multiplied = rounded((gate / (1.0 + torch.exp(-gate))) * up)
     down = rounded(multiplied @ down_weight.t() + down_bias)
     return rounded(down + residual).double()
 
@@ -115,7 +114,7 @@ def main():
     eager = torch.ops.gaudirt.silu_and_mul.default(packed)
     assert eager.shape == (3, 129) and eager.untyped_storage().nbytes() % 256 == 0
     gate, up = packed_cpu.double().chunk(2, dim=-1)
-    truth = direct_bf16(direct_bf16(gate / (1 + torch.exp(-gate))) * up)
+    truth = direct_bf16((gate / (1 + torch.exp(-gate))) * up)
     actual = eager.cpu().double()
     assert torch.isfinite(actual).all() and torch.isfinite(truth).all()
     eager_error = (torch.linalg.vector_norm(actual - truth, dim=-1) /
