@@ -68,10 +68,16 @@ def main():
             x_cpu = torch.randn(3, 64, generator=rng)
             actual = fn(x_cpu.to("gaudirt:0"), weights[2]).cpu()
             assert torch.allclose(actual, F.linear(x_cpu, host[2]), atol=2e-4, rtol=2e-4)
+            address = weights[2].data_ptr()
+            weights[2].set_(weights[2].untyped_storage(), 0, (32, 64), (64, 1))
+            host[2] = host[2][:32]
+            assert weights[2].data_ptr() == address
+            actual = fn(x_cpu.to("gaudirt:0"), weights[2]).cpu()
+            assert torch.allclose(actual, F.linear(x_cpu, host[2]), atol=2e-4, rtol=2e-4)
         assert calls == [2, 1, 1], calls
     finally:
         sys.setprofile(previous)
-    assert len(captures) == 2, captures
+    assert len(captures) == 3, captures
     print("static tensor signature evaluations", calls, "FX captures", len(captures), flush=True)
 
 
