@@ -5,6 +5,7 @@ import functools
 import math
 import operator
 import struct
+import threading
 import weakref
 
 import torch
@@ -559,7 +560,20 @@ def gaudirt_backend(graph_module, example_inputs):
 
 def compile(module, dynamic_arg_indices=(0,)):
     """Capture once with unpadded token tensors and dispatch the supported FX graph."""
-    compiled = torch.compile(module, backend=gaudirt_backend, dynamic=True, fullgraph=True)
+    class CaptureConfigRequired(Exception):
+        pass
+
+    capture = threading.local()
+
+    def guarded_backend(graph, inputs):
+        # A changed Dynamo guard can require capture even when the inexpensive
+        # outer signature is unchanged. Never build that graph without the
+        # configuration used for the first capture.
+        if not getattr(capture, "enabled", False):
+            raise CaptureConfigRequired()
+        return gaudirt_backend(graph, inputs)
+
+    compiled = torch.compile(module, backend=guarded_backend, dynamic=True, fullgraph=True)
     captured_signatures = set()
     static_signatures = []
     signature_tokens = {}
@@ -575,7 +589,10 @@ def compile(module, dynamic_arg_indices=(0,)):
             return (type(value), tuple(signature(item) for item in value))
         if isinstance(value, dict):
             return (dict, tuple((key, signature(item)) for key, item in sorted(value.items())))
-        return (type(value), id(value))
+        # Dynamo guards actual object identity and the attributes it consumed.
+        # A freshly created scheduler metadata object need not force a config
+        # patch on every step when those guards still hit.
+        return (type(value),)
 
     def static_tensor_token(value, index):
         # Parameters and buffers are normally the same Tensor objects at every
@@ -630,15 +647,27 @@ def compile(module, dynamic_arg_indices=(0,)):
         key = (tuple(static_tokens[index] if static_tokens[index] is not None else
                      signature(value, index in dynamic_arg_indices)
                      for index, value in enumerate(prepared_args)), signature(kwargs))
-        if key not in captured_signatures:
-            with torch._dynamo.config.patch(specialize_float=True, suppress_errors=False,
-                                           fail_on_recompile_limit_hit=True), \
-                 torch.fx.experimental._config.patch(backed_size_oblivious=True, use_duck_shape=False), \
-                 torch._dynamo.error_on_graph_break(True):
+        needs_capture = key not in captured_signatures
+        while True:
+            if needs_capture:
+                with torch._dynamo.config.patch(specialize_float=True, suppress_errors=False,
+                                               fail_on_recompile_limit_hit=True), \
+                     torch.fx.experimental._config.patch(backed_size_oblivious=True, use_duck_shape=False), \
+                     torch._dynamo.error_on_graph_break(True):
+                    capture.enabled = True
+                    try:
+                        result = compiled(*prepared_args, **kwargs)
+                    finally:
+                        capture.enabled = False
+                captured_signatures.add(key)
+                break
+            try:
                 result = compiled(*prepared_args, **kwargs)
-            captured_signatures.add(key)
-        else:
-            result = compiled(*prepared_args, **kwargs)
+                break
+            except torch._dynamo.exc.BackendCompilerFailed as error:
+                if not isinstance(error.inner_exception, CaptureConfigRequired):
+                    raise
+                needs_capture = True
 
         return _restore_staged_outputs(result, replacements) if replacements else result
 

@@ -17,6 +17,15 @@ def projection(value, weight):
     return F.linear(value, weight)
 
 
+def add_option(value, options):
+    return value + options.offset
+
+
+class Options:
+    def __init__(self, offset):
+        self.offset = offset
+
+
 def main():
     torch.set_num_threads(4)
     torch.random.default_generator.manual_seed(248)
@@ -58,6 +67,23 @@ def main():
     assert len(captures) == 2, captures
     assert calls == [2, 2], calls
     print("FX captures", len(captures), "capture configuration patch calls", calls, flush=True)
+
+    captures.clear()
+    calls[:] = [0, 0]
+    value = torch.randn(3, 16)
+    device_value = value.to("gaudirt:0")
+    compiled_options = compiler.compile(add_option)
+    previous_profile = sys.getprofile()
+    sys.setprofile(profile)
+    try:
+        for offset in (1.5, 1.5, 2.5, 2.5):
+            result = compiled_options(device_value, Options(offset)).cpu()
+            assert torch.equal(result, value + offset)
+    finally:
+        sys.setprofile(previous_profile)
+    assert len(captures) == 2, captures
+    assert calls == [2, 2], calls
+    print("FX object guard recompiles", len(captures), "capture configuration patch calls", calls, flush=True)
 
 
 if __name__ == "__main__":
