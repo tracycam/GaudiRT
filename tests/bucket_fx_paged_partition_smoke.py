@@ -26,6 +26,17 @@ def connected(x, qkv_weight, out_weight, key_pool, value_pool, locations, reques
     return output.view(-1, 4, 64).reshape(x.shape[0], -1)
 
 
+def connected_compact(x, qkv_weight, out_weight, key_pool, value_pool, locations, requests,
+                      positions, mapping, header):
+    query, key, value = F.linear(x, qkv_weight).split([256, 128, 128], dim=-1)
+    query, key = query * 1.0, key * 1.0
+    attention = torch.ops.gaudirt._paged_attn_validated.default(
+        query, key, value, key_pool, value_pool,
+        locations, requests, positions, mapping, header, 64, 0.125,
+    )
+    return F.linear(attention, out_weight).view(-1, 4, 64).reshape(x.shape[0], -1)
+
+
 def reference(x, qkv_weight, out_weight, key_pool, value_pool, locations, requests,
               positions, mapping, fp64):
     dtype = torch.float64 if fp64 else torch.float32
@@ -54,6 +65,9 @@ def main():
     captures, observed, calls, executors, profile_events = [], [], [], [], []
     tracing = os.environ.get("GAUDIRT_TEST_SEGMENT_TRACE") == "1"
     profiling = os.environ.get("GAUDIRT_TEST_SEGMENT_PROFILE") == "1"
+    compact = os.environ.get("GAUDIRT_TEST_COMPACT_QKV") == "1"
+    compact_reference = os.environ.get("GAUDIRT_TEST_COMPACT_REFERENCE") == "1"
+    assert not compact or tracing
     reference_split = os.environ.get("GAUDIRT_TEST_REFERENCE_SPLIT") == "1"
     assert not (tracing and profiling)
 
@@ -91,6 +105,11 @@ def main():
 
                 def observe(*args, index=index, previous=previous):
                     output = previous(*args)
+                    if compact and not compact_reference and index == 0:
+                        values = output if isinstance(output, (tuple, list)) else (output,)
+                        kv = [value for value in values if isinstance(value, torch.Tensor) and
+                              value.ndim == 2 and value.shape[-1] == 128]
+                        assert len(kv) == 2 and all(value.is_contiguous() for value in kv), kv
                     observed.append(index)
                     return output
 
@@ -108,7 +127,7 @@ def main():
         return execution
 
     compiler.gaudirt_backend = capture
-    compiled = compiler.compile(connected, dynamic_arg_indices=(0, 5, 6, 7))
+    compiled = compiler.compile(connected_compact if compact else connected, dynamic_arg_indices=(0, 5, 6, 7))
     qkv_weight, out_weight = [(torch.randn(*shape) * 0.025).to(torch.bfloat16)
                               for shape in ((512, 256), (256, 256))]
     device_weights = [weight.to("gaudirt:0") for weight in (qkv_weight, out_weight)]

@@ -40,7 +40,7 @@ def _restore_staged_outputs(value, replacements):
     return value
 
 
-def _program_backend(graph_module, example_inputs):
+def _program_backend(graph_module, example_inputs, compact_outputs=()):
     nodes = tuple(graph_module.graph.nodes)
     placeholders = tuple(node for node in nodes if node.op == "placeholder")
     if len(placeholders) != len(example_inputs):
@@ -450,7 +450,17 @@ def _program_backend(graph_module, example_inputs):
         operations.append(operation)
     if output is None or any(value not in ids for value in output):
         raise RuntimeError("GaudiRT FX: unsupported program output")
-    output_ids = [alias_views[value][0] if value in alias_views else ids[value] for value in output]
+    output_bases = [alias_views[value][0] if value in alias_views else ids[value] for value in output]
+    output_ids, output_views = [], []
+    for index, value in enumerate(output):
+        base, views = alias_views.get(value, (ids[value], ()))
+        # Only internal values consumed exclusively by attention may lose the
+        # producer's stride. Public outputs and shared views retain aliasing.
+        compact = (index in compact_outputs and base >= len(tensor_indices) and
+                   output_bases.count(base) == 1 and len(views) == 1 and
+                   views[0][0] == "feature" and ids[value] != base)
+        output_ids.append(ids[value] if compact else base)
+        output_views.append(() if compact else views)
     computed_ids = list(dict.fromkeys(value for value in output_ids if value >= len(tensor_indices)))
     if operations and not computed_ids and any(
         operation.op not in (Op.feature_slice, Op.reshape, Op.transpose) for operation in operations
@@ -462,8 +472,8 @@ def _program_backend(graph_module, example_inputs):
     computed_slots = {value: index for index, value in enumerate(computed_ids)}
     result_routes = tuple((value < len(tensor_indices),
                            tensor_indices[value] if value < len(tensor_indices) else computed_slots[value],
-                           alias_views.get(node, (None, ()))[1])
-                          for node, value in zip(output, output_ids))
+                           views)
+                          for value, views in zip(output_ids, output_views))
     dynamic_argument = tensor_indices[roles.index(1)] if validated_row_bindings else None
 
     def execute(*args):
@@ -613,6 +623,30 @@ def _segment_executor(split, example_inputs, paged):
                 result.append(("literal", value))
         return tuple(result)
 
+    def attention_only(value):
+        if not value.users:
+            return False
+        for user in value.users:
+            if user.op != "call_module":
+                return False
+            target = split.get_submodule(user.target)
+            if not any(item.op == "call_function" and item.target in paged for item in target.graph.nodes):
+                return False
+        return True
+
+    def compact_attention_outputs(node, segment):
+        returned = next(item for item in segment.graph.nodes if item.op == "output").args[0]
+        if isinstance(returned, torch.fx.Node):
+            return (0,) if attention_only(node) else ()
+        if not isinstance(returned, (tuple, list)):
+            return ()
+        eligible = set()
+        for user in node.users:
+            if (user.op == "call_function" and user.target is operator.getitem and
+                    len(user.args) == 2 and isinstance(user.args[1], int) and attention_only(user)):
+                eligible.add(user.args[1])
+        return tuple(sorted(eligible))
+
     for node in graph_nodes:
         if node.op == "placeholder":
             continue
@@ -674,7 +708,7 @@ def _segment_executor(split, example_inputs, paged):
             continue
         examples = [item.meta.get("example_value") for item in segment_inputs]
         program, tensor_arguments, routes, single, token_bindings, row_bindings = \
-            _program_backend(segment, examples)._gaudirt_segment
+            _program_backend(segment, examples, compact_attention_outputs(node, segment))._gaudirt_segment
         slots = [tensor_slot(node.args[index]) for index in tensor_arguments]
         compiled_routes = []
         for is_input, index, operations in routes:
