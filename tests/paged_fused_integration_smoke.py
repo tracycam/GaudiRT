@@ -22,7 +22,7 @@ atexit.register(assert_no_bridge)
 import torch
 import gaudirt
 from fp64_reference import direct_bf16
-from paged_attention_reference import isolated_errors, tiled_bf16_pv
+from paged_attention_reference import isolated_errors
 
 
 def main():
@@ -90,9 +90,6 @@ def main():
             ref_pv.append(torch.einsum("ht,thd->hd", probabilities, vs.float()))
         ref64 = direct_bf16(torch.stack(ref64).reshape(rows, -1))
         ref_pv = torch.stack(ref_pv).reshape(rows, -1).to(torch.bfloat16).double()
-        if case == "decode" and prefix + 1 > 512:
-            ref_pv = tiled_bf16_pv(query, expected_key, expected_value, requests, positions, mapping,
-                                   heads, kv_heads, dim, scale, 512)
         actual = result.cpu().double()
         err64, err_pv = isolated_errors(actual, ref64, ref_pv)
         payload.extend(result.cpu().view(torch.int16).numpy().tobytes())

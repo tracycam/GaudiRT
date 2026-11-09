@@ -217,9 +217,7 @@ int main(int argc, char** argv) {
     const auto value_new_addr = arena.allocate(value_new.size() * 2);
     const auto locations_addr = arena.allocate(locations.size() * 4);
     const auto valid_addr = arena.allocate(12);
-    const bool tiled_decode = rows == 1 && kv > 512;
-    const uint32_t decode_tiles = tiled_decode ? kv / 512 : 1;
-    const uint64_t header_offset = (uint64_t{tiled_decode ? decode_tiles : rows} * 4 + 255) & ~uint64_t{255};
+    const uint64_t header_offset = (uint64_t{rows} * 4 + 255) & ~uint64_t{255};
     const uint64_t metadata_bytes = header_offset + 256;
     const uint64_t index_bytes = uint64_t{2} * tiles * kv * kvh * 4;
     const uint64_t metadata_total_bytes = uint64_t{query_blocks} * tiles * metadata_bytes;
@@ -263,23 +261,14 @@ int main(int argc, char** argv) {
     for (uint32_t block = 0; block < query_blocks; ++block) {
       for (uint32_t tile = 0; tile < tiles; ++tile) {
         const auto offset = (index_bytes + uint64_t{block * tiles + tile} * metadata_bytes) / 4;
-        if (tiled_decode) {
-          for (uint32_t part = 0; part < decode_tiles; ++part)
-            packed_metadata[offset + part] = std::clamp(static_cast<int32_t>(effective_kv) -
-                                                        static_cast<int32_t>(part * 512) - 1, -1, 511);
-          packed_metadata[offset + header_offset / 4] = decode_tiles;
-          packed_metadata[offset + header_offset / 4 + 1] = 512;
-          packed_metadata[offset + header_offset / 4 + 2] = 0;
-        } else {
-          std::copy_n(positions.begin() + block * rows, rows, packed_metadata.begin() + offset);
-          packed_metadata[offset + header_offset / 4] = valid;
-          packed_metadata[offset + header_offset / 4 + 1] = effective_kv;
-          packed_metadata[offset + header_offset / 4 + 2] = tile * kv;
-        }
+        std::copy_n(positions.begin() + block * rows, rows, packed_metadata.begin() + offset);
+        packed_metadata[offset + header_offset / 4] = valid;
+        packed_metadata[offset + header_offset / 4 + 1] = effective_kv;
+        packed_metadata[offset + header_offset / 4 + 2] = tile * kv;
       }
     }
     h2d(packed_metadata.data(), metadata_base, index_bytes + metadata_total_bytes);
-    const std::string shape = "_v2_d" + std::to_string(d) + "_q" + std::to_string(rows) + "_k" +
+    const std::string shape = "_d" + std::to_string(d) + "_q" + std::to_string(rows) + "_k" +
         std::to_string(kv) + "_h" + std::to_string(heads) + "_kh" + std::to_string(kvh);
     Graph fused("fused_decode" + shape);
     const auto tq = fused.tensor({d, rows, group, kvh}, syn_type_bf16, q_addr);
@@ -298,7 +287,7 @@ int main(int argc, char** argv) {
     const auto pool = fused.tensor({d, 2 * max_slots * kvh}, syn_type_bf16, pool_addr, old_pool);
     const auto ti = fused.tensor({kv * kvh}, syn_type_int32, index_addr[0]);
     const auto vi = fused.tensor({kv * kvh}, syn_type_int32, index_addr[0] + uint64_t{kv} * kvh * 4, ti, uint64_t{kv} * kvh * 4);
-    const auto tp = fused.tensor({tiled_decode ? decode_tiles : rows}, syn_type_int32, metadata_addr[0]);
+    const auto tp = fused.tensor({rows}, syn_type_int32, metadata_addr[0]);
     const auto th = fused.tensor({3}, syn_type_int32, metadata_addr[0] + header_offset, tp, header_offset);
     const auto result = rows == 1 ? fused.tensor({d, heads, rows}, syn_type_bf16, output_addr) :
                                     fused.tensor({d, rows, group, kvh}, syn_type_bf16, output_addr);
@@ -313,37 +302,27 @@ int main(int argc, char** argv) {
       fused.node("reshape", {gathered}, {cache_tiles[which]});
     }
     const auto score4=fused.tensor({kv,rows,group,kvh},syn_type_float);
-    const auto score3 = tiled_decode ? fused.tensor({512,decode_tiles,heads},syn_type_float) :
-                                       fused.tensor({kv,rows,heads},syn_type_float);
-    const auto probability3 = tiled_decode ? fused.tensor({512,decode_tiles,heads},syn_type_bf16) :
-                                             fused.tensor({kv,rows,heads},syn_type_bf16);
+    const auto score3=fused.tensor({kv,rows,heads},syn_type_float);
+    const auto probability3=fused.tensor({kv,rows,heads},syn_type_bf16);
+    const auto probability4=fused.tensor({kv,rows,group,kvh},syn_type_bf16);
     const synGEMMParams qk{false,true}, pv{false,false};
     fused.node("batch_gemm",{tq,cache_tiles[0]},{score4},&qk,sizeof(qk));
     fused.node("reshape",{score4},{score3});
-    if (tiled_decode) {
-      const auto tile_max=fused.tensor({64,decode_tiles,heads},syn_type_float);
-      const auto tile_sum=fused.tensor({64,decode_tiles,heads},syn_type_float);
-      fused.node("gk_attn_tile_softmax_bf16_v1",{score3,tp,th},{probability3,tile_max,tile_sum},&scale,sizeof(scale));
-      const auto probability5=fused.tensor({512,1,decode_tiles,group,kvh},syn_type_bf16);
-      const auto values5=fused.tensor({d,512,decode_tiles,1,kvh},syn_type_bf16);
-      const auto output5=fused.tensor({d,1,decode_tiles,group,kvh},syn_type_float);
-      const auto output3=fused.tensor({d,decode_tiles,heads},syn_type_float);
-      fused.node("reshape",{probability3},{probability5});
-      fused.node("reshape",{cache_tiles[1]},{values5});
-      fused.node("batch_gemm",{probability5,values5},{output5},&pv,sizeof(pv));
-      fused.node("reshape",{output5},{output3});
-      fused.node("gk_attn_decode_reduce_bf16_v1",{tile_max,tile_sum,output3},{result});
-    } else {
+    if (kv <= 512) {
       fused.node("gk_attn_direct_softmax_bf16_v1",{score3,tp,th},{probability3},&scale,sizeof(scale));
-      const auto probability4=fused.tensor({kv,rows,group,kvh},syn_type_bf16);
-      fused.node("reshape",{probability3},{probability4});
-      if (rows == 1) {
-        const auto output4=fused.tensor({d,rows,group,kvh},syn_type_bf16);
-        fused.node("batch_gemm",{probability4,cache_tiles[1]},{output4},&pv,sizeof(pv));
-        fused.node("reshape",{output4},{result});
-      } else {
-        fused.node("batch_gemm",{probability4,cache_tiles[1]},{result},&pv,sizeof(pv));
-      }
+    } else {
+      const auto exponent=fused.tensor({kv,rows,heads},syn_type_float);
+      const auto sum=fused.tensor({64,heads},syn_type_float);
+      fused.node("gk_attn_decode_exp_f32_v1",{score3,tp,th},{exponent,sum},&scale,sizeof(scale));
+      fused.node("gk_attn_decode_normalize_bf16_v1",{exponent,sum},{probability3});
+    }
+    fused.node("reshape",{probability3},{probability4});
+    if (rows == 1) {
+      const auto output4=fused.tensor({d,rows,group,kvh},syn_type_bf16);
+      fused.node("batch_gemm",{probability4,cache_tiles[1]},{output4},&pv,sizeof(pv));
+      fused.node("reshape",{output4},{result});
+    } else {
+      fused.node("batch_gemm",{probability4,cache_tiles[1]},{result},&pv,sizeof(pv));
     }
     fused.compile(cache);
     if (fused.sections.size() >= 12) throw std::runtime_error("fused graph exceeds section budget");
@@ -399,42 +378,40 @@ int main(int argc, char** argv) {
     } else {
       checked_rows = {0, total_rows / 2, total_rows - 1};
     }
-    const uint32_t ref_tile = tiled_decode ? 512 : kv;
-    const uint32_t ref_tiles = (kv + ref_tile - 1) / ref_tile;
     const auto visible = [&](uint32_t row, uint32_t tile) {
-      const int64_t count = int64_t{positions[row]} - int64_t{tile} * ref_tile + 1;
-      return static_cast<uint32_t>(std::clamp<int64_t>(count, 0, ref_tile));
+      const int64_t count = int64_t{positions[row]} - int64_t{tile} * kv + 1;
+      return static_cast<uint32_t>(std::clamp<int64_t>(count, 0, kv));
     };
     for (uint32_t row : checked_rows) {
       double err64 = 0, norm64 = 0, err_tiled = 0, norm_tiled = 0;
       for (uint32_t head = 0; head < heads; ++head) {
-        std::vector<double> scores64(kv);
-        std::vector<float> scores32(kv), tile_max(ref_tiles, -std::numeric_limits<float>::infinity());
+        std::vector<double> scores64(tiles * kv);
+        std::vector<float> scores32(tiles * kv), tile_max(tiles, -std::numeric_limits<float>::infinity());
         double max64 = -std::numeric_limits<double>::infinity();
-        for (uint32_t tile = 0; tile < ref_tiles; ++tile) {
+        for (uint32_t tile = 0; tile < tiles; ++tile) {
           const uint32_t count = visible(row, tile);
           for (uint32_t t = 0; t < count; ++t) {
             double x64 = 0;
             float x32 = 0;
             for (uint32_t col = 0; col < d; ++col) {
               const float x = widen(q[(static_cast<size_t>(row) * heads + head) * d + col]);
-              const float y = widen(expected_key[static_cast<size_t>(indices[0][tile * ref_tile + t]) * width + (head / group) * d + col]);
+              const float y = widen(expected_key[static_cast<size_t>(indices[tile][t]) * width + (head / group) * d + col]);
               x64 += static_cast<double>(x) * y;
               x32 += x * y;
             }
-            scores64[tile * ref_tile + t] = x64 * scale;
-            scores32[tile * ref_tile + t] = x32 * scale;
-            max64 = std::max(max64, scores64[tile * ref_tile + t]);
-            tile_max[tile] = std::max(tile_max[tile], scores32[tile * ref_tile + t]);
+            scores64[tile * kv + t] = x64 * scale;
+            scores32[tile * kv + t] = x32 * scale;
+            max64 = std::max(max64, scores64[tile * kv + t]);
+            tile_max[tile] = std::max(tile_max[tile], scores32[tile * kv + t]);
           }
         }
         double den64 = 0;
-        std::vector<double> p64(kv);
-        std::vector<float> p32(kv), tile_sum(ref_tiles);
-        for (uint32_t tile = 0; tile < ref_tiles; ++tile) {
+        std::vector<double> p64(tiles * kv);
+        std::vector<float> p32(tiles * kv), tile_sum(tiles);
+        for (uint32_t tile = 0; tile < tiles; ++tile) {
           const uint32_t count = visible(row, tile);
           for (uint32_t t = 0; t < count; ++t) {
-            const auto i = tile * ref_tile + t;
+            const auto i = tile * kv + t;
             p64[i] = std::exp(scores64[i] - max64);
             p32[i] = std::exp(scores32[i] - tile_max[tile]);
             den64 += p64[i];
@@ -444,15 +421,14 @@ int main(int argc, char** argv) {
         for (uint32_t col = 0; col < d; ++col) {
           double out64 = 0;
           float m = 0, sum = 0, acc = 0;
-          for (uint32_t tile = 0; tile < ref_tiles; ++tile) {
+          for (uint32_t tile = 0; tile < tiles; ++tile) {
             const uint32_t count = visible(row, tile);
             if (!count) continue;
             float tile_acc = 0;
             for (uint32_t t = 0; t < count; ++t) {
-              const auto i = tile * ref_tile + t;
-              const float v = widen(expected_value[static_cast<size_t>(indices[0][i]) * width + (head / group) * d + col]);
-              out64 += p64[i] * v;
-              tile_acc += widen(bf16(p32[i] / tile_sum[tile])) * v;
+              const float v = widen(expected_value[static_cast<size_t>(indices[tile][t]) * width + (head / group) * d + col]);
+              out64 += p64[tile * kv + t] * v;
+              tile_acc += widen(bf16(p32[tile * kv + t] / tile_sum[tile])) * v;
             }
             const float next_m = sum > 0 ? std::max(m, tile_max[tile]) : tile_max[tile];
             const float a = sum > 0 ? std::exp(m - next_m) : 0;
