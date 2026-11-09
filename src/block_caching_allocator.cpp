@@ -59,8 +59,7 @@ BlockCachingAllocator::~BlockCachingAllocator() {
   for (auto& [address, block] : blocks_) {
     (void)address;
     for (auto stream : block.streams) synStreamSynchronize(stream);
-    for (const auto& fence : block.fences)
-      events_.synchronize(fence.event);
+    for (auto stream : block.pending_streams) synStreamSynchronize(stream);
   }
   blocks_.clear();
   if (base_ && owns_slab_) synDeviceFree(device_, base_, 0);
@@ -81,18 +80,23 @@ uint64_t BlockCachingAllocator::allocate(uint64_t bytes, synStreamHandle stream)
                              std::to_string(size) + ", allocated=" +
                              std::to_string(allocated_) + ", capacity=" +
                              std::to_string(capacity_));
-  for (const auto& fence : best->second.fences)
-    check(events_.wait(fence.event, stream), "stream wait failed");
+  // All uses were submitted before free. FIFO orders same-stream reuse;
+  // for another stream, record after those uses and wait before recycling.
+  for (auto producer : best->second.pending_streams) {
+    if (producer == stream) continue;
+    auto event = events_.record(producer);
+    check(events_.wait(event, stream), "stream wait failed");
+  }
   const uint64_t address = best->first;
   if (best->second.bytes > size) {
     Block remainder{best->second.bytes - size, false, {}, {}};
-    remainder.fences = best->second.fences;
+    remainder.pending_streams = best->second.pending_streams;
     blocks_.emplace(address + size, std::move(remainder));
   }
   auto& block = best->second;
   block.bytes = size;
   block.allocated = true;
-  block.fences.clear();
+  block.pending_streams.clear();
   block.streams = {stream};
   allocated_ += size;
   peak_ = std::max(peak_, allocated_);
@@ -114,28 +118,22 @@ void BlockCachingAllocator::record_stream(uint64_t address, synStreamHandle stre
 }
 
 BlockCachingAllocator::Blocks::iterator BlockCachingAllocator::merge_free(Blocks::iterator it) {
-  // Records are serialized by mutex_. A later event on the same stream
-  // subsumes all earlier events on that stream, even for adjacent blocks.
-  const auto retain_latest_per_stream = [](auto& to, const auto& from) {
-    for (const auto& fence : from) {
-      const auto previous = std::find_if(to.begin(), to.end(), [&](const auto& candidate) {
-        return candidate.stream == fence.stream;
-      });
-      if (previous == to.end()) to.push_back(fence);
-      else if (previous->sequence < fence.sequence) *previous = fence;
+  const auto retain_streams = [](auto& to, const auto& from) {
+    for (auto stream : from) {
+      if (std::find(to.begin(), to.end(), stream) == to.end()) to.push_back(stream);
     }
   };
   auto next = std::next(it);
   if (next != blocks_.end() && !next->second.allocated) {
     it->second.bytes += next->second.bytes;
-    retain_latest_per_stream(it->second.fences, next->second.fences);
+    retain_streams(it->second.pending_streams, next->second.pending_streams);
     blocks_.erase(next);
   }
   if (it != blocks_.begin()) {
     auto prev = std::prev(it);
     if (!prev->second.allocated) {
       prev->second.bytes += it->second.bytes;
-      retain_latest_per_stream(prev->second.fences, it->second.fences);
+      retain_streams(prev->second.pending_streams, it->second.pending_streams);
       blocks_.erase(it);
       it = prev;
     }
@@ -148,16 +146,10 @@ void BlockCachingAllocator::free(uint64_t address) {
   auto it = blocks_.find(address);
   if (it == blocks_.end() || !it->second.allocated)
     throw std::invalid_argument("BlockCachingAllocator: unknown or freed allocation");
-  std::vector<Fence> events;
-  events.reserve(it->second.streams.size());
-  for (auto stream : it->second.streams) {
-    auto event = events_.record(stream);
-    events.push_back({stream, ++next_fence_sequence_, std::move(event)});
-  }
+  for (auto stream : it->second.streams) events_.prepare(stream);
   allocated_ -= it->second.bytes;
   it->second.allocated = false;
-  it->second.streams.clear();
-  it->second.fences = std::move(events);
+  it->second.pending_streams.swap(it->second.streams);
   merge_free(it);
 }
 
@@ -165,9 +157,9 @@ void BlockCachingAllocator::empty_cache() {
   std::lock_guard lock(mutex_);
   for (auto& [address, block] : blocks_) {
     (void)address;
-    for (const auto& fence : block.fences)
-      check(events_.synchronize(fence.event), "event wait failed");
-    block.fences.clear();
+    for (auto stream : block.pending_streams)
+      check(synStreamSynchronize(stream), "stream wait failed");
+    block.pending_streams.clear();
   }
   if (base_ && owns_slab_ && allocated_ == 0) {
     check(synDeviceFree(device_, base_, 0), "slab release failed");

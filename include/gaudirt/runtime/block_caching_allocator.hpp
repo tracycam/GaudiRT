@@ -29,7 +29,7 @@ class BlockCachingAllocator {
   void record_stream(uint64_t address, synStreamHandle stream);
   void free(uint64_t address);
 
-  // Wait for free blocks' fences. A completely unused slab is returned to
+  // Wait for free blocks' streams. A completely unused slab is returned to
   // Synapse; the next allocation reacquires the configured budget.
   void empty_cache();
   uint64_t memory_allocated() const;
@@ -43,17 +43,11 @@ class BlockCachingAllocator {
   struct BorrowedSlab {};
   BlockCachingAllocator(synDeviceId device, uint64_t address, uint64_t bytes,
                         BorrowedSlab);
-  using Event = EventPool::Event;
-  struct Fence {
-    synStreamHandle stream;
-    uint64_t sequence;
-    Event event;
-  };
   struct Block {
     uint64_t bytes = 0;
     bool allocated = false;
     std::vector<synStreamHandle> streams;
-    std::vector<Fence> fences;
+    std::vector<synStreamHandle> pending_streams;
   };
   using Blocks = std::map<uint64_t, Block>;
   void reserve_slab();
@@ -64,7 +58,6 @@ class BlockCachingAllocator {
   uint64_t base_ = 0;
   uint64_t allocated_ = 0;
   uint64_t peak_ = 0;
-  uint64_t next_fence_sequence_ = 0;
   bool owns_slab_ = true;
   EventPool events_;
   Blocks blocks_;

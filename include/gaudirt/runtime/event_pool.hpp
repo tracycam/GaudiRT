@@ -8,7 +8,7 @@
 
 namespace gaudirt::runtime {
 
-// The owning allocator serializes records and waits and outlives its streams.
+// The owning allocator serializes records and waits and is destroyed before its streams.
 // A stream's latest record covers all earlier work on that stream. Synapse
 // snapshots the event state when a wait is submitted, so later records do not
 // change already-submitted waits. Sharing one event per producer stream may
@@ -42,20 +42,10 @@ class EventPool {
   EventPool(const EventPool&) = delete;
   EventPool& operator=(const EventPool&) = delete;
 
+  void prepare(synStreamHandle stream) { (void)state_for(stream); }
+
   Event record(synStreamHandle stream) {
-    auto existing = events_.find(stream);
-    if (existing == events_.end()) {
-      synEventHandle event = nullptr;
-      if (synEventCreate(&event, device_, 0) != synSuccess)
-        throw std::runtime_error("EventPool: event creation failed");
-      try {
-        existing = events_.emplace(stream, State{event, false}).first;
-      } catch (...) {
-        synEventDestroy(event);
-        throw;
-      }
-    }
-    auto& state = existing->second;
+    auto& state = state_for(stream);
     // Synapse requires every recorded event to be waited upon before it is
     // re-recorded. A same-stream wait consumes an otherwise unobserved
     // record without blocking the host or changing stream ordering.
@@ -81,6 +71,22 @@ class EventPool {
   }
 
  private:
+  State& state_for(synStreamHandle stream) {
+    auto existing = events_.find(stream);
+    if (existing == events_.end()) {
+      synEventHandle event = nullptr;
+      if (synEventCreate(&event, device_, 0) != synSuccess)
+        throw std::runtime_error("EventPool: event creation failed");
+      try {
+        existing = events_.emplace(stream, State{event, false}).first;
+      } catch (...) {
+        synEventDestroy(event);
+        throw;
+      }
+    }
+    return existing->second;
+  }
+
   synDeviceId device_;
   std::unordered_map<synStreamHandle, State> events_;
 };
