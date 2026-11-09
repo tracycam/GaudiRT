@@ -16,7 +16,7 @@ void FxNode::append_normalized(std::ostream& output) const {
       output << ":s" << value.start << ":" << value.width << ":" << value.total;
     else if constexpr (std::is_same_v<T, FxEpsilon>) output << ":e" << std::bit_cast<uint32_t>(value.value);
     else if constexpr (std::is_same_v<T, FxRotary>)
-      output << ":r" << value.context << ":" << value.head_dim << ":" << value.rotary_dim << ":" << value.neox;
+      output << ":r" << value.head_dim << ":" << value.rotary_dim << ":" << value.neox;
     else if constexpr (std::is_same_v<T, FxCast>) output << ":c" << value.to_float;
     else if constexpr (std::is_same_v<T, FxShape>) {
       output << ":v";

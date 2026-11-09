@@ -41,7 +41,8 @@ class SynapseGraphBuilder {
   SynapseGraphBuilder& operator=(const SynapseGraphBuilder&) = delete;
 
   synTensor tensor(synDataType type, const std::vector<uint64_t>& dims, int slot,
-                   int shared_slot = -1, uint64_t offset = 0, bool dynamic = false);
+                   int shared_slot = -1, uint64_t offset = 0, bool dynamic = false,
+                   const std::vector<uint64_t>& min_dims = {});
   void permutation(synTensor tensor, const synTensorPermutation& permutation);
   void node(const NodeSpec& node);
   void compile(runtime::RecipeCache& cache, const std::string& key);

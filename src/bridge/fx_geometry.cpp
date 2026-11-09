@@ -12,13 +12,33 @@
 
 namespace gaudirt::generic {
 
+std::vector<bool> rotary_cache_inputs(const std::vector<int64_t>& roles,
+                                      const std::vector<FxNode>& operations) {
+  std::vector<bool> caches(roles.size(), false), other_uses(roles.size(), false);
+  for (const auto& op : operations) {
+    for (size_t index = 0; index < op.inputs.size(); ++index) {
+      const auto id = op.inputs[index];
+      if (id < 0 || id >= static_cast<int64_t>(roles.size())) continue;
+      if (op.op == FxOp::rotary && index == 2 &&
+          std::get<FxRotary>(op.parameters).context <= static_cast<int64_t>(kRotaryDynamicRows))
+        caches[id] = true;
+      else
+        other_uses[id] = true;
+    }
+  }
+  for (size_t i = 0; i < caches.size(); ++i) caches[i] = caches[i] && !roles[i] && !other_uses[i];
+  return caches;
+}
+
 FxGeometry infer_fx_geometry(const std::vector<at::Tensor>& inputs, const std::vector<int64_t>& roles,
                              const std::vector<FxNode>& operations, const std::vector<int64_t>& outputs) {
   TORCH_CHECK(inputs.size() == roles.size(), "GaudiRT FX: wrong input count");
   std::vector<TensorSpec> specs;
   specs.reserve(inputs.size() + operations.size());
   std::ostringstream normalized;
-  normalized << "fx_program_v15;";
+  const auto caches = rotary_cache_inputs(roles, operations);
+  normalized << (std::any_of(caches.begin(), caches.end(), [](bool value) { return value; })
+                     ? "fx_program_rotary_dynamic_v1;" : "fx_program_v15;");
   for (size_t i = 0; i < inputs.size(); ++i) {
     const auto& tensor = inputs[i];
     const bool floating = tensor.scalar_type() == at::kBFloat16 || tensor.scalar_type() == at::kFloat;
@@ -31,7 +51,10 @@ FxGeometry infer_fx_geometry(const std::vector<at::Tensor>& inputs, const std::v
     for (auto size : sizes) TORCH_CHECK(size > 0, "GaudiRT FX: empty input dimension");
     if (roles[i]) sizes[0] = -1;
     normalized << "i" << roles[i] << ":" << static_cast<int>(tensor.scalar_type());
-    for (auto size : sizes) normalized << ":" << size;
+    for (size_t dim = 0; dim < sizes.size(); ++dim) {
+      if (caches[i] && dim == 0) normalized << ":rotary_capacity";
+      else normalized << ":" << sizes[dim];
+    }
     normalized << ";";
     specs.push_back({tensor.scalar_type(), std::move(sizes), roles[i] == 1});
   }

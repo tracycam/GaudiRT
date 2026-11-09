@@ -62,6 +62,8 @@ class BucketProgram {
   std::vector<FxNode> operations_;
   std::vector<int64_t> outputs_;
   bool has_embedding_ = false;
+  std::vector<bool> rotary_cache_inputs_;
+  std::vector<int64_t> rotary_cache_contexts_;
   std::vector<TensorSpec> specs_;
   std::string digest_;
   std::once_flag geometry_once_;

@@ -26,8 +26,11 @@ SynapseGraphBuilder::~SynapseGraphBuilder() {
 }
 
 synTensor SynapseGraphBuilder::tensor(synDataType type, const std::vector<uint64_t>& dims, int slot,
-                                     int shared_slot, uint64_t offset, bool dynamic) {
+                                     int shared_slot, uint64_t offset, bool dynamic,
+                                     const std::vector<uint64_t>& min_dims) {
   TORCH_CHECK(!dims.empty() && dims.size() <= 5, "GaudiRT FX: tensor rank must be 1..5");
+  TORCH_CHECK(min_dims.empty() || (dynamic && min_dims.size() == dims.size()),
+              "GaudiRT FX: invalid dynamic tensor bounds");
   TORCH_CHECK(slot < static_cast<int>(slot_sections_.size()) &&
               (shared_slot < 0 || (slot >= 0 && shared_slot < static_cast<int>(slot_sections_.size()) &&
                                    slot_sections_[shared_slot])),
@@ -52,7 +55,9 @@ synTensor SynapseGraphBuilder::tensor(synDataType type, const std::vector<uint64
   desc.m_dims = dims.size();
   for (size_t dim = 0; dim < dims.size(); ++dim) {
     desc.m_sizes[dim] = dims[dim];
-    desc.m_minSizes[dim] = dynamic ? 1 : dims[dim];
+    desc.m_minSizes[dim] = min_dims.empty() ? (dynamic ? 1 : dims[dim]) : min_dims[dim];
+    TORCH_CHECK(desc.m_minSizes[dim] > 0 && desc.m_minSizes[dim] <= dims[dim],
+                "GaudiRT FX: invalid dynamic tensor extent");
   }
   synTensor handle = nullptr;
   check(synTensorCreate(&handle, &desc, section, offset), "program tensor creation failed");

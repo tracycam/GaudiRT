@@ -124,6 +124,14 @@ BucketProgram::BucketProgram(std::vector<int64_t> roles, std::vector<FxNode> ope
     TORCH_CHECK(id >= static_cast<int64_t>(roles_.size()) &&
                 id < static_cast<int64_t>(roles_.size() + operations_.size()),
                 "GaudiRT FX: output must be a program operation");
+  rotary_cache_inputs_ = rotary_cache_inputs(roles_, operations_);
+  rotary_cache_contexts_.resize(roles_.size());
+  for (const auto& op : operations_) {
+    if (op.op != FxOp::rotary) continue;
+    const auto id = op.inputs[2];
+    if (id < static_cast<int64_t>(roles_.size()) && rotary_cache_inputs_[id])
+      rotary_cache_contexts_[id] = std::max(rotary_cache_contexts_[id], std::get<FxRotary>(op.parameters).context);
+  }
   std::vector<bool> static_inputs(roles_.size(), false);
   const auto mark_weight = [&](int64_t id) {
     if (id >= 0 && id < static_cast<int64_t>(roles_.size()) && !roles_[id]) static_inputs[id] = true;
@@ -290,7 +298,13 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
     };
     for (size_t i = 0; i < roles_.size(); ++i) {
       const auto& spec = specs_[i];
-      values[i] = tensor_from_spec(spec, i);
+      if (rotary_cache_inputs_[i]) {
+        const auto width = static_cast<uint64_t>(spec.sizes[1]);
+        values[i] = builder.tensor(cast_type(spec.dtype).syn, {width, kRotaryDynamicRows}, i,
+                                   -1, 0, true, {width, 1});
+      } else {
+        values[i] = tensor_from_spec(spec, i);
+      }
     }
     const auto row_count = has_embedding_ ?
         tensor_nd(syn_type_int32, {1}, static_cast<int>(row_count_slot)) : nullptr;
@@ -619,6 +633,10 @@ std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs
                 input.scalar_type() == spec.dtype && input.dim() == static_cast<int64_t>(spec.sizes.size()),
                 "GaudiRT FX: input device, dtype or rank changed");
     for (int64_t dim = 0; dim < input.dim(); ++dim) {
+      if (rotary_cache_inputs_[i] && dim == 0) {
+        TORCH_CHECK(input.size(0) >= rotary_cache_contexts_[i], "GaudiRT FX: rotary cache is too short");
+        continue;
+      }
       const auto expected = spec.dynamic() && dim == 0 ? m : spec.sizes[dim];
       TORCH_CHECK(input.size(dim) == expected, "GaudiRT FX: input geometry changed");
     }
@@ -646,6 +664,9 @@ std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs
   ProgramTemporaries temporaries(*ctx, stream);
   c10::SmallVector<std::pair<uint64_t, uint64_t>, 8> regions;
   c10::SmallVector<synLaunchTensorInfo, 16> bindings(compiled.tensors.begin(), compiled.tensors.end());
+  for (size_t i = 0; i < inputs.size(); ++i)
+    if (rotary_cache_inputs_[i])
+      bindings[i].tensorSize[1] = std::min<uint64_t>(inputs[i].size(0), kRotaryDynamicRows);
   if (static_binding) {
     for (const auto& cached : static_binding->inputs) {
       regions.emplace_back(cached.address, cached.bytes);
