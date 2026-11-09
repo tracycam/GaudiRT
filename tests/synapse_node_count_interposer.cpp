@@ -13,6 +13,7 @@
 namespace {
 std::atomic<uint64_t> split_nodes{0};
 std::atomic<uint64_t> d2d_copies{0};
+std::atomic<uint64_t> h2d_copies{0};
 std::atomic<uint64_t> event_creates{0};
 std::atomic<uint64_t> event_destroys{0};
 std::atomic<uint64_t> event_synchronizes{0};
@@ -27,6 +28,7 @@ bool launch_gate_timed_out = false;
 
 extern "C" uint64_t gaudirt_test_split_node_count() { return split_nodes.load(); }
 extern "C" uint64_t gaudirt_test_d2d_copy_count() { return d2d_copies.load(); }
+extern "C" uint64_t gaudirt_test_h2d_copy_count() { return h2d_copies.load(); }
 extern "C" uint64_t gaudirt_test_event_create_count() { return event_creates.load(); }
 extern "C" uint64_t gaudirt_test_event_destroy_count() { return event_destroys.load(); }
 extern "C" uint64_t gaudirt_test_event_synchronize_count() { return event_synchronizes.load(); }
@@ -83,6 +85,7 @@ extern "C" synStatus SYN_API_CALL synMemCopyAsync(
     return function;
   }();
   if (direction == DRAM_TO_DRAM) ++d2d_copies;
+  if (direction == HOST_TO_DRAM) ++h2d_copies;
   return real(stream, source, bytes, destination, direction);
 }
 

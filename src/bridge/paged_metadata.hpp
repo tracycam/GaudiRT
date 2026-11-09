@@ -19,7 +19,7 @@ class PagedMetadata : public torch::CustomClassHolder {
                 const at::Tensor& positions, const at::Tensor& mapping,
                 std::vector<int64_t> prefixes, std::vector<int64_t> lengths, int64_t slots,
                 const at::Tensor& token_ids = {}, int64_t vocabulary = 0,
-                bool scheduler_owned = false);
+                bool scheduler_owned = false, bool fuse_scheduler_plan = false);
   static c10::intrusive_ptr<PagedMetadata> from_device(
       const at::Tensor& locations, const at::Tensor& batch_requests,
       const at::Tensor& positions, const at::Tensor& mapping,
@@ -47,10 +47,25 @@ class PagedMetadata : public torch::CustomClassHolder {
                                              std::move(prefixes), std::move(lengths), slots,
                                              token_ids, vocabulary, true);
   }
+  static c10::intrusive_ptr<PagedMetadata> from_scheduler_fused(
+      const at::Tensor& locations, const at::Tensor& batch_requests,
+      const at::Tensor& positions, const at::Tensor& mapping,
+      std::vector<int64_t> prefixes, std::vector<int64_t> lengths, int64_t slots,
+      const at::Tensor& token_ids, int64_t vocabulary,
+      int64_t query_heads, int64_t kv_heads, int64_t head_dim) {
+    auto metadata = c10::make_intrusive<PagedMetadata>(locations, batch_requests, positions, mapping,
+        std::move(prefixes), std::move(lengths), slots, token_ids, vocabulary, true, true);
+    metadata->attention_plan(query_heads, kv_heads, head_dim);
+    return metadata;
+  }
   int64_t rows() const { return rows_; }
   int64_t slots() const { return slots_; }
   int64_t context() const { return context_; }
   at::Tensor rotary_positions() const { return positions_.narrow(0, 0, rows_); }
+  at::Tensor model_positions() const {
+    TORCH_CHECK(model_positions_.defined(), "GaudiRT: model positions require fused scheduler metadata");
+    return model_positions_;
+  }
   at::Tensor rotary_header() const { return header_; }
   at::Tensor row_locations() const { return locations_.narrow(0, 0, rows_); }
   at::Tensor row_requests() const { return requests_.narrow(0, 0, rows_); }
@@ -77,6 +92,14 @@ class PagedMetadata : public torch::CustomClassHolder {
   struct Sequence { int32_t row, length, prefix; };
   std::vector<Sequence> sequences_;
   at::Tensor attention_plan_;
+  std::vector<int32_t> pending_host_;
+  at::Tensor pending_locations_, pending_requests_, pending_tokens_, pending_info_, pending_status_,
+      pending_token_status_, model_positions_;
+  void launch_device_metadata(const at::Tensor& locations, const at::Tensor& batch_requests,
+                              const at::Tensor& positions, const at::Tensor& token_ids,
+                              const at::Tensor& device_info, const at::Tensor& status,
+                              const at::Tensor& token_status, bool scheduler_owned);
+  void finish_pending_metadata();
 };
 
 }  // namespace gaudirt::generic

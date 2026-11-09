@@ -219,11 +219,21 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& requ
 PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batch_requests,
                              const at::Tensor& positions, const at::Tensor& mapping,
                              std::vector<int64_t> prefixes, std::vector<int64_t> lengths, int64_t slots,
-                             const at::Tensor& token_ids, int64_t vocabulary, bool scheduler_owned) {
-  for (const auto& tensor : {locations, batch_requests, positions})
+                             const at::Tensor& token_ids, int64_t vocabulary, bool scheduler_owned,
+                             bool fuse_scheduler_plan) {
+  TORCH_CHECK(!fuse_scheduler_plan || scheduler_owned,
+              "GaudiRT device metadata: fused plan requires scheduler-owned inputs");
+  for (const auto& tensor : {locations, batch_requests})
     TORCH_CHECK(tensor.device().type() == c10::kPrivateUse1 && tensor.device().index() == 0 &&
                 tensor.dim() == 1 && (tensor.scalar_type() == at::kInt || tensor.scalar_type() == at::kLong),
                 "GaudiRT device metadata: expected gaudirt int32 or int64 vectors");
+  TORCH_CHECK(positions.dim() == 1 &&
+              ((fuse_scheduler_plan && positions.device().is_cpu() && positions.scalar_type() == at::kLong &&
+                positions.is_contiguous()) ||
+               (!fuse_scheduler_plan && positions.device().type() == c10::kPrivateUse1 &&
+                positions.device().index() == 0 &&
+                (positions.scalar_type() == at::kInt || positions.scalar_type() == at::kLong))),
+              "GaudiRT device metadata: invalid position input");
   TORCH_CHECK(mapping.device().type() == c10::kPrivateUse1 && mapping.device().index() == 0 &&
               mapping.scalar_type() == at::kInt && mapping.dim() == 2 && mapping.is_contiguous(),
               "GaudiRT device metadata: expected a contiguous gaudirt int32 request map");
@@ -260,6 +270,12 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
     last_token_indices[index] = static_cast<int32_t>(cursor - 1);
   }
   TORCH_CHECK(cursor == m, "GaudiRT device metadata: sequence lengths do not cover token rows");
+  if (fuse_scheduler_plan) {
+    const auto* host_positions = positions.data_ptr<int64_t>();
+    for (int64_t row = 0; row < m; ++row)
+      TORCH_CHECK(host_positions[row] == info[1 + bucket + row],
+                  "GaudiRT device metadata: host position does not match scheduler lengths");
+  }
   auto ctx = current();
   auto& stream_state = ctx->streams.state(active_stream_id);
   auto compute = stream_state.handle;
@@ -278,6 +294,7 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
   const auto header_offset = reserve(1);
   const auto info_offset = reserve(info.size());
   const auto last_offset = reserve(batch);
+  const auto model_positions_offset = fuse_scheduler_plan ? reserve(2 * bucket) : 0;
   const auto staged_words = cursor_words;
   const auto locations_offset = reserve(bucket);
   const auto requests_offset = reserve(bucket);
@@ -290,6 +307,8 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
   header_ = view(header_offset, 1);
   auto device_info = view(info_offset, info.size());
   last_token_indices_ = view(last_offset, batch);
+  if (fuse_scheduler_plan)
+    model_positions_ = view(model_positions_offset, 2 * bucket).view(at::kLong).narrow(0, 0, m);
   locations_ = view(locations_offset, bucket);
   requests_ = view(requests_offset, bucket);
   positions_ = view(positions_offset, bucket);
@@ -300,12 +319,29 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
     token_ids_ = view(token_offset, bucket);
     token_status = view(token_status_offset, bucket);
   }
-  const auto mapping_address = scheduler_owned ? 0 : address_of(mapping_, *ctx);
-  TORCH_CHECK(scheduler_owned || mapping_address % BlockCachingAllocator::kAlignment == 0,
-              "GaudiRT device metadata: request map must be 256-byte aligned");
-  const auto header_address = address_of(header_, *ctx), info_address = address_of(device_info, *ctx);
-  const auto location_address = address_of(locations_, *ctx), request_address = address_of(requests_, *ctx);
-  const auto position_address = address_of(positions_, *ctx), status_address = address_of(status, *ctx);
+  rows_ = m;
+  slots_ = slots;
+  request_count_ = request_count;
+  context_ = context;
+  vocabulary_ = vocabulary;
+  bucket_ = bucket;
+  if (fuse_scheduler_plan) {
+    pending_host_.assign(staged_words, 0);
+    pending_host_[header_offset] = static_cast<int32_t>(m);
+    std::memcpy(pending_host_.data() + info_offset, info.data(), info.size() * sizeof(int32_t));
+    std::memcpy(pending_host_.data() + last_offset, last_token_indices.data(),
+                last_token_indices.size() * sizeof(int32_t));
+    std::memcpy(pending_host_.data() + model_positions_offset, positions.data_ptr<int64_t>(),
+                m * sizeof(int64_t));
+    pending_locations_ = locations;
+    pending_requests_ = batch_requests;
+    pending_tokens_ = token_ids;
+    pending_info_ = device_info;
+    pending_status_ = status;
+    pending_token_status_ = token_status;
+    return;
+  }
+  const auto header_address = address_of(header_, *ctx);
   {
     const uint64_t bytes = staged_words * sizeof(int32_t);
     TemporaryHost staging(*ctx, bytes);
@@ -322,6 +358,25 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
     ctx->pinned.copy_h2d(header_address, host, bytes, h2d, true);
     ready.record_and_wait(h2d, compute);
   }
+  launch_device_metadata(locations, batch_requests, positions, token_ids, device_info,
+                         status, token_status, scheduler_owned);
+}
+
+void PagedMetadata::launch_device_metadata(const at::Tensor& locations, const at::Tensor& batch_requests,
+    const at::Tensor& positions, const at::Tensor& token_ids, const at::Tensor& device_info,
+    const at::Tensor& status, const at::Tensor& token_status, bool scheduler_owned) {
+  auto ctx = current();
+  auto& stream_state = ctx->streams.state(active_stream_id);
+  const auto compute = stream_state.handle;
+  const auto m = rows_, request_count = request_count_, context = context_, slots = slots_, vocabulary = vocabulary_;
+  const auto bucket = bucket_;
+  const bool has_tokens = token_ids.defined();
+  const auto mapping_address = scheduler_owned ? 0 : address_of(mapping_, *ctx);
+  TORCH_CHECK(scheduler_owned || mapping_address % BlockCachingAllocator::kAlignment == 0,
+              "GaudiRT device metadata: request map must be 256-byte aligned");
+  const auto header_address = address_of(header_, *ctx), info_address = address_of(device_info, *ctx);
+  const auto location_address = address_of(locations_, *ctx), request_address = address_of(requests_, *ctx);
+  const auto position_address = address_of(positions_, *ctx), status_address = address_of(status, *ctx);
   const std::array<at::Tensor, 4> sources{locations, batch_requests, positions, token_ids};
   const std::array<int, 4> lanes{locations.element_size() == 8 ? 2 : 1,
                                   batch_requests.element_size() == 8 ? 2 : 1,
@@ -411,12 +466,15 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
       for (int64_t row = 0; row < m; ++row)
         TORCH_CHECK(flags[m + row] == 0, "GaudiRT device metadata: token ID outside vocabulary at row ", row);
   }
-  rows_ = m;
-  slots_ = slots;
-  request_count_ = request_count;
-  context_ = context;
-  vocabulary_ = vocabulary;
-  bucket_ = bucket;
+}
+
+void PagedMetadata::finish_pending_metadata() {
+  TORCH_CHECK(!pending_host_.empty(), "GaudiRT device metadata: no pending scheduler metadata");
+  launch_device_metadata(pending_locations_, pending_requests_, model_positions_, pending_tokens_,
+                         pending_info_, pending_status_, pending_token_status_, true);
+  pending_host_.clear();
+  pending_locations_ = pending_requests_ = pending_tokens_ = pending_info_ = pending_status_ =
+      pending_token_status_ = at::Tensor();
 }
 
 }  // namespace gaudirt::generic

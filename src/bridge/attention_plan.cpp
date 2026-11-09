@@ -2,6 +2,7 @@
 #include "attention_plan.hpp"
 
 #include "graph_builder.hpp"
+#include "layout_copy.hpp"
 #include "paged_kv_pool.hpp"
 #include "paged_metadata.hpp"
 #include "temporaries.hpp"
@@ -168,6 +169,8 @@ at::Tensor PagedMetadata::attention_plan(int64_t query_heads, int64_t kv_heads, 
     block.store_header_offset = append_aligned({block.valid_rows, static_cast<int32_t>(slots_),
                                                 static_cast<int32_t>(kv_heads)});
   }
+  const bool pending_metadata = !pending_host_.empty();
+  const uint64_t pending_offset = pending_metadata ? append_aligned(pending_host_) : 0;
   host.resize(align(host.size() * sizeof(int32_t)) / sizeof(int32_t), 0);
   const uint64_t host_bytes = host.size() * sizeof(int32_t);
   plan->scratch_offset = index_bytes + host_bytes;
@@ -197,6 +200,13 @@ at::Tensor PagedMetadata::attention_plan(int64_t query_heads, int64_t kv_heads, 
     ctx->allocator.record_stream(address, h2d);
     ctx->pinned.copy_h2d(address + index_bytes, staging.address, host_bytes, h2d, true);
     stream_state.metadata_ready.record_and_wait(h2d, compute);
+  }
+  if (pending_metadata) {
+    const auto destination = address_of(header_, *ctx);
+    ctx->allocator.record_stream(destination, compute);
+    dma_copy(destination, nullptr, address + pending_offset, nullptr, 0, pending_host_.size(),
+             sizeof(int32_t), compute, DRAM_TO_DRAM);
+    finish_pending_metadata();
   }
   const auto map_address = address_of(mapping_, *ctx);
   const auto request_address = address_of(requests_, *ctx);
