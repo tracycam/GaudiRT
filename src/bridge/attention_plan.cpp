@@ -89,8 +89,15 @@ at::Tensor PagedMetadata::attention_plan(int64_t query_heads, int64_t kv_heads, 
       const int32_t end = sequence.prefix + done + remaining;
       int32_t count = std::min<int32_t>(remaining, 256);
       uint32_t q_bucket = std::bit_ceil(static_cast<uint32_t>(count));
-      const bool single_decode = remaining == 1 && end <= 4096;
       const uint32_t direct_kv = std::max<uint32_t>(128, std::bit_ceil(static_cast<uint32_t>(end)));
+      // Account for BF16 K/V, FP32 scores and exponentials, and BF16 probabilities.
+      // Leave SRAM headroom for graph scheduling instead of tying the choice to a model geometry.
+      const uint64_t fused_bytes = uint64_t{direct_kv} *
+          (4 * static_cast<uint64_t>(kv_heads) * static_cast<uint64_t>(head_dim) +
+           10 * static_cast<uint64_t>(query_heads));
+      constexpr uint64_t kFusedDecodeBudget = 40ULL * 1024 * 1024;
+      const bool single_decode = remaining == 1 &&
+          (end <= 4096 || (end <= 8192 && fused_bytes <= kFusedDecodeBudget));
       const bool short_prefill = end <= 512 &&
           uint64_t{q_bucket} * direct_kv * static_cast<uint64_t>(query_heads) <= 4 * 1024 * 1024;
       if (!single_decode && !short_prefill) {

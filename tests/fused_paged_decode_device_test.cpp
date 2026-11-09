@@ -142,10 +142,10 @@ int main(int argc, char** argv) {
     constexpr uint32_t max_slots = 131072;
     if (!effective_kv || effective_kv > kv || effective_kv < valid || (rows > 1 && kv > 512) ||
         (mode != "cold" && mode != "warm") || (d != 64 && d != 128) || !rows || rows > 256 ||
-        !valid || valid > rows || !kv || kv > 4096 || kv % 128 || !kvh || heads % kvh || heads > 256 ||
+        !valid || valid > rows || !kv || kv > 8192 || kv % 128 || !kvh || heads % kvh || heads > 256 ||
         uint64_t{kv} * rows * heads > 4ULL * 1024 * 1024 || kvh * d % 128 ||
         slots < 2048 || slots > max_slots || (page != 1 && page != 16) || slots % page ||
-        uint64_t{tiles} * kv + page >= slots)
+        uint64_t{effective_kv} + page >= slots)
       throw std::invalid_argument("unsupported geometry");
     const uint32_t group = heads / kvh, width = kvh * d, total_rows = rows * query_blocks;
     const float scale = 1.f / std::sqrt(static_cast<float>(d));
@@ -157,7 +157,7 @@ int main(int argc, char** argv) {
     for (auto& x : key_new) x = bf16(normal(generator));
     for (auto& x : value_new) x = bf16(normal(generator));
     std::vector<std::vector<int32_t>> indices(tiles, std::vector<int32_t>(kv));
-    for (uint32_t i = 0; i < tiles * kv; ++i) {
+    for (uint32_t i = 0; i < effective_kv; ++i) {
       const uint32_t slot = page == 1 ? 1 + (i * 5) % (slots - 1) :
           (1 + ((i / page) * 5) % (slots / page - 1)) * page + i % page;
       indices[i / kv][i % kv] = static_cast<int32_t>(slot);
@@ -173,7 +173,7 @@ int main(int argc, char** argv) {
     }
     std::vector<uint16_t> key_pool(static_cast<size_t>(slots) * width, 0x3e80);
     std::vector<uint16_t> value_pool(static_cast<size_t>(slots) * width, 0x3f00);
-    for (uint32_t i = 0; i < tiles * kv; ++i) {
+    for (uint32_t i = 0; i < effective_kv; ++i) {
       const auto slot = indices[i / kv][i % kv];
       for (uint32_t col = 0; col < width; ++col) {
         key_pool[static_cast<size_t>(slot) * width + col] = bf16(normal(generator));

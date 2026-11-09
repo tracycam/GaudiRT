@@ -60,6 +60,10 @@ def main():
         result = torch.ops.gaudirt.paged_attn.default(query.to("gaudirt:0"), key.to("gaudirt:0"),
             value.to("gaudirt:0"), key_pool, value_pool, metadata, dim, scale)
         gaudirt.synchronize()
+        if case == "decode" and os.environ.get("GAUDIRT_TEST_REQUIRE_FUSED") == "1":
+            recipe_keys = gaudirt._C._recipe_cache_keys()
+            assert any(key.startswith("paged_fused_") for key in recipe_keys), recipe_keys
+            assert not any(key.startswith("paged_tile_") for key in recipe_keys), recipe_keys
         expected_key, expected_value = key_base.clone(), value_base.clone()
         expected_key[locations.long()] = key.reshape(rows, kv_heads, dim)
         expected_value[locations.long()] = value.reshape(rows, kv_heads, dim)
