@@ -316,6 +316,21 @@ at::Tensor& fill(at::Tensor& tensor, const at::Scalar& scalar) {
   }
   if (width == 1) pattern = (pattern & 0xff) * uint64_t{0x01010101};
   if (width == 2) pattern = (pattern & 0xffff) | ((pattern & 0xffff) << 16);
+  const uint64_t bytes = tensor.nbytes();
+  if (tensor.is_contiguous() && address % BlockCachingAllocator::kAlignment == 0 &&
+      bytes % 4 == 0 && bytes / 4 <= UINT32_MAX &&
+      (width != 8 || static_cast<uint32_t>(pattern) == static_cast<uint32_t>(pattern >> 32))) {
+    const auto compute = ctx->stream();
+    {
+      std::lock_guard lock(ctx->cold_mutex);
+      if (ctx->graph_pool && ctx->graph_pool->contains_live_range(address, 1))
+        ctx->graph_pool->record_stream(address, compute);
+      ctx->allocator.record_stream(address, compute);
+    }
+    TORCH_CHECK(synMemsetD32Async(address, static_cast<uint32_t>(pattern), bytes / 4, compute) == synSuccess,
+                "GaudiRT: fill memset failed");
+    return tensor;
+  }
   std::lock_guard lock(ctx->cold_mutex);
   auto& recipe = broadcast_recipe(*ctx, tensor.numel(), width);
   auto compute = ctx->stream();
