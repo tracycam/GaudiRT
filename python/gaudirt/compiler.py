@@ -6,6 +6,7 @@ import math
 import operator
 import struct
 import threading
+import types
 import weakref
 
 import torch
@@ -795,12 +796,79 @@ def compile(module, dynamic_arg_indices=(0,)):
         # configuration used for the first capture.
         if not getattr(capture, "enabled", False):
             raise CaptureConfigRequired()
-        return gaudirt_backend(graph, inputs)
+        result = gaudirt_backend(graph, inputs)
+        capture.segmented = isinstance(getattr(result, "__self__", None), _SegmentExecution)
+        return result
 
     compiled = torch.compile(module, backend=guarded_backend, dynamic=True, fullgraph=True)
     captured_signatures = set()
     static_signatures = []
     signature_tokens = {}
+    fast_paths = []
+
+    def frame_locals(code, cells, bound, args, kwargs):
+        result = {name: cell.cell_contents for name, cell in cells}
+        if (code.co_argcount == 0 and code.co_kwonlyargcount == 0 and
+                code.co_flags & 0x0c == 0x0c and code.co_varnames[:2] == ("args", "kwargs")):
+            result.update(args=tuple(args), kwargs=kwargs)
+        elif not kwargs and not code.co_kwonlyargcount and not code.co_flags & 0x0c:
+            positional = (bound, *args) if bound is not None else tuple(args)
+            if len(positional) != code.co_argcount:
+                return None
+            result.update(zip(code.co_varnames[:code.co_argcount], positional))
+        else:
+            return None
+        return result
+
+    def remember_segmented_path(args, kwargs):
+        # Dynamo's rewritten top-level frame already lifts the graph inputs and
+        # reconstructs the Python result. Reuse it only with its original C++
+        # guard manager, so changes in module state or ambient PyTorch state
+        # still trigger normal capture rather than running a stale graph.
+        if not getattr(capture, "segmented", False):
+            return
+        original = getattr(compiled, "_torchdynamo_orig_callable", None)
+        function = getattr(original, "__func__", original)
+        bound = getattr(original, "__self__", None)
+        code = getattr(function, "__code__", None)
+        if code is None:
+            return
+        cells = tuple(zip(code.co_freevars, function.__closure__ or ()))
+        locals_ = frame_locals(code, cells, bound, args, kwargs)
+        if locals_ is None:
+            return
+        for entry in torch._dynamo.eval_frame._debug_get_cache_entry_list(function):
+            if (getattr(entry.backend, "compiler_fn", None) is not guarded_backend or
+                    entry.code.co_freevars != code.co_freevars or
+                    any(candidate[0] is entry for candidate in fast_paths) or
+                    not entry.guard_manager.check(locals_)):
+                continue
+            rewritten = types.FunctionType(entry.code, function.__globals__, function.__name__,
+                                           function.__defaults__, function.__closure__)
+            if bound is not None:
+                rewritten = types.MethodType(rewritten, bound)
+            fast_paths.insert(0, (entry, rewritten, code, cells, bound))
+
+    def prepare_dynamic_inputs(args):
+        prepared_args = list(args)
+        staged_inputs, replacements = {}, []
+        for index in dynamic_arg_indices:
+            original = args[index]
+            if id(original) not in staged_inputs:
+                if (isinstance(original, torch.Tensor) and original.ndim == 1 and original.stride(0) == 1 and
+                        original.device.type == "gaudirt" and original.device.index == 0 and
+                        0 < original.shape[0] <= 4096):
+                    staged = None
+                else:
+                    staged = _C._prepare_strided_input(original)
+                if staged is not None:
+                    replacements.append((original, staged))
+                    for name in ("_gaudirt_validated_vocab", "_gaudirt_validated_rows"):
+                        if hasattr(original, name):
+                            setattr(staged, name, getattr(original, name))
+                staged_inputs[id(original)] = original if staged is None else staged
+            prepared_args[index] = staged_inputs[id(original)]
+        return prepared_args, replacements
 
     def signature(value, dynamic=False):
         if isinstance(value, torch.Tensor):
@@ -848,9 +916,14 @@ def compile(module, dynamic_arg_indices=(0,)):
 
     @functools.wraps(module)
     def execute(*args, **kwargs):
-        prepared_args = list(args)
-        staged_inputs = {}
-        replacements = []
+        prepared_args, replacements = prepare_dynamic_inputs(args)
+        if (fast_paths and torch._guards.TracingContext.try_get() is None and
+                not torch.fx._symbolic_trace.is_fx_symbolic_tracing() and not torch._C._is_tracing()):
+            for entry, rewritten, code, cells, bound in fast_paths:
+                locals_ = frame_locals(code, cells, bound, prepared_args, kwargs)
+                if locals_ is not None and entry.guard_manager.check(locals_):
+                    result = rewritten(*prepared_args, **kwargs)
+                    return _restore_staged_outputs(result, replacements) if replacements else result
         dynamic_ids = {id(args[index]) for index in dynamic_arg_indices}
         static_tokens = [None] * len(args)
         declared_dynamic = set()
@@ -864,21 +937,6 @@ def compile(module, dynamic_arg_indices=(0,)):
                 else:
                     static_tokens[index] = static_tensor_token(value, index)
         for index in dynamic_arg_indices:
-            original = args[index]
-            if id(original) not in staged_inputs:
-                if (isinstance(original, torch.Tensor) and original.ndim == 1 and original.stride(0) == 1 and
-                        original.device.type == "gaudirt" and original.device.index == 0 and
-                        0 < original.shape[0] <= 4096):
-                    staged = None
-                else:
-                    staged = _C._prepare_strided_input(original)
-                if staged is not None:
-                    replacements.append((original, staged))
-                    for name in ("_gaudirt_validated_vocab", "_gaudirt_validated_rows"):
-                        if hasattr(original, name):
-                            setattr(staged, name, getattr(original, name))
-                staged_inputs[id(original)] = original if staged is None else staged
-            prepared_args[index] = staged_inputs[id(original)]
             if prepared_args[index].ndim > 1:
                 torch._dynamo.mark_static(prepared_args[index], list(range(1, prepared_args[index].ndim)))
             torch._dynamo.mark_dynamic(prepared_args[index], 0, min=1, max=4096)
@@ -898,6 +956,7 @@ def compile(module, dynamic_arg_indices=(0,)):
                     finally:
                         capture.enabled = False
                 captured_signatures.add(key)
+                remember_segmented_path(prepared_args, kwargs)
                 break
             try:
                 result = compiled(*prepared_args, **kwargs)

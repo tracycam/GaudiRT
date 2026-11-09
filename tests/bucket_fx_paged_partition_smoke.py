@@ -70,6 +70,18 @@ def main():
     assert not compact or tracing
     reference_split = os.environ.get("GAUDIRT_TEST_REFERENCE_SPLIT") == "1"
     assert not (tracing and profiling)
+    test_fastpath = os.environ.get("GAUDIRT_TEST_FASTPATH") == "1"
+    marks = []
+    if test_fastpath:
+        original_mark_dynamic = torch._dynamo.mark_dynamic
+
+        def count_mark_dynamic(*args, **kwargs):
+            caller = sys._getframe(1)
+            if caller.f_globals is compiler.__dict__ and caller.f_code.co_name == "execute":
+                marks.append(1)
+            return original_mark_dynamic(*args, **kwargs)
+
+        torch._dynamo.mark_dynamic = count_mark_dynamic
 
     def capture(graph, inputs):
         captures.append(graph)
@@ -132,6 +144,7 @@ def main():
                               for shape in ((512, 256), (256, 256))]
     device_weights = [weight.to("gaudirt:0") for weight in (qkv_weight, out_weight)]
     payload, errors, floors, absolutes = bytearray(), [], [], []
+    initial_marks = None
     for rows in (1, 3, 17, 137, 513):
         metadata, locations, requests, positions, mapping = attention_ref.metadata(rows)
         x = torch.randn(rows, 256, dtype=torch.bfloat16)
@@ -146,6 +159,12 @@ def main():
         result = compiled(x.to("gaudirt:0"), *device_weights, key_pool, value_pool,
                           metadata.row_locations(), metadata.row_requests(), metadata.rotary_positions(),
                           plan, metadata.rotary_header())
+        if test_fastpath:
+            if initial_marks is None:
+                initial_marks = len(marks)
+                assert initial_marks == 4, initial_marks
+            else:
+                assert len(marks) == initial_marks, (rows, len(marks), initial_marks)
         if profiling:
             assert len(executors[0].profile_host_ms) == 3
             assert all(value > 0 for value in executors[0].profile_host_ms)
