@@ -30,27 +30,82 @@ def reference(x, qkv_weight, out_weight, key_pool, value_pool, locations, reques
               positions, mapping, fp64):
     dtype = torch.float64 if fp64 else torch.float32
     rounded = direct_bf16 if fp64 else lambda value: value.to(torch.bfloat16).float()
-    query, key, value = (x.to(dtype) @ qkv_weight.to(dtype).t()).split([256, 128, 128], dim=-1)
+    qkv = x.to(dtype) @ qkv_weight.to(dtype).t()
+    if not fp64:
+        # The same-boundary FP32 reference rounds each model-visible BF16
+        # operator output, while its arithmetic and softmax remain FP32.
+        qkv = rounded(qkv)
+    query, key, value = qkv.split([256, 128, 128], dim=-1)
     key_pool = key_pool.to(dtype).clone()
     value_pool = value_pool.to(dtype).clone()
     key_pool[locations] = key.reshape(-1, 2, 64)
     value_pool[locations] = value.reshape(-1, 2, 64)
     attention = attention_ref.expected_unrounded(query, key_pool, value_pool, requests, positions, mapping, dtype)
+    if not fp64:
+        attention = rounded(attention)
     return rounded(attention @ out_weight.to(dtype).t()).double()
 
 
 def main():
     torch.set_num_threads(4)
     torch.random.default_generator.manual_seed(41628)
-    gaudirt.initialize(hbm_bytes=512 * 1024 * 1024, pinned_bytes=4 * 1024 * 1024)
+    gaudirt.initialize(hbm_bytes=2 * 1024**3, pinned_bytes=4 * 1024 * 1024)
     original = compiler.gaudirt_backend
-    captures = []
+    captures, observed, calls, executors, profile_events = [], [], [], [], []
+    tracing = os.environ.get("GAUDIRT_TEST_SEGMENT_TRACE") == "1"
+    profiling = os.environ.get("GAUDIRT_TEST_SEGMENT_PROFILE") == "1"
+    reference_split = os.environ.get("GAUDIRT_TEST_REFERENCE_SPLIT") == "1"
+    assert not (tracing and profiling)
 
     def capture(graph, inputs):
         captures.append(graph)
         assert sum(node.target == torch.ops.gaudirt._paged_attn_validated.default
                    for node in graph.graph.nodes) == 1
-        return original(graph, inputs)
+        execution = original(graph, inputs)
+        executor = execution.__self__
+        executors.append(executor)
+        if reference_split:
+            return execution
+
+        class CountCalls:
+            def __init__(self, runner):
+                self.runner = runner
+
+            def run(self, values):
+                calls.append("run")
+                return self.runner.run(values)
+
+            def run_traced(self, values, indices):
+                calls.append("trace")
+                return self.runner.run_traced(values, indices)
+
+            def run_profiled(self, values, events):
+                calls.append("profile")
+                return self.runner.run_profiled(values, events)
+
+        executor.runner = CountCalls(executor.runner)
+        if tracing:
+            executor.enable_trace()
+            for index, (_, segment) in enumerate(executor.named_children()):
+                previous = segment.forward
+
+                def observe(*args, index=index, previous=previous):
+                    output = previous(*args)
+                    observed.append(index)
+                    return output
+
+                segment.forward = observe
+        if profiling:
+            profile_events.extend((gaudirt.Event(enable_timing=True), gaudirt.Event(enable_timing=True))
+                                  for _ in executor.records)
+            for start, end in profile_events:
+                start.record()
+                end.record()
+            for start, end in profile_events:
+                start.synchronize()
+                end.synchronize()
+            executor.profile(profile_events)
+        return execution
 
     compiler.gaudirt_backend = capture
     compiled = compiler.compile(connected, dynamic_arg_indices=(0, 5, 6, 7))
@@ -63,10 +118,26 @@ def main():
         x = torch.randn(rows, 256, dtype=torch.bfloat16)
         base_key, base_value = [torch.randn(attention_ref.SLOTS, 2, 64, dtype=torch.bfloat16)
                                 for _ in range(2)]
-        key_pool, value_pool = [value.to("gaudirt:0") for value in (base_key, base_value)]
+        combined = gaudirt._C._allocate_paged_kv(1, attention_ref.SLOTS, 2, 64)
+        combined[0, 0].copy_(base_key.transpose(0, 1).contiguous())
+        combined[0, 1].copy_(base_value.transpose(0, 1).contiguous())
+        key_pool, value_pool = combined[0, 0].transpose(0, 1), combined[0, 1].transpose(0, 1)
+        plan = metadata.attention_plan(4, 2, 64)
+        torch._dynamo.mark_dynamic(plan, 0, min=1, max=536870912)
         result = compiled(x.to("gaudirt:0"), *device_weights, key_pool, value_pool,
                           metadata.row_locations(), metadata.row_requests(), metadata.rotary_positions(),
-                          metadata.request_mapping(), metadata.rotary_header())
+                          plan, metadata.rotary_header())
+        if profiling:
+            assert len(executors[0].profile_host_ms) == 3
+            assert all(value > 0 for value in executors[0].profile_host_ms)
+            device_ms = []
+            for start, end in profile_events:
+                start.synchronize()
+                end.synchronize()
+                device_ms.append(start.elapsed_time(end))
+            print("segment profile rows", rows, "host_ms", executors[0].profile_host_ms,
+                  "device_ms", device_ms, flush=True)
+            assert all(value >= 0 for value in device_ms) and any(value > 0 for value in device_ms)
         actual_key, actual_value = key_pool.cpu(), value_pool.cpu()
         untouched = torch.ones(attention_ref.SLOTS, dtype=torch.bool)
         untouched[locations] = False
@@ -87,7 +158,12 @@ def main():
         for tensor in (result.cpu(), actual_key, actual_value):
             payload.extend(tensor.contiguous().view(torch.int16).numpy().tobytes())
         print("paged FX rows", rows, "cache", gaudirt.recipe_cache_stats(), flush=True)
+        del result, key_pool, value_pool, combined, metadata, plan
     assert len(captures) == 1, len(captures)
+    if not reference_split:
+        assert calls == ["trace" if tracing else "profile" if profiling else "run"] * 5, calls
+    if tracing:
+        assert observed == [0, 1, 2] * 5, observed
     counts = gaudirt.recipe_cache_stats()
     if os.environ.get("GAUDIRT_TEST_CACHE") == "cold":
         assert counts[0] == 0 and counts[1] > 0, counts

@@ -192,8 +192,8 @@ const BucketProgram::StaticBindings* BucketProgram::find_static_bindings(
       const auto& version = impl->version_counter();
       if (version.enabled() != cached.versioned ||
           (cached.versioned && version.current_version() != cached.version) ||
-          (!cached.versioned && (value.sizes().vec() != specs_[cached.index].sizes ||
-                                 value.strides().vec() != cached.strides))) {
+          (!cached.versioned && (!value.sizes().equals(specs_[cached.index].sizes) ||
+                                 !value.strides().equals(cached.strides)))) {
         matches = false;
         break;
       }
@@ -603,7 +603,13 @@ class ProgramTemporaries {
 };
 
 std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs) {
+  return run_internal(inputs, {});
+}
+
+std::vector<at::Tensor> BucketProgram::run_internal(const std::vector<at::Tensor>& inputs,
+                                                    const std::vector<bool>& trusted) {
   TORCH_CHECK(inputs.size() == roles_.size(), "GaudiRT FX: wrong input count");
+  TORCH_CHECK(trusted.empty() || trusted.size() == inputs.size(), "GaudiRT FX: invalid trusted input plan");
   int64_t m = -1;
   size_t dynamic_input = 0;
   for (size_t i = 0; i < inputs.size(); ++i) {
@@ -629,6 +635,7 @@ std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs
       ++next_static;
       continue;
     }
+    if (!trusted.empty() && trusted[i]) continue;
     const auto& input = inputs[i];
     const auto& spec = specs_[i];
     TORCH_CHECK(input.device().type() == c10::kPrivateUse1 && input.device().index() == 0 &&
@@ -662,7 +669,8 @@ std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs
         TORCH_CHECK(width <= INT64_MAX / sizes[dim], "GaudiRT FX: output size overflow");
         width *= sizes[dim];
       }
-      results.push_back(bucket_output(inputs[dynamic_input], spec.dtype, bucket, m, width).view(sizes));
+      auto result = bucket_output(inputs[dynamic_input], spec.dtype, bucket, m, width);
+      results.push_back(sizes.size() == 2 ? std::move(result) : result.view(sizes));
     } else {
       results.push_back(at::empty(spec.sizes, inputs[dynamic_input].options().dtype(spec.dtype)));
     }
@@ -697,11 +705,13 @@ std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs
                 "GaudiRT FX: input allocation size overflow");
     const uint64_t bytes = rotary_cache_inputs_[i] ? kRotaryStaticRows * dynamic_width * item
         : spec.dynamic() ? static_cast<uint64_t>(bucket) * dynamic_width * item : input.nbytes();
-    const auto& allocation = validated_program_input(input, *ctx);
     const uint64_t address = reinterpret_cast<uint64_t>(input.data_ptr());
-    if (allocation.stream != stream) {
-      if (allocation.kind == AllocationKind::graph) ctx->graph_pool->record_stream(address, stream);
-      else ctx->allocator.record_stream(address, stream);
+    if (trusted.empty() || !trusted[i]) {
+      const auto& allocation = validated_program_input(input, *ctx);
+      if (allocation.stream != stream) {
+        if (allocation.kind == AllocationKind::graph) ctx->graph_pool->record_stream(address, stream);
+        else ctx->allocator.record_stream(address, stream);
+      }
     }
     const uint64_t offset = static_cast<uint64_t>(input.storage_offset()) * item;
     const uint64_t storage = input.storage().nbytes();

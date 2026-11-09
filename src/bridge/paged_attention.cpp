@@ -150,8 +150,16 @@ void record_if_needed(Context& ctx, const at::Tensor& tensor, synStreamHandle st
 
 at::Tensor paged_attn_validated(const at::Tensor& query, const at::Tensor& key, const at::Tensor& value,
     const at::Tensor& key_pool, const at::Tensor& value_pool, const at::Tensor& locations,
-    const at::Tensor&, const at::Tensor&, const at::Tensor& plan_tensor, const at::Tensor&,
+    const at::Tensor& requests, const at::Tensor& positions, const at::Tensor& plan_tensor, const at::Tensor& header,
     int64_t head_dim, double scale) {
+  return paged_attn_internal(query, key, value, key_pool, value_pool, locations, requests, positions,
+                             plan_tensor, header, head_dim, scale, false, false, false);
+}
+
+at::Tensor paged_attn_internal(const at::Tensor& query, const at::Tensor& key, const at::Tensor& value,
+    const at::Tensor& key_pool, const at::Tensor& value_pool, const at::Tensor& locations,
+    const at::Tensor&, const at::Tensor&, const at::Tensor& plan_tensor, const at::Tensor&,
+    int64_t head_dim, double scale, bool query_trusted, bool key_trusted, bool value_trusted) {
   auto ctx = current();
   const auto stream = ctx->stream();
   const auto& plan = attention_plan_data(plan_tensor, *ctx);
@@ -184,7 +192,10 @@ at::Tensor paged_attn_validated(const at::Tensor& query, const at::Tensor& key, 
               pool_address - storage_base <= pool_storage.nbytes() &&
               descriptor_bytes <= pool_storage.nbytes() - (pool_address - storage_base),
               "GaudiRT attention: KV pool descriptor is not backed by combined storage");
-  for (const auto& input : {query, key, value, locations, key_pool}) record_if_needed(*ctx, input, stream);
+  if (!query_trusted) record_if_needed(*ctx, query, stream);
+  if (!key_trusted) record_if_needed(*ctx, key, stream);
+  if (!value_trusted) record_if_needed(*ctx, value, stream);
+  for (const auto& input : {locations, key_pool}) record_if_needed(*ctx, input, stream);
   const auto output_bucket = std::bit_ceil(static_cast<uint32_t>(plan.rows));
   auto output = bucket_output(query, at::kBFloat16, output_bucket, plan.rows, query.size(1));
   auto input_address = [&](const at::Tensor& input, int64_t first_row, int64_t valid_rows, uint32_t bucket,

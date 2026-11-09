@@ -26,6 +26,15 @@ struct AllocationContext {
 struct CastType { synDataType syn; const char* name; };
 
 std::shared_ptr<Context> current();
+class ContextScope {
+ public:
+  explicit ContextScope(std::shared_ptr<Context> context);
+  ~ContextScope();
+  ContextScope(const ContextScope&) = delete;
+  ContextScope& operator=(const ContextScope&) = delete;
+ private:
+  std::shared_ptr<Context> previous_;
+};
 uint64_t span_bytes(const at::Tensor& tensor);
 uint64_t address_of(const at::Tensor& tensor, const Context& ctx);
 c10::DataPtr allocation_data_ptr(const std::shared_ptr<Context>& ctx, uint64_t address,

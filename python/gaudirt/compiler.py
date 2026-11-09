@@ -493,7 +493,208 @@ def _program_backend(graph_module, example_inputs):
         result = tuple(result)
         return result[0] if single_output else result
 
+    execute._gaudirt_segment = (program, tuple(tensor_indices), result_routes, single_output,
+                                tuple((tensor_indices[index], tensor_indices[weight])
+                                      for index, weight in validated_token_bindings),
+                                tuple((tensor_indices[index], dynamic_argument)
+                                      for index in validated_row_bindings))
     return execute
+
+
+class _SegmentExecution:
+    def __init__(self, split, runner, input_indices, output_template, checks, records):
+        self.split = split
+        self.runner = runner
+        self.input_indices = input_indices
+        self.output_template = output_template
+        self.token_checks, self.row_checks = checks
+        self.records = records
+        self.tracing = False
+        self.trace_result = None
+        self.trace_deltas = ()
+        self.profile_events = None
+        self.profile_host_ms = None
+
+    def enable_trace(self):
+        """Observe actual C++ segment results for correctness audits."""
+        if self.profile_events is not None:
+            raise RuntimeError("GaudiRT FX: tracing and segment profiling are mutually exclusive")
+        self.tracing = True
+        for segment, *_ in self.records:
+            segment.forward = lambda *args: self.trace_result
+
+    def named_children(self):
+        if not self.tracing:
+            raise RuntimeError("GaudiRT FX: enable segment tracing before attaching audit callbacks")
+        return self.split.named_children()
+
+    def trace_compile_delta(self, index):
+        return self.trace_deltas[index]
+
+    def profile(self, events):
+        """Use initialized timing events; the caller synchronizes before reuse."""
+        if events is not None and (self.tracing or len(events) != len(self.records)):
+            raise RuntimeError("GaudiRT FX: invalid segment profiling events")
+        self.profile_events = None if events is None else tuple(event.event_id for pair in events for event in pair)
+
+    def forward(self, *args):
+        for index, weight in self.token_checks:
+            vocabulary = getattr(args[index], "_gaudirt_validated_vocab", None)
+            if not isinstance(vocabulary, int) or vocabulary <= 0 or vocabulary > args[weight].shape[0]:
+                raise RuntimeError("GaudiRT FX: embedding token IDs must pass batch metadata validation")
+        for index, dynamic in self.row_checks:
+            if getattr(args[index], "_gaudirt_validated_rows", None) != args[dynamic].shape[0]:
+                raise RuntimeError("GaudiRT FX: row indices must pass batch metadata validation")
+        inputs = [args[index] for index in self.input_indices]
+        if self.tracing:
+            result, traces = self.runner.run_traced(inputs, list(range(len(self.records))))
+            self.trace_deltas = tuple(trace[2] for trace in traces)
+            for i, (segment, host_arguments, tensor_arguments, single) in enumerate(self.records):
+                tensor_values, outputs, _ = traces[i]
+                actual = [args[value] if kind == "input" else value for kind, value in host_arguments]
+                for index, tensor in zip(tensor_arguments, tensor_values):
+                    actual[index] = tensor
+                self.trace_result = outputs[0] if single else tuple(outputs)
+                segment.forward(*actual)
+                traces[i] = None
+            self.trace_result = None
+        elif self.profile_events is not None:
+            result, self.profile_host_ms = self.runner.run_profiled(inputs, self.profile_events)
+        else:
+            result = self.runner.run(inputs)
+
+        def restore(template):
+            kind, value = template
+            if kind == "tensor":
+                return result[value]
+            if kind == "input":
+                return args[value]
+            if kind == "tuple":
+                return tuple(restore(item) for item in value)
+            if kind == "list":
+                return [restore(item) for item in value]
+            return value
+
+        return restore(self.output_template)
+
+
+def _segment_executor(split, example_inputs, paged):
+    graph_nodes = tuple(split.graph.nodes)
+    placeholders = tuple(node for node in graph_nodes if node.op == "placeholder")
+    if len(placeholders) != len(example_inputs):
+        raise RuntimeError("GaudiRT FX: split placeholder count mismatch")
+    positions = {node: index for index, node in enumerate(placeholders)}
+    input_indices = tuple(index for index, value in enumerate(example_inputs) if isinstance(value, torch.Tensor))
+    values = {placeholders[index]: slot for slot, index in enumerate(input_indices)}
+    runner = _C.SegmentedRunner(len(input_indices))
+    token_checks, row_checks, records = set(), set(), []
+    dynamic_inputs = [index for index in input_indices if placeholders[index].meta.get("gaudirt_dynamic")]
+    dynamic_input = dynamic_inputs[0] if dynamic_inputs else None
+
+    def tensor_slot(value):
+        if not isinstance(value, torch.fx.Node) or value not in values or isinstance(values[value], tuple):
+            raise RuntimeError("GaudiRT FX: unsupported tensor connection between segments")
+        return values[value]
+
+    def external_index(value):
+        if not isinstance(value, torch.fx.Node) or value not in positions:
+            raise RuntimeError("GaudiRT FX: validated metadata must enter the captured graph directly")
+        return positions[value]
+
+    def host_arguments(arguments, tensor_arguments):
+        tensor_arguments = set(tensor_arguments)
+        result = []
+        for index, value in enumerate(arguments):
+            if index in tensor_arguments:
+                result.append(("literal", None))
+            elif isinstance(value, torch.fx.Node):
+                result.append(("input", external_index(value)))
+            else:
+                result.append(("literal", value))
+        return tuple(result)
+
+    for node in graph_nodes:
+        if node.op == "placeholder":
+            continue
+        if node.op == "call_function" and node.target is operator.getitem:
+            source, index = node.args
+            if source not in values or not isinstance(values[source], tuple) or not isinstance(index, int):
+                raise RuntimeError("GaudiRT FX: unsupported split graph indexing")
+            values[node] = values[source][index]
+            continue
+        if node.op == "output":
+            output_ids = []
+
+            def output_template(value):
+                if isinstance(value, torch.fx.Node):
+                    if value in values:
+                        slots = values[value]
+                        if isinstance(slots, tuple):
+                            return ("tuple", tuple(output_template_slot(slot) for slot in slots))
+                        return output_template_slot(slots)
+                    return ("input", external_index(value))
+                if isinstance(value, (tuple, list)):
+                    return ("tuple" if isinstance(value, tuple) else "list",
+                            tuple(output_template(item) for item in value))
+                return ("literal", value)
+
+            def output_template_slot(slot):
+                output_ids.append(slot)
+                return ("tensor", len(output_ids) - 1)
+
+            template = output_template(node.args[0])
+            runner.set_outputs(output_ids)
+            return _SegmentExecution(split, runner, input_indices, template,
+                                     (tuple(sorted(token_checks)), tuple(sorted(row_checks))), records).forward
+        if node.op != "call_module" or node.kwargs:
+            raise RuntimeError("GaudiRT FX: unsupported operation between segments")
+        segment = split.get_submodule(node.target)
+        segment_nodes = tuple(segment.graph.nodes)
+        segment_inputs = tuple(item for item in segment_nodes if item.op == "placeholder")
+        if len(segment_inputs) != len(node.args):
+            raise RuntimeError("GaudiRT FX: segment argument count mismatch")
+        stateful = [item for item in segment_nodes if item.op == "call_function" and item.target in paged]
+        if stateful:
+            if len(stateful) != 1 or any(item.op not in ("placeholder", "output") and item is not stateful[0]
+                                         for item in segment_nodes):
+                raise RuntimeError("GaudiRT FX: invalid paged-attention partition")
+            attention = stateful[0]
+            if len(attention.args) != 12 or attention.kwargs:
+                raise RuntimeError("GaudiRT FX: unsupported paged-attention arguments")
+            try:
+                tensor_arguments = tuple(segment_inputs.index(item) for item in attention.args[:10])
+            except ValueError as error:
+                raise RuntimeError("GaudiRT FX: attention tensors must be segment inputs") from error
+            head_dim, scale = attention.args[10:]
+            if not isinstance(head_dim, int) or not isinstance(scale, (int, float)):
+                raise RuntimeError("GaudiRT FX: attention geometry must be static")
+            slots = [tensor_slot(node.args[index]) for index in tensor_arguments]
+            values[node] = runner.add_attention(slots, head_dim, float(scale))
+            records.append((segment, host_arguments(node.args, tensor_arguments), tensor_arguments, True))
+            continue
+        examples = [item.meta.get("example_value") for item in segment_inputs]
+        program, tensor_arguments, routes, single, token_bindings, row_bindings = \
+            _program_backend(segment, examples)._gaudirt_segment
+        slots = [tensor_slot(node.args[index]) for index in tensor_arguments]
+        compiled_routes = []
+        for is_input, index, operations in routes:
+            source = tensor_arguments.index(index) if is_input else index
+            views = []
+            for operation in operations:
+                kind = getattr(_C.SegmentViewKind, operation[0])
+                arguments = operation[1] if operation[0] == "reshape" else operation[1:]
+                views.append(_C.SegmentView(kind, list(arguments)))
+            compiled_routes.append(_C.SegmentRoute(is_input, source, views))
+        emitted = tuple(runner.add_program(program, slots, compiled_routes))
+        values[node] = emitted[0] if single else emitted
+        for index, weight in token_bindings:
+            token_checks.add((external_index(node.args[index]), external_index(node.args[weight])))
+        for index, _ in row_bindings:
+            if dynamic_input is None:
+                raise RuntimeError("GaudiRT FX: missing dynamic input for validated row indices")
+            row_checks.add((external_index(node.args[index]), dynamic_input))
+        records.append((segment, host_arguments(node.args, tensor_arguments), tensor_arguments, single))
+    raise RuntimeError("GaudiRT FX: split graph has no output")
 
 
 def _partition_backend(graph_module, example_inputs):
@@ -535,23 +736,7 @@ def _partition_backend(graph_module, example_inputs):
         else:
             partitions[node] = partition
     split = split_module(graph_module, graph_module, lambda node: partitions[node], keep_original_order=True)
-    for _, segment in split.named_children():
-        segment_nodes = tuple(segment.graph.nodes)
-        stateful = [node for node in segment_nodes if node.op == "call_function" and node.target in paged]
-        if stateful:
-            if len(stateful) != 1 or any(node.op not in ("placeholder", "output") and node is not stateful[0]
-                                         for node in segment_nodes):
-                raise RuntimeError("GaudiRT FX: invalid paged-attention partition")
-            continue
-        compiled = []
-
-        def execute(*args, _segment=segment, _compiled=compiled):
-            if not _compiled:
-                _compiled.append(_program_backend(_segment, args))
-            return _compiled[0](*args)
-
-        segment.forward = execute
-    return split.forward
+    return _segment_executor(split, example_inputs, paged)
 
 
 def gaudirt_backend(graph_module, example_inputs):
@@ -634,13 +819,25 @@ def compile(module, dynamic_arg_indices=(0,)):
         replacements = []
         dynamic_ids = {id(args[index]) for index in dynamic_arg_indices}
         static_tokens = [None] * len(args)
+        declared_dynamic = set()
         for index, value in enumerate(args):
             if isinstance(value, torch.Tensor) and id(value) not in dynamic_ids:
-                static_tokens[index] = static_tensor_token(value, index)
+                dimensions = getattr(value, "_dynamo_dynamic_indices", set()) or set()
+                if dimensions == {0}:
+                    declared_dynamic.add(index)
+                elif dimensions:
+                    raise RuntimeError("GaudiRT FX: only the outer dimension may be dynamic")
+                else:
+                    static_tokens[index] = static_tensor_token(value, index)
         for index in dynamic_arg_indices:
             original = args[index]
             if id(original) not in staged_inputs:
-                staged = _C._prepare_strided_input(original)
+                if (isinstance(original, torch.Tensor) and original.ndim == 1 and original.stride(0) == 1 and
+                        original.device.type == "gaudirt" and original.device.index == 0 and
+                        0 < original.shape[0] <= 4096):
+                    staged = None
+                else:
+                    staged = _C._prepare_strided_input(original)
                 if staged is not None:
                     replacements.append((original, staged))
                     for name in ("_gaudirt_validated_vocab", "_gaudirt_validated_rows"):
@@ -652,7 +849,7 @@ def compile(module, dynamic_arg_indices=(0,)):
                 torch._dynamo.mark_static(prepared_args[index], list(range(1, prepared_args[index].ndim)))
             torch._dynamo.mark_dynamic(prepared_args[index], 0, min=1, max=4096)
         key = (tuple(static_tokens[index] if static_tokens[index] is not None else
-                     signature(value, index in dynamic_arg_indices)
+                     signature(value, index in dynamic_arg_indices or index in declared_dynamic)
                      for index, value in enumerate(prepared_args)), signature(kwargs))
         needs_capture = key not in captured_signatures
         while True:

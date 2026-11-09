@@ -26,6 +26,7 @@ class BucketProgram {
   BucketProgram(std::vector<int64_t> roles, std::vector<FxNode> operations, std::vector<int64_t> outputs = {});
   ~BucketProgram();
   std::vector<at::Tensor> run(const std::vector<at::Tensor>& inputs);
+  std::vector<at::Tensor> run_internal(const std::vector<at::Tensor>& inputs, const std::vector<bool>& trusted);
 
  private:
   struct CachedContext {

@@ -18,6 +18,9 @@ def main():
     probe.gaudirt_test_launch_gate_passed.restype = ctypes.c_bool
     gaudirt.initialize(hbm_bytes=256 * 1024**2, pinned_bytes=8 * 1024**2)
     program = gaudirt._C.BucketProgram([1, 1], [gaudirt._C.FxNode.binary(gaudirt._C.FxOp.add, 0, 1)], [2])
+    runner = gaudirt._C.SegmentedRunner(2)
+    outputs = runner.add_program(program, [0, 1], [gaudirt._C.SegmentRoute(False, 0, [])])
+    runner.set_outputs(outputs)
     streams = [gaudirt.Stream(), gaudirt.Stream()]
     host = [torch.full((4, 64), i + 1, dtype=torch.bfloat16) for i in range(2)]
     inputs = [(x.to("gaudirt:0"), (x + 2).to("gaudirt:0")) for x in host]
@@ -30,7 +33,7 @@ def main():
     def run(index):
         with gaudirt.stream(streams[index]):
             barrier.wait(timeout=30)
-            return program.run(list(inputs[index]))[0]
+            return runner.run(list(inputs[index]))[0]
 
     probe.gaudirt_test_launch_gate_arm()
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -40,7 +43,7 @@ def main():
     for index, result in enumerate(results):
         assert torch.equal(result.cpu(), host[index] * 2 + 2)
     assert gaudirt.recipe_cache_stats()[2] == 1
-    del result, results, inputs, streams, program
+    del result, results, inputs, streams, runner, program
     gaudirt.empty_cache()
     gaudirt.shutdown()
     print("two warmed FX segments reached synLaunch concurrently and produced correct output", flush=True)

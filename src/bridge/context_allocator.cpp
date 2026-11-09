@@ -52,8 +52,16 @@ at::Tensor tensor_from_allocation(c10::DataPtr data, uint64_t bytes, at::IntArra
 
 std::mutex context_mutex;
 std::shared_ptr<Context> context;
+thread_local std::shared_ptr<Context> scoped_context;
+
+ContextScope::ContextScope(std::shared_ptr<Context> value) : previous_(std::move(scoped_context)) {
+  scoped_context = std::move(value);
+}
+
+ContextScope::~ContextScope() { scoped_context = std::move(previous_); }
 
 std::shared_ptr<Context> current() {
+  if (scoped_context) return scoped_context;
   std::lock_guard lock(context_mutex);
   TORCH_CHECK(context, "GaudiRT: device is not initialized");
   return context;

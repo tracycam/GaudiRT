@@ -33,7 +33,7 @@ def connected(x, q0, q1, q2, o0, o1, o2, k0, v0, k1, v1, k2, v2,
 def main():
     torch.set_num_threads(4)
     torch.random.default_generator.manual_seed(6531)
-    gaudirt.initialize(hbm_bytes=512 * 1024 * 1024, pinned_bytes=4 * 1024 * 1024)
+    gaudirt.initialize(hbm_bytes=2 * 1024**3, pinned_bytes=4 * 1024 * 1024)
     original = compiler.gaudirt_backend
     captures = []
 
@@ -54,10 +54,17 @@ def main():
         x = torch.randn(rows, 256, dtype=torch.bfloat16)
         bases = [(torch.randn(attention_ref.SLOTS, 2, 64, dtype=torch.bfloat16),
                   torch.randn(attention_ref.SLOTS, 2, 64, dtype=torch.bfloat16)) for _ in range(3)]
-        pools = [tensor.to("gaudirt:0") for pair in bases for tensor in pair]
+        combined = [gaudirt._C._allocate_paged_kv(1, attention_ref.SLOTS, 2, 64) for _ in bases]
+        pools = []
+        for allocation, pair in zip(combined, bases):
+            for index, tensor in enumerate(pair):
+                allocation[0, index].copy_(tensor.transpose(0, 1).contiguous())
+                pools.append(allocation[0, index].transpose(0, 1))
+        plan = metadata.attention_plan(4, 2, 64)
+        torch._dynamo.mark_dynamic(plan, 0, min=1, max=536870912)
         result = compiled(x.to("gaudirt:0"), *device_weights, *pools, metadata.row_locations(),
                           metadata.row_requests(), metadata.rotary_positions(),
-                          metadata.request_mapping(), metadata.rotary_header())
+                          plan, metadata.rotary_header())
         truth, floor = x.double(), x.double()
         for layer in range(3):
             args = (weights[layer], weights[3 + layer], *bases[layer], locations, requests, positions, mapping)
@@ -82,9 +89,9 @@ def main():
     assert len(captures) == 1, len(captures)
     counts = gaudirt.recipe_cache_stats()
     if os.environ.get("GAUDIRT_TEST_CACHE") == "cold":
-        assert counts[:2] == [0, 15], counts
+        assert counts[:2] == [0, 16], counts
     elif os.environ.get("GAUDIRT_TEST_CACHE") == "warm":
-        assert counts[:2] == [15, 0], counts
+        assert counts[:2] == [16, 0], counts
     if path := os.environ.get("GAUDIRT_TEST_OUTPUT"):
         with open(path, "wb") as output:
             output.write(payload)

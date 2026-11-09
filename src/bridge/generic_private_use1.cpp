@@ -7,6 +7,7 @@
 #include "cold_recipe.hpp"
 #include "bridge_internal.hpp"
 #include "bucket_program.hpp"
+#include "segmented_runner.hpp"
 #include "context.hpp"
 #include "fx_node.hpp"
 #include "fx_geometry.hpp"
@@ -307,8 +308,9 @@ at::Tensor bucket_output(const at::Tensor& reference, at::ScalarType dtype,
   const uint64_t elements = static_cast<uint64_t>(bucket) * width;
   const uint64_t bytes = (elements * item + BlockCachingAllocator::kAlignment - 1) &
                          ~(BlockCachingAllocator::kAlignment - 1);
-  auto storage = at::empty({static_cast<int64_t>(bytes / item)}, reference.options().dtype(dtype));
-  return storage.narrow(0, 0, elements).view({static_cast<int64_t>(bucket), width}).narrow(0, 0, rows);
+  auto output = at::empty({static_cast<int64_t>(bytes / item)}, reference.options().dtype(dtype));
+  output.unsafeGetTensorImpl()->set_sizes_contiguous({rows, width});
+  return output;
 }
 
 at::Tensor bucket_linear(const at::Tensor& input, const at::Tensor& weight,
@@ -686,8 +688,29 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_static("rotary", &FxNode::rotary).def_static("cast", &FxNode::cast)
       .def_static("concat", &FxNode::concat).def_static("reshape", &FxNode::reshape)
       .def_static("transpose", &FxNode::transpose).def_static("scalar", &FxNode::scalar);
-  pybind11::class_<gaudirt::generic::BucketProgram>(m, "BucketProgram")
+  pybind11::class_<gaudirt::generic::BucketProgram, std::shared_ptr<gaudirt::generic::BucketProgram>>(m, "BucketProgram")
       .def(pybind11::init<std::vector<int64_t>, std::vector<FxNode>, std::vector<int64_t>>())
       .def("run", &gaudirt::generic::BucketProgram::run,
+           pybind11::call_guard<pybind11::gil_scoped_release>());
+  using gaudirt::generic::SegmentViewKind;
+  using gaudirt::generic::SegmentView;
+  using gaudirt::generic::SegmentRoute;
+  using gaudirt::generic::SegmentedRunner;
+  pybind11::enum_<SegmentViewKind>(m, "SegmentViewKind")
+      .value("feature", SegmentViewKind::feature).value("reshape", SegmentViewKind::reshape)
+      .value("transpose", SegmentViewKind::transpose);
+  pybind11::class_<SegmentView>(m, "SegmentView")
+      .def(pybind11::init<SegmentViewKind, std::vector<int64_t>>());
+  pybind11::class_<SegmentRoute>(m, "SegmentRoute")
+      .def(pybind11::init<bool, size_t, std::vector<SegmentView>>());
+  pybind11::class_<SegmentedRunner>(m, "SegmentedRunner")
+      .def(pybind11::init<size_t>())
+      .def("add_program", &SegmentedRunner::add_program)
+      .def("add_attention", &SegmentedRunner::add_attention)
+      .def("set_outputs", &SegmentedRunner::set_outputs)
+      .def("run", &SegmentedRunner::run, pybind11::call_guard<pybind11::gil_scoped_release>())
+      .def("run_traced", &SegmentedRunner::run_traced,
+           pybind11::call_guard<pybind11::gil_scoped_release>())
+      .def("run_profiled", &SegmentedRunner::run_profiled,
            pybind11::call_guard<pybind11::gil_scoped_release>());
 }
