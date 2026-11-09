@@ -51,7 +51,7 @@ def main():
             CONTEXT = context
             positions_cpu = torch.arange(end - rows, end, dtype=torch.int32)
             prepared = metadata(context, positions_cpu)
-            cache = cache_cpu[:context].contiguous().to("gaudirt:0")
+            cache = gaudirt._reserve_rotary_cache(cache_cpu[:context].contiguous())
             before = gaudirt.recipe_cache_stats()
             output = run(x, weight, prepared.rotary_positions(), prepared.rotary_header(), cache)
             after = gaudirt.recipe_cache_stats()
@@ -69,13 +69,20 @@ def main():
     expected = [0, 2] if os.environ["GAUDIRT_TEST_CACHE"] == "cold" else [2, 0]
     stats = gaudirt.recipe_cache_stats()
     assert stats[:2] == expected, stats
-    short_cache = cache_cpu[:4608].contiguous().to("gaudirt:0")
+    short_cache = gaudirt._reserve_rotary_cache(cache_cpu[:4608].contiguous())
     try:
         run(x, weight, prepared.rotary_positions(), prepared.rotary_header(), short_cache)
     except RuntimeError as error:
         assert "rotary" in str(error).lower(), str(error)
     else:
         raise AssertionError("rotary cache shorter than the validated context was accepted")
+    unreserved = cache_cpu.to("gaudirt:0")
+    try:
+        run(x, weight, prepared.rotary_positions(), prepared.rotary_header(), unreserved)
+    except RuntimeError as error:
+        assert "reserved static storage" in str(error).lower(), str(error)
+    else:
+        raise AssertionError("rotary cache without reserved static storage was accepted")
     if path := os.environ.get("GAUDIRT_TEST_OUTPUT"):
         with open(path, "wb") as out:
             out.write(payload)

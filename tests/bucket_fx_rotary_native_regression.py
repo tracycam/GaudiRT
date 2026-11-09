@@ -36,7 +36,7 @@ def main():
     x, weight = x_cpu.to("gaudirt:0"), weight_cpu.to("gaudirt:0")
     prepared, _ = metadata(137)
     positions, header = prepared.rotary_positions(), prepared.rotary_header()
-    cache = torch.randn(128, 64).to(torch.bfloat16).to("gaudirt:0")
+    cache = gaudirt._reserve_rotary_cache(torch.randn(128, 64).to(torch.bfloat16))
     plain = compiler.compile(projection, dynamic_arg_indices=(0,))(x, weight)
     projected = compiler.compile(projection_and_rotary, dynamic_arg_indices=(0, 2))(
         x, weight, positions, header, cache

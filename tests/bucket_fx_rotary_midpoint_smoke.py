@@ -43,7 +43,7 @@ def main():
     denominator = torch.linalg.vector_norm(reference).clamp_min(1e-30)
     floor = (torch.linalg.vector_norm(reference32 - reference) / denominator).item()
     weight = weight_cpu.to("gaudirt:0")
-    cache = torch.zeros((128, 128), dtype=torch.bfloat16).to("gaudirt:0")
+    cache = gaudirt._reserve_rotary_cache(torch.zeros((128, 128), dtype=torch.bfloat16))
     compiled = compiler.compile(graph, dynamic_arg_indices=(0, 2))
     payload = bytearray()
     for rows in (1, 3):

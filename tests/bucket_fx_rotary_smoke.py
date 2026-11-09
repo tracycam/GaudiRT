@@ -69,7 +69,7 @@ def main():
     weights_cpu = [(torch.randn(256, INPUT_WIDTH) * 0.05).to(torch.bfloat16) for _ in range(2)]
     weights = [value.to("gaudirt:0") for value in weights_cpu]
     cache_cpu = torch.randn(128, 64, dtype=torch.bfloat16)
-    cache = cache_cpu.to("gaudirt:0")
+    cache = gaudirt._reserve_rotary_cache(cache_cpu)
     first_graph = compiler.compile(graph, dynamic_arg_indices=(0, 2))
     second_graph = compiler.compile(second_layer, dynamic_arg_indices=(0, 2))
     payload, errors, floors, absolutes = bytearray(), [], [], []

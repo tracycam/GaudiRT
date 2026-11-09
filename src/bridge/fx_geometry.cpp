@@ -20,7 +20,7 @@ std::vector<bool> rotary_cache_inputs(const std::vector<int64_t>& roles,
       const auto id = op.inputs[index];
       if (id < 0 || id >= static_cast<int64_t>(roles.size())) continue;
       if (op.op == FxOp::rotary && index == 2 &&
-          std::get<FxRotary>(op.parameters).context <= static_cast<int64_t>(kRotaryDynamicRows))
+          std::get<FxRotary>(op.parameters).context <= static_cast<int64_t>(kRotaryStaticRows))
         caches[id] = true;
       else
         other_uses[id] = true;
@@ -38,7 +38,7 @@ FxGeometry infer_fx_geometry(const std::vector<at::Tensor>& inputs, const std::v
   std::ostringstream normalized;
   const auto caches = rotary_cache_inputs(roles, operations);
   normalized << (std::any_of(caches.begin(), caches.end(), [](bool value) { return value; })
-                     ? "fx_program_rotary_dynamic_v1;" : "fx_program_v15;");
+                     ? "fx_program_rotary_static_v1;" : "fx_program_v15;");
   for (size_t i = 0; i < inputs.size(); ++i) {
     const auto& tensor = inputs[i];
     const bool floating = tensor.scalar_type() == at::kBFloat16 || tensor.scalar_type() == at::kFloat;

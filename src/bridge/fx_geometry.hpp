@@ -11,9 +11,9 @@
 
 namespace gaudirt::generic {
 
-// A rotary table larger than this can still use a static descriptor. Tables
-// whose validated context fits this range share one dynamic descriptor.
-inline constexpr uint64_t kRotaryDynamicRows = 131072;
+// Rotary tables whose validated context fits this range share a static
+// descriptor backed by an allocation of at least this many rows.
+inline constexpr uint64_t kRotaryStaticRows = 131072;
 
 struct FxGeometry {
   std::vector<TensorSpec> specs;

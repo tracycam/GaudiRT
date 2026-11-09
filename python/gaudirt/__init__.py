@@ -109,6 +109,18 @@ def initialize(module_id=0, hbm_bytes=256 * 1024 * 1024, pinned_bytes=8 * 1024 *
     _C.initialize(module_id, hbm_bytes, pinned_bytes)
 
 
+def _reserve_rotary_cache(cache):
+    """Keep the logical lookup extent while reserving static descriptor storage."""
+    if (cache.device.type not in ("cpu", "gaudirt") or cache.dtype != torch.bfloat16 or
+            cache.ndim != 2 or not cache.is_contiguous() or min(cache.shape) <= 0):
+        raise ValueError("GaudiRT: rotary cache must be a contiguous BF16 matrix")
+    rows = max(cache.shape[0], _C._rotary_static_rows)
+    storage = torch.empty((rows, cache.shape[1]), device="gaudirt:0", dtype=cache.dtype)
+    visible = storage.narrow(0, 0, cache.shape[0])
+    visible.copy_(cache, non_blocking=True)
+    return visible
+
+
 def validated_token_ids(metadata):
     """Return logical token IDs that have passed the batch metadata gate."""
     tokens = metadata.token_ids()

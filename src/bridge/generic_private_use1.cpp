@@ -9,6 +9,7 @@
 #include "bucket_program.hpp"
 #include "context.hpp"
 #include "fx_node.hpp"
+#include "fx_geometry.hpp"
 #include "layout_copy.hpp"
 #include "eager_copy.hpp"
 #include "paged_metadata.hpp"
@@ -661,6 +662,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("_feature_view", &gaudirt::generic::feature_view);
   m.def("_reshape_view", &gaudirt::generic::reshape_view);
   m.def("_transpose_feature_view", &gaudirt::generic::transpose_feature_view);
+  m.attr("_rotary_static_rows") = gaudirt::generic::kRotaryStaticRows;
   m.def("bucket_linear", &gaudirt::generic::bucket_linear,
         pybind11::arg("input"), pybind11::arg("weight"), pybind11::arg("bias") = pybind11::none());
   using gaudirt::generic::FxNode;

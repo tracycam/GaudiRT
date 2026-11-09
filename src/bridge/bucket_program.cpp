@@ -215,7 +215,10 @@ const BucketProgram::StaticBindings* BucketProgram::bind_static_inputs(
     const auto& allocation = validated_program_input(input, ctx);
     const auto address = reinterpret_cast<uint64_t>(input.data_ptr());
     const auto base = reinterpret_cast<uint64_t>(input.storage().data());
-    const auto bytes = input.nbytes(), storage = input.storage().nbytes();
+    const uint64_t bytes = rotary_cache_inputs_[index]
+        ? kRotaryStaticRows * static_cast<uint64_t>(input.size(1)) * input.element_size()
+        : input.nbytes();
+    const auto storage = input.storage().nbytes();
     if (!input.is_contiguous() || address % BlockCachingAllocator::kAlignment != 0 || address < base ||
         address - base > storage || bytes > storage - (address - base)) return nullptr;
     for (const auto& other : binding->inputs)
@@ -300,8 +303,7 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
       const auto& spec = specs_[i];
       if (rotary_cache_inputs_[i]) {
         const auto width = static_cast<uint64_t>(spec.sizes[1]);
-        values[i] = builder.tensor(cast_type(spec.dtype).syn, {width, kRotaryDynamicRows}, i,
-                                   -1, 0, true, {width, 1});
+        values[i] = builder.tensor(cast_type(spec.dtype).syn, {width, kRotaryStaticRows}, i);
       } else {
         values[i] = tensor_from_spec(spec, i);
       }
@@ -635,6 +637,11 @@ std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs
     for (int64_t dim = 0; dim < input.dim(); ++dim) {
       if (rotary_cache_inputs_[i] && dim == 0) {
         TORCH_CHECK(input.size(0) >= rotary_cache_contexts_[i], "GaudiRT FX: rotary cache is too short");
+        const uint64_t offset = static_cast<uint64_t>(input.storage_offset()) * input.element_size();
+        const uint64_t required = kRotaryStaticRows * static_cast<uint64_t>(input.size(1)) * input.element_size();
+        TORCH_CHECK(input.is_contiguous() && offset <= input.storage().nbytes() &&
+                    required <= input.storage().nbytes() - offset,
+                    "GaudiRT FX: rotary cache requires reserved static storage");
         continue;
       }
       const auto expected = spec.dynamic() && dim == 0 ? m : spec.sizes[dim];
@@ -664,9 +671,6 @@ std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs
   ProgramTemporaries temporaries(*ctx, stream);
   c10::SmallVector<std::pair<uint64_t, uint64_t>, 8> regions;
   c10::SmallVector<synLaunchTensorInfo, 16> bindings(compiled.tensors.begin(), compiled.tensors.end());
-  for (size_t i = 0; i < inputs.size(); ++i)
-    if (rotary_cache_inputs_[i])
-      bindings[i].tensorSize[1] = std::min<uint64_t>(inputs[i].size(0), kRotaryDynamicRows);
   if (static_binding) {
     for (const auto& cached : static_binding->inputs) {
       regions.emplace_back(cached.address, cached.bytes);
@@ -691,7 +695,8 @@ std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs
     }
     TORCH_CHECK(!spec.dynamic() || dynamic_width <= UINT64_MAX / bucket / item,
                 "GaudiRT FX: input allocation size overflow");
-    const uint64_t bytes = spec.dynamic() ? static_cast<uint64_t>(bucket) * dynamic_width * item : input.nbytes();
+    const uint64_t bytes = rotary_cache_inputs_[i] ? kRotaryStaticRows * dynamic_width * item
+        : spec.dynamic() ? static_cast<uint64_t>(bucket) * dynamic_width * item : input.nbytes();
     const auto& allocation = validated_program_input(input, *ctx);
     const uint64_t address = reinterpret_cast<uint64_t>(input.data_ptr());
     if (allocation.stream != stream) {
