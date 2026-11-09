@@ -39,7 +39,7 @@ def main():
             digest.update(b.contiguous().view(torch.uint8).numpy().tobytes())
         token_view = scheduler.token_ids()
         bucket = 1 << (rows - 1).bit_length()
-        padded = token_view.as_strided((bucket,), (1,), 0).cpu()
+        padded = token_view.as_strided((bucket,), (1,), token_view.storage_offset()).cpu()
         assert torch.equal(padded[:rows], tokens.int()) and torch.count_nonzero(padded[rows:]) == 0
         del checked, scheduler, args, keep, token_view
 

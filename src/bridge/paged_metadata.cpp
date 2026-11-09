@@ -265,44 +265,61 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
   auto compute = stream_state.handle;
   auto h2d = ctx->device.h2d_stream();
   const auto options = at::TensorOptions().device(c10::Device(c10::kPrivateUse1, 0)).dtype(at::kInt);
-  locations_ = at::empty({bucket}, options);
-  requests_ = at::empty({bucket}, options);
-  positions_ = at::empty({bucket}, options);
+  // Give each graph input/output its own aligned range while sharing one
+  // allocation and one lifetime across the metadata streams.
+  constexpr int64_t alignment = BlockCachingAllocator::kAlignment / sizeof(int32_t);
+  const auto aligned = [](int64_t count) { return (count + alignment - 1) / alignment * alignment; };
+  int64_t cursor_words = 0;
+  const auto reserve = [&](int64_t count) {
+    const auto start = cursor_words;
+    cursor_words += aligned(count);
+    return start;
+  };
+  const auto header_offset = reserve(1);
+  const auto info_offset = reserve(info.size());
+  const auto last_offset = reserve(batch);
+  const auto staged_words = cursor_words;
+  const auto locations_offset = reserve(bucket);
+  const auto requests_offset = reserve(bucket);
+  const auto positions_offset = reserve(bucket);
+  const auto status_offset = reserve(bucket);
+  const auto token_offset = has_tokens ? reserve(bucket) : 0;
+  const auto token_status_offset = has_tokens ? reserve(bucket) : 0;
+  auto storage = at::empty({cursor_words}, options);
+  const auto view = [&](int64_t offset, int64_t count) { return storage.narrow(0, offset, count); };
+  header_ = view(header_offset, 1);
+  auto device_info = view(info_offset, info.size());
+  last_token_indices_ = view(last_offset, batch);
+  locations_ = view(locations_offset, bucket);
+  requests_ = view(requests_offset, bucket);
+  positions_ = view(positions_offset, bucket);
   mapping_ = mapping;
-  header_ = at::empty({1}, options);
-  last_token_indices_ = at::empty({batch}, options);
-  auto device_info = at::empty({static_cast<int64_t>(info.size())}, options);
-  auto status = at::empty({bucket}, options);
+  auto status = view(status_offset, bucket);
   at::Tensor token_status;
   if (has_tokens) {
-    token_ids_ = at::empty({bucket}, options);
-    token_status = at::empty({bucket}, options);
+    token_ids_ = view(token_offset, bucket);
+    token_status = view(token_status_offset, bucket);
   }
   const auto mapping_address = scheduler_owned ? 0 : address_of(mapping_, *ctx);
   TORCH_CHECK(scheduler_owned || mapping_address % BlockCachingAllocator::kAlignment == 0,
               "GaudiRT device metadata: request map must be 256-byte aligned");
   const auto header_address = address_of(header_, *ctx), info_address = address_of(device_info, *ctx);
-  const auto last_token_address = address_of(last_token_indices_, *ctx);
   const auto location_address = address_of(locations_, *ctx), request_address = address_of(requests_, *ctx);
   const auto position_address = address_of(positions_, *ctx), status_address = address_of(status, *ctx);
   {
-    const uint64_t bytes = (1 + info.size() + last_token_indices.size()) * sizeof(int32_t);
+    const uint64_t bytes = staged_words * sizeof(int32_t);
     TemporaryHost staging(*ctx, bytes);
     auto* host = static_cast<int32_t*>(staging.address);
-    host[0] = static_cast<int32_t>(m);
-    std::memcpy(host + 1, info.data(), info.size() * sizeof(int32_t));
-    std::memcpy(host + 1 + info.size(), last_token_indices.data(), last_token_indices.size() * sizeof(int32_t));
+    std::memset(host, 0, bytes);
+    host[header_offset] = static_cast<int32_t>(m);
+    std::memcpy(host + info_offset, info.data(), info.size() * sizeof(int32_t));
+    std::memcpy(host + last_offset, last_token_indices.data(), last_token_indices.size() * sizeof(int32_t));
     auto& reusable = stream_state.metadata_reusable;
     auto& ready = stream_state.metadata_ready;
     reusable.record_and_wait(compute, h2d);
-    for (const auto address : {header_address, info_address, last_token_address}) {
-      ctx->allocator.record_stream(address, h2d);
-      ctx->allocator.record_stream(address, compute);
-    }
-    ctx->pinned.copy_h2d(header_address, host, sizeof(int32_t), h2d, true);
-    ctx->pinned.copy_h2d(info_address, host + 1, info.size() * sizeof(int32_t), h2d, true);
-    ctx->pinned.copy_h2d(last_token_address, host + 1 + info.size(),
-                         last_token_indices.size() * sizeof(int32_t), h2d, true);
+    ctx->allocator.record_stream(header_address, h2d);
+    ctx->allocator.record_stream(header_address, compute);
+    ctx->pinned.copy_h2d(header_address, host, bytes, h2d, true);
     ready.record_and_wait(h2d, compute);
   }
   const std::array<at::Tensor, 4> sources{locations, batch_requests, positions, token_ids};
@@ -350,9 +367,6 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
       reserved.emplace_back(input_addresses[i], bytes);
     }
     if (!scheduler_owned) ctx->allocator.record_stream(mapping_address, compute);
-    for (const auto address : {header_address, info_address, location_address,
-                               request_address, position_address, status_address})
-      ctx->allocator.record_stream(address, compute);
     if (recipe.workspace) workspace = std::make_unique<GraphTemporary>(graph_pool(), compute, recipe.workspace);
     auto bindings = recipe.tensors;
     const uint64_t addresses[] = {input_addresses[0], input_addresses[1], input_addresses[2], mapping_address,
@@ -368,8 +382,6 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
     if (has_tokens) {
       const auto token_address = address_of(token_ids_, *ctx);
       const auto token_status_address = address_of(token_status, *ctx);
-      ctx->allocator.record_stream(token_address, compute);
-      ctx->allocator.record_stream(token_status_address, compute);
       bindings[binding_index(10)].pTensorAddress = input_addresses[3];
       bindings[binding_index(11)].pTensorAddress = token_address;
       bindings[binding_index(12)].pTensorAddress = token_status_address;
@@ -387,7 +399,6 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
     ctx->pinned.copy_d2h(host_status.address, status_address, static_cast<uint64_t>(m) * sizeof(int32_t), d2h, true);
     if (has_tokens) {
       const auto token_status_address = address_of(token_status, *ctx);
-      ctx->allocator.record_stream(token_status_address, d2h);
       ctx->pinned.copy_d2h(static_cast<int32_t*>(host_status.address) + m, token_status_address,
                            static_cast<uint64_t>(m) * sizeof(int32_t), d2h, true);
     }
