@@ -105,6 +105,25 @@ ColdRecipe& fused_recipe(Context& ctx, const AttentionPlan& plan, const Attentio
   return *it->second;
 }
 
+ColdRecipe& cached_fused_recipe(Context& ctx, const AttentionPlan& plan, const AttentionBlock& block, float scale) {
+  struct Cache {
+    uint64_t generation = 0;
+    uint32_t rows = 0, kv = 0, scale = 0;
+    int64_t heads = 0, kv_heads = 0, head_dim = 0;
+    ColdRecipe* recipe = nullptr;
+  };
+  thread_local Cache cache;
+  const auto scale_bits = std::bit_cast<uint32_t>(scale);
+  if (cache.recipe && cache.generation == ctx.generation && cache.rows == block.query_bucket &&
+      cache.kv == block.kv_bucket && cache.scale == scale_bits && cache.heads == plan.query_heads &&
+      cache.kv_heads == plan.kv_heads && cache.head_dim == plan.head_dim) return *cache.recipe;
+  std::lock_guard lock(ctx.cold_mutex);
+  auto& recipe = fused_recipe(ctx, plan, block, scale);
+  cache = {ctx.generation, block.query_bucket, block.kv_bucket, scale_bits,
+           plan.query_heads, plan.kv_heads, plan.head_dim, &recipe};
+  return recipe;
+}
+
 void record_if_needed(Context& ctx, const at::Tensor& tensor, synStreamHandle stream) {
   const auto& allocation = validated_program_input(tensor, ctx);
   if (allocation.stream != stream) {
@@ -204,11 +223,7 @@ at::Tensor paged_attn_validated(const at::Tensor& query, const at::Tensor& key, 
                              {q_address, k_address, v_address, locations_address, pool_address, out_binding},
                              scale_f);
     } else {
-      ColdRecipe* recipe;
-      {
-        std::lock_guard lock(ctx->cold_mutex);
-        recipe = &fused_recipe(*ctx, plan, block, scale_f);
-      }
+      auto* recipe = &cached_fused_recipe(*ctx, plan, block, scale_f);
       auto bindings = recipe->tensors;
       const uint64_t value_indices_offset = static_cast<uint64_t>(block.kv_bucket) * plan.kv_heads * sizeof(int32_t);
       const std::array<uint64_t, kFusedSlots> addresses{

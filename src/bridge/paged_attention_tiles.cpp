@@ -149,6 +149,33 @@ uint64_t zero_state(Context& ctx, uint64_t bytes, synStreamHandle stream) {
   }
   return address;
 }
+
+struct TiledRecipes {
+  uint64_t generation = 0, zero = 0;
+  synStreamHandle stream = nullptr;
+  uint32_t rows = 0, kv = 0, scale = 0;
+  int64_t heads = 0, kv_heads = 0, head_dim = 0;
+  ColdRecipe *store = nullptr, *step = nullptr, *finish = nullptr;
+};
+
+const TiledRecipes& cached_tiled_recipes(Context& ctx, const AttentionPlan& plan,
+                                          const AttentionBlock& block, float scale, uint64_t stride) {
+  thread_local TiledRecipes cache;
+  const auto stream = ctx.stream();
+  const auto scale_bits = std::bit_cast<uint32_t>(scale);
+  if (cache.store && cache.generation == ctx.generation && cache.stream == stream &&
+      cache.rows == block.query_bucket && cache.kv == block.kv_bucket && cache.scale == scale_bits &&
+      cache.heads == plan.query_heads && cache.kv_heads == plan.kv_heads && cache.head_dim == plan.head_dim)
+    return cache;
+  std::lock_guard lock(ctx.cold_mutex);
+  auto* store = &store_recipe(ctx, plan, block);
+  auto* step = &step_recipe(ctx, plan, block, scale);
+  auto* finish = &finish_recipe(ctx, plan, block);
+  const auto zero = zero_state(ctx, stride, stream);
+  cache = {ctx.generation, zero, stream, block.query_bucket, block.kv_bucket, scale_bits,
+           plan.query_heads, plan.kv_heads, plan.head_dim, store, step, finish};
+  return cache;
+}
 }  // namespace
 
 void launch_tiled_attention(Context& ctx, const AttentionPlan& plan, const AttentionBlock& block,
@@ -159,15 +186,11 @@ void launch_tiled_attention(Context& ctx, const AttentionPlan& plan, const Atten
   const uint64_t output_bytes = align(rows * heads * d * sizeof(float));
   const uint64_t stride = 2 * stats + output_bytes;
   TORCH_CHECK(plan.scratch_bytes >= 2 * stride, "GaudiRT attention: insufficient tile scratch");
-  ColdRecipe *store, *step, *finish;
-  uint64_t zero;
-  {
-    std::lock_guard lock(ctx.cold_mutex);
-    store = &store_recipe(ctx, plan, block);
-    step = &step_recipe(ctx, plan, block, scale);
-    finish = &finish_recipe(ctx, plan, block);
-    zero = zero_state(ctx, stride, stream);
-  }
+  const auto& cached = cached_tiled_recipes(ctx, plan, block, scale, stride);
+  auto* store = cached.store;
+  auto* step = cached.step;
+  auto* finish = cached.finish;
+  const auto zero = cached.zero;
   const auto workspace_size = std::max({store->workspace, step->workspace, finish->workspace});
   std::unique_ptr<TemporaryDevice> workspace;
   if (workspace_size) workspace = std::make_unique<TemporaryDevice>(ctx, workspace_size);
