@@ -26,8 +26,7 @@ struct GraphKey {
   }
 };
 
-ColdRecipe& store_recipe(Context& ctx, const AttentionPlan& plan, const AttentionBlock& block) {
-  const auto rows = block.query_bucket;
+ColdRecipe& store_recipe(Context& ctx, const AttentionPlan& plan, uint32_t rows) {
   const uint64_t d = plan.head_dim, kv_heads = plan.kv_heads, width = d * kv_heads;
   GraphKey graph_key("store:" + std::to_string(rows) + ':' + std::to_string(d) + ':' +
                      std::to_string(kv_heads), rows);
@@ -155,7 +154,7 @@ struct TiledRecipes {
   synStreamHandle stream = nullptr;
   uint32_t rows = 0, kv = 0, scale = 0;
   int64_t heads = 0, kv_heads = 0, head_dim = 0;
-  ColdRecipe *store = nullptr, *step = nullptr, *finish = nullptr;
+  ColdRecipe *step = nullptr, *finish = nullptr;
 };
 
 const TiledRecipes& cached_tiled_recipes(Context& ctx, const AttentionPlan& plan,
@@ -163,20 +162,45 @@ const TiledRecipes& cached_tiled_recipes(Context& ctx, const AttentionPlan& plan
   thread_local TiledRecipes cache;
   const auto stream = ctx.stream();
   const auto scale_bits = std::bit_cast<uint32_t>(scale);
-  if (cache.store && cache.generation == ctx.generation && cache.stream == stream &&
+  if (cache.step && cache.generation == ctx.generation && cache.stream == stream &&
       cache.rows == block.query_bucket && cache.kv == block.kv_bucket && cache.scale == scale_bits &&
       cache.heads == plan.query_heads && cache.kv_heads == plan.kv_heads && cache.head_dim == plan.head_dim)
     return cache;
   std::lock_guard lock(ctx.cold_mutex);
-  auto* store = &store_recipe(ctx, plan, block);
   auto* step = &step_recipe(ctx, plan, block, scale);
   auto* finish = &finish_recipe(ctx, plan, block);
   const auto zero = zero_state(ctx, stride, stream);
   cache = {ctx.generation, zero, stream, block.query_bucket, block.kv_bucket, scale_bits,
-           plan.query_heads, plan.kv_heads, plan.head_dim, store, step, finish};
+           plan.query_heads, plan.kv_heads, plan.head_dim, step, finish};
   return cache;
 }
 }  // namespace
+
+void launch_layer_kv_store(Context& ctx, const AttentionPlan& plan, uint64_t key, uint64_t value,
+                           uint64_t locations, uint64_t pool) {
+  struct Cache {
+    uint64_t generation = 0;
+    uint32_t rows = 0;
+    int64_t kv_heads = 0, head_dim = 0;
+    ColdRecipe* recipe = nullptr;
+  };
+  thread_local Cache cached;
+  const auto rows = std::bit_ceil(static_cast<uint32_t>(plan.rows));
+  if (!cached.recipe || cached.generation != ctx.generation || cached.rows != rows ||
+      cached.kv_heads != plan.kv_heads || cached.head_dim != plan.head_dim) {
+    std::lock_guard lock(ctx.cold_mutex);
+    cached = {ctx.generation, rows, plan.kv_heads, plan.head_dim, &store_recipe(ctx, plan, rows)};
+  }
+  auto& recipe = *cached.recipe;
+  auto bindings = recipe.tensors;
+  const std::array<uint64_t, 6> addresses{key, value, locations,
+      plan.address + plan.store_header_offset, pool, pool};
+  for (size_t i = 0; i < addresses.size(); ++i) bindings[i].pTensorAddress = addresses[i];
+  std::unique_ptr<TemporaryDevice> workspace;
+  if (recipe.workspace) workspace = std::make_unique<TemporaryDevice>(ctx, recipe.workspace);
+  TORCH_CHECK(synLaunch(ctx.stream(), bindings.data(), bindings.size(), workspace ? workspace->address : 0,
+                        recipe.recipe, 0) == synSuccess, "GaudiRT attention: KV store launch failed");
+}
 
 void launch_tiled_attention(Context& ctx, const AttentionPlan& plan, const AttentionBlock& block,
                             const TiledAttentionInputs& input, float scale) {
@@ -187,20 +211,13 @@ void launch_tiled_attention(Context& ctx, const AttentionPlan& plan, const Atten
   const uint64_t stride = 2 * stats + output_bytes;
   TORCH_CHECK(plan.scratch_bytes >= 2 * stride, "GaudiRT attention: insufficient tile scratch");
   const auto& cached = cached_tiled_recipes(ctx, plan, block, scale, stride);
-  auto* store = cached.store;
   auto* step = cached.step;
   auto* finish = cached.finish;
   const auto zero = cached.zero;
-  const auto workspace_size = std::max({store->workspace, step->workspace, finish->workspace});
+  const auto workspace_size = std::max(step->workspace, finish->workspace);
   std::unique_ptr<TemporaryDevice> workspace;
   if (workspace_size) workspace = std::make_unique<TemporaryDevice>(ctx, workspace_size);
   const auto work = workspace ? workspace->address : 0;
-  auto store_bindings = store->tensors;
-  const std::array<uint64_t, 6> store_addresses{input.key, input.value, input.locations,
-      plan.address + block.store_header_offset, input.pool, input.pool};
-  for (size_t i = 0; i < store_addresses.size(); ++i) store_bindings[i].pTensorAddress = store_addresses[i];
-  TORCH_CHECK(synLaunch(stream, store_bindings.data(), store_bindings.size(), work, store->recipe, 0) == synSuccess,
-              "GaudiRT attention: KV store launch failed");
   auto bindings = step->tensors;
   const auto scratch = plan.address + plan.scratch_offset;
   const auto value_indices_offset = static_cast<uint64_t>(block.kv_bucket) * plan.kv_heads * sizeof(int32_t);

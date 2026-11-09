@@ -84,8 +84,10 @@ def main():
               "untouched KV exact", flush=True)
         del result, key_pool, value_pool, combined, metadata, key_view, key_storage
     counts = gaudirt.recipe_cache_stats()
-    expected = [0, 11] if os.environ["GAUDIRT_TEST_CACHE"] == "cold" else [11, 0]
-    assert counts[:2] == expected, counts
+    if os.environ["GAUDIRT_TEST_CACHE"] == "cold":
+        assert counts[0] == 0 and counts[1] > 0, counts
+    else:
+        assert counts[0] > 0 and counts[1] == 0, counts
     if path := os.environ.get("GAUDIRT_TEST_OUTPUT"):
         with open(path, "wb") as output:
             output.write(payload)

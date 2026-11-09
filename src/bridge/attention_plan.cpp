@@ -146,6 +146,8 @@ at::Tensor PagedMetadata::attention_plan(int64_t query_heads, int64_t kv_heads, 
     return offset;
   };
   const uint64_t context_offset = append_aligned({static_cast<int32_t>(context_)});
+  plan->store_header_offset = append_aligned({static_cast<int32_t>(rows_), static_cast<int32_t>(slots_),
+                                               static_cast<int32_t>(kv_heads)});
   size_t sequence_index = 0;
   for (auto& block : plan->blocks) {
     while (sequence_index + 1 < sequences_.size() &&
