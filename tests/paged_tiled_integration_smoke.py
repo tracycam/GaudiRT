@@ -5,6 +5,7 @@ import hashlib
 import math
 import os
 import sys
+import time
 
 assert os.environ.get("TORCH_DEVICE_BACKEND_AUTOLOAD") == "0"
 
@@ -31,15 +32,15 @@ def main():
     kv_heads, dim = (2, 128) if heads == 4 else (8, 128)
     slots = int(os.environ.get("GAUDIRT_TEST_SLOTS", "2048"))
     context = int(os.environ.get("GAUDIRT_TEST_CONTEXT", "1024"))
+    prefix = int(os.environ.get("GAUDIRT_TEST_PREFIX", "512"))
     request_count = int(os.environ.get("GAUDIRT_TEST_REQUESTS", "1"))
-    assert slots > 1024 and context >= 1024 and 1 <= request_count <= 256
+    assert prefix >= 512 and slots > prefix + 137 and context >= prefix + 137 and 1 <= request_count <= 256
     gaudirt.initialize(hbm_bytes=1024 * 1024 * 1024, pinned_bytes=8 * 1024 * 1024)
     mapping = (torch.arange(context, dtype=torch.int32) % (slots - 1) + 1).reshape(1, -1).repeat(request_count, 1)
     head_map = torch.arange(heads) // (heads // kv_heads)
     scale = torch.tensor(1 / math.sqrt(dim), dtype=torch.float32).item()
     payload = bytearray()
     for rows in (7, 137):
-        prefix = 512
         rng = torch.Generator().manual_seed(3000 + rows)
         query = torch.randn(rows, heads * dim, generator=rng).to(torch.bfloat16)
         key = torch.randn(rows, kv_heads * dim, generator=rng).to(torch.bfloat16)
@@ -57,8 +58,13 @@ def main():
         key_storage = torch.empty((rows, kv_heads * dim + 1), dtype=torch.bfloat16, device="gaudirt:0")
         key_view = key_storage[:, 1:]
         key_view.copy_(key)
-        result = torch.ops.gaudirt.paged_attn.default(query.to("gaudirt:0"), key_view,
-            value.to("gaudirt:0"), key_pool, value_pool, metadata, dim, scale)
+        device_query, device_value = query.to("gaudirt:0"), value.to("gaudirt:0")
+
+        def launch():
+            return torch.ops.gaudirt.paged_attn.default(device_query, key_view, device_value,
+                                                        key_pool, value_pool, metadata, dim, scale)
+
+        result = launch()
         gaudirt.synchronize()
         expected_key, expected_value = key_base.clone(), value_base.clone()
         expected_key[locations.long()] = key.reshape(rows, kv_heads, dim)
@@ -82,7 +88,20 @@ def main():
         payload.extend(result.cpu().view(torch.int16).numpy().tobytes())
         print("tiled extend", rows, "prefix", prefix, "max relative l2", errors,
               "untouched KV exact", flush=True)
-        del result, key_pool, value_pool, combined, metadata, key_view, key_storage
+        if repetitions := int(os.environ.get("GAUDIRT_TEST_TIMING_REPETITIONS", "0")):
+            start, end = gaudirt.Event(enable_timing=True), gaudirt.Event(enable_timing=True)
+            gaudirt.synchronize()
+            start.record()
+            host_start = time.perf_counter()
+            for _ in range(repetitions):
+                timed = launch()
+            host_ms = 1000 * (time.perf_counter() - host_start) / repetitions
+            end.record()
+            end.synchronize()
+            print("rows", rows, "device_stream_ms", start.elapsed_time(end) / repetitions,
+                  "host_submit_ms", host_ms, "repetitions", repetitions, flush=True)
+            del timed, start, end
+        del result, key_pool, value_pool, combined, metadata, key_view, key_storage, device_query, device_value
     counts = gaudirt.recipe_cache_stats()
     if os.environ["GAUDIRT_TEST_CACHE"] == "cold":
         assert counts[0] == 0 and counts[1] > 0, counts
