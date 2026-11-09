@@ -33,6 +33,12 @@ def main():
         args, keep, tokens = make_metadata(rows, sliced=rows == 137)
         checked = torch.classes.gaudirt.PagedMetadata.from_device_with_tokens(*args)
         scheduler = torch.classes.gaudirt.PagedMetadata._from_scheduler(*args)
+        parts = scheduler.forward_tensors(4, 2, 128)
+        for part, name in zip(parts[:6], ("token_ids", "last_token_indices", "rotary_positions",
+                                          "rotary_header", "row_locations", "row_requests")):
+            assert torch.equal(part.cpu(), getattr(scheduler, name)().cpu()), (rows, name)
+        assert parts[6].data_ptr() == scheduler.attention_plan(4, 2, 128).data_ptr()
+        assert parts[7] == scheduler.context()
         for name in ("row_locations", "row_requests", "rotary_positions", "last_token_indices", "token_ids"):
             a, b = getattr(checked, name)().cpu(), getattr(scheduler, name)().cpu()
             assert torch.equal(a, b), (rows, name)
@@ -41,7 +47,7 @@ def main():
         bucket = 1 << (rows - 1).bit_length()
         padded = token_view.as_strided((bucket,), (1,), token_view.storage_offset()).cpu()
         assert torch.equal(padded[:rows], tokens.int()) and torch.count_nonzero(padded[rows:]) == 0
-        del checked, scheduler, args, keep, token_view
+        del checked, scheduler, args, keep, token_view, parts, part
 
     # Warm the recipe, then put enough device copies ahead of it that a host
     # synchronization inside metadata preparation would make the event complete.

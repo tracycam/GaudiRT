@@ -5,6 +5,7 @@
 #include <torch/custom_class.h>
 
 #include <cstdint>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -64,6 +65,11 @@ class PagedMetadata : public torch::CustomClassHolder {
     return token_ids_.narrow(0, 0, rows_);
   }
   int64_t vocabulary() const { return vocabulary_; }
+  std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t>
+  forward_tensors(int64_t query_heads, int64_t kv_heads, int64_t head_dim) {
+    return {token_ids(), last_token_indices(), rotary_positions(), rotary_header(), row_locations(),
+            row_requests(), attention_plan(query_heads, kv_heads, head_dim), context_};
+  }
 
   int64_t rows_ = 0, slots_ = 0, request_count_ = 0, context_ = 0, vocabulary_ = 0;
   uint32_t bucket_ = 0;

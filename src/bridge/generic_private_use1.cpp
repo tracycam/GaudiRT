@@ -604,6 +604,7 @@ TORCH_LIBRARY(gaudirt, m) {
       .def("rows", &gaudirt::generic::PagedMetadata::rows)
       .def("slots", &gaudirt::generic::PagedMetadata::slots)
       .def("context", &gaudirt::generic::PagedMetadata::context)
+      .def("forward_tensors", &gaudirt::generic::PagedMetadata::forward_tensors)
       .def("rotary_positions", &gaudirt::generic::PagedMetadata::rotary_positions)
       .def("rotary_header", &gaudirt::generic::PagedMetadata::rotary_header)
       .def("row_locations", &gaudirt::generic::PagedMetadata::row_locations)
