@@ -459,6 +459,12 @@ def _program_backend(graph_module, example_inputs):
     program = _C.BucketProgram(roles, operations, computed_ids) if computed_ids else None
     if program is None and (computed_ids or validated_token_bindings):
         raise RuntimeError("GaudiRT FX: unsupported identity graph")
+    computed_slots = {value: index for index, value in enumerate(computed_ids)}
+    result_routes = tuple((value < len(tensor_indices),
+                           tensor_indices[value] if value < len(tensor_indices) else computed_slots[value],
+                           alias_views.get(node, (None, ()))[1])
+                          for node, value in zip(output, output_ids))
+    dynamic_argument = tensor_indices[roles.index(1)] if validated_row_bindings else None
 
     def execute(*args):
         for index_id, weight_id_value in validated_token_bindings:
@@ -469,23 +475,22 @@ def _program_backend(graph_module, example_inputs):
                 raise RuntimeError("GaudiRT FX: embedding token IDs must pass batch metadata validation")
         for index_id in validated_row_bindings:
             index = args[tensor_indices[index_id]]
-            dynamic = args[tensor_indices[roles.index(1)]]
+            dynamic = args[dynamic_argument]
             if getattr(index, "_gaudirt_validated_rows", None) != dynamic.shape[0]:
                 raise RuntimeError("GaudiRT FX: row indices must pass batch metadata validation")
-        computed = dict(zip(computed_ids, program.run([args[index] for index in tensor_indices]))) if program else {}
-        result = tuple(args[tensor_indices[value]] if value < len(tensor_indices) else computed[value]
-                       for value in output_ids)
-        def apply_views(node, tensor):
-            for operation in alias_views.get(node, (None, ()))[1]:
+        computed = program.run([args[index] for index in tensor_indices]) if program else ()
+        result = []
+        for is_input, index, views in result_routes:
+            tensor = args[index] if is_input else computed[index]
+            for operation in views:
                 if operation[0] == "feature":
                     tensor = _C._feature_view(tensor, operation[1], operation[2])
                 elif operation[0] == "reshape":
                     tensor = _C._reshape_view(tensor, operation[1])
                 else:
                     tensor = _C._transpose_feature_view(tensor, operation[1], operation[2])
-            return tensor
-
-        result = tuple(apply_views(node, tensor) for node, tensor in zip(output, result))
+            result.append(tensor)
+        result = tuple(result)
         return result[0] if single_output else result
 
     return execute
