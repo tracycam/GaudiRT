@@ -5,6 +5,7 @@ import hashlib
 import math
 import os
 import sys
+import time
 
 assert os.environ.get("TORCH_DEVICE_BACKEND_AUTOLOAD") == "0"
 
@@ -21,17 +22,19 @@ atexit.register(assert_no_bridge)
 import torch
 import gaudirt
 from fp64_reference import direct_bf16
-from paged_attention_reference import isolated_errors
+from paged_attention_reference import isolated_errors, tiled_bf16_pv
 
 
 def main():
     torch.set_num_threads(4)
     heads = int(os.environ.get("GAUDIRT_TEST_HEADS", "4"))
-    kv_heads, dim = (2, 128) if heads == 4 else (8, 128)
+    kv_heads = int(os.environ.get("GAUDIRT_TEST_KV_HEADS", "2" if heads == 4 else "8"))
+    dim = int(os.environ.get("GAUDIRT_TEST_HEAD_DIM", "128"))
     slots = int(os.environ.get("GAUDIRT_TEST_SLOTS", "512"))
     context = int(os.environ.get("GAUDIRT_TEST_CONTEXT", "256"))
     decode_prefix = int(os.environ.get("GAUDIRT_TEST_PREFIX", "143"))
-    assert heads in (4, 56) and context >= max(192, decode_prefix + 1)
+    assert heads > 0 and kv_heads > 0 and heads % kv_heads == 0 and dim in (64, 128)
+    assert kv_heads * dim % 128 == 0 and context >= max(192, decode_prefix + 1)
     assert slots > max(150, decode_prefix + 1)
     gaudirt.initialize(hbm_bytes=1024 * 1024 * 1024, pinned_bytes=8 * 1024 * 1024)
     mapping = (torch.arange(context, dtype=torch.int32) % (slots - 1) + 1).reshape(1, -1)
@@ -57,8 +60,11 @@ def main():
         key_pool, value_pool = combined[0, 0].transpose(0, 1), combined[0, 1].transpose(0, 1)
         combined[0, 0].copy_(key_base.transpose(0, 1).contiguous())
         combined[0, 1].copy_(value_base.transpose(0, 1).contiguous())
-        result = torch.ops.gaudirt.paged_attn.default(query.to("gaudirt:0"), key.to("gaudirt:0"),
-            value.to("gaudirt:0"), key_pool, value_pool, metadata, dim, scale)
+        device_query, device_key, device_value = (tensor.to("gaudirt:0") for tensor in (query, key, value))
+        def launch():
+            return torch.ops.gaudirt.paged_attn.default(device_query, device_key, device_value,
+                key_pool, value_pool, metadata, dim, scale)
+        result = launch()
         gaudirt.synchronize()
         if case == "decode" and os.environ.get("GAUDIRT_TEST_REQUIRE_FUSED") == "1":
             recipe_keys = gaudirt._C._recipe_cache_keys()
@@ -84,6 +90,9 @@ def main():
             ref_pv.append(torch.einsum("ht,thd->hd", probabilities, vs.float()))
         ref64 = direct_bf16(torch.stack(ref64).reshape(rows, -1))
         ref_pv = torch.stack(ref_pv).reshape(rows, -1).to(torch.bfloat16).double()
+        if case == "decode" and prefix + 1 > 512:
+            ref_pv = tiled_bf16_pv(query, expected_key, expected_value, requests, positions, mapping,
+                                   heads, kv_heads, dim, scale, 512)
         actual = result.cpu().double()
         err64, err_pv = isolated_errors(actual, ref64, ref_pv)
         payload.extend(result.cpu().view(torch.int16).numpy().tobytes())
@@ -91,6 +100,19 @@ def main():
         payload.extend(actual_value.contiguous().view(torch.int16).numpy().tobytes())
         print(case, "rows", rows, "max relative l2", err64, "BF16-PV", err_pv,
               "untouched KV exact", flush=True)
+        if repetitions := int(os.environ.get("GAUDIRT_TEST_TIMING_REPETITIONS", "0")):
+            assert repetitions > 0
+            start, end = gaudirt.Event(enable_timing=True), gaudirt.Event(enable_timing=True)
+            gaudirt.synchronize()
+            start.record()
+            host_start = time.perf_counter()
+            for _ in range(repetitions):
+                timed = launch()
+            host_ms = 1000 * (time.perf_counter() - host_start) / repetitions
+            end.record()
+            end.synchronize()
+            print("device_stream_ms", start.elapsed_time(end) / repetitions,
+                  "host_submit_ms", host_ms, "repetitions", repetitions, flush=True)
     stats = gaudirt.recipe_cache_stats()
     count = 2 * len(cases)
     expected = [0, count] if os.environ["GAUDIRT_TEST_CACHE"] == "cold" else [count, 0]

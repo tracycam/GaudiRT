@@ -158,6 +158,15 @@ at::Tensor PagedMetadata::attention_plan(int64_t query_heads, int64_t kv_heads, 
     block.positions_offset = append_aligned(positions);
     for (auto& tile : block.tiles)
       tile.header_offset = append_aligned({block.valid_rows, tile.valid_keys, tile.first_key});
+    if (block.query_bucket == 1 && block.tiles.size() == 1 && block.kv_bucket > 512) {
+      const auto tiles = block.kv_bucket / 512;
+      std::vector<int32_t> local_positions(tiles);
+      for (uint32_t tile = 0; tile < tiles; ++tile)
+        local_positions[tile] = std::clamp(block.tiles[0].valid_keys - static_cast<int32_t>(tile * 512) - 1,
+                                           -1, 511);
+      block.decode_positions_offset = append_aligned(local_positions);
+      block.decode_header_offset = append_aligned({static_cast<int32_t>(tiles), 512, 0});
+    }
     block.store_header_offset = append_aligned({block.valid_rows, static_cast<int32_t>(slots_),
                                                 static_cast<int32_t>(kv_heads)});
   }

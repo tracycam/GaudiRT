@@ -23,6 +23,8 @@ struct AttentionBlock {
   uint32_t query_bucket;
   uint32_t kv_bucket;
   uint64_t positions_offset;
+  uint64_t decode_positions_offset;
+  uint64_t decode_header_offset;
   uint64_t store_header_offset;
   std::vector<AttentionTile> tiles;
 };

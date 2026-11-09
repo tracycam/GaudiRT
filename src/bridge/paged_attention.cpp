@@ -31,7 +31,7 @@ enum FusedSlot {
 
 ColdRecipe& fused_recipe(Context& ctx, const AttentionPlan& plan, const AttentionBlock& block, float scale) {
   std::ostringstream signature;
-  signature << "paged_fused_v1:" << block.query_bucket << ':' << block.kv_bucket << ':'
+  signature << "paged_fused_v2:" << block.query_bucket << ':' << block.kv_bucket << ':'
             << plan.query_heads << ':' << plan.kv_heads << ':' << plan.head_dim << ':'
             << std::bit_cast<uint32_t>(scale);
   const auto structure = signature.str();
@@ -44,6 +44,8 @@ ColdRecipe& fused_recipe(Context& ctx, const AttentionPlan& plan, const Attentio
   SynapseGraphBuilder graph(prefix, *recipe);
   const uint64_t d = plan.head_dim, rows = block.query_bucket, kv = block.kv_bucket;
   const uint64_t heads = plan.query_heads, kv_heads = plan.kv_heads, group = heads / kv_heads;
+  const bool tiled_decode = rows == 1 && kv > 512;
+  const uint64_t decode_tiles = tiled_decode ? kv / 512 : 1;
   const uint64_t kv_width = kv_heads * d;
   const auto query = graph.tensor(syn_type_bf16, {d, rows, group, kv_heads}, kQuery);
   synTensorPermutation permutation{};
@@ -60,8 +62,8 @@ ColdRecipe& fused_recipe(Context& ctx, const AttentionPlan& plan, const Attentio
   const auto key_indices = graph.tensor(syn_type_int32, {kv * kv_heads}, kKeyIndices);
   const auto value_indices = graph.tensor(syn_type_int32, {kv * kv_heads}, kValueIndices,
                                           kKeyIndices, kv * kv_heads * sizeof(int32_t));
-  const auto positions = graph.tensor(syn_type_int32, {rows}, kPositions);
-  const auto header_offset = (rows * sizeof(int32_t) + 255) & ~uint64_t{255};
+  const auto positions = graph.tensor(syn_type_int32, {tiled_decode ? decode_tiles : rows}, kPositions);
+  const auto header_offset = ((tiled_decode ? decode_tiles : rows) * sizeof(int32_t) + 255) & ~uint64_t{255};
   const auto header = graph.tensor(syn_type_int32, {3}, kTileHeader, kPositions, header_offset);
   const auto result = rows == 1 ? graph.tensor(syn_type_bf16, {d, heads, rows}, kResult) :
                                   graph.tensor(syn_type_bf16, {d, rows, group, kv_heads}, kResult);
@@ -78,26 +80,37 @@ ColdRecipe& fused_recipe(Context& ctx, const AttentionPlan& plan, const Attentio
     graph.node({"reshape", {gathered}, {tiles[i]}, {}});
   }
   const auto score4 = graph.tensor(syn_type_float, {kv, rows, group, kv_heads}, -1);
-  const auto score3 = graph.tensor(syn_type_float, {kv, rows, heads}, -1);
-  const auto probability3 = graph.tensor(syn_type_bf16, {kv, rows, heads}, -1);
-  const auto probability4 = graph.tensor(syn_type_bf16, {kv, rows, group, kv_heads}, -1);
+  const auto score3 = graph.tensor(syn_type_float,
+      tiled_decode ? std::vector<uint64_t>{512, decode_tiles, heads} : std::vector<uint64_t>{kv, rows, heads}, -1);
+  const auto probability3 = graph.tensor(syn_type_bf16,
+      tiled_decode ? std::vector<uint64_t>{512, decode_tiles, heads} : std::vector<uint64_t>{kv, rows, heads}, -1);
   graph.node({"batch_gemm", {query, tiles[0]}, {score4}, synGEMMParams{false, true}});
   graph.node({"reshape", {score4}, {score3}, {}});
-  if (kv <= 512) {
+  if (tiled_decode) {
+    const auto tile_max = graph.tensor(syn_type_float, {64, decode_tiles, heads}, -1);
+    const auto tile_sum = graph.tensor(syn_type_float, {64, decode_tiles, heads}, -1);
+    graph.node({"gk_attn_tile_softmax_bf16_v1", {score3, positions, header},
+                {probability3, tile_max, tile_sum}, scale});
+    const auto probability5 = graph.tensor(syn_type_bf16, {512, 1, decode_tiles, group, kv_heads}, -1);
+    const auto values5 = graph.tensor(syn_type_bf16, {d, 512, decode_tiles, 1, kv_heads}, -1);
+    const auto output5 = graph.tensor(syn_type_float, {d, 1, decode_tiles, group, kv_heads}, -1);
+    const auto output3 = graph.tensor(syn_type_float, {d, decode_tiles, heads}, -1);
+    graph.node({"reshape", {probability3}, {probability5}, {}});
+    graph.node({"reshape", {tiles[1]}, {values5}, {}});
+    graph.node({"batch_gemm", {probability5, values5}, {output5}, synGEMMParams{false, false}});
+    graph.node({"reshape", {output5}, {output3}, {}});
+    graph.node({"gk_attn_decode_reduce_bf16_v1", {tile_max, tile_sum, output3}, {result}, {}});
+  } else {
     graph.node({"gk_attn_direct_softmax_bf16_v1", {score3, positions, header}, {probability3}, scale});
-  } else {
-    const auto exponent = graph.tensor(syn_type_float, {kv, rows, heads}, -1);
-    const auto sum = graph.tensor(syn_type_float, {64, heads}, -1);
-    graph.node({"gk_attn_decode_exp_f32_v1", {score3, positions, header}, {exponent, sum}, scale});
-    graph.node({"gk_attn_decode_normalize_bf16_v1", {exponent, sum}, {probability3}, {}});
-  }
-  graph.node({"reshape", {probability3}, {probability4}, {}});
-  if (rows == 1) {
-    const auto output4 = graph.tensor(syn_type_bf16, {d, rows, group, kv_heads}, -1);
-    graph.node({"batch_gemm", {probability4, tiles[1]}, {output4}, synGEMMParams{false, false}});
-    graph.node({"reshape", {output4}, {result}, {}});
-  } else {
-    graph.node({"batch_gemm", {probability4, tiles[1]}, {result}, synGEMMParams{false, false}});
+    const auto probability4 = graph.tensor(syn_type_bf16, {kv, rows, group, kv_heads}, -1);
+    graph.node({"reshape", {probability3}, {probability4}, {}});
+    if (rows == 1) {
+      const auto output4 = graph.tensor(syn_type_bf16, {d, rows, group, kv_heads}, -1);
+      graph.node({"batch_gemm", {probability4, tiles[1]}, {output4}, synGEMMParams{false, false}});
+      graph.node({"reshape", {output4}, {result}, {}});
+    } else {
+      graph.node({"batch_gemm", {probability4, tiles[1]}, {result}, synGEMMParams{false, false}});
+    }
   }
   graph.compile(ctx.cache, key);
   auto [it, inserted] = ctx.cold_recipes.emplace(key, std::move(recipe));
@@ -226,11 +239,13 @@ at::Tensor paged_attn_validated(const at::Tensor& query, const at::Tensor& key, 
       auto* recipe = &cached_fused_recipe(*ctx, plan, block, scale_f);
       auto bindings = recipe->tensors;
       const uint64_t value_indices_offset = static_cast<uint64_t>(block.kv_bucket) * plan.kv_heads * sizeof(int32_t);
+      const bool tiled_decode = block.query_bucket == 1 && block.kv_bucket > 512;
       const std::array<uint64_t, kFusedSlots> addresses{
           q_address, k_address, v_address, locations_address, plan.address + block.store_header_offset,
           pool_address, pool_address, plan.address + tile.indices_offset,
-          plan.address + tile.indices_offset + value_indices_offset, plan.address + block.positions_offset,
-          plan.address + tile.header_offset, out_binding};
+          plan.address + tile.indices_offset + value_indices_offset,
+          plan.address + (tiled_decode ? block.decode_positions_offset : block.positions_offset),
+          plan.address + (tiled_decode ? block.decode_header_offset : tile.header_offset), out_binding};
       for (size_t i = 0; i < addresses.size(); ++i) bindings[i].pTensorAddress = addresses[i];
       std::unique_ptr<TemporaryDevice> workspace;
       if (recipe->workspace) workspace = std::make_unique<TemporaryDevice>(*ctx, recipe->workspace);
