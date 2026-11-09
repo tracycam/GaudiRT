@@ -373,14 +373,15 @@ ColdRecipe& argmax_recipe(Context& ctx, const at::Tensor& input, const at::Tenso
   for (auto size : input.sizes()) signature += ":" + std::to_string(size);
   const auto hash = common::sha256_bytes(reinterpret_cast<const uint8_t*>(signature.data()),
                                           signature.size());
-  const std::string key = (values_only ? "cold_max_i32_" : "cold_argmax_") + hash;
+  const std::string key = (values_only ? "cold_max_i32_" : "cold_argmax_i64_") + hash;
   auto found = ctx.cold_recipes.find(key);
   if (found != ctx.cold_recipes.end()) return *found->second;
   auto recipe = std::make_unique<ColdRecipe>();
   synGraphHandle graph = nullptr;
   std::array<synSectionHandle, 2> sections{};
-  std::array<synTensor, 16> tensors{};
+  std::array<synTensor, 17> tensors{};
   std::array<std::string, 14> internal_names{};
+  const std::string index_name = key + "_index_i32";
   const auto check = [](synStatus status, const char* message) {
     TORCH_CHECK(status == synSuccess, "GaudiRT: ", message, " status=", static_cast<int>(status));
   };
@@ -398,7 +399,8 @@ ColdRecipe& argmax_recipe(Context& ctx, const at::Tensor& input, const at::Tenso
       check(synSectionSetPersistent(sections[i], true), "argmax section setup failed");
       synTensorDescriptor desc{};
       desc.m_name = recipe->names[i].c_str();
-      desc.m_dataType = i == 0 ? cast_type(input.scalar_type()).syn : syn_type_int32;
+      desc.m_dataType = i == 0 ? cast_type(input.scalar_type()).syn :
+                        (values_only ? syn_type_int32 : syn_type_int64);
       desc.m_dims = shaped.dim();
       for (unsigned dim = 0; dim < desc.m_dims; ++dim) {
         const auto size = shaped.size(shaped.dim() - dim - 1);
@@ -414,6 +416,15 @@ ColdRecipe& argmax_recipe(Context& ctx, const at::Tensor& input, const at::Tenso
     params.reductionDimension = input.dim() - axis - 1;
     const bool floating = !values_only &&
                           (input.scalar_type() == at::kFloat || input.scalar_type() == at::kBFloat16);
+    if (!values_only) {
+      synTensorDescriptor desc{};
+      desc.m_name = index_name.c_str();
+      desc.m_dataType = syn_type_int32;
+      desc.m_dims = reduced.dim();
+      for (unsigned dim = 0; dim < desc.m_dims; ++dim)
+        desc.m_sizes[dim] = desc.m_minSizes[dim] = reduced.size(reduced.dim() - dim - 1);
+      check(synTensorCreate(&tensors[16], &desc, nullptr, 0), "argmax index creation failed");
+    }
     if (floating) {
       const synDataType dtypes[] = {syn_type_uint8, syn_type_float, syn_type_float,
                                    syn_type_float, syn_type_uint8, syn_type_int32, syn_type_int32,
@@ -434,7 +445,7 @@ ColdRecipe& argmax_recipe(Context& ctx, const at::Tensor& input, const at::Tenso
     const auto guid = values_only ? std::string("reduce_max_i32") :
                                     "argmax_fwd_" + std::string(cast_type(input.scalar_type()).name);
     const auto node = key + "_n0";
-    auto* ordinary = floating ? &tensors[8] : &tensors[1];
+    auto* ordinary = floating ? &tensors[8] : (values_only ? &tensors[1] : &tensors[16]);
     check(synNodeCreate(graph, &tensors[0], ordinary, 1, 1, &params, sizeof(params),
                         guid.c_str(), node.c_str(), nullptr, nullptr), "argmax node creation failed");
     if (floating) {
@@ -491,8 +502,15 @@ ColdRecipe& argmax_recipe(Context& ctx, const at::Tensor& input, const at::Tenso
                           "where_fwd_i32", safe_node.c_str(), nullptr, nullptr), "argmax infinity selection failed");
       synTensor choices[] = {tensors[6], tensors[7], tensors[15]};
       const auto select_node = key + "_n14";
-      check(synNodeCreate(graph, choices, &tensors[1], 3, 1, nullptr, 0,
+      check(synNodeCreate(graph, choices, &tensors[16], 3, 1, nullptr, 0,
                           "where_fwd_i32", select_node.c_str(), nullptr, nullptr), "argmax NaN selection failed");
+    }
+    if (!values_only) {
+      ns_CastKernel::ParamsV3 cast{};
+      cast.round_mode = CAST_ROUND_HALF_NE;
+      const auto cast_node = key + "_to_i64";
+      check(synNodeCreate(graph, &tensors[16], &tensors[1], 1, 1, &cast, sizeof(cast),
+                          "cast_i32_to_i64", cast_node.c_str(), nullptr, nullptr), "argmax int64 cast failed");
     }
     recipe->recipe = compile_cached(graph, key, key, &ctx.cache);
     check(synWorkspaceGetSize(&recipe->workspace, recipe->recipe), "argmax workspace query failed");
@@ -584,7 +602,7 @@ at::Tensor argmax(const at::Tensor& input, std::optional<int64_t> dimension, boo
   }
   std::vector<int64_t> reduced_shape(source.sizes().begin(), source.sizes().end());
   reduced_shape[axis] = 1;
-  auto reduced = at::empty(reduced_shape, source.options().dtype(at::kInt));
+  auto reduced = at::empty(reduced_shape, source.options().dtype(at::kLong));
   auto ctx = current();
   auto source_address = address_of(source, *ctx);
   if (source_address % BlockCachingAllocator::kAlignment) {
@@ -606,7 +624,7 @@ at::Tensor argmax(const at::Tensor& input, std::optional<int64_t> dimension, boo
                           workspace ? workspace->address : 0, recipe.recipe, 0) == synSuccess,
                 "GaudiRT: argmax launch failed");
   }
-  return reduced.to(at::kLong).view(shape);
+  return reduced.view(shape);
 }
 
 }  // namespace gaudirt::generic

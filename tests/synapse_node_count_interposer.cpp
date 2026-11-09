@@ -17,6 +17,7 @@ std::atomic<uint64_t> event_creates{0};
 std::atomic<uint64_t> event_destroys{0};
 std::atomic<uint64_t> event_synchronizes{0};
 std::atomic<uint64_t> stream_event_creates{0};
+std::atomic<uint64_t> launches{0};
 std::atomic<bool> launch_gate_enabled{false};
 std::mutex launch_gate_mutex;
 std::condition_variable launch_gate_cv;
@@ -30,6 +31,7 @@ extern "C" uint64_t gaudirt_test_event_create_count() { return event_creates.loa
 extern "C" uint64_t gaudirt_test_event_destroy_count() { return event_destroys.load(); }
 extern "C" uint64_t gaudirt_test_event_synchronize_count() { return event_synchronizes.load(); }
 extern "C" uint64_t gaudirt_test_stream_event_create_count() { return stream_event_creates.load(); }
+extern "C" uint64_t gaudirt_test_launch_count() { return launches.load(); }
 extern "C" void gaudirt_test_launch_gate_arm() {
   std::lock_guard lock(launch_gate_mutex);
   launch_gate_waiting = 0;
@@ -44,6 +46,7 @@ extern "C" bool gaudirt_test_launch_gate_passed() {
 extern "C" synStatus SYN_API_CALL synLaunch(
     synStreamHandle stream, const synLaunchTensorInfo* tensors, uint32_t count,
     uint64_t workspace, synRecipeHandle recipe, uint32_t flags) {
+  ++launches;
   using Function = decltype(&synLaunch);
   static const auto real = [] {
     void* library = dlopen("libSynapse.so", RTLD_NOW | RTLD_NOLOAD);
