@@ -47,7 +47,7 @@ BucketProgram::BucketProgram(std::vector<int64_t> roles, std::vector<FxNode> ope
         valid = (op.inputs.size() == 2 || op.inputs.size() == 3) &&
                 std::holds_alternative<FxLinear>(op.parameters);
         break;
-      case FxOp::block_fp8_linear:
+      case FxOp::block_fp8_linear: case FxOp::fp8_linear:
         valid = (op.inputs.size() == 3 || op.inputs.size() == 4) && no_params;
         break;
       case FxOp::add: case FxOp::sub: case FxOp::mul: case FxOp::div: case FxOp::bmm:
@@ -145,7 +145,7 @@ BucketProgram::BucketProgram(std::vector<int64_t> roles, std::vector<FxNode> ope
         mark_weight(op.inputs[1]);
         if (op.inputs.size() == 3) mark_weight(op.inputs[2]);
         break;
-      case FxOp::block_fp8_linear:
+      case FxOp::block_fp8_linear: case FxOp::fp8_linear:
         mark_weight(op.inputs[1]);
         mark_weight(op.inputs[2]);
         if (op.inputs.size() == 4) mark_weight(op.inputs[3]);
@@ -639,6 +639,94 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
           for (uint64_t r = 0; r < row_tiles; ++r)
             builder.node(NodeSpec{"concat", products[r], {result_rows[r]}, column_axis});
         if (row_tiles > 1) builder.node(NodeSpec{"concat", result_rows, {flat_output}, feature_axis});
+        if (input_spec.sizes.size() == 3) node({flat_output}, values[id], std::monostate{}, "reshape");
+        continue;
+      }
+      if (op.op == FxOp::fp8_linear) {
+        const auto& input_spec = specs_[op.inputs[0]];
+        const auto& weight_spec = specs_[op.inputs[1]];
+        const uint64_t columns = weight_spec.sizes[0], input_width = weight_spec.sizes[1];
+        const uint64_t token_rows = bucket * (input_spec.sizes.size() == 3 ? input_spec.sizes[1] : 1);
+        TORCH_CHECK(token_rows > 0 && token_rows <= 4096, "GaudiRT FP8: flattened token rows outside 1..4096");
+        uint64_t rmw_limit = 0;
+        synDeviceAttribute attribute = DEVICE_ATTRIBUTE_MAX_RMW_SIZE;
+        TORCH_CHECK(synDeviceGetAttribute(&rmw_limit, &attribute, 1, ctx.device.device_id()) == synSuccess,
+                    "GaudiRT FP8: cannot query RMW capacity");
+        const uint64_t rows_fit = rmw_limit / (128 * sizeof(float));
+        TORCH_CHECK(rows_fit > 0, "GaudiRT FP8: a minimum tile exceeds device RMW capacity");
+        const uint64_t tile_rows = std::min<uint64_t>(token_rows, std::bit_floor(rows_fit));
+        const uint64_t tile_columns = std::min<uint64_t>(columns,
+            (rmw_limit / (tile_rows * sizeof(float)) / 128) * 128);
+        TORCH_CHECK(tile_columns >= 128, "GaudiRT FP8: invalid device tile capacity");
+        const uint64_t row_tiles = (token_rows + tile_rows - 1) / tile_rows;
+        const uint64_t column_tiles = (columns + tile_columns - 1) / tile_columns;
+        auto local = [&](synDataType dtype, std::vector<uint64_t> dimensions, bool rmw = false) {
+          return builder.tensor(dtype, dimensions, -1, -1, 0, false, {}, rmw);
+        };
+        auto input = values[op.inputs[0]];
+        if (input_spec.sizes.size() == 3) {
+          auto flat = local(syn_type_bf16, {input_width, token_rows});
+          node({input}, flat, std::monostate{}, "reshape");
+          input = flat;
+        }
+        auto bias = op.inputs.size() == 4 ? values[op.inputs[3]] : local(syn_type_float, {columns});
+        if (op.inputs.size() == 3) {
+          ns_ConstantKernel::ParamsV3 zero{};
+          zero.constant.f = 0.f;
+          node({}, bias, zero, "constant_f32");
+        } else if (specs_[op.inputs[3]].dtype == at::kBFloat16) {
+          auto wide_bias = local(syn_type_float, {columns});
+          ns_CastKernel::ParamsV3 cast{};
+          cast.round_mode = CAST_ROUND_HALF_NE;
+          node({bias}, wide_bias, cast, "cast_bf16_to_f32");
+          bias = wide_bias;
+        }
+        auto quantized = local(syn_type_fp8_143, {input_width, token_rows});
+        auto activation_scales = local(syn_type_float, {1, token_rows});
+        builder.node(NodeSpec{"gk_fp8_token_quant_bf16_v1", {input}, {quantized, activation_scales}, {}});
+        std::vector<synTensor> weights, weight_scales, biases, activations, scales, result_rows;
+        for (uint64_t i = 0; i < column_tiles; ++i) {
+          const auto width = std::min(tile_columns, columns - i * tile_columns);
+          weights.push_back(column_tiles == 1 ? values[op.inputs[1]] :
+                            local(syn_type_fp8_143, {input_width, width}));
+          weight_scales.push_back(column_tiles == 1 ? values[op.inputs[2]] : local(syn_type_float, {width}));
+          biases.push_back(column_tiles == 1 ? bias : local(syn_type_float, {width}));
+        }
+        const synAxisParams row_axis{1}, column_axis{0};
+        if (column_tiles > 1) {
+          builder.node(NodeSpec{"split", {values[op.inputs[1]]}, weights, row_axis});
+          builder.node(NodeSpec{"split", {values[op.inputs[2]]}, weight_scales, column_axis});
+          builder.node(NodeSpec{"split", {bias}, biases, column_axis});
+        }
+        const auto flat_output = input_spec.sizes.size() == 3 ? local(syn_type_bf16, {columns, token_rows}) : values[id];
+        for (uint64_t r = 0; r < row_tiles; ++r) {
+          const auto height = std::min(tile_rows, token_rows - r * tile_rows);
+          activations.push_back(row_tiles == 1 ? quantized : local(syn_type_fp8_143, {input_width, height}));
+          scales.push_back(row_tiles == 1 ? activation_scales : local(syn_type_float, {1, height}));
+          result_rows.push_back(row_tiles == 1 ? flat_output : local(syn_type_bf16, {columns, height}));
+        }
+        if (row_tiles > 1) {
+          builder.node(NodeSpec{"split", {quantized}, activations, row_axis});
+          builder.node(NodeSpec{"split", {activation_scales}, scales, row_axis});
+        }
+        std::vector<std::vector<synTensor>> products(row_tiles);
+        const synGEMMParams gemm{false, true};
+        for (uint64_t i = 0; i < column_tiles; ++i) {
+          const auto width = std::min(tile_columns, columns - i * tile_columns);
+          for (uint64_t r = 0; r < row_tiles; ++r) {
+            const auto height = std::min(tile_rows, token_rows - r * tile_rows);
+            auto result = column_tiles == 1 ? result_rows[r] : local(syn_type_bf16, {width, height});
+            products[r].push_back(result);
+            auto partial = local(syn_type_float, {width, height}, true);
+            node({activations[r], weights[i]}, partial, gemm, "gemm");
+            node({partial, scales[r], weight_scales[i], biases[i]}, result, std::monostate{},
+                 "gk_fp8_channel_finish_bf16_v1");
+          }
+        }
+        if (column_tiles > 1)
+          for (uint64_t r = 0; r < row_tiles; ++r)
+            builder.node(NodeSpec{"concat", products[r], {result_rows[r]}, column_axis});
+        if (row_tiles > 1) builder.node(NodeSpec{"concat", result_rows, {flat_output}, row_axis});
         if (input_spec.sizes.size() == 3) node({flat_output}, values[id], std::monostate{}, "reshape");
         continue;
       }

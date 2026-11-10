@@ -204,6 +204,26 @@ FxGeometry infer_fx_geometry(const std::vector<at::Tensor>& inputs, const std::v
       specs.push_back({at::kBFloat16, std::move(sizes), true});
       continue;
     }
+    if (op.op == FxOp::fp8_linear) {
+      const auto& weight = specs[op.inputs[1]];
+      const auto& scales = specs[op.inputs[2]];
+      TORCH_CHECK(a.dtype == at::kBFloat16 && a.dynamic() && (a.sizes.size() == 2 || a.sizes.size() == 3) &&
+                  !weight.dynamic() && weight.dtype == at::kFloat8_e4m3fn && weight.sizes.size() == 2 &&
+                  weight.sizes[0] > 0 && weight.sizes[0] % 128 == 0 && weight.sizes[1] > 0 &&
+                  weight.sizes[1] % 128 == 0 && a.sizes.back() == weight.sizes[1] &&
+                  !scales.dynamic() && scales.dtype == at::kFloat && scales.sizes ==
+                      std::vector<int64_t>{weight.sizes[0]}, "GaudiRT FX: invalid prepared FP8 channel geometry");
+      if (op.inputs.size() == 4) {
+        const auto& bias = specs[op.inputs[3]];
+        TORCH_CHECK(!bias.dynamic() && (bias.dtype == at::kBFloat16 || bias.dtype == at::kFloat) &&
+                    bias.sizes.size() == 1 && bias.sizes[0] == weight.sizes[0],
+                    "GaudiRT FX: invalid FP8 linear bias");
+      }
+      auto sizes = a.sizes;
+      sizes.back() = weight.sizes[0];
+      specs.push_back({at::kBFloat16, std::move(sizes), true});
+      continue;
+    }
     const auto& b = specs[op.inputs[1]];
     TORCH_CHECK(a.dtype == b.dtype, "GaudiRT FX: input dtype mismatch");
     if (op.op == FxOp::fused_add_rms_norm) {

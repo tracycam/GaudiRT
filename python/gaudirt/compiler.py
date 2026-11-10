@@ -64,6 +64,7 @@ def _program_backend(graph_module, example_inputs, compact_outputs=()):
     validated_token_bindings, validated_row_bindings = [], []
     linear_targets = (torch.nn.functional.linear, torch.ops.aten.linear.default)
     block_fp8_targets = (torch.ops.gaudirt.block_fp8_linear, torch.ops.gaudirt.block_fp8_linear.default)
+    fp8_targets = (torch.ops.gaudirt.fp8_linear, torch.ops.gaudirt.fp8_linear.default)
     mm_targets = (torch.mm, torch.ops.aten.mm.default, torch.matmul,
                   torch.ops.aten.matmul.default, operator.matmul)
     bmm_targets = (torch.bmm, torch.ops.aten.bmm.default)
@@ -403,6 +404,12 @@ def _program_backend(graph_module, example_inputs, compact_outputs=()):
             bias = node.args[3] if len(node.args) == 4 else node.kwargs.get("bias")
             operation = Node.block_fp8(*(tensor_id(value) for value in node.args[:3]),
                                        None if bias is None else tensor_id(bias))
+        elif node.target in fp8_targets and len(node.args) in (3, 4):
+            if set(node.kwargs) - {"bias"} or (len(node.args) == 4 and "bias" in node.kwargs):
+                raise RuntimeError("GaudiRT FX: unsupported FP8 linear arguments")
+            bias = node.args[3] if len(node.args) == 4 else node.kwargs.get("bias")
+            operation = Node.fp8(*(tensor_id(value) for value in node.args[:3]),
+                                  None if bias is None else tensor_id(bias))
         elif node.target in linear_targets and len(node.args) in (2, 3):
             if set(node.kwargs) - {"bias"} or (len(node.args) == 3 and "bias" in node.kwargs):
                 raise RuntimeError("GaudiRT FX: unsupported linear arguments")

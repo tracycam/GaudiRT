@@ -14,7 +14,7 @@ enum class FxOp {
   linear, add, rms_norm, silu_and_mul, feature_slice, fused_add_rms_norm,
   fused_residual, rotary, rotary_key, embedding, gather_rows, cast, sub, mul,
   div, concat, bmm, reshape, transpose, copy, scalar_add, scalar_sub,
-  scalar_mul, scalar_div, block_fp8_linear,
+  scalar_mul, scalar_div, block_fp8_linear, fp8_linear,
 };
 
 struct FxLinear { bool transpose_weight; };
@@ -44,6 +44,11 @@ struct FxNode {
     std::vector<int64_t> inputs{input, weight, scales};
     if (bias) inputs.push_back(*bias);
     return {FxOp::block_fp8_linear, std::move(inputs), {}};
+  }
+  static FxNode fp8(int64_t input, int64_t weight, int64_t scales, std::optional<int64_t> bias) {
+    std::vector<int64_t> inputs{input, weight, scales};
+    if (bias) inputs.push_back(*bias);
+    return {FxOp::fp8_linear, std::move(inputs), {}};
   }
   static FxNode slice(int64_t input, int64_t start, int64_t width, int64_t total) {
     return {FxOp::feature_slice, {input}, FxSlice{start, width, total}};
