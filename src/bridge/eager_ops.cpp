@@ -131,6 +131,18 @@ at::Tensor cat(const at::ITensorListRef& tensors, int64_t axis) {
     copy(result, active.front(), true);
     return result;
   }
+  // One-dimensional concatenation is a sequence of copies into disjoint
+  // output ranges.  Keeping it on the compute stream avoids a shape-specific
+  // graph for changing metadata lengths, and also handles strided inputs.
+  if (reference->dim() == 1) {
+    int64_t offset = 0;
+    for (const auto& tensor : active) {
+      auto slice = result.narrow(0, offset, tensor.numel());
+      copy(slice, tensor, true);
+      offset += tensor.numel();
+    }
+    return result;
+  }
   auto ctx = current();
   std::vector<std::pair<uint64_t, uint64_t>> regions;
   for (auto& tensor : active) {
