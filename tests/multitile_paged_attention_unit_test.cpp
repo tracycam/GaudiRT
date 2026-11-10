@@ -258,22 +258,24 @@ void verify_recipe_structure(const MockRecipe& recipe) {
 
   const size_t chunk_tiles = softmaxes.size();
   assert(chunk_tiles >= 1 && chunk_tiles <= gaudirt::generic::kMaxFusedAttentionTiles);
-  assert(packs.size() == chunk_tiles);
+  assert(packs.empty() && "packed 2D tile stats eliminate redundant gk_attn_pack_stats_f32_v1 nodes");
   assert(merges.size() == chunk_tiles);
   assert(key_index_sections.size() == chunk_tiles && "each tile must use a distinct persistent index section");
 
   const MockTensor* shared_positions = softmaxes[0]->inputs[1];
   for (size_t t = 0; t < chunk_tiles; ++t) {
-    assert(softmaxes[t]->inputs.size() == 3);
+    assert(softmaxes[t]->inputs.size() == 3 && softmaxes[t]->outputs.size() == 3);
     assert(softmaxes[t]->inputs[1] == shared_positions && "all tiles in chunk share block positions tensor");
     const auto& hdr = recipe.tensor_snapshots.at(softmaxes[t]->inputs[2]);
     assert(hdr.section && hdr.section->persistent);
     assert(header_sections.insert(hdr.section->id).second && "each tile must bind its own persistent header section");
 
-    // Pack stats feeds tile_m, tile_l into merge[t] inputs 3, 4.
+    // Softmax emits packed 2D {stats_rows, heads} tile_m, tile_l directly into merge[t] inputs 3, 4.
     assert(merges[t]->inputs.size() == 6 && merges[t]->outputs.size() == 3);
-    assert(merges[t]->inputs[3] == packs[t]->outputs[0]);
-    assert(merges[t]->inputs[4] == packs[t]->outputs[1]);
+    assert(merges[t]->inputs[3] == softmaxes[t]->outputs[1]);
+    assert(merges[t]->inputs[4] == softmaxes[t]->outputs[2]);
+    assert(recipe.tensor_snapshots.at(softmaxes[t]->outputs[1]).dims == 2);
+    assert(recipe.tensor_snapshots.at(softmaxes[t]->outputs[2]).dims == 2);
 
     // Sequential state chain: merge[t-1].outputs[0..2] == merge[t].inputs[0..2]!
     if (t > 0) {
@@ -531,10 +533,19 @@ void execute_recipe_on_cpu(const MockRecipe& recipe, const synLaunchTensorInfo* 
       const auto* positions = reinterpret_cast<const int32_t*>(load_tensor(node.inputs[1]).data());
       const auto* hdr = reinterpret_cast<const int32_t*>(load_tensor(node.inputs[2]).data());
       auto* probs = reinterpret_cast<uint16_t*>(alloc_tensor(node.outputs[0]).data());
-      auto* exp_m = reinterpret_cast<float*>(alloc_tensor(node.outputs[1]).data());
-      auto* exp_l = reinterpret_cast<float*>(alloc_tensor(node.outputs[2]).data());
+      const auto& stat_spec = recipe.tensor_snapshots.at(node.outputs[1]);
+      const bool packed_2d = (stat_spec.dims == 2);
+      const uint64_t padded = (rows + 63) / 64 * 64;
+      auto* out_m = reinterpret_cast<float*>(alloc_tensor(node.outputs[1]).data());
+      auto* out_l = reinterpret_cast<float*>(alloc_tensor(node.outputs[2]).data());
       const int32_t valid_rows = hdr[0], valid_keys = hdr[1], key_start = hdr[2];
-      for (uint64_t h = 0; h < heads; ++h)
+      for (uint64_t h = 0; h < heads; ++h) {
+        if (packed_2d) {
+          for (uint64_t r = rows; r < padded; ++r) {
+            out_m[h * padded + r] = -std::numeric_limits<float>::infinity();
+            out_l[h * padded + r] = 0.f;
+          }
+        }
         for (uint64_t r = 0; r < rows; ++r) {
           float m = -std::numeric_limits<float>::infinity();
           float sum = 0.f;
@@ -557,9 +568,15 @@ void execute_recipe_on_cpu(const MockRecipe& recipe, const synLaunchTensorInfo* 
           } else {
             std::fill_n(dst, keys, uint16_t{0});
           }
-          std::fill_n(exp_m + (h * rows + r) * 64, 64, m);
-          std::fill_n(exp_l + (h * rows + r) * 64, 64, sum);
+          if (packed_2d) {
+            out_m[h * padded + r] = m;
+            out_l[h * padded + r] = sum;
+          } else {
+            std::fill_n(out_m + (h * rows + r) * 64, 64, m);
+            std::fill_n(out_l + (h * rows + r) * 64, 64, sum);
+          }
         }
+      }
     } else if (node.guid == "gk_attn_pack_stats_f32_v1") {
       const auto& in_spec = recipe.tensor_snapshots.at(node.inputs[0]);
       const uint64_t rows = in_spec.sizes[1], heads = in_spec.sizes[2];

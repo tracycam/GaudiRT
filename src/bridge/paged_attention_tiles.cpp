@@ -56,7 +56,7 @@ ColdRecipe& chunk_recipe(Context& ctx, const AttentionPlan& plan, const Attentio
   const uint64_t d = plan.head_dim, heads = plan.query_heads, kv_heads = plan.kv_heads;
   const uint64_t group = heads / kv_heads, stats_rows = (rows + 63) / 64 * 64;
   std::ostringstream signature;
-  signature << "chunk_v1:" << rows << ':' << kv << ':' << d << ':' << heads << ':' << kv_heads << ':'
+  signature << "chunk_v2:" << rows << ':' << kv << ':' << d << ':' << heads << ':' << kv_heads << ':'
             << std::bit_cast<uint32_t>(scale) << ':' << chunk_tiles << ':'
             << (first_chunk ? 1 : 0) << ':' << (finalize_last ? 1 : 0);
   GraphKey graph_key(signature.str(), rows);
@@ -133,15 +133,12 @@ ColdRecipe& chunk_recipe(Context& ctx, const AttentionPlan& plan, const Attentio
     auto probability4 = graph.tensor(syn_type_bf16, {kv, rows, group, kv_heads}, -1);
     auto tile_m = graph.tensor(syn_type_float, {stats_rows, heads}, -1);
     auto tile_l = graph.tensor(syn_type_float, {stats_rows, heads}, -1);
-    auto expanded_m = graph.tensor(syn_type_float, {64, rows, heads}, -1);
-    auto expanded_l = graph.tensor(syn_type_float, {64, rows, heads}, -1);
     auto tile_o4 = graph.tensor(syn_type_float, {d, rows, group, kv_heads}, -1);
     auto tile_o = graph.tensor(syn_type_float, {d, rows, heads}, -1);
     graph.node({"batch_gemm", {query, kv_tiles[0]}, {score4}, synGEMMParams{false, true}});
     graph.node({"reshape", {score4}, {score3}, {}});
     graph.node({"gk_attn_tile_softmax_bf16_v1", {score3, positions, headers[t]},
-                {probability3, expanded_m, expanded_l}, scale});
-    graph.node({"gk_attn_pack_stats_f32_v1", {expanded_m, expanded_l}, {tile_m, tile_l}, {}});
+                {probability3, tile_m, tile_l}, scale});
     graph.node({"reshape", {probability3}, {probability4}, {}});
     graph.node({"batch_gemm", {probability4, kv_tiles[1]}, {tile_o4}, synGEMMParams{false, false}});
     graph.node({"reshape", {tile_o4}, {tile_o}, {}});

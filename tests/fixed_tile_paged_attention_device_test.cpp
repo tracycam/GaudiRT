@@ -430,16 +430,13 @@ int main(int argc, char** argv) {
         const auto score3 = g.tensor({kv, rows, heads}, syn_type_float);
         const auto prob3 = g.tensor({kv, rows, heads}, syn_type_bf16);
         const auto prob4 = g.tensor({kv, rows, group, kvh}, syn_type_bf16);
-        const auto exp_m = g.tensor({64, rows, heads}, syn_type_float);
-        const auto exp_l = g.tensor({64, rows, heads}, syn_type_float);
         const auto tile_m = g.tensor({stats_rows, heads}, syn_type_float);
         const auto tile_l = g.tensor({stats_rows, heads}, syn_type_float);
         const auto tile_o4 = g.tensor({d, rows, group, kvh}, syn_type_float);
         const auto tile_o = g.tensor({d, rows, heads}, syn_type_float);
         g.node("batch_gemm", {tq, kv_tiles[0]}, {score4}, &qk, sizeof(qk));
         g.node("reshape", {score4}, {score3});
-        g.node("gk_attn_tile_softmax_bf16_v1", {score3, tp, t_hdr[t]}, {prob3, exp_m, exp_l}, &scale, sizeof(scale));
-        g.node("gk_attn_pack_stats_f32_v1", {exp_m, exp_l}, {tile_m, tile_l});
+        g.node("gk_attn_tile_softmax_bf16_v1", {score3, tp, t_hdr[t]}, {prob3, tile_m, tile_l}, &scale, sizeof(scale));
         g.node("reshape", {prob3}, {prob4});
         g.node("batch_gemm", {prob4, kv_tiles[1]}, {tile_o4}, &pv, sizeof(pv));
         g.node("reshape", {tile_o4}, {tile_o});
