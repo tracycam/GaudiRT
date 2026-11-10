@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -54,6 +55,10 @@ extern "C" synStatus SYN_API_CALL synLaunch(
     synStreamHandle stream, const synLaunchTensorInfo* tensors, uint32_t count,
     uint64_t workspace, synRecipeHandle recipe, uint32_t flags) {
   ++launches;
+  static const bool trace_cold = std::getenv("GAUDIRT_TEST_TRACE_COLD") != nullptr;
+  if (trace_cold && count && tensors && tensors[0].tensorName &&
+      std::strncmp(tensors[0].tensorName, "cold_", 5) == 0)
+    std::fprintf(stderr, "GAUDIRT_TEST_COLD_LAUNCH %s\n", tensors[0].tensorName);
   using Function = decltype(&synLaunch);
   static const auto real = [] {
     void* library = dlopen("libSynapse.so", RTLD_NOW | RTLD_NOLOAD);
