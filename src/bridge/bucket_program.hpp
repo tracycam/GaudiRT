@@ -24,8 +24,19 @@ struct ColdRecipe;
 class BucketProgram {
  public:
   struct ReusableOutputs {
+    struct Block {
+      uint32_t bucket;
+      bool dynamic;
+      at::Tensor tensor;
+    };
     uint32_t bucket = 0;
-    std::vector<at::Tensor> values;
+    std::vector<Block> available;
+    std::vector<Block> active;
+
+    void prepare(uint32_t new_bucket);
+    void reclaim();
+    at::Tensor acquire(const at::Tensor& reference, at::ScalarType dtype,
+                       at::IntArrayRef sizes, bool dynamic, int64_t width);
   };
   BucketProgram(std::vector<int64_t> roles, std::vector<FxNode> operations, std::vector<int64_t> outputs = {});
   ~BucketProgram();

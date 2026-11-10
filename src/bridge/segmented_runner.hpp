@@ -21,11 +21,11 @@ class SegmentOutputPool {
   struct Frame {
     uint64_t generation;
     synStreamHandle stream;
-    bool busy = false, exposed = false;
-    std::vector<BucketProgram::ReusableOutputs> programs;
+    bool busy = false;
+    BucketProgram::ReusableOutputs outputs;
   };
-  Frame* acquire(uint64_t generation, synStreamHandle stream, size_t count);
-  void release(Frame* frame, bool exposed);
+  Frame* acquire(uint64_t generation, synStreamHandle stream);
+  void release(Frame* frame);
   bool trim();
 
  private:

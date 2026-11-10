@@ -606,6 +606,44 @@ std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs
   return run_internal(inputs, {});
 }
 
+void BucketProgram::ReusableOutputs::prepare(uint32_t new_bucket) {
+  if (bucket == new_bucket) return;
+  available.clear();
+  bucket = new_bucket;
+}
+
+void BucketProgram::ReusableOutputs::reclaim() {
+  for (size_t i = 0; i < active.size();) {
+    auto& block = active[i];
+    // A route may leave another TensorImpl pointing at this storage. Trace
+    // captures can also retain a Tensor after its graph slot is consumed.
+    if (block.tensor.use_count() != 1 || !block.tensor.storage().unique()) {
+      ++i;
+      continue;
+    }
+    if (block.bucket == bucket) available.push_back(std::move(block));
+    if (i + 1 != active.size()) active[i] = std::move(active.back());
+    active.pop_back();
+  }
+}
+
+at::Tensor BucketProgram::ReusableOutputs::acquire(const at::Tensor& reference, at::ScalarType dtype,
+                                                   at::IntArrayRef sizes, bool dynamic, int64_t width) {
+  for (size_t i = 0; i < available.size(); ++i) {
+    auto& block = available[i];
+    if (block.dynamic != dynamic || block.tensor.scalar_type() != dtype || block.tensor.sizes() != sizes) continue;
+    active.push_back(std::move(block));
+    if (i + 1 != available.size()) available[i] = std::move(available.back());
+    available.pop_back();
+    return active.back().tensor;
+  }
+  auto tensor = dynamic ? bucket_output(reference, dtype, bucket, bucket, width)
+                        : at::empty(sizes, reference.options().dtype(dtype));
+  if (dynamic) tensor.unsafeGetTensorImpl()->set_sizes_contiguous(sizes);
+  active.push_back({bucket, dynamic, std::move(tensor)});
+  return active.back().tensor;
+}
+
 std::vector<at::Tensor> BucketProgram::run_internal(const std::vector<at::Tensor>& inputs,
                                                     const std::vector<bool>& trusted,
                                                     ReusableOutputs* reusable,
@@ -659,11 +697,7 @@ std::vector<at::Tensor> BucketProgram::run_internal(const std::vector<at::Tensor
   }
   if (!static_binding) static_binding = bind_static_inputs(inputs, *ctx, stream);
   const uint32_t bucket = std::bit_ceil(static_cast<uint32_t>(m));
-  if (reusable && reusable->bucket != bucket) {
-    reusable->values.clear();
-    reusable->values.resize(outputs_.size());
-    reusable->bucket = bucket;
-  }
+  if (reusable) reusable->prepare(bucket);
   std::vector<at::Tensor> results;
   results.reserve(outputs_.size());
   for (size_t output_index = 0; output_index < outputs_.size(); ++output_index) {
@@ -681,18 +715,17 @@ std::vector<at::Tensor> BucketProgram::run_internal(const std::vector<at::Tensor
       }
       at::Tensor result;
       if (cache) {
-        auto& stored = reusable->values[output_index];
-        if (!stored.defined()) stored = bucket_output(inputs[dynamic_input], spec.dtype, bucket, bucket, width);
+        auto full_sizes = sizes;
+        full_sizes[0] = bucket;
+        auto stored = reusable->acquire(inputs[dynamic_input], spec.dtype, full_sizes, true, width);
         result = m == bucket ? stored : stored.narrow(0, 0, m);
       } else {
         result = bucket_output(inputs[dynamic_input], spec.dtype, bucket, m, width);
       }
-      results.push_back(sizes.size() == 2 ? std::move(result) : result.view(sizes));
+      results.push_back(cache || sizes.size() == 2 ? std::move(result) : result.view(sizes));
     } else {
       if (cache) {
-        auto& stored = reusable->values[output_index];
-        if (!stored.defined()) stored = at::empty(spec.sizes, inputs[dynamic_input].options().dtype(spec.dtype));
-        results.push_back(stored);
+        results.push_back(reusable->acquire(inputs[dynamic_input], spec.dtype, spec.sizes, false, 0));
       } else {
         results.push_back(at::empty(spec.sizes, inputs[dynamic_input].options().dtype(spec.dtype)));
       }

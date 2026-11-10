@@ -10,40 +10,26 @@
 
 namespace gaudirt::generic {
 
-SegmentOutputPool::Frame* SegmentOutputPool::acquire(uint64_t generation, synStreamHandle stream, size_t count) {
+SegmentOutputPool::Frame* SegmentOutputPool::acquire(uint64_t generation, synStreamHandle stream) {
   std::lock_guard lock(mutex_);
   for (const auto& frame : frames_) {
     if (frame->busy || frame->generation != generation || frame->stream != stream) continue;
-    bool available = true;
-    if (frame->exposed) {
-      for (const auto& program : frame->programs) {
-        for (const auto& tensor : program.values) {
-          if (tensor.defined() && (tensor.use_count() != 1 || !tensor.storage().unique())) {
-            available = false;
-            break;
-          }
-        }
-        if (!available) break;
-      }
-    }
-    if (!available) continue;
+    frame->outputs.reclaim();
     frame->busy = true;
-    frame->exposed = false;
     return frame.get();
   }
   auto frame = std::make_unique<Frame>();
   frame->generation = generation;
   frame->stream = stream;
   frame->busy = true;
-  frame->programs.resize(count);
   auto* result = frame.get();
   frames_.push_back(std::move(frame));
   return result;
 }
 
-void SegmentOutputPool::release(Frame* frame, bool exposed) {
+void SegmentOutputPool::release(Frame* frame) {
   std::lock_guard lock(mutex_);
-  frame->exposed = exposed;
+  frame->outputs.reclaim();
   frame->busy = false;
 }
 
@@ -158,9 +144,9 @@ SegmentedRunner::TracedResult SegmentedRunner::execute(const std::vector<at::Ten
               "GaudiRT segments: invalid input count");
   auto ctx = current();
   ContextScope scope(ctx);
-  auto* frame = bound ? output_pool_->acquire(ctx->generation, ctx->stream(), instructions_.size()) : nullptr;
-  const auto release_frame = [this, &trace](SegmentOutputPool::Frame* value) {
-    if (value) output_pool_->release(value, !trace.empty());
+  auto* frame = bound ? output_pool_->acquire(ctx->generation, ctx->stream()) : nullptr;
+  const auto release_frame = [this](SegmentOutputPool::Frame* value) {
+    if (value) output_pool_->release(value);
   };
   std::unique_ptr<SegmentOutputPool::Frame, decltype(release_frame)> frame_guard(frame, release_frame);
   std::vector<at::Tensor> values(slots_);
@@ -196,7 +182,7 @@ SegmentedRunner::TracedResult SegmentedRunner::execute(const std::vector<at::Ten
                                                      step.trusted[0], step.trusted[1], step.trusted[2]);
     } else {
       auto computed = step.program ? step.program->run_internal(arguments, step.trusted,
-          frame ? &frame->programs[step_index] : nullptr, &step.reusable_outputs) : std::vector<at::Tensor>{};
+          frame ? &frame->outputs : nullptr, &step.reusable_outputs) : std::vector<at::Tensor>{};
       for (size_t route_index = 0; route_index < step.routes.size(); ++route_index) {
         const auto& route = step.routes[route_index];
         TORCH_CHECK(route.input || route.index < computed.size(), "GaudiRT segments: invalid program output route");
@@ -223,6 +209,10 @@ SegmentedRunner::TracedResult SegmentedRunner::execute(const std::vector<at::Ten
     }
     for (auto slot : step.inputs)
       if (--uses[slot] == 0) values[slot] = at::Tensor{};
+    for (auto slot : step.outputs)
+      if (uses[slot] == 0) values[slot] = at::Tensor{};
+    arguments.clear();
+    if (frame) frame->outputs.reclaim();
   }
   std::vector<at::Tensor> result;
   result.reserve(outputs_.size());
