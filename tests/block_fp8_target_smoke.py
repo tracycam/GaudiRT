@@ -44,8 +44,8 @@ def main():
         assert stats[1] == 0, stats
 
     grouped = x.float().reshape(m, k // 128, 128)
-    scale = grouped.abs().amax(-1, keepdim=True).clamp_min(1e-10) / 448.0
-    quant = (grouped / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+    scale = grouped.abs().amax(-1, keepdim=True) / 448.0
+    quant = (grouped / torch.where(scale == 0, 1.0, scale)).clamp(-448, 448).to(torch.float8_e4m3fn)
     qx = (quant.double() * scale.double()).reshape(m, k)
     raw_x = x.double()
     errors = torch.zeros(m, dtype=torch.float64)

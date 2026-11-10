@@ -38,8 +38,8 @@ def main():
 
     def check(input_cpu, result, expected_bias):
         flat = input_cpu.float().reshape(-1, k)
-        act_scale = flat.abs().amax(-1, keepdim=True).clamp_min(1e-10) / 448.0
-        original_q = (flat / act_scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+        act_scale = flat.abs().amax(-1, keepdim=True) / 448.0
+        original_q = (flat / torch.where(act_scale == 0, 1.0, act_scale)).clamp(-448, 448).to(torch.float8_e4m3fn)
         reference = (original_q.double() * act_scale.double()) @ reference_weight.T
         unquantized = input_cpu.double().reshape(-1, k) @ reference_weight.T
         if expected_bias is not None:

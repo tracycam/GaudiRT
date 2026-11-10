@@ -42,8 +42,8 @@ def main():
             with_bias = torch.ops.gaudirt.block_fp8_linear.default(device_x, w_device, s_device, b_device).cpu()
             assert no_bias.shape == with_bias.shape == (m, n)
             group = x.float().reshape(m, k // 128, 128)
-            act_scale = group.abs().amax(-1, keepdim=True).clamp_min(1e-10) / 448.0
-            q = (group / act_scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+            act_scale = group.abs().amax(-1, keepdim=True) / 448.0
+            q = (group / torch.where(act_scale == 0, 1.0, act_scale)).clamp(-448, 448).to(torch.float8_e4m3fn)
             qx = (q.double() * act_scale.double()).reshape(m, k)
             raw_x = x.double()
             errors = torch.zeros((2, m), dtype=torch.float64)

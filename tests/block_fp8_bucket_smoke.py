@@ -42,8 +42,8 @@ def main():
 
     def check(input_cpu, result, expected_bias):
         grouped = input_cpu.float().reshape(-1, groups, 128)
-        act_scale = grouped.abs().amax(-1, keepdim=True).clamp_min(1e-10) / 448.0
-        original_q = (grouped / act_scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+        act_scale = grouped.abs().amax(-1, keepdim=True) / 448.0
+        original_q = (grouped / torch.where(act_scale == 0, 1.0, act_scale)).clamp(-448, 448).to(torch.float8_e4m3fn)
         act64 = (original_q.double() * act_scale.double()).reshape(-1, k)
         reference = act64 @ reference_weight.T
         raw_reference = input_cpu.double().reshape(-1, k) @ reference_weight.T
