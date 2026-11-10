@@ -78,6 +78,8 @@ add_executable(attention_tile_indices_device_test tests/attention_tile_indices_d
 target_link_libraries(attention_tile_indices_device_test PRIVATE gaudirt)
 add_executable(direct_softmax_device_test tests/direct_softmax_device_test.cpp)
 target_link_libraries(direct_softmax_device_test PRIVATE gaudirt)
+add_executable(block_fp8_device_test tests/block_fp8_device_test.cpp)
+target_link_libraries(block_fp8_device_test PRIVATE gaudirt)
 
 add_executable(stream_event_reuse_device_test tests/stream_event_reuse_device_test.cpp)
 target_link_libraries(stream_event_reuse_device_test PRIVATE gaudirt)
