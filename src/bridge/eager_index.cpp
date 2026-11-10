@@ -120,9 +120,10 @@ void validate_indices(const at::Tensor& index, int64_t upper) {
 }
 
 ColdRecipe& gather_recipe(Context& ctx, const at::Tensor& input, const at::Tensor& output,
-                          uint32_t indices, int64_t axis) {
+                          uint32_t indices, int64_t axis, bool wide_indices) {
   std::string signature = std::to_string(static_cast<int>(input.scalar_type())) + ":" +
-                          std::to_string(axis) + ":" + std::to_string(indices);
+                          std::to_string(axis) + ":" + std::to_string(indices) + ":" +
+                          std::to_string(wide_indices);
   for (auto size : input.sizes()) signature += ":" + std::to_string(size);
   const auto hash = common::sha256_bytes(reinterpret_cast<const uint8_t*>(signature.data()),
                                           signature.size());
@@ -132,7 +133,8 @@ ColdRecipe& gather_recipe(Context& ctx, const at::Tensor& input, const at::Tenso
   auto recipe = std::make_unique<ColdRecipe>(3);
   synGraphHandle graph = nullptr;
   std::array<synSectionHandle, 3> sections{};
-  std::array<synTensor, 3> tensors{};
+  std::array<synTensor, 4> tensors{};
+  const auto narrow_name = key + "_index_i32";
   const auto check = [](synStatus status, const char* message) {
     TORCH_CHECK(status == synSuccess, "GaudiRT: ", message, " status=", static_cast<int>(status));
   };
@@ -150,7 +152,8 @@ ColdRecipe& gather_recipe(Context& ctx, const at::Tensor& input, const at::Tenso
       check(synSectionSetPersistent(sections[i], true), "gather section setup failed");
       synTensorDescriptor desc{};
       desc.m_name = recipe->names[i].c_str();
-      desc.m_dataType = i == 1 ? syn_type_int32 : cast_type(input.scalar_type()).syn;
+      desc.m_dataType = i == 1 ? (wide_indices ? syn_type_int64 : syn_type_int32)
+                               : cast_type(input.scalar_type()).syn;
       desc.m_dims = i == 1 ? 1 : shaped.dim();
       for (unsigned dim = 0; dim < desc.m_dims; ++dim) {
         const auto size = i == 1 ? indices : shaped.size(shaped.dim() - dim - 1);
@@ -162,12 +165,27 @@ ColdRecipe& gather_recipe(Context& ctx, const at::Tensor& input, const at::Tenso
       recipe->tensors[i].tensorName = recipe->names[i].c_str();
       recipe->tensors[i].tensorType = DATA_TENSOR;
     }
+    if (wide_indices) {
+      synTensorDescriptor desc{};
+      desc.m_name = narrow_name.c_str();
+      desc.m_dataType = syn_type_int32;
+      desc.m_dims = 1;
+      desc.m_sizes[0] = desc.m_minSizes[0] = indices;
+      check(synTensorCreate(&tensors[3], &desc, nullptr, 0), "gather index tensor creation failed");
+      ns_CastKernel::ParamsV3 cast{};
+      cast.round_mode = CAST_ROUND_HALF_NE;
+      const auto cast_name = key + "_cast";
+      check(synNodeCreate(graph, &tensors[1], &tensors[3], 1, 1, &cast, sizeof(cast),
+                          "cast_i64_to_i32", cast_name.c_str(), nullptr, nullptr),
+            "gather index cast creation failed");
+    }
     ns_GatherKernel::ParamsV2 params{};
     params.axis = input.dim() - axis - 1;
     params.batchDims = 0;
     const auto guid = "gather_fwd_" + std::string(cast_type(input.scalar_type()).name);
     const auto node = key + "_n0";
-    check(synNodeCreate(graph, tensors.data(), &tensors[2], 2, 1, &params, sizeof(params),
+    synTensor gather_inputs[] = {tensors[0], wide_indices ? tensors[3] : tensors[1]};
+    check(synNodeCreate(graph, gather_inputs, &tensors[2], 2, 1, &params, sizeof(params),
                         guid.c_str(), node.c_str(), nullptr, nullptr), "gather node creation failed");
     recipe->recipe = compile_cached(graph, key, key, &ctx.cache);
     check(synWorkspaceGetSize(&recipe->workspace, recipe->recipe), "gather workspace query failed");
@@ -182,7 +200,7 @@ ColdRecipe& gather_recipe(Context& ctx, const at::Tensor& input, const at::Tenso
   return *it->second;
 }
 
-at::Tensor index_select(const at::Tensor& input, int64_t axis, const at::Tensor& index) {
+at::Tensor index_select_impl(const at::Tensor& input, int64_t axis, const at::Tensor& index, bool validated) {
   TORCH_CHECK(input.device() == index.device() && input.device().type() == c10::kPrivateUse1 &&
               (index.scalar_type() == at::kInt || index.scalar_type() == at::kLong),
               "GaudiRT: index_select requires device int32 or int64 indices");
@@ -191,7 +209,7 @@ at::Tensor index_select(const at::Tensor& input, int64_t axis, const at::Tensor&
   cast_type(input.scalar_type());
   axis = at::maybe_wrap_dim(axis, input.dim());
   const auto count = index.numel();
-  validate_indices(index, input.size(axis));
+  if (!validated) validate_indices(index, input.size(axis));
   std::vector<int64_t> shape(input.sizes().begin(), input.sizes().end());
   shape[axis] = count;
   auto result = at::empty(shape, input.options());
@@ -203,7 +221,7 @@ at::Tensor index_select(const at::Tensor& input, int64_t axis, const at::Tensor&
     source = at::empty(input.sizes(), input.options());
     copy(source, input, true);
   }
-  auto ids = index.scalar_type() == at::kInt ? index : index.to(at::kInt);
+  auto ids = index;
   source_address = address_of(source, *ctx);
   const auto ids_address = address_of(ids, *ctx);
   const bool overlaps = ids_address < source_address + source.nbytes() &&
@@ -214,7 +232,7 @@ at::Tensor index_select(const at::Tensor& input, int64_t axis, const at::Tensor&
     ids = std::move(staged);
   }
   std::lock_guard lock(ctx->cold_mutex);
-  auto& recipe = gather_recipe(*ctx, source, result, count, axis);
+  auto& recipe = gather_recipe(*ctx, source, result, count, axis, ids.scalar_type() == at::kLong);
   auto stream = ctx->stream();
   auto bindings = recipe.tensors;
   bindings[0].pTensorAddress = address_of(source, *ctx);
@@ -229,14 +247,24 @@ at::Tensor index_select(const at::Tensor& input, int64_t axis, const at::Tensor&
   return result;
 }
 
-ColdRecipe& index_put_recipe(Context& ctx, uint32_t count, uint32_t slots) {
-  const auto key = "cold_index_put_i64_" + std::to_string(count) + "_" + std::to_string(slots);
+at::Tensor index_select(const at::Tensor& input, int64_t axis, const at::Tensor& index) {
+  return index_select_impl(input, axis, index, false);
+}
+
+at::Tensor index_select_validated(const at::Tensor& input, int64_t axis, const at::Tensor& index) {
+  return index_select_impl(input, axis, index, true);
+}
+
+ColdRecipe& index_put_recipe(Context& ctx, uint32_t count, uint32_t slots, bool wide_indices) {
+  const auto key = "cold_index_put_i64_" + std::to_string(count) + "_" + std::to_string(slots) +
+                   (wide_indices ? "_idx64" : "_idx32");
   auto found = ctx.cold_recipes.find(key);
   if (found != ctx.cold_recipes.end()) return *found->second;
   auto compiled = std::make_unique<ColdRecipe>(3);
   synGraphHandle graph = nullptr;
   std::array<synSectionHandle, 3> sections{};
-  std::array<synTensor, 3> tensors{};
+  std::array<synTensor, 4> tensors{};
+  const auto narrow_name = key + "_index_i32";
   const auto check = [](synStatus status, const char* message) {
     TORCH_CHECK(status == synSuccess, "GaudiRT index put: ", message, " status=", static_cast<int>(status));
   };
@@ -247,13 +275,13 @@ ColdRecipe& index_put_recipe(Context& ctx, uint32_t count, uint32_t slots) {
   };
   try {
     check(synGraphCreate(&graph, synDeviceGaudi2), "graph creation failed");
-    for (size_t i = 0; i < tensors.size(); ++i) {
+    for (size_t i = 0; i < sections.size(); ++i) {
       compiled->names[i] = key + "_t" + std::to_string(i);
       check(synSectionCreate(&sections[i], 0, graph), "section creation failed");
       check(synSectionSetPersistent(sections[i], true), "section setup failed");
       synTensorDescriptor desc{};
       desc.m_name = compiled->names[i].c_str();
-      desc.m_dataType = syn_type_int32;
+      desc.m_dataType = i == 0 && wide_indices ? syn_type_int64 : syn_type_int32;
       desc.m_dims = i == 0 ? 1 : 2;
       desc.m_sizes[0] = desc.m_minSizes[0] = i == 0 ? count : 2;
       if (i != 0) desc.m_sizes[1] = desc.m_minSizes[1] = i == 1 ? count : slots;
@@ -263,8 +291,23 @@ ColdRecipe& index_put_recipe(Context& ctx, uint32_t count, uint32_t slots) {
       for (unsigned dim = 0; dim < desc.m_dims; ++dim)
         compiled->tensors[i].tensorSize[dim] = desc.m_sizes[dim];
     }
+    if (wide_indices) {
+      synTensorDescriptor desc{};
+      desc.m_name = narrow_name.c_str();
+      desc.m_dataType = syn_type_int32;
+      desc.m_dims = 1;
+      desc.m_sizes[0] = desc.m_minSizes[0] = count;
+      check(synTensorCreate(&tensors[3], &desc, nullptr, 0), "index cast tensor creation failed");
+      ns_CastKernel::ParamsV3 cast{};
+      cast.round_mode = CAST_ROUND_HALF_NE;
+      const auto cast_name = key + "_cast";
+      check(synNodeCreate(graph, &tensors[0], &tensors[3], 1, 1, &cast, sizeof(cast),
+                          "cast_i64_to_i32", cast_name.c_str(), nullptr, nullptr),
+            "index cast creation failed");
+    }
+    synTensor put_inputs[] = {wide_indices ? tensors[3] : tensors[0], tensors[1]};
     const auto node = key + "_n0";
-    check(synNodeCreate(graph, tensors.data(), tensors.data() + 2, 2, 1, nullptr, 0,
+    check(synNodeCreate(graph, put_inputs, tensors.data() + 2, 2, 1, nullptr, 0,
                         "gk_index_put_i64_v1", node.c_str(), nullptr, nullptr), "node creation failed");
     compiled->recipe = compile_cached(graph, key, key, &ctx.cache);
     check(synWorkspaceGetSize(&compiled->workspace, compiled->recipe), "workspace query failed");
@@ -285,8 +328,8 @@ at::Tensor index_tensor(const at::Tensor& input, const c10::List<std::optional<a
   return gaudirt::generic::index_select(input, 0, *indices.get(0));
 }
 
-at::Tensor& index_put(at::Tensor& self, const c10::List<std::optional<at::Tensor>>& indices,
-                      const at::Tensor& values, bool accumulate, bool unsafe) {
+at::Tensor& index_put_impl(at::Tensor& self, const c10::List<std::optional<at::Tensor>>& indices,
+                           const at::Tensor& values, bool accumulate, bool unsafe, bool validated) {
   TORCH_CHECK(!accumulate && !unsafe && indices.size() == 1 && indices.get(0).has_value(),
               "GaudiRT: index put supports one safe non-accumulating index");
   auto index = *indices.get(0);
@@ -303,7 +346,7 @@ at::Tensor& index_put(at::Tensor& self, const c10::List<std::optional<at::Tensor
               "GaudiRT: index put supports INT64 vectors with matching device indices and values; ",
               "self=", self.scalar_type(), "/", self.dim(), " values=", incoming.scalar_type(), "/", incoming.dim(),
               "/", incoming.numel(), " indices=", index.scalar_type(), "/", index.dim(), "/", index.numel());
-  validate_indices(index, self.numel());
+  if (!validated) validate_indices(index, self.numel());
   if (!index.numel()) return self;
   auto ctx = current();
   auto output = self;
@@ -313,7 +356,7 @@ at::Tensor& index_put(at::Tensor& self, const c10::List<std::optional<at::Tensor
     copy(output, self, true);
     output_address = address_of(output, *ctx);
   }
-  auto ids = index.scalar_type() == at::kInt ? index : index.to(at::kInt);
+  auto ids = index;
   auto id_address = address_of(ids, *ctx);
   auto overlaps = [](uint64_t a, uint64_t a_bytes, uint64_t b, uint64_t b_bytes) {
     return a < b + b_bytes && b < a + a_bytes;
@@ -337,7 +380,7 @@ at::Tensor& index_put(at::Tensor& self, const c10::List<std::optional<at::Tensor
   }
   {
     std::lock_guard lock(ctx->cold_mutex);
-    auto& recipe = index_put_recipe(*ctx, index.numel(), self.numel());
+    auto& recipe = index_put_recipe(*ctx, index.numel(), self.numel(), ids.scalar_type() == at::kLong);
     auto stream = ctx->stream();
     auto bindings = recipe.tensors;
     bindings[0].pTensorAddress = id_address;
@@ -352,6 +395,17 @@ at::Tensor& index_put(at::Tensor& self, const c10::List<std::optional<at::Tensor
   }
   if (output.unsafeGetTensorImpl() != self.unsafeGetTensorImpl()) copy(self, output, true);
   return self;
+}
+
+at::Tensor& index_put(at::Tensor& self, const c10::List<std::optional<at::Tensor>>& indices,
+                      const at::Tensor& values, bool accumulate, bool unsafe) {
+  return index_put_impl(self, indices, values, accumulate, unsafe, false);
+}
+
+at::Tensor& index_put_validated(at::Tensor& self, const at::Tensor& index, const at::Tensor& values) {
+  c10::List<std::optional<at::Tensor>> indices;
+  indices.push_back(index);
+  return index_put_impl(self, indices, values, false, false, true);
 }
 
 at::Tensor embedding(const at::Tensor& weight, const at::Tensor& index, int64_t padding_idx,
