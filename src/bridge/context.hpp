@@ -21,6 +21,7 @@
 namespace gaudirt::generic {
 
 struct Context;
+class AttentionStagingPool;
 struct EventState {
   Context* owner;
   synEventHandle handle;
@@ -58,6 +59,7 @@ struct Context {
   synStreamHandle stream();
   void synchronize_stream();
   void synchronize_all();
+  AttentionStagingPool& attention_staging();
   uint64_t row_count_address(uint32_t rows);
   static constexpr uint64_t kRowCountTableBytes = 4096 * 256;
   static std::filesystem::path cache_path();
@@ -69,6 +71,8 @@ struct Context {
   runtime::BlockCachingAllocator allocator;
   std::unique_ptr<runtime::GraphPool> graph_pool;
   runtime::PinnedHostPool pinned;
+  std::once_flag attention_staging_once;
+  std::unique_ptr<AttentionStagingPool> attention_staging_pool;
   std::once_flag row_count_once;
   uint64_t row_count_table = 0;
   runtime::RecipeCache cache;

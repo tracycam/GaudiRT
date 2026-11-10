@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "context.hpp"
+#include "attention_plan.hpp"
 
 #include <c10/util/Exception.h>
 
@@ -84,6 +85,13 @@ void Context::synchronize_stream() {
 }
 
 void Context::synchronize_all() { streams.synchronize(); device.synchronize_all(); }
+
+AttentionStagingPool& Context::attention_staging() {
+  std::call_once(attention_staging_once, [&] {
+    attention_staging_pool = std::make_unique<AttentionStagingPool>(*this);
+  });
+  return *attention_staging_pool;
+}
 
 uint64_t Context::row_count_address(uint32_t rows) {
   // Every value has a 256-byte-aligned address, so warm launches bind an

@@ -30,7 +30,7 @@ uint64_t align(uint64_t size) { return (size + kAlignment - 1) & ~(kAlignment - 
 
 void release_attention_plan(void* pointer) {
   std::unique_ptr<AttentionPlan> plan(static_cast<AttentionPlan*>(pointer));
-  if (auto ctx = plan->owner.lock()) ctx->allocator.free(plan->address);
+  if (auto ctx = plan->owner.lock()) ctx->attention_staging().release(plan->staging_slot, plan->stream);
 }
 
 ColdRecipe& indices_recipe(Context& ctx, uint32_t rows, uint32_t tasks) {
@@ -53,6 +53,57 @@ ColdRecipe& indices_recipe(Context& ctx, uint32_t rows, uint32_t tasks) {
   return *it->second;
 }
 }  // namespace
+
+AttentionStagingPool::~AttentionStagingPool() {
+  for (auto& slot : slots_) {
+    if (slot.recorded) synEventQuery(slot.completed);
+    if (slot.completed) synEventDestroy(slot.completed);
+    if (slot.host) context_.pinned.free(slot.host);
+    if (slot.address) context_.allocator.free(slot.address);
+  }
+}
+
+AttentionStagingPool::Lease AttentionStagingPool::acquire(uint64_t device_bytes, uint64_t host_bytes) {
+  std::lock_guard lock(mutex_);
+  for (size_t i = 0; i < slots_.size(); ++i) {
+    auto& slot = slots_[i];
+    if (slot.in_use || slot.device_bytes < device_bytes || slot.host_bytes < host_bytes) continue;
+    if (slot.recorded) {
+      const auto status = synEventQuery(slot.completed);
+      TORCH_CHECK(status == synSuccess || status == synBusy, "GaudiRT attention: staging event query failed");
+      if (status == synBusy) continue;
+    }
+    slot.in_use = true;
+    return {i, slot.address, slot.host};
+  }
+  Slot slot;
+  slot.device_bytes = device_bytes;
+  slot.host_bytes = host_bytes;
+  slot.in_use = true;
+  try {
+    slot.address = context_.allocator.allocate(device_bytes, context_.device.h2d_stream());
+    slot.host = context_.pinned.allocate(host_bytes);
+    TORCH_CHECK(synEventCreate(&slot.completed, context_.device.device_id(), 0) == synSuccess,
+                "GaudiRT attention: staging event creation failed");
+    slots_.push_back(slot);
+  } catch (...) {
+    if (slot.completed) synEventDestroy(slot.completed);
+    if (slot.host) context_.pinned.free(slot.host);
+    if (slot.address) context_.allocator.free(slot.address);
+    throw;
+  }
+  return {slots_.size() - 1, slot.address, slot.host};
+}
+
+void AttentionStagingPool::release(size_t index, synStreamHandle compute) {
+  std::lock_guard lock(mutex_);
+  TORCH_CHECK(index < slots_.size() && slots_[index].in_use, "GaudiRT attention: invalid staging lease");
+  auto& slot = slots_[index];
+  TORCH_CHECK(synEventRecord(slot.completed, compute) == synSuccess,
+              "GaudiRT attention: staging completion record failed");
+  slot.recorded = true;
+  slot.in_use = false;
+}
 
 const AttentionPlan& attention_plan_data(const at::Tensor& tensor, const Context& ctx) {
   TORCH_CHECK(tensor.device().type() == c10::kPrivateUse1 && tensor.device().index() == 0,
@@ -184,7 +235,9 @@ at::Tensor PagedMetadata::attention_plan(int64_t query_heads, int64_t kv_heads, 
   plan->bytes = plan->scratch_offset + plan->scratch_bytes;
   const auto compute = ctx->stream();
   plan->stream = compute;
-  plan->address = ctx->allocator.allocate(plan->bytes, compute);
+  const auto staging = ctx->attention_staging().acquire(plan->bytes, host_bytes);
+  plan->address = staging.address;
+  plan->staging_slot = staging.index;
   const auto address = plan->address;
   const auto bytes = plan->bytes;
   c10::DataPtr data(reinterpret_cast<void*>(address), plan.release(), release_attention_plan,
@@ -194,11 +247,8 @@ at::Tensor PagedMetadata::attention_plan(int64_t query_heads, int64_t kv_heads, 
   auto& stream_state = ctx->streams.state(active_stream_id);
   const auto h2d = ctx->device.h2d_stream();
   {
-    TemporaryHost staging(*ctx, host_bytes);
-    std::memcpy(staging.address, host.data(), host_bytes);
-    stream_state.metadata_reusable.record_and_wait(compute, h2d);
-    ctx->allocator.record_stream(address, h2d);
-    ctx->pinned.copy_h2d(address + index_bytes, staging.address, host_bytes, h2d, true);
+    std::memcpy(staging.host, host.data(), host_bytes);
+    ctx->pinned.copy_h2d(address + index_bytes, staging.host, host_bytes, h2d, true);
     stream_state.metadata_ready.record_and_wait(h2d, compute);
   }
   if (pending_metadata) {

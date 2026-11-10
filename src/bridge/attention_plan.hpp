@@ -6,9 +6,31 @@
 #include <ATen/core/Tensor.h>
 
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <vector>
 
 namespace gaudirt::generic {
+
+class AttentionStagingPool {
+ public:
+  struct Lease { size_t index; uint64_t address; void* host; };
+  explicit AttentionStagingPool(Context& context) : context_(context) {}
+  ~AttentionStagingPool();
+  Lease acquire(uint64_t device_bytes, uint64_t host_bytes);
+  void release(size_t index, synStreamHandle compute);
+
+ private:
+  struct Slot {
+    uint64_t address = 0, device_bytes = 0, host_bytes = 0;
+    void* host = nullptr;
+    synEventHandle completed = nullptr;
+    bool in_use = false, recorded = false;
+  };
+  Context& context_;
+  std::mutex mutex_;
+  std::vector<Slot> slots_;
+};
 
 struct AttentionTile {
   uint64_t indices_offset;
@@ -37,6 +59,7 @@ struct AttentionPlan {
   uint64_t scratch_bytes;
   uint64_t store_header_offset;
   synStreamHandle stream;
+  size_t staging_slot = 0;
   int64_t rows, slots, query_heads, kv_heads, head_dim;
   std::vector<AttentionBlock> blocks;
 };
