@@ -14,6 +14,7 @@ synStatus synDeviceAcquireByModuleId(synDeviceId* pDeviceId, synModuleId moduleI
 synStatus synDeviceRelease(synDeviceId devId);
 synStatus synDeviceSynchronize(synDeviceId devId);
 synStatus synDeviceGetMemoryInfo(synDeviceId, uint64_t*, uint64_t*);
+synStatus synDeviceGetAttribute(uint64_t*, const synDeviceAttribute*, unsigned, synDeviceId);
 synStatus synDeviceMalloc(synDeviceId, uint64_t, uint64_t, uint32_t, uint64_t*);
 synStatus synDeviceFree(synDeviceId, uint64_t, uint32_t);
 synStatus synHostMalloc(synDeviceId, uint64_t, uint32_t, void**);

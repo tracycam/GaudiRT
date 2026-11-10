@@ -50,6 +50,15 @@ if(GAUDIRT_BUILD_TORCH)
     target_link_libraries(_gaudirt_C PRIVATE gaudirt ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIBRARY} Python3::Module)
     set_target_properties(_gaudirt_C PROPERTIES PREFIX "")
 
+    add_executable(block_fp8_hybrid_lowering_unit_test
+        src/bridge/bucket_program.cpp src/bridge/fx_geometry.cpp src/bridge/fx_node.cpp
+        src/bridge/tensor_spec.cpp src/bridge/graph_builder.cpp
+        src/block_caching_allocator.cpp src/sha256.cpp
+        tests/block_fp8_hybrid_lowering_unit_test.cpp)
+    target_include_directories(block_fp8_hybrid_lowering_unit_test BEFORE PRIVATE tests/mock_synapse src/bridge)
+    target_compile_options(block_fp8_hybrid_lowering_unit_test PRIVATE ${TORCH_CXX_FLAGS} -UNDEBUG)
+    target_link_libraries(block_fp8_hybrid_lowering_unit_test PRIVATE ${TORCH_LIBRARIES})
+
     add_executable(multitile_paged_attention_unit_test
         tests/multitile_paged_attention_unit_test.cpp
         src/bridge/attention_plan.cpp

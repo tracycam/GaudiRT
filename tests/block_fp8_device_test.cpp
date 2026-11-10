@@ -184,7 +184,8 @@ int main(int argc, char** argv) {
         scales[index] = original_scales[index] * 2.f;
       }
     DeviceRuntime runtime({});
-    if (tile_width) {
+    const bool use_hybrid = m >= 512;
+    if (!use_hybrid && tile_width) {
       uint64_t limit = 0;
       synDeviceAttribute attribute = DEVICE_ATTRIBUTE_MAX_RMW_SIZE;
       check(synDeviceGetAttribute(&limit, &attribute, 1, runtime.device_id()), "RMW capacity query");
@@ -192,17 +193,18 @@ int main(int argc, char** argv) {
         throw std::invalid_argument("M/N tile exceeds the device RMW capacity");
     }
     const uint64_t partial_bytes = m * n * groups * sizeof(float);
-    if (!tile_width && partial_bytes > 256ULL * 1024 * 1024)
+    if (!use_hybrid && !tile_width && partial_bytes > 256ULL * 1024 * 1024)
       throw std::invalid_argument("untiled partial exceeds the device-test memory budget");
     const uint64_t arena_bytes = prepared.size() + x.size() * sizeof(x[0]) +
-        output.size() * sizeof(output[0]) + (tile_width ? 512ULL * 1024 * 1024 :
-                                              2 * partial_bytes + 256ULL * 1024 * 1024);
+        output.size() * sizeof(output[0]) +
+        (use_hybrid ? 2ULL * 1024 * 1024 * 1024
+                    : (tile_width ? 512ULL * 1024 * 1024 : 2 * partial_bytes + 256ULL * 1024 * 1024));
     HbmArena arena(runtime.device_id(), arena_bytes);
     RecipeCache cache(argv[1]);
     const auto xa = arena.allocate(x.size() * sizeof(x[0]));
     const auto wa = arena.allocate(prepared.size());
     const auto sa = arena.allocate(scales.size() * sizeof(scales[0]));
-    const auto ba = has_bias ? arena.allocate(bias.size() * sizeof(bias[0])) : 0;
+    const auto ba = (!use_hybrid || has_bias) ? arena.allocate(bias.size() * sizeof(bias[0])) : 0;
     const auto ya = arena.allocate(output.size() * sizeof(output[0]));
     auto upload = [&](const void* src, uint64_t dst, size_t bytes) {
       arena.copy_h2d_sync(runtime.h2d_stream(), src, dst, bytes);
@@ -214,27 +216,75 @@ int main(int argc, char** argv) {
     upload(output.data(), ya, output.size() * sizeof(output[0]));
     Graph graph("block_fp8_m" + std::to_string(m) + "_n" + std::to_string(n) +
                 "_k" + std::to_string(k) + "_bias" + bias_flag + "_tile" + std::to_string(tile_width) +
-                "_rows" + std::to_string(rows_per_tile));
-    if (tile_width) graph.enable_rmw();
+                "_rows" + std::to_string(rows_per_tile) + (use_hybrid ? "_hybrid1k2k" : ""));
+    if (!use_hybrid && tile_width) graph.enable_rmw();
     const auto tx = graph.tensor({k, m}, syn_type_bf16, xa);
     const auto tw = graph.tensor({128, n, groups}, syn_type_fp8_143, wa);
     const auto ts = graph.tensor({groups, n / 128}, syn_type_float, sa);
-    const auto tb = graph.tensor({n}, syn_type_float, ba);
     const auto ty = graph.tensor({n, m}, syn_type_bf16, ya);
-    const auto tq = graph.tensor({128, m, groups}, syn_type_fp8_143);
-    const auto tas = graph.tensor({1, m, groups}, syn_type_float);
-    if (!has_bias) {
-      ns_ConstantKernel::ParamsV3 zero{};
-      zero.constant.f = 0.f;
-      graph.node("constant_f32", {}, {tb}, &zero, sizeof(zero));
-    }
-    graph.node("gk_fp8_block_quant_bf16_v1", {tx}, {tq, tas});
     const synGEMMParams gemm{false, true};
-    if (!tile_width) {
-      const auto tp = graph.tensor({n, m, groups}, syn_type_float);
-      graph.node("batch_gemm", {tq, tw}, {tp}, &gemm, sizeof(gemm));
-      graph.node("gk_fp8_block_reduce_bf16_v1", {tp, tas, ts, tb}, {ty});
+    if (use_hybrid) {
+      const auto row_scale = graph.tensor({1, m}, syn_type_float);
+      graph.node("gk_fp8_act_row_scale_f32_v1", {tx}, {row_scale});
+      const auto act_1k = graph.tensor({k, m}, syn_type_bf16);
+      const auto act_2k = graph.tensor({k * 2, m}, syn_type_fp8_143);
+      graph.node("gk_fp8_quant_act_hybrid_v1", {tx, row_scale}, {act_1k, act_2k});
+      const size_t tb = has_bias ? graph.tensor({n}, syn_type_float, ba) : 0;
+      const uint64_t col_tile = tile_width ? tile_width : n;
+      const uint64_t count = (n + col_tile - 1) / col_tile;
+      std::vector<size_t> weights, scales_tiled, biases, outputs;
+      for (uint64_t i = 0; i < count; ++i) {
+        const auto width = std::min(col_tile, n - i * col_tile);
+        weights.push_back(count == 1 ? tw : graph.tensor({128, width, groups}, syn_type_fp8_143));
+        scales_tiled.push_back(count == 1 ? ts : graph.tensor({groups, width / 128}, syn_type_float));
+        if (has_bias) biases.push_back(count == 1 ? tb : graph.tensor({width}, syn_type_float));
+      }
+      const synSplitParams split_features{1}, split_bias{0};
+      if (count > 1) {
+        graph.node("split", std::vector<size_t>{tw}, weights, &split_features, sizeof(split_features));
+        graph.node("split", std::vector<size_t>{ts}, scales_tiled, &split_features, sizeof(split_features));
+        if (has_bias) graph.node("split", std::vector<size_t>{tb}, biases, &split_bias, sizeof(split_bias));
+      }
+      for (uint64_t i = 0; i < count; ++i) {
+        const auto width = std::min(col_tile, n - i * col_tile);
+        const auto w_1k = graph.tensor({k, width}, syn_type_bf16);
+        graph.node("gk_fp8_dequant_weight_bf16_1k_v1", {weights[i], scales_tiled[i]}, {w_1k});
+        const auto blk_scale = graph.tensor({1, width / 128}, syn_type_float);
+        graph.node("gk_fp8_weight_blk_scale_f32_v1", {scales_tiled[i]}, {blk_scale});
+        const auto w_2k = graph.tensor({k * 2, width}, syn_type_fp8_143);
+        graph.node("gk_fp8_dequant_weight_fp8_2k_v1",
+                   {weights[i], scales_tiled[i], blk_scale}, {w_2k});
+        const auto c0 = graph.tensor({width, m}, syn_type_float);
+        graph.node("gemm", {act_1k, w_1k}, {c0}, &gemm, sizeof(gemm));
+        const auto c1 = graph.tensor({width, m}, syn_type_float);
+        graph.node("gemm", {act_2k, w_2k}, {c1}, &gemm, sizeof(gemm));
+        const auto result = count == 1 ? ty : graph.tensor({width, m}, syn_type_bf16);
+        if (!has_bias) {
+          graph.node("gk_fp8_hybrid_epilogue_bf16_v1",
+                     {c0, c1, row_scale, blk_scale}, {result});
+        } else {
+          graph.node("gk_fp8_hybrid_epilogue_bias_bf16_v1",
+                     {c0, c1, row_scale, blk_scale, biases[i]}, {result});
+        }
+        outputs.push_back(result);
+      }
+      const synConcatenateParams concat_width{0};
+      if (count > 1) graph.node("concat", outputs, std::vector<size_t>{ty}, &concat_width, sizeof(concat_width));
     } else {
+      const auto tb = graph.tensor({n}, syn_type_float, ba);
+      const auto tq = graph.tensor({128, m, groups}, syn_type_fp8_143);
+      const auto tas = graph.tensor({1, m, groups}, syn_type_float);
+      if (!has_bias) {
+        ns_ConstantKernel::ParamsV3 zero{};
+        zero.constant.f = 0.f;
+        graph.node("constant_f32", {}, {tb}, &zero, sizeof(zero));
+      }
+      graph.node("gk_fp8_block_quant_bf16_v1", {tx}, {tq, tas});
+      if (!tile_width) {
+        const auto tp = graph.tensor({n, m, groups}, syn_type_float);
+        graph.node("batch_gemm", {tq, tw}, {tp}, &gemm, sizeof(gemm));
+        graph.node("gk_fp8_block_reduce_bf16_v1", {tp, tas, ts, tb}, {ty});
+      } else {
       const auto count = (n + tile_width - 1) / tile_width;
       const auto row_count = (m + rows_per_tile - 1) / rows_per_tile;
       std::vector<size_t> weights, scales_tiled, biases, activations, activation_scales, rows;
@@ -282,12 +332,16 @@ int main(int argc, char** argv) {
       }
       if (row_count > 1)
         graph.node("concat", rows, std::vector<size_t>{ty}, &concat_rows, sizeof(concat_rows));
+      }
     }
     graph.compile(cache);
     check(synLaunch(runtime.compute_stream(), graph.bindings.data(), graph.bindings.size(),
                     arena.ensure_workspace(graph.workspace), graph.recipe, 0), "launch");
     runtime.synchronize_compute();
     arena.copy_d2h_sync(runtime.d2h_stream(), ya, output.data(), output.size() * sizeof(output[0]));
+    for (uint16_t raw_out : output) {
+      if (!std::isfinite(widen(raw_out))) throw std::runtime_error("nonfinite result");
+    }
     std::array<double, 127> magnitudes{};
     for (unsigned code = 0; code < magnitudes.size(); ++code) magnitudes[code] = ocp(code);
     std::array<double, 256> decoded{};
@@ -333,7 +387,7 @@ int main(int argc, char** argv) {
         ideal_error += (actual - ideal) * (actual - ideal);
         ideal_energy += ideal * ideal;
       }
-      if (reference_energy == 0 || ideal_energy == 0) throw std::runtime_error("zero reference row");
+      if (!(reference_energy > 0.0) || !(ideal_energy > 0.0)) throw std::runtime_error("zero reference row");
       max_row_error = std::max(max_row_error, std::sqrt(squared_error / reference_energy));
       max_unquantized_error = std::max(max_unquantized_error, std::sqrt(ideal_error / ideal_energy));
     }

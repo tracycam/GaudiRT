@@ -38,7 +38,11 @@ FxGeometry infer_fx_geometry(const std::vector<at::Tensor>& inputs, const std::v
   std::ostringstream normalized;
   const auto caches = rotary_cache_inputs(roles, operations);
   normalized << (std::any_of(caches.begin(), caches.end(), [](bool value) { return value; })
-                     ? "fx_program_rotary_static_v1;" : "fx_program_v15;");
+                     ? "fx_program_rotary_static_v2;" : "fx_program_v16;");
+  if (std::any_of(operations.begin(), operations.end(),
+                  [](const FxNode& op) { return op.op == FxOp::block_fp8_linear; })) {
+    normalized << "block_fp8_hybrid_1k2k_v4;";
+  }
   for (size_t i = 0; i < inputs.size(); ++i) {
     const auto& tensor = inputs[i];
     const bool floating = tensor.scalar_type() == at::kBFloat16 || tensor.scalar_type() == at::kFloat;

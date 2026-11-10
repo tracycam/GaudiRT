@@ -558,6 +558,92 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
         const uint64_t input_width = groups * 128;
         const uint64_t token_rows = bucket * (input_spec.sizes.size() == 3 ? input_spec.sizes[1] : 1);
         TORCH_CHECK(token_rows > 0 && token_rows <= 4096, "GaudiRT FP8: flattened token rows outside 1..4096");
+        auto local = [&](synDataType dtype, std::vector<uint64_t> dimensions, bool rmw = false) {
+          return builder.tensor(dtype, dimensions, -1, -1, 0, false, {}, rmw);
+        };
+        if (token_rows >= 512) {
+          constexpr uint64_t kMaxTileAccumBytes = 384ULL << 20;
+          const uint64_t max_cols_by_accum =
+              std::max<uint64_t>(128, ((kMaxTileAccumBytes / (token_rows * 2 * sizeof(float))) / 128) * 128);
+          const uint64_t raw_tiles = (columns + max_cols_by_accum - 1) / max_cols_by_accum;
+          const uint64_t tile_columns = std::min<uint64_t>(
+              columns,
+              std::min<uint64_t>(max_cols_by_accum, (((columns + raw_tiles - 1) / raw_tiles + 127) / 128) * 128));
+          const uint64_t column_tiles = (columns + tile_columns - 1) / tile_columns;
+          auto input = values[op.inputs[0]];
+          if (input_spec.sizes.size() == 3) {
+            auto flat = local(syn_type_bf16, {input_width, token_rows});
+            node({input}, flat, std::monostate{}, "reshape");
+            input = flat;
+          }
+          auto row_scale = local(syn_type_float, {1, token_rows});
+          node({input}, row_scale, std::monostate{}, "gk_fp8_act_row_scale_f32_v1");
+          auto act_1k = local(syn_type_bf16, {input_width, token_rows});
+          auto act_2k = local(syn_type_fp8_143, {input_width * 2, token_rows});
+          builder.node(NodeSpec{"gk_fp8_quant_act_hybrid_v1", {input, row_scale}, {act_1k, act_2k}, std::monostate{}});
+          synTensor bias = nullptr;
+          if (op.inputs.size() == 4) {
+            bias = values[op.inputs[3]];
+            if (specs_[op.inputs[3]].dtype == at::kBFloat16) {
+              auto wide_bias = local(syn_type_float, {columns});
+              ns_CastKernel::ParamsV3 cast{};
+              cast.round_mode = CAST_ROUND_HALF_NE;
+              node({bias}, wide_bias, cast, "cast_bf16_to_f32");
+              bias = wide_bias;
+            }
+          }
+          std::vector<synTensor> weights, weight_scales, biases, products;
+          weights.reserve(column_tiles);
+          weight_scales.reserve(column_tiles);
+          if (bias) biases.reserve(column_tiles);
+          products.reserve(column_tiles);
+          for (uint64_t i = 0; i < column_tiles; ++i) {
+            const auto width = std::min(tile_columns, columns - i * tile_columns);
+            weights.push_back(column_tiles == 1 ? values[op.inputs[1]] :
+                              local(syn_type_fp8_143, {128, width, groups}));
+            weight_scales.push_back(column_tiles == 1 ? values[op.inputs[2]] :
+                                    local(syn_type_float, {groups, width / 128}));
+            if (bias) biases.push_back(column_tiles == 1 ? bias : local(syn_type_float, {width}));
+          }
+          const synAxisParams feature_axis{1}, column_axis{0};
+          if (column_tiles > 1) {
+            builder.node(NodeSpec{"split", {values[op.inputs[1]]}, weights, feature_axis});
+            builder.node(NodeSpec{"split", {values[op.inputs[2]]}, weight_scales, feature_axis});
+            if (bias) builder.node(NodeSpec{"split", {bias}, biases, column_axis});
+          }
+          const auto flat_output =
+              input_spec.sizes.size() == 3 ? local(syn_type_bf16, {columns, token_rows}) : values[id];
+          const synGEMMParams gemm{false, true};
+          for (uint64_t i = 0; i < column_tiles; ++i) {
+            const auto width = std::min(tile_columns, columns - i * tile_columns);
+            auto w_1k = local(syn_type_bf16, {input_width, width});
+            node({weights[i], weight_scales[i]}, w_1k, std::monostate{},
+                 "gk_fp8_dequant_weight_bf16_1k_v1");
+            auto blk_scale = local(syn_type_float, {1, width / 128});
+            node({weight_scales[i]}, blk_scale, std::monostate{},
+                 "gk_fp8_weight_blk_scale_f32_v1");
+            auto w_2k = local(syn_type_fp8_143, {input_width * 2, width});
+            node({weights[i], weight_scales[i], blk_scale}, w_2k, std::monostate{},
+                 "gk_fp8_dequant_weight_fp8_2k_v1");
+            auto c0 = local(syn_type_float, {width, token_rows});
+            node({act_1k, w_1k}, c0, gemm, "gemm");
+            auto c1 = local(syn_type_float, {width, token_rows});
+            node({act_2k, w_2k}, c1, gemm, "gemm");
+            auto result = column_tiles == 1 ? flat_output : local(syn_type_bf16, {width, token_rows});
+            if (bias) {
+              node({c0, c1, row_scale, blk_scale, biases[i]}, result, std::monostate{},
+                   "gk_fp8_hybrid_epilogue_bias_bf16_v1");
+            } else {
+              node({c0, c1, row_scale, blk_scale}, result, std::monostate{},
+                   "gk_fp8_hybrid_epilogue_bf16_v1");
+            }
+            products.push_back(result);
+          }
+          if (column_tiles > 1)
+            builder.node(NodeSpec{"concat", products, {flat_output}, column_axis});
+          if (input_spec.sizes.size() == 3) node({flat_output}, values[id], std::monostate{}, "reshape");
+          continue;
+        }
         uint64_t rmw_limit = 0;
         synDeviceAttribute attribute = DEVICE_ATTRIBUTE_MAX_RMW_SIZE;
         TORCH_CHECK(synDeviceGetAttribute(&rmw_limit, &attribute, 1, ctx.device.device_id()) == synSuccess,
@@ -570,9 +656,6 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
         TORCH_CHECK(tile_columns >= 128, "GaudiRT FP8: invalid device tile capacity");
         const uint64_t row_tiles = (token_rows + tile_rows - 1) / tile_rows;
         const uint64_t column_tiles = (columns + tile_columns - 1) / tile_columns;
-        auto local = [&](synDataType dtype, std::vector<uint64_t> dimensions, bool rmw = false) {
-          return builder.tensor(dtype, dimensions, -1, -1, 0, false, {}, rmw);
-        };
         auto input = values[op.inputs[0]];
         if (input_spec.sizes.size() == 3) {
           auto flat = local(syn_type_bf16, {input_width, token_rows});

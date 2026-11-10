@@ -28,13 +28,17 @@ enum synStatus {
 };
 
 enum synDeviceType {
-  synDeviceGaudi2 = 0,
+  synDeviceGaudi2 = 3,
 };
 
 enum synDmaDir {
   HOST_TO_DRAM = 0,
   DRAM_TO_HOST = 1,
   DRAM_TO_DRAM = 2,
+};
+
+enum synDeviceAttribute {
+  DEVICE_ATTRIBUTE_MAX_RMW_SIZE = 0,
 };
 
 enum synDataType {
@@ -76,6 +80,7 @@ enum TransposePermutationDim {
   TPD_Height = 2,
   TPD_4Dim_Batch = 3,
   TPD_Batch = 4,
+  TPD_5Dim_Batch = 4,
 };
 
 struct synTensorDescriptor {
@@ -108,6 +113,8 @@ struct synFpQuantMetadata {
 struct synGEMMParams {
   bool transpose_a = false;
   bool transpose_b = false;
+  constexpr synGEMMParams(bool ta = false, bool tb = false)
+      : transpose_a(ta), transpose_b(tb) {}
 };
 
 struct synTransposeParams {
@@ -118,6 +125,9 @@ struct synTransposeParams {
 struct synAxisParams {
   unsigned axis = 0;
 };
+
+using synSplitParams = synAxisParams;
+using synConcatenateParams = synAxisParams;
 
 struct synLaunchTensorInfo {
   const char* tensorName = nullptr;
