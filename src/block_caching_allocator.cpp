@@ -65,6 +65,12 @@ BlockCachingAllocator::~BlockCachingAllocator() {
   if (base_ && owns_slab_) synDeviceFree(device_, base_, 0);
 }
 
+void BlockCachingAllocator::prepare_stream(synStreamHandle stream) {
+  if (!stream) throw std::invalid_argument("BlockCachingAllocator: null stream");
+  std::lock_guard lock(mutex_);
+  events_.prepare(stream);
+}
+
 uint64_t BlockCachingAllocator::allocate(uint64_t bytes, synStreamHandle stream) {
   const uint64_t size = aligned(bytes);
   if (!stream) throw std::invalid_argument("BlockCachingAllocator: null stream");
@@ -203,6 +209,7 @@ GraphPool::GraphPool(BlockCachingAllocator& parent, uint64_t bytes, synStreamHan
   try {
     pool_.reset(new BlockCachingAllocator(parent_.device_, reservation_, size,
                                            BlockCachingAllocator::BorrowedSlab{}));
+    prepare_stream(stream);
   } catch (...) {
     parent_.free(reservation_);
     reservation_ = 0;
@@ -219,9 +226,23 @@ GraphPool::~GraphPool() {
   if (reservation_) parent_.free(reservation_);
 }
 
+void GraphPool::prepare_stream_locked(synStreamHandle stream) {
+  if (std::find(streams_.begin(), streams_.end(), stream) != streams_.end()) return;
+  pool_->prepare_stream(stream);
+  for (auto& region : extra_regions_) region.pool->prepare_stream(stream);
+  streams_.push_back(stream);
+}
+
+void GraphPool::prepare_stream(synStreamHandle stream) {
+  if (!stream) throw std::invalid_argument("GraphPool: null stream");
+  std::lock_guard lock(mutex_);
+  prepare_stream_locked(stream);
+}
+
 uint64_t GraphPool::allocate(uint64_t bytes, synStreamHandle stream) {
   const uint64_t size = aligned(bytes);
   std::lock_guard lock(mutex_);
+  prepare_stream_locked(stream);
   BlockCachingAllocator* best = nullptr;
   uint64_t best_free = std::numeric_limits<uint64_t>::max();
   const auto consider = [&](BlockCachingAllocator& pool) {
@@ -241,6 +262,7 @@ uint64_t GraphPool::allocate(uint64_t bytes, synStreamHandle stream) {
     try {
       auto pool = std::unique_ptr<BlockCachingAllocator>(new BlockCachingAllocator(
           parent_.device_, reservation, region_bytes, BlockCachingAllocator::BorrowedSlab{}));
+      for (auto known_stream : streams_) pool->prepare_stream(known_stream);
       extra_regions_.push_back(Region{reservation, std::move(pool)});
       best = extra_regions_.back().pool.get();
     } catch (...) {
@@ -269,6 +291,7 @@ bool GraphPool::contains_live_range(uint64_t address, uint64_t bytes) const {
 
 void GraphPool::record_stream(uint64_t address, synStreamHandle stream) {
   std::lock_guard lock(mutex_);
+  prepare_stream_locked(stream);
   if (pool_->contains_live_range(address, 1)) return pool_->record_stream(address, stream);
   for (const auto& region : extra_regions_)
     if (region.pool->contains_live_range(address, 1)) return region.pool->record_stream(address, stream);

@@ -26,6 +26,7 @@ class BlockCachingAllocator {
   BlockCachingAllocator& operator=(const BlockCachingAllocator&) = delete;
 
   uint64_t allocate(uint64_t bytes, synStreamHandle stream);
+  void prepare_stream(synStreamHandle stream);
   void record_stream(uint64_t address, synStreamHandle stream);
   void free(uint64_t address);
 
@@ -74,6 +75,7 @@ class GraphPool {
   GraphPool& operator=(const GraphPool&) = delete;
   BlockCachingAllocator& allocator() noexcept { return *pool_; }
   uint64_t allocate(uint64_t bytes, synStreamHandle stream);
+  void prepare_stream(synStreamHandle stream);
   void free(uint64_t address);
   bool contains_live_range(uint64_t address, uint64_t bytes) const;
   void record_stream(uint64_t address, synStreamHandle stream);
@@ -88,7 +90,9 @@ class GraphPool {
   uint64_t reservation_ = 0;
   std::unique_ptr<BlockCachingAllocator> pool_;
   std::vector<Region> extra_regions_;
+  std::vector<synStreamHandle> streams_;
   mutable std::mutex mutex_;
+  void prepare_stream_locked(synStreamHandle stream);
 };
 
 }  // namespace gaudirt::runtime

@@ -54,16 +54,23 @@ ColdRecipe& indices_recipe(Context& ctx, uint32_t rows, uint32_t tasks) {
 }
 }  // namespace
 
+AttentionStagingPool::AttentionStagingPool(Context& context)
+    : context_(context), events_(context.device.device_id()) {}
+
 AttentionStagingPool::~AttentionStagingPool() {
   release_all();
+}
+
+void AttentionStagingPool::prepare_stream(synStreamHandle stream) {
+  std::lock_guard lock(mutex_);
+  events_.prepare(stream);
 }
 
 void AttentionStagingPool::release_all() {
   for (auto& slot : slots_) {
     if (slot.recorded)
-      TORCH_CHECK(synEventSynchronize(slot.completed) == synSuccess,
+      TORCH_CHECK(events_.synchronize(slot.completed) == synSuccess,
                   "GaudiRT attention: staging completion wait failed");
-    if (slot.completed) synEventDestroy(slot.completed);
     if (slot.host) context_.pinned.free(slot.host);
     if (slot.address) context_.allocator.free(slot.address);
   }
@@ -83,9 +90,10 @@ AttentionStagingPool::Lease AttentionStagingPool::acquire(uint64_t device_bytes,
     auto& slot = slots_[i];
     if (slot.in_use || slot.device_bytes < device_bytes || slot.host_bytes < host_bytes) continue;
     if (slot.recorded) {
-      const auto status = synEventQuery(slot.completed);
+      const auto status = events_.query(slot.completed);
       TORCH_CHECK(status == synSuccess || status == synBusy, "GaudiRT attention: staging event query failed");
       if (status == synBusy) continue;
+      slot.recorded = false;
     }
     slot.in_use = true;
     return {i, slot.address, slot.host};
@@ -97,11 +105,8 @@ AttentionStagingPool::Lease AttentionStagingPool::acquire(uint64_t device_bytes,
   try {
     slot.address = context_.allocator.allocate(device_bytes, context_.device.h2d_stream());
     slot.host = context_.pinned.allocate(host_bytes);
-    TORCH_CHECK(synEventCreate(&slot.completed, context_.device.device_id(), 0) == synSuccess,
-                "GaudiRT attention: staging event creation failed");
     slots_.push_back(slot);
   } catch (...) {
-    if (slot.completed) synEventDestroy(slot.completed);
     if (slot.host) context_.pinned.free(slot.host);
     if (slot.address) context_.allocator.free(slot.address);
     throw;
@@ -113,8 +118,10 @@ void AttentionStagingPool::release(size_t index, synStreamHandle compute) {
   std::lock_guard lock(mutex_);
   TORCH_CHECK(index < slots_.size() && slots_[index].in_use, "GaudiRT attention: invalid staging lease");
   auto& slot = slots_[index];
-  TORCH_CHECK(synEventRecord(slot.completed, compute) == synSuccess,
-              "GaudiRT attention: staging completion record failed");
+  const auto completion = events_.prepare(compute);
+  const auto status = events_.query(completion);
+  TORCH_CHECK(status == synSuccess || status == synBusy, "GaudiRT attention: staging event query failed");
+  slot.completed = events_.record(compute);
   slot.recorded = true;
   slot.in_use = false;
 }

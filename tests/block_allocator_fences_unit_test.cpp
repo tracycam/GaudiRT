@@ -8,7 +8,11 @@
 #include <vector>
 
 namespace {
-struct RecordedEvent { synStreamHandle stream = nullptr; uint64_t ordinal = 0; bool needs_wait = false; };
+struct RecordedEvent {
+  synStreamHandle stream = nullptr;
+  uint64_t ordinal = 0;
+  bool needs_wait = false, complete = false;
+};
 std::map<synStreamHandle, uint64_t> recorded;
 std::vector<RecordedEvent> waited;
 std::vector<synStreamHandle> synchronized;
@@ -46,7 +50,15 @@ synStatus synEventRecord(synEventHandle p, synStreamHandle s) {
   return synSuccess;
 }
 synStatus synEventSynchronize(synEventHandle p) {
-  static_cast<RecordedEvent*>(p)->needs_wait = false;
+  auto& event = *static_cast<RecordedEvent*>(p);
+  event.needs_wait = false;
+  event.complete = true;
+  return synSuccess;
+}
+synStatus synEventQuery(synEventHandle p) {
+  auto& event = *static_cast<RecordedEvent*>(p);
+  if (!event.complete) return synBusy;
+  event.needs_wait = false;
   return synSuccess;
 }
 synStatus synStreamWaitEvent(synStreamHandle, synEventHandle p, uint32_t) {
@@ -60,6 +72,21 @@ synStatus synStreamSynchronize(synStreamHandle s) { synchronized.push_back(s); r
 
 int main() {
   using gaudirt::runtime::BlockCachingAllocator;
+  {
+    gaudirt::runtime::EventPool events(0);
+    auto event = events.prepare(stream(1));
+    assert(events.query(event) == synSuccess && created_events == 1);
+    events.record(stream(1));
+    assert(events.query(event) == synBusy);
+    events.record(stream(1));
+    assert(waited.size() == 1 && waited[0].ordinal == 1);
+    static_cast<RecordedEvent*>(event.get())->complete = true;
+    assert(events.query(event) == synSuccess);
+    events.record(stream(1));
+    assert(waited.size() == 1 && recorded[stream(1)] == 3);
+    assert(events.synchronize(event) == synSuccess);
+  }
+  reset();
   {
     BlockCachingAllocator pool(0, 4096);
     for (unsigned i = 0; i < 1000; ++i) {

@@ -17,6 +17,7 @@ class EventPool {
   struct State {
     synEventHandle handle = nullptr;
     bool needs_wait = false;
+    bool recorded = false;
   };
 
  public:
@@ -42,7 +43,7 @@ class EventPool {
   EventPool(const EventPool&) = delete;
   EventPool& operator=(const EventPool&) = delete;
 
-  void prepare(synStreamHandle stream) { (void)state_for(stream); }
+  Event prepare(synStreamHandle stream) { return Event(&state_for(stream)); }
 
   Event record(synStreamHandle stream) {
     auto& state = state_for(stream);
@@ -55,7 +56,15 @@ class EventPool {
     if (synEventRecord(state.handle, stream) != synSuccess)
       throw std::runtime_error("EventPool: event record failed");
     state.needs_wait = true;
+    state.recorded = true;
     return Event(&state);
+  }
+
+  synStatus query(Event event) {
+    if (!event.state_->recorded) return synSuccess;
+    const auto status = synEventQuery(event.get());
+    if (status == synSuccess) event.state_->needs_wait = false;
+    return status;
   }
 
   synStatus wait(Event event, synStreamHandle stream) {
@@ -78,7 +87,7 @@ class EventPool {
       if (synEventCreate(&event, device_, 0) != synSuccess)
         throw std::runtime_error("EventPool: event creation failed");
       try {
-        existing = events_.emplace(stream, State{event, false}).first;
+        existing = events_.emplace(stream, State{event, false, false}).first;
       } catch (...) {
         synEventDestroy(event);
         throw;

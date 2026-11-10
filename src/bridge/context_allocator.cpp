@@ -198,7 +198,9 @@ class Guard final : public c10::impl::DeviceGuardImplInterface {
   c10::Stream getNewStream(c10::Device device, int priority) const override {
     TORCH_CHECK(priority == 0, "GaudiRT: stream priorities are unsupported");
     auto ctx = checked(device);
-    return c10::Stream(c10::Stream::UNSAFE, c10::Device(type(), 0), ctx->streams.create());
+    const auto id = ctx->streams.create();
+    ctx->prepare_stream(ctx->streams.get(id));
+    return c10::Stream(c10::Stream::UNSAFE, c10::Device(type(), 0), id);
   }
   c10::Stream getStreamFromGlobalPool(c10::Device device, bool high_priority) const override {
     TORCH_CHECK(!high_priority, "GaudiRT: stream priorities are unsupported");

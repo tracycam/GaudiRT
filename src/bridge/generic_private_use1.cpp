@@ -188,7 +188,7 @@ std::optional<at::Tensor> prepare_strided_input(const at::Tensor& input) {
     if (!ctx->graph_pool) {
       const uint64_t budget = std::min<uint64_t>(ctx->allocator.capacity_bytes() / 8, uint64_t{1} << 30);
       TORCH_CHECK(budget >= 256, "GaudiRT FX: HBM budget is too small for graph temporaries");
-      ctx->graph_pool = std::make_unique<GraphPool>(ctx->allocator, budget, stream);
+      ctx->ensure_graph_pool(budget, stream);
     }
     destination = ctx->graph_pool->allocate(bytes, stream);
     allocation = allocation_data_ptr(ctx, destination, bytes, stream, AllocationKind::graph);
@@ -375,7 +375,7 @@ at::Tensor bucket_linear(const at::Tensor& input, const at::Tensor& weight,
   if ((!direct || recipe.workspace) && !ctx->graph_pool) {
     const uint64_t budget = std::min<uint64_t>(ctx->allocator.capacity_bytes() / 8, uint64_t{1} << 30);
     TORCH_CHECK(budget >= 256, "GaudiRT: HBM budget is too small for graph temporaries");
-    ctx->graph_pool = std::make_unique<GraphPool>(ctx->allocator, budget, stream);
+    ctx->ensure_graph_pool(budget, stream);
   }
   std::unique_ptr<GraphTemporary> staged, workspace;
   ctx->allocator.record_stream(input_address, stream);
@@ -544,7 +544,7 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_validated(const at::Tensor& 
     if (!ctx->graph_pool) {
       const uint64_t budget = std::min<uint64_t>(ctx->allocator.capacity_bytes() / 8, uint64_t{1} << 30);
       TORCH_CHECK(budget >= 256, "GaudiRT rotary: HBM budget is too small for graph temporaries");
-      ctx->graph_pool = std::make_unique<GraphPool>(ctx->allocator, budget, stream);
+      ctx->ensure_graph_pool(budget, stream);
     }
     return *ctx->graph_pool;
   };

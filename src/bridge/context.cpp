@@ -46,6 +46,14 @@ c10::StreamId StreamRegistry::create() {
 
 synStreamHandle StreamRegistry::get(c10::StreamId id) { return state(id).handle; }
 
+std::vector<synStreamHandle> StreamRegistry::handles() {
+  std::lock_guard lock(mutex_);
+  std::vector<synStreamHandle> result;
+  result.reserve(streams_.size());
+  for (const auto& stream : streams_) result.push_back(stream->handle);
+  return result;
+}
+
 StreamRegistry::StreamState& StreamRegistry::state(c10::StreamId id) {
   if (id == 0) return *primary_;
   std::lock_guard lock(mutex_);
@@ -62,7 +70,11 @@ void StreamRegistry::synchronize() {
 Context::Context(uint32_t module, uint64_t hbm_bytes, uint64_t pinned_bytes)
     : generation(next_context_generation.fetch_add(1, std::memory_order_relaxed)),
       device(config(module)), streams(device.device_id(), device.compute_stream()),
-      allocator(device.device_id(), hbm_bytes), pinned(device.device_id(), pinned_bytes), cache(cache_path()) {}
+      allocator(device.device_id(), hbm_bytes), pinned(device.device_id(), pinned_bytes),
+      attention_staging_pool(std::make_unique<AttentionStagingPool>(*this)), cache(cache_path()) {
+  for (auto stream : {device.compute_stream(), device.h2d_stream(), device.d2h_stream()})
+    prepare_stream(stream);
+}
 
 Context::~Context() {
   try { streams.synchronize(); } catch (...) {}
@@ -88,11 +100,25 @@ void Context::synchronize_stream() {
 
 void Context::synchronize_all() { streams.synchronize(); device.synchronize_all(); }
 
-AttentionStagingPool& Context::attention_staging() {
-  std::call_once(attention_staging_once, [&] {
-    attention_staging_pool = std::make_unique<AttentionStagingPool>(*this);
-  });
-  return *attention_staging_pool;
+void Context::prepare_stream(synStreamHandle stream) {
+  allocator.prepare_stream(stream);
+  pinned.prepare_stream(stream);
+  attention_staging_pool->prepare_stream(stream);
+  std::lock_guard lock(cold_mutex);
+  if (graph_pool) graph_pool->prepare_stream(stream);
+}
+
+AttentionStagingPool& Context::attention_staging() { return *attention_staging_pool; }
+
+runtime::GraphPool& Context::ensure_graph_pool(uint64_t budget, synStreamHandle stream) {
+  if (!graph_pool) {
+    auto pool = std::make_unique<runtime::GraphPool>(allocator, budget, stream);
+    for (auto registered : streams.handles()) pool->prepare_stream(registered);
+    pool->prepare_stream(device.h2d_stream());
+    pool->prepare_stream(device.d2h_stream());
+    graph_pool = std::move(pool);
+  }
+  return *graph_pool;
 }
 
 void Context::register_segment_outputs(const std::shared_ptr<SegmentOutputPool>& pool) {

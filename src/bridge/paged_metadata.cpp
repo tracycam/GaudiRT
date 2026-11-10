@@ -392,7 +392,7 @@ void PagedMetadata::launch_device_metadata(const at::Tensor& locations, const at
       if (!ctx->graph_pool) {
         const uint64_t budget = std::min<uint64_t>(ctx->allocator.capacity_bytes() / 8, uint64_t{1} << 30);
         TORCH_CHECK(budget >= 256, "GaudiRT device metadata: HBM budget is too small for graph temporaries");
-        ctx->graph_pool = std::make_unique<GraphPool>(ctx->allocator, budget, compute);
+        ctx->ensure_graph_pool(budget, compute);
       }
       return *ctx->graph_pool;
     };

@@ -44,6 +44,7 @@ class StreamRegistry {
   ~StreamRegistry();
   c10::StreamId create();
   synStreamHandle get(c10::StreamId id);
+  std::vector<synStreamHandle> handles();
   StreamState& state(c10::StreamId id);
   void synchronize();
 
@@ -60,7 +61,10 @@ struct Context {
   synStreamHandle stream();
   void synchronize_stream();
   void synchronize_all();
+  void prepare_stream(synStreamHandle stream);
   AttentionStagingPool& attention_staging();
+  // The caller holds cold_mutex when creating or accessing the graph pool.
+  runtime::GraphPool& ensure_graph_pool(uint64_t budget, synStreamHandle stream);
   void register_segment_outputs(const std::shared_ptr<SegmentOutputPool>& pool);
   bool trim_segment_outputs();
   uint64_t row_count_address(uint32_t rows);
@@ -74,7 +78,6 @@ struct Context {
   runtime::BlockCachingAllocator allocator;
   std::unique_ptr<runtime::GraphPool> graph_pool;
   runtime::PinnedHostPool pinned;
-  std::once_flag attention_staging_once;
   std::unique_ptr<AttentionStagingPool> attention_staging_pool;
   std::mutex segment_outputs_mutex;
   std::vector<std::weak_ptr<SegmentOutputPool>> segment_outputs;

@@ -585,7 +585,7 @@ class ProgramTemporaries {
     if (!ctx_.graph_pool) {
       const uint64_t budget = std::min<uint64_t>(ctx_.allocator.capacity_bytes() / 8, uint64_t{1} << 30);
       TORCH_CHECK(budget >= 256, "GaudiRT FX: HBM budget is too small for graph temporaries");
-      ctx_.graph_pool = std::make_unique<GraphPool>(ctx_.allocator, budget, stream_);
+      ctx_.ensure_graph_pool(budget, stream_);
     }
     const auto address = ctx_.graph_pool->allocate(bytes, stream_);
     try {

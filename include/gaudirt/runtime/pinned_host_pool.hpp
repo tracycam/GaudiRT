@@ -39,6 +39,7 @@ class PinnedHostPool {
   PinnedHostPool& operator=(const PinnedHostPool&) = delete;
 
   void* allocate(uint64_t bytes);
+  void prepare_stream(synStreamHandle stream);
   void free(void* address);
   void record_stream(const void* address, synStreamHandle stream);
   bool contains_live_range(const void* address, uint64_t bytes) const;

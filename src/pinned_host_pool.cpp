@@ -57,6 +57,12 @@ PinnedHostPool::PinnedHostPool(synDeviceId device, uint64_t bytes)
     throw;
   }
 }
+
+void PinnedHostPool::prepare_stream(synStreamHandle stream) {
+  if (!stream) throw std::invalid_argument("PinnedHostPool: null stream");
+  std::lock_guard lock(mutex_);
+  events_.prepare(stream);
+}
 PinnedHostPool::~PinnedHostPool() {
   for (auto& [address, block] : blocks_) {
     (void)address;
