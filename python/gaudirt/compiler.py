@@ -513,10 +513,11 @@ def _program_backend(graph_module, example_inputs, compact_outputs=()):
 
 
 class _SegmentExecution:
-    def __init__(self, split, runner, input_indices, output_template, checks, records):
+    def __init__(self, split, runner, input_indices, input_sources, output_template, checks, records):
         self.split = split
         self.runner = runner
         self.input_indices = input_indices
+        self.input_sources = input_sources
         self.output_template = output_template
         self.token_checks, self.row_checks = checks
         self.records = records
@@ -525,6 +526,9 @@ class _SegmentExecution:
         self.trace_deltas = ()
         self.profile_events = None
         self.profile_host_ms = None
+        self._first_args = None
+        self._first_outputs = None
+        self._binding_attempted = False
 
     def enable_trace(self):
         """Observe actual C++ segment results for correctness audits."""
@@ -548,6 +552,18 @@ class _SegmentExecution:
             raise RuntimeError("GaudiRT FX: invalid segment profiling events")
         self.profile_events = None if events is None else tuple(event.event_id for pair in events for event in pair)
 
+    def consume_trace(self, traces, input_at):
+        self.trace_deltas = tuple(trace[2] for trace in traces)
+        for i, (segment, host_arguments, tensor_arguments, single) in enumerate(self.records):
+            tensor_values, outputs, _ = traces[i]
+            actual = [input_at(value) if kind == "input" else value for kind, value in host_arguments]
+            for index, tensor in zip(tensor_arguments, tensor_values):
+                actual[index] = tensor
+            self.trace_result = outputs[0] if single else tuple(outputs)
+            segment.forward(*actual)
+            traces[i] = None
+        self.trace_result = None
+
     def forward(self, *args):
         for index, weight in self.token_checks:
             vocabulary = getattr(args[index], "_gaudirt_validated_vocab", None)
@@ -559,20 +575,14 @@ class _SegmentExecution:
         inputs = [args[index] for index in self.input_indices]
         if self.tracing:
             result, traces = self.runner.run_traced(inputs, list(range(len(self.records))))
-            self.trace_deltas = tuple(trace[2] for trace in traces)
-            for i, (segment, host_arguments, tensor_arguments, single) in enumerate(self.records):
-                tensor_values, outputs, _ = traces[i]
-                actual = [args[value] if kind == "input" else value for kind, value in host_arguments]
-                for index, tensor in zip(tensor_arguments, tensor_values):
-                    actual[index] = tensor
-                self.trace_result = outputs[0] if single else tuple(outputs)
-                segment.forward(*actual)
-                traces[i] = None
-            self.trace_result = None
+            self.consume_trace(traces, lambda index: args[index])
         elif self.profile_events is not None:
             result, self.profile_host_ms = self.runner.run_profiled(inputs, self.profile_events)
         else:
             result = self.runner.run(inputs)
+
+        if not self._binding_attempted and self._first_args is None:
+            self._first_args, self._first_outputs = args, result
 
         def restore(template):
             kind, value = template
@@ -679,7 +689,8 @@ def _segment_executor(split, example_inputs, paged):
 
             template = output_template(node.args[0])
             runner.set_outputs(output_ids)
-            return _SegmentExecution(split, runner, input_indices, template,
+            sources = tuple(getattr(node.meta.get("gaudirt_source"), "name", None) for node in placeholders)
+            return _SegmentExecution(split, runner, input_indices, sources, template,
                                      (tuple(sorted(token_checks)), tuple(sorted(row_checks))), records).forward
         if node.op != "call_module" or node.kwargs:
             raise RuntimeError("GaudiRT FX: unsupported operation between segments")
@@ -771,6 +782,8 @@ def _partition_backend(graph_module, example_inputs):
         else:
             partitions[node] = partition
     split = split_module(graph_module, graph_module, lambda node: partitions[node], keep_original_order=True)
+    for target, source in zip((node for node in split.graph.nodes if node.op == "placeholder"), placeholders):
+        target.meta["gaudirt_source"] = getattr(source.meta.get("grapharg"), "source", None)
     return _segment_executor(split, example_inputs, paged)
 
 
@@ -783,7 +796,7 @@ def gaudirt_backend(graph_module, example_inputs):
     return _program_backend(graph_module, example_inputs)
 
 
-def compile(module, dynamic_arg_indices=(0,)):
+def compile(module, dynamic_arg_indices=(0,), prepare_capture=None):
     """Capture once with unpadded token tensors and dispatch the supported FX graph."""
     class CaptureConfigRequired(Exception):
         pass
@@ -798,6 +811,7 @@ def compile(module, dynamic_arg_indices=(0,)):
             raise CaptureConfigRequired()
         result = gaudirt_backend(graph, inputs)
         capture.segmented = isinstance(getattr(result, "__self__", None), _SegmentExecution)
+        capture.execution = getattr(result, "__self__", None) if capture.segmented else None
         return result
 
     compiled = torch.compile(module, backend=guarded_backend, dynamic=True, fullgraph=True)
@@ -820,7 +834,7 @@ def compile(module, dynamic_arg_indices=(0,)):
             return None
         return result
 
-    def remember_segmented_path(args, kwargs):
+    def remember_segmented_path(args, kwargs, model_result):
         # Dynamo's rewritten top-level frame already lifts the graph inputs and
         # reconstructs the Python result. Reuse it only with its original C++
         # guard manager, so changes in module state or ambient PyTorch state
@@ -847,7 +861,13 @@ def compile(module, dynamic_arg_indices=(0,)):
                                            function.__defaults__, function.__closure__)
             if bound is not None:
                 rewritten = types.MethodType(rewritten, bound)
-            fast_paths.insert(0, (entry, rewritten, code, cells, bound))
+            from .segment_binding import bind
+
+            execution = capture.execution
+            direct = bind(execution, entry.guard_manager, locals_, function.__globals__, model_result)
+            execution._first_args = execution._first_outputs = None
+            execution._binding_attempted = True
+            fast_paths.insert(0, (entry, rewritten, code, cells, bound, direct, execution))
 
     def prepare_dynamic_inputs(args):
         prepared_args = list(args)
@@ -919,10 +939,10 @@ def compile(module, dynamic_arg_indices=(0,)):
         prepared_args, replacements = prepare_dynamic_inputs(args)
         if (fast_paths and torch._guards.TracingContext.try_get() is None and
                 not torch.fx._symbolic_trace.is_fx_symbolic_tracing() and not torch._C._is_tracing()):
-            for entry, rewritten, code, cells, bound in fast_paths:
+            for entry, rewritten, code, cells, bound, direct, execution in fast_paths:
                 locals_ = frame_locals(code, cells, bound, prepared_args, kwargs)
                 if locals_ is not None and entry.guard_manager.check(locals_):
-                    result = rewritten(*prepared_args, **kwargs)
+                    result = direct(locals_) if direct is not None else rewritten(*prepared_args, **kwargs)
                     return _restore_staged_outputs(result, replacements) if replacements else result
         dynamic_ids = {id(args[index]) for index in dynamic_arg_indices}
         static_tokens = [None] * len(args)
@@ -946,6 +966,8 @@ def compile(module, dynamic_arg_indices=(0,)):
         needs_capture = key not in captured_signatures
         while True:
             if needs_capture:
+                if prepare_capture is not None:
+                    prepare_capture()
                 with torch._dynamo.config.patch(specialize_float=True, suppress_errors=False,
                                                fail_on_recompile_limit_hit=True), \
                      torch.fx.experimental._config.patch(backed_size_oblivious=True, use_duck_shape=False), \
@@ -956,7 +978,7 @@ def compile(module, dynamic_arg_indices=(0,)):
                     finally:
                         capture.enabled = False
                 captured_signatures.add(key)
-                remember_segmented_path(prepared_args, kwargs)
+                remember_segmented_path(prepared_args, kwargs, result)
                 break
             try:
                 result = compiled(*prepared_args, **kwargs)

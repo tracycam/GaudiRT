@@ -607,7 +607,9 @@ std::vector<at::Tensor> BucketProgram::run(const std::vector<at::Tensor>& inputs
 }
 
 std::vector<at::Tensor> BucketProgram::run_internal(const std::vector<at::Tensor>& inputs,
-                                                    const std::vector<bool>& trusted) {
+                                                    const std::vector<bool>& trusted,
+                                                    ReusableOutputs* reusable,
+                                                    const std::vector<bool>* reusable_mask) {
   TORCH_CHECK(inputs.size() == roles_.size(), "GaudiRT FX: wrong input count");
   TORCH_CHECK(trusted.empty() || trusted.size() == inputs.size(), "GaudiRT FX: invalid trusted input plan");
   int64_t m = -1;
@@ -657,10 +659,18 @@ std::vector<at::Tensor> BucketProgram::run_internal(const std::vector<at::Tensor
   }
   if (!static_binding) static_binding = bind_static_inputs(inputs, *ctx, stream);
   const uint32_t bucket = std::bit_ceil(static_cast<uint32_t>(m));
+  if (reusable && reusable->bucket != bucket) {
+    reusable->values.clear();
+    reusable->values.resize(outputs_.size());
+    reusable->bucket = bucket;
+  }
   std::vector<at::Tensor> results;
   results.reserve(outputs_.size());
-  for (auto id : outputs_) {
+  for (size_t output_index = 0; output_index < outputs_.size(); ++output_index) {
+    const auto id = outputs_[output_index];
     const auto& spec = specs_[id];
+    const bool cache = reusable && reusable_mask && output_index < reusable_mask->size() &&
+                       (*reusable_mask)[output_index];
     if (spec.dynamic()) {
       int64_t width = 1;
       auto sizes = spec.sizes;
@@ -669,10 +679,23 @@ std::vector<at::Tensor> BucketProgram::run_internal(const std::vector<at::Tensor
         TORCH_CHECK(width <= INT64_MAX / sizes[dim], "GaudiRT FX: output size overflow");
         width *= sizes[dim];
       }
-      auto result = bucket_output(inputs[dynamic_input], spec.dtype, bucket, m, width);
+      at::Tensor result;
+      if (cache) {
+        auto& stored = reusable->values[output_index];
+        if (!stored.defined()) stored = bucket_output(inputs[dynamic_input], spec.dtype, bucket, bucket, width);
+        result = m == bucket ? stored : stored.narrow(0, 0, m);
+      } else {
+        result = bucket_output(inputs[dynamic_input], spec.dtype, bucket, m, width);
+      }
       results.push_back(sizes.size() == 2 ? std::move(result) : result.view(sizes));
     } else {
-      results.push_back(at::empty(spec.sizes, inputs[dynamic_input].options().dtype(spec.dtype)));
+      if (cache) {
+        auto& stored = reusable->values[output_index];
+        if (!stored.defined()) stored = at::empty(spec.sizes, inputs[dynamic_input].options().dtype(spec.dtype));
+        results.push_back(stored);
+      } else {
+        results.push_back(at::empty(spec.sizes, inputs[dynamic_input].options().dtype(spec.dtype)));
+      }
     }
   }
   auto& compiled = cached_recipe(*ctx, bucket);

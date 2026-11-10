@@ -718,9 +718,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("add_program", &SegmentedRunner::add_program)
       .def("add_attention", &SegmentedRunner::add_attention)
       .def("set_outputs", &SegmentedRunner::set_outputs)
+      .def("bind_static", &SegmentedRunner::bind_static)
       .def("run", &SegmentedRunner::run, pybind11::call_guard<pybind11::gil_scoped_release>())
+      .def("run_bound", &SegmentedRunner::run_bound, pybind11::call_guard<pybind11::gil_scoped_release>())
       .def("run_traced", &SegmentedRunner::run_traced,
            pybind11::call_guard<pybind11::gil_scoped_release>())
+      .def("run_bound_traced", &SegmentedRunner::run_bound_traced,
+           pybind11::call_guard<pybind11::gil_scoped_release>())
       .def("run_profiled", &SegmentedRunner::run_profiled,
+           pybind11::call_guard<pybind11::gil_scoped_release>())
+      .def("run_bound_profiled", &SegmentedRunner::run_bound_profiled,
            pybind11::call_guard<pybind11::gil_scoped_release>());
 }

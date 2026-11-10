@@ -23,10 +23,16 @@ struct ColdRecipe;
 // A node's output ID is input_count + its index in the program.
 class BucketProgram {
  public:
+  struct ReusableOutputs {
+    uint32_t bucket = 0;
+    std::vector<at::Tensor> values;
+  };
   BucketProgram(std::vector<int64_t> roles, std::vector<FxNode> operations, std::vector<int64_t> outputs = {});
   ~BucketProgram();
   std::vector<at::Tensor> run(const std::vector<at::Tensor>& inputs);
-  std::vector<at::Tensor> run_internal(const std::vector<at::Tensor>& inputs, const std::vector<bool>& trusted);
+  std::vector<at::Tensor> run_internal(const std::vector<at::Tensor>& inputs, const std::vector<bool>& trusted,
+                                       ReusableOutputs* reusable = nullptr,
+                                       const std::vector<bool>* reusable_mask = nullptr);
 
  private:
   struct CachedContext {

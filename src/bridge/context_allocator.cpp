@@ -355,6 +355,7 @@ void shutdown() {
     std::lock_guard lock(context_mutex);
     TORCH_CHECK(context, "GaudiRT: device is not initialized");
     TORCH_CHECK(context->attention_staging().trim(), "GaudiRT: attention metadata must be destroyed before shutdown");
+    TORCH_CHECK(context->trim_segment_outputs(), "GaudiRT: segment execution is still active during shutdown");
     const uint64_t graph_reservation = context->graph_pool ?
         context->graph_pool->capacity_bytes() : 0;
     TORCH_CHECK(!context->graph_pool || context->graph_pool->memory_allocated() == 0,
@@ -407,6 +408,7 @@ std::vector<std::string> recipe_cache_keys() {
 void empty_cache() {
   auto ctx = current();
   ctx->attention_staging().trim();
+  ctx->trim_segment_outputs();
   std::lock_guard lock(ctx->cold_mutex);
   if (ctx->graph_pool && !ctx->graph_pool->memory_allocated()) ctx->graph_pool.reset();
   ctx->allocator.empty_cache();

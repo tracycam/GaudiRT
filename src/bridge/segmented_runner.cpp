@@ -10,6 +10,50 @@
 
 namespace gaudirt::generic {
 
+SegmentOutputPool::Frame* SegmentOutputPool::acquire(uint64_t generation, synStreamHandle stream, size_t count) {
+  std::lock_guard lock(mutex_);
+  for (const auto& frame : frames_) {
+    if (frame->busy || frame->generation != generation || frame->stream != stream) continue;
+    bool available = true;
+    if (frame->exposed) {
+      for (const auto& program : frame->programs) {
+        for (const auto& tensor : program.values) {
+          if (tensor.defined() && (tensor.use_count() != 1 || !tensor.storage().unique())) {
+            available = false;
+            break;
+          }
+        }
+        if (!available) break;
+      }
+    }
+    if (!available) continue;
+    frame->busy = true;
+    frame->exposed = false;
+    return frame.get();
+  }
+  auto frame = std::make_unique<Frame>();
+  frame->generation = generation;
+  frame->stream = stream;
+  frame->busy = true;
+  frame->programs.resize(count);
+  auto* result = frame.get();
+  frames_.push_back(std::move(frame));
+  return result;
+}
+
+void SegmentOutputPool::release(Frame* frame, bool exposed) {
+  std::lock_guard lock(mutex_);
+  frame->exposed = exposed;
+  frame->busy = false;
+}
+
+bool SegmentOutputPool::trim() {
+  std::lock_guard lock(mutex_);
+  for (const auto& frame : frames_) if (frame->busy) return false;
+  frames_.clear();
+  return true;
+}
+
 SegmentedRunner::SegmentedRunner(size_t input_count)
     : input_count_(input_count), slots_(input_count), trusted_slots_(input_count, false) {}
 
@@ -65,16 +109,71 @@ void SegmentedRunner::set_outputs(std::vector<size_t> outputs) {
     TORCH_CHECK(slot < slots_, "GaudiRT segments: unknown output");
     ++uses_[slot];
   }
+  std::vector<bool> escapes(slots_, false);
+  for (auto slot : outputs_) escapes[slot] = true;
+  for (auto step = instructions_.rbegin(); step != instructions_.rend(); ++step) {
+    if (step->attention) continue;
+    for (size_t i = 0; i < step->routes.size(); ++i)
+      if (escapes[step->outputs[i]] && step->routes[i].input)
+        escapes[step->inputs[step->routes[i].index]] = true;
+  }
+  for (auto& step : instructions_) {
+    if (!step.program) continue;
+    for (const auto& route : step.routes)
+      if (!route.input && route.index >= step.reusable_outputs.size())
+        step.reusable_outputs.resize(route.index + 1, false);
+    for (size_t i = 0; i < step.routes.size(); ++i)
+      if (!step.routes[i].input && !escapes[step.outputs[i]])
+        step.reusable_outputs[step.routes[i].index] = true;
+    for (size_t i = 0; i < step.routes.size(); ++i)
+      if (!step.routes[i].input && escapes[step.outputs[i]])
+        step.reusable_outputs[step.routes[i].index] = false;
+  }
+}
+
+void SegmentedRunner::bind_static(const std::vector<size_t>& slots, const std::vector<at::Tensor>& inputs) {
+  TORCH_CHECK(!uses_.empty() && static_inputs_.empty() && !slots.empty() && slots.size() == inputs.size(),
+              "GaudiRT segments: invalid static bindings");
+  std::vector<bool> seen(input_count_, false);
+  static_slots_ = slots;
+  static_inputs_.reserve(slots.size());
+  for (size_t i = 0; i < slots.size(); ++i) {
+    TORCH_CHECK(slots[i] < input_count_ && !seen[slots[i]] && inputs[i].defined(),
+                "GaudiRT segments: invalid static slot");
+    seen[slots[i]] = true;
+    static_inputs_.emplace_back(inputs[i].getIntrusivePtr());
+  }
+  for (size_t i = 0; i < input_count_; ++i)
+    if (!seen[i]) dynamic_slots_.push_back(i);
+  output_pool_ = std::make_shared<SegmentOutputPool>();
+  current()->register_segment_outputs(output_pool_);
 }
 
 SegmentedRunner::TracedResult SegmentedRunner::execute(const std::vector<at::Tensor>& inputs,
                                                         const std::vector<bool>& trace,
                                                         const std::vector<synEventHandle>* events,
-                                                        std::vector<double>* host_ms) const {
-  TORCH_CHECK(!uses_.empty() && inputs.size() == input_count_, "GaudiRT segments: invalid input count");
-  ContextScope scope(current());
+                                                        std::vector<double>* host_ms, bool bound) const {
+  TORCH_CHECK(!uses_.empty() && (bound ? !static_inputs_.empty() && inputs.size() == dynamic_slots_.size()
+                                      : inputs.size() == input_count_),
+              "GaudiRT segments: invalid input count");
+  auto ctx = current();
+  ContextScope scope(ctx);
+  auto* frame = bound ? output_pool_->acquire(ctx->generation, ctx->stream(), instructions_.size()) : nullptr;
+  const auto release_frame = [this, &trace](SegmentOutputPool::Frame* value) {
+    if (value) output_pool_->release(value, !trace.empty());
+  };
+  std::unique_ptr<SegmentOutputPool::Frame, decltype(release_frame)> frame_guard(frame, release_frame);
   std::vector<at::Tensor> values(slots_);
-  for (size_t i = 0; i < inputs.size(); ++i) values[i] = inputs[i];
+  if (bound) {
+    for (size_t i = 0; i < static_slots_.size(); ++i) {
+      auto tensor = static_inputs_[i].lock();
+      TORCH_CHECK(tensor, "GaudiRT segments: static tensor expired");
+      values[static_slots_[i]] = at::Tensor(std::move(tensor));
+    }
+    for (size_t i = 0; i < inputs.size(); ++i) values[dynamic_slots_[i]] = inputs[i];
+  } else {
+    for (size_t i = 0; i < inputs.size(); ++i) values[i] = inputs[i];
+  }
   auto uses = uses_;
   std::vector<SegmentTrace> recorded(trace.empty() ? 0 : instructions_.size());
   std::vector<at::Tensor> arguments;
@@ -96,7 +195,8 @@ SegmentedRunner::TracedResult SegmentedRunner::execute(const std::vector<at::Ten
                                                      arguments[8], arguments[9], step.head_dim, step.scale,
                                                      step.trusted[0], step.trusted[1], step.trusted[2]);
     } else {
-      auto computed = step.program ? step.program->run_internal(arguments, step.trusted) : std::vector<at::Tensor>{};
+      auto computed = step.program ? step.program->run_internal(arguments, step.trusted,
+          frame ? &frame->programs[step_index] : nullptr, &step.reusable_outputs) : std::vector<at::Tensor>{};
       for (size_t route_index = 0; route_index < step.routes.size(); ++route_index) {
         const auto& route = step.routes[route_index];
         TORCH_CHECK(route.input || route.index < computed.size(), "GaudiRT segments: invalid program output route");
@@ -134,18 +234,42 @@ std::vector<at::Tensor> SegmentedRunner::run(const std::vector<at::Tensor>& inpu
   return execute(inputs, {}).first;
 }
 
+std::vector<at::Tensor> SegmentedRunner::run_bound(const std::vector<at::Tensor>& inputs) const {
+  return execute(inputs, {}, nullptr, nullptr, true).first;
+}
+
 SegmentedRunner::TracedResult SegmentedRunner::run_traced(const std::vector<at::Tensor>& inputs,
                                                            const std::vector<size_t>& traced) const {
+  return this->traced(inputs, traced, false);
+}
+
+SegmentedRunner::TracedResult SegmentedRunner::run_bound_traced(const std::vector<at::Tensor>& inputs,
+                                                                 const std::vector<size_t>& traced) const {
+  return this->traced(inputs, traced, true);
+}
+
+SegmentedRunner::TracedResult SegmentedRunner::traced(const std::vector<at::Tensor>& inputs,
+                                                       const std::vector<size_t>& traced, bool bound) const {
   std::vector<bool> mask(instructions_.size(), false);
   for (auto index : traced) {
     TORCH_CHECK(index < mask.size(), "GaudiRT segments: invalid trace index");
     mask[index] = true;
   }
-  return execute(inputs, mask);
+  return execute(inputs, mask, nullptr, nullptr, bound);
 }
 
 SegmentedRunner::ProfiledResult SegmentedRunner::run_profiled(const std::vector<at::Tensor>& inputs,
                                                              const std::vector<uint64_t>& event_ids) const {
+  return profiled(inputs, event_ids, false);
+}
+
+SegmentedRunner::ProfiledResult SegmentedRunner::run_bound_profiled(
+    const std::vector<at::Tensor>& inputs, const std::vector<uint64_t>& event_ids) const {
+  return profiled(inputs, event_ids, true);
+}
+
+SegmentedRunner::ProfiledResult SegmentedRunner::profiled(const std::vector<at::Tensor>& inputs,
+                                                           const std::vector<uint64_t>& event_ids, bool bound) const {
   TORCH_CHECK(event_ids.size() == instructions_.size() * 2, "GaudiRT segments: wrong profiling event count");
   auto ctx = current();
   std::vector<synEventHandle> events;
@@ -160,7 +284,7 @@ SegmentedRunner::ProfiledResult SegmentedRunner::run_profiled(const std::vector<
     }
   }
   std::vector<double> host_ms(instructions_.size());
-  auto result = execute(inputs, {}, &events, &host_ms);
+  auto result = execute(inputs, {}, &events, &host_ms, bound);
   return {std::move(result.first), std::move(host_ms)};
 }
 

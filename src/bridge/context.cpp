@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "context.hpp"
 #include "attention_plan.hpp"
+#include "segmented_runner.hpp"
 
 #include <c10/util/Exception.h>
 
@@ -67,6 +68,7 @@ Context::~Context() {
   try { streams.synchronize(); } catch (...) {}
   synStreamSynchronize(device.h2d_stream());
   synStreamSynchronize(device.d2h_stream());
+  trim_segment_outputs();
   std::lock_guard lock(event_mutex);
   for (auto* event : events) {
     if (event->handle) synEventDestroy(event->handle);
@@ -91,6 +93,25 @@ AttentionStagingPool& Context::attention_staging() {
     attention_staging_pool = std::make_unique<AttentionStagingPool>(*this);
   });
   return *attention_staging_pool;
+}
+
+void Context::register_segment_outputs(const std::shared_ptr<SegmentOutputPool>& pool) {
+  std::lock_guard lock(segment_outputs_mutex);
+  segment_outputs.emplace_back(pool);
+}
+
+bool Context::trim_segment_outputs() {
+  std::lock_guard lock(segment_outputs_mutex);
+  bool idle = true;
+  for (auto it = segment_outputs.begin(); it != segment_outputs.end();) {
+    if (auto pool = it->lock()) {
+      idle = pool->trim() && idle;
+      ++it;
+    } else {
+      it = segment_outputs.erase(it);
+    }
+  }
+  return idle;
 }
 
 uint64_t Context::row_count_address(uint32_t rows) {
