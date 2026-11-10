@@ -3,6 +3,7 @@
 #include "eager_copy.hpp"
 #include "eager_ops.hpp"
 #include "eager_index.hpp"
+#include "argmax_vocab.hpp"
 #include "layout_copy.hpp"
 #include "temporaries.hpp"
 #include "gaudirt/common/sha256.hpp"
@@ -666,7 +667,10 @@ at::Tensor argmax(const at::Tensor& input, std::optional<int64_t> dimension, boo
   }
   {
     std::lock_guard lock(ctx->cold_mutex);
-    auto& recipe = argmax_recipe(*ctx, source, reduced, axis);
+    const bool vocabulary = source.dim() == 2 && axis == 1 && source.size(1) <= INT_MAX - 127 &&
+                            (source.scalar_type() == at::kFloat || source.scalar_type() == at::kBFloat16);
+    auto& recipe = vocabulary ? vocabulary_argmax_recipe(*ctx, source)
+                              : argmax_recipe(*ctx, source, reduced, axis);
     auto stream = ctx->stream();
     auto bindings = recipe.tensors;
     bindings[0].pTensorAddress = address_of(source, *ctx);

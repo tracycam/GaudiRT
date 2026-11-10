@@ -21,9 +21,14 @@ struct RotaryParameters {
   int32_t is_neox;
 };
 
+struct ArgmaxParameters {
+  int32_t width;
+  int32_t blocks_per_part;
+};
+
 using NodeParameters = std::variant<std::monostate, synTransposeParams, synGEMMParams,
                                     ns_GatherKernel::ParamsV2, ns_CastKernel::ParamsV3,
-                                    synAxisParams, RotaryParameters, float, int32_t,
+                                    synAxisParams, RotaryParameters, ArgmaxParameters, float, int32_t,
                                     ns_ConstantKernel::ParamsV3, ns_BroadcastNonFcd::Params>;
 
 struct NodeSpec {
