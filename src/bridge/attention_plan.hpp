@@ -19,6 +19,7 @@ class AttentionStagingPool {
   ~AttentionStagingPool();
   Lease acquire(uint64_t device_bytes, uint64_t host_bytes);
   void release(size_t index, synStreamHandle compute);
+  bool trim();
 
  private:
   struct Slot {
@@ -30,6 +31,7 @@ class AttentionStagingPool {
   Context& context_;
   std::mutex mutex_;
   std::vector<Slot> slots_;
+  void release_all();
 };
 
 struct AttentionTile {

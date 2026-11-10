@@ -55,12 +55,26 @@ ColdRecipe& indices_recipe(Context& ctx, uint32_t rows, uint32_t tasks) {
 }  // namespace
 
 AttentionStagingPool::~AttentionStagingPool() {
+  release_all();
+}
+
+void AttentionStagingPool::release_all() {
   for (auto& slot : slots_) {
-    if (slot.recorded) synEventQuery(slot.completed);
+    if (slot.recorded)
+      TORCH_CHECK(synEventSynchronize(slot.completed) == synSuccess,
+                  "GaudiRT attention: staging completion wait failed");
     if (slot.completed) synEventDestroy(slot.completed);
     if (slot.host) context_.pinned.free(slot.host);
     if (slot.address) context_.allocator.free(slot.address);
   }
+  slots_.clear();
+}
+
+bool AttentionStagingPool::trim() {
+  std::lock_guard lock(mutex_);
+  for (const auto& slot : slots_) if (slot.in_use) return false;
+  release_all();
+  return true;
 }
 
 AttentionStagingPool::Lease AttentionStagingPool::acquire(uint64_t device_bytes, uint64_t host_bytes) {

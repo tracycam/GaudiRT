@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "bridge_internal.hpp"
+#include "attention_plan.hpp"
 
 #include <ATen/detail/PrivateUse1HooksInterface.h>
 #include <c10/core/impl/DeviceGuardImplInterface.h>
@@ -353,6 +354,7 @@ void shutdown() {
   {
     std::lock_guard lock(context_mutex);
     TORCH_CHECK(context, "GaudiRT: device is not initialized");
+    TORCH_CHECK(context->attention_staging().trim(), "GaudiRT: attention metadata must be destroyed before shutdown");
     const uint64_t graph_reservation = context->graph_pool ?
         context->graph_pool->capacity_bytes() : 0;
     TORCH_CHECK(!context->graph_pool || context->graph_pool->memory_allocated() == 0,
@@ -404,6 +406,7 @@ std::vector<std::string> recipe_cache_keys() {
 }
 void empty_cache() {
   auto ctx = current();
+  ctx->attention_staging().trim();
   std::lock_guard lock(ctx->cold_mutex);
   if (ctx->graph_pool && !ctx->graph_pool->memory_allocated()) ctx->graph_pool.reset();
   ctx->allocator.empty_cache();
