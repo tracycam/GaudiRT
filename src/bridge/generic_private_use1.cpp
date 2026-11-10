@@ -14,6 +14,7 @@
 #include "layout_copy.hpp"
 #include "eager_copy.hpp"
 #include "eager_index.hpp"
+#include "eager_scheduler.hpp"
 #include "paged_metadata.hpp"
 #include "paged_attention.hpp"
 #include "paged_kv_pool.hpp"
@@ -635,6 +636,7 @@ TORCH_LIBRARY(gaudirt, m) {
         "Tensor header, int context, int head_dim, int rotary_dim, bool is_neox) -> (Tensor, Tensor)");
   m.def("_index_select_validated(Tensor input, int axis, Tensor indices) -> Tensor");
   m.def("_index_put_validated_(Tensor(a!) input, Tensor indices, Tensor values) -> Tensor(a!)");
+  m.def("_advance_decode_lengths(Tensor seq_lens, Tensor orig_seq_lens) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(gaudirt, PrivateUse1, m) {
@@ -647,6 +649,7 @@ TORCH_LIBRARY_IMPL(gaudirt, PrivateUse1, m) {
   m.impl("_rotary_embedding_validated", TORCH_FN(gaudirt::generic::rotary_embedding_validated));
   m.impl("_index_select_validated", TORCH_FN(gaudirt::generic::index_select_validated));
   m.impl("_index_put_validated_", TORCH_FN(gaudirt::generic::index_put_validated));
+  m.impl("_advance_decode_lengths", TORCH_FN(gaudirt::generic::advance_decode_lengths));
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
