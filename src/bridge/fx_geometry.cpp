@@ -42,10 +42,11 @@ FxGeometry infer_fx_geometry(const std::vector<at::Tensor>& inputs, const std::v
   for (size_t i = 0; i < inputs.size(); ++i) {
     const auto& tensor = inputs[i];
     const bool floating = tensor.scalar_type() == at::kBFloat16 || tensor.scalar_type() == at::kFloat;
+    const bool prepared_fp8 = tensor.scalar_type() == at::kFloat8_e4m3fn;
     const bool integer_vector = tensor.scalar_type() == at::kInt && tensor.dim() == 1;
     TORCH_CHECK(tensor.device().type() == c10::kPrivateUse1 && tensor.device().index() == 0 &&
-                (floating || integer_vector), "GaudiRT FX: unsupported input device or dtype");
-    TORCH_CHECK((floating && tensor.dim() >= 1 && tensor.dim() <= 5) || integer_vector,
+                (floating || integer_vector || prepared_fp8), "GaudiRT FX: unsupported input device or dtype");
+    TORCH_CHECK(((floating || (prepared_fp8 && !roles[i])) && tensor.dim() >= 1 && tensor.dim() <= 5) || integer_vector,
                 "GaudiRT FX: unsupported input rank");
     std::vector<int64_t> sizes(tensor.sizes().begin(), tensor.sizes().end());
     for (auto size : sizes) TORCH_CHECK(size > 0, "GaudiRT FX: empty input dimension");
@@ -180,6 +181,27 @@ FxGeometry infer_fx_geometry(const std::vector<at::Tensor>& inputs, const std::v
       TORCH_CHECK(a.dtype == at::kBFloat16 && a.dynamic() && a.sizes.size() == 2 &&
                   a.sizes[1] % 2 == 0, "GaudiRT FX: invalid BF16 SiLU/multiply geometry");
       specs.push_back({a.dtype, {-1, a.sizes[1] / 2}, true});
+      continue;
+    }
+    if (op.op == FxOp::block_fp8_linear) {
+      const auto& weight = specs[op.inputs[1]];
+      const auto& scales = specs[op.inputs[2]];
+      TORCH_CHECK(a.dtype == at::kBFloat16 && a.dynamic() && (a.sizes.size() == 2 || a.sizes.size() == 3) &&
+                  !weight.dynamic() && weight.dtype == at::kFloat8_e4m3fn && weight.sizes.size() == 3 &&
+                  weight.sizes[0] > 0 && weight.sizes[1] > 0 && weight.sizes[1] % 128 == 0 &&
+                  weight.sizes[2] == 128 && a.sizes.back() == weight.sizes[0] * 128 &&
+                  !scales.dynamic() && scales.dtype == at::kFloat && scales.sizes.size() == 2 &&
+                  scales.sizes[0] == weight.sizes[1] / 128 && scales.sizes[1] == weight.sizes[0],
+                  "GaudiRT FX: invalid prepared block FP8 geometry");
+      if (op.inputs.size() == 4) {
+        const auto& bias = specs[op.inputs[3]];
+        TORCH_CHECK(!bias.dynamic() && (bias.dtype == at::kBFloat16 || bias.dtype == at::kFloat) &&
+                    bias.sizes.size() == 1 && bias.sizes[0] == weight.sizes[1],
+                    "GaudiRT FX: invalid block FP8 bias");
+      }
+      auto sizes = a.sizes;
+      sizes.back() = weight.sizes[1];
+      specs.push_back({at::kBFloat16, std::move(sizes), true});
       continue;
     }
     const auto& b = specs[op.inputs[1]];

@@ -423,6 +423,18 @@ at::Tensor bucket_silu_and_mul(const at::Tensor& input) {
   return program.run({input})[0];
 }
 
+at::Tensor bucket_block_fp8(const at::Tensor& input, const at::Tensor& weight,
+                            const at::Tensor& scales, const std::optional<at::Tensor>& bias) {
+  std::vector<int64_t> roles{1, 0, 0};
+  std::vector<at::Tensor> inputs{input, weight, scales};
+  if (bias) {
+    roles.push_back(0);
+    inputs.push_back(*bias);
+  }
+  BucketProgram program(std::move(roles), {FxNode::block_fp8(0, 1, 2, bias ? std::optional<int64_t>(3) : std::nullopt)});
+  return program.run(inputs)[0];
+}
+
 at::Tensor paged_attn(const at::Tensor& query, const at::Tensor& key, const at::Tensor& value,
                       const at::Tensor& key_pool, const at::Tensor& value_pool,
                       c10::intrusive_ptr<PagedMetadata> metadata, int64_t head_dim, double scale) {
@@ -624,6 +636,7 @@ TORCH_LIBRARY(gaudirt, m) {
   m.def("rms_norm(Tensor input, Tensor weight, float epsilon) -> Tensor");
   m.def("fused_add_rms_norm(Tensor input, Tensor residual, Tensor weight, float epsilon) -> (Tensor, Tensor)");
   m.def("silu_and_mul(Tensor input) -> Tensor");
+  m.def("block_fp8_linear(Tensor input, Tensor weight, Tensor scales, Tensor? bias=None) -> Tensor");
   m.def("paged_attn(Tensor query, Tensor key, Tensor value, Tensor(a!) key_pool, Tensor(b!) value_pool, "
         "__torch__.torch.classes.gaudirt.PagedMetadata metadata, int head_dim, float scale) -> Tensor");
   m.def("_paged_attn_validated(Tensor query, Tensor key, Tensor value, Tensor(a!) key_pool, Tensor(b!) value_pool, "
@@ -643,6 +656,7 @@ TORCH_LIBRARY_IMPL(gaudirt, PrivateUse1, m) {
   m.impl("rms_norm", TORCH_FN(gaudirt::generic::bucket_rms_norm));
   m.impl("fused_add_rms_norm", TORCH_FN(gaudirt::generic::bucket_fused_add_rms_norm));
   m.impl("silu_and_mul", TORCH_FN(gaudirt::generic::bucket_silu_and_mul));
+  m.impl("block_fp8_linear", TORCH_FN(gaudirt::generic::bucket_block_fp8));
   m.impl("paged_attn", TORCH_FN(gaudirt::generic::paged_attn));
   m.impl("_paged_attn_validated", TORCH_FN(gaudirt::generic::paged_attn_validated));
   m.impl("rotary_embedding", TORCH_FN(gaudirt::generic::rotary_embedding));
@@ -689,11 +703,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .value("concat", FxOp::concat).value("bmm", FxOp::bmm).value("reshape", FxOp::reshape)
       .value("transpose", FxOp::transpose).value("copy", FxOp::copy)
       .value("scalar_add", FxOp::scalar_add).value("scalar_sub", FxOp::scalar_sub)
-      .value("scalar_mul", FxOp::scalar_mul).value("scalar_div", FxOp::scalar_div);
+      .value("scalar_mul", FxOp::scalar_mul).value("scalar_div", FxOp::scalar_div)
+      .value("block_fp8_linear", FxOp::block_fp8_linear);
   pybind11::class_<FxNode>(m, "FxNode")
       .def_readonly("op", &FxNode::op)
       .def_static("unary", &FxNode::unary).def_static("binary", &FxNode::binary)
       .def_static("linear", &FxNode::linear).def_static("slice", &FxNode::slice)
+      .def_static("block_fp8", &FxNode::block_fp8)
       .def_static("norm", &FxNode::norm).def_static("fused_norm", &FxNode::fused_norm)
       .def_static("rotary", &FxNode::rotary).def_static("cast", &FxNode::cast)
       .def_static("concat", &FxNode::concat).def_static("reshape", &FxNode::reshape)

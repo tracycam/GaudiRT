@@ -27,10 +27,12 @@ SynapseGraphBuilder::~SynapseGraphBuilder() {
 
 synTensor SynapseGraphBuilder::tensor(synDataType type, const std::vector<uint64_t>& dims, int slot,
                                      int shared_slot, uint64_t offset, bool dynamic,
-                                     const std::vector<uint64_t>& min_dims) {
+                                     const std::vector<uint64_t>& min_dims, bool rmw) {
   TORCH_CHECK(!dims.empty() && dims.size() <= 5, "GaudiRT FX: tensor rank must be 1..5");
   TORCH_CHECK(min_dims.empty() || (dynamic && min_dims.size() == dims.size()),
               "GaudiRT FX: invalid dynamic tensor bounds");
+  TORCH_CHECK(!rmw || (slot < 0 && shared_slot < 0 && offset == 0 && !dynamic),
+              "GaudiRT FX: invalid RMW tensor");
   TORCH_CHECK(slot < static_cast<int>(slot_sections_.size()) &&
               (shared_slot < 0 || (slot >= 0 && shared_slot < static_cast<int>(slot_sections_.size()) &&
                                    slot_sections_[shared_slot])),
@@ -47,6 +49,11 @@ synTensor SynapseGraphBuilder::tensor(synDataType type, const std::vector<uint64
     }
     slot_sections_[slot] = section;
     recipe_.names[slot] = tensor_names_.back();
+  } else if (rmw) {
+    check(synSectionCreate(&section, 0, graph_), "program RMW section creation failed");
+    sections_.push_back(section);
+    check(synSectionSetPersistent(section, false), "program RMW persistence failed");
+    check(synSectionSetRMW(section, true), "program RMW setup failed");
   }
   synTensorDescriptor desc{};
   desc.m_name = slot >= 0 ? recipe_.names[slot].c_str() : tensor_names_.back().c_str();
@@ -62,6 +69,12 @@ synTensor SynapseGraphBuilder::tensor(synDataType type, const std::vector<uint64
   synTensor handle = nullptr;
   check(synTensorCreate(&handle, &desc, section, offset), "program tensor creation failed");
   tensors_.push_back(handle);
+  if (type == syn_type_fp8_143) {
+    synFpQuantParam quant{1.0, 7};
+    synFpQuantMetadata metadata{type, &quant, 1};
+    check(synTensorSetQuantizationData(handle, SYN_FP_QUANT_METADATA, &metadata, sizeof(metadata)),
+          "program FP8 metadata failed");
+  }
   if (slot >= 0) {
     auto& binding = recipe_.tensors[slot];
     binding.tensorName = recipe_.names[slot].c_str();

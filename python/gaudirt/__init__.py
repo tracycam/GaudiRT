@@ -76,6 +76,11 @@ def _fake_silu_and_mul(input):
     return input.new_empty((*input.shape[:-1], input.shape[-1] // 2))
 
 
+@torch.library.register_fake("gaudirt::block_fp8_linear")
+def _fake_block_fp8_linear(input, weight, scales, bias=None):
+    return input.new_empty((*input.shape[:-1], weight.shape[1]))
+
+
 @torch.library.register_fake("gaudirt::paged_attn")
 def _fake_paged_attn(query, key, value, key_pool, value_pool, metadata, head_dim, scale):
     return torch.empty_like(query, memory_format=torch.contiguous_format)
