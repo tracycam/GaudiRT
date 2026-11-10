@@ -43,6 +43,8 @@ struct AttentionTile {
   int32_t valid_keys;
 };
 
+inline constexpr size_t kMaxFusedAttentionTiles = 8;
+
 struct AttentionBlock {
   int32_t first_row;
   int32_t valid_rows;

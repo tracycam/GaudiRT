@@ -49,6 +49,25 @@ if(GAUDIRT_BUILD_TORCH)
     target_compile_options(_gaudirt_C PRIVATE ${TORCH_CXX_FLAGS})
     target_link_libraries(_gaudirt_C PRIVATE gaudirt ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIBRARY} Python3::Module)
     set_target_properties(_gaudirt_C PROPERTIES PREFIX "")
+
+    add_executable(multitile_paged_attention_unit_test
+        tests/multitile_paged_attention_unit_test.cpp
+        src/bridge/attention_plan.cpp
+        src/bridge/paged_attention.cpp
+        src/bridge/paged_attention_tiles.cpp
+        src/bridge/paged_metadata.cpp
+        src/bridge/paged_kv_pool.cpp
+        src/bridge/context.cpp
+        src/bridge/layout_copy.cpp
+        src/bridge/graph_builder.cpp
+        src/block_caching_allocator.cpp
+        src/device_runtime.cpp
+        src/pinned_host_pool.cpp
+        src/recipe_registry.cpp
+        src/sha256.cpp)
+    target_include_directories(multitile_paged_attention_unit_test BEFORE PRIVATE tests/mock_synapse src/bridge)
+    target_compile_options(multitile_paged_attention_unit_test PRIVATE ${TORCH_CXX_FLAGS} -UNDEBUG)
+    target_link_libraries(multitile_paged_attention_unit_test PRIVATE ${TORCH_LIBRARIES} pthread)
 endif()
 
 add_executable(gaudirt_runtime_unit_tests tests/runtime_unit_tests.cpp)

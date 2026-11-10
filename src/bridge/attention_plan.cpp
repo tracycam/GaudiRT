@@ -248,7 +248,7 @@ at::Tensor PagedMetadata::attention_plan(int64_t query_heads, int64_t kv_heads, 
   plan->scratch_offset = index_bytes + host_bytes;
   plan->scratch_bytes = 0;
   for (const auto& block : plan->blocks) {
-    if (block.tiles.size() <= 1) continue;
+    if (block.tiles.size() <= kMaxFusedAttentionTiles) continue;
     const uint64_t stats = align(((block.query_bucket + 63) / 64 * 64) * query_heads * sizeof(float));
     const uint64_t output = align(static_cast<uint64_t>(block.query_bucket) * query_heads * head_dim * sizeof(float));
     plan->scratch_bytes = std::max(plan->scratch_bytes, 2 * (2 * stats + output));
