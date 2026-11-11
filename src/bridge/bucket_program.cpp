@@ -562,23 +562,41 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
           return builder.tensor(dtype, dimensions, -1, -1, 0, false, {}, rmw);
         };
         if (token_rows >= 512) {
-          // MantaRayBundlizer single-MME SRAM invariant: each GEMM needs its own dedicated
-          // 1-output TPC producers and an activation row tile whose unsliced [K, tile_rows]
-          // FP16 / [2*K, tile_rows] FP8_143 footprint fits in SRAM (~22 MiB).
-          constexpr uint64_t kMaxSramActBytes = 22ULL << 20;
-          constexpr uint64_t kMaxTotalAccumBytes = 768ULL << 20;
-          const uint64_t sram_rows = kMaxSramActBytes / (input_width * sizeof(uint16_t));
-          const uint64_t tile_rows =
-              std::min<uint64_t>(token_rows, std::max<uint64_t>(128, std::bit_floor(sram_rows)));
-          const uint64_t row_tiles = (token_rows + tile_rows - 1) / tile_rows;
-          const uint64_t max_cols_by_accum = std::max<uint64_t>(
-              128, ((kMaxTotalAccumBytes / (token_rows * 2 * sizeof(float))) / 128) * 128);
-          const uint64_t raw_col_tiles = (columns + max_cols_by_accum - 1) / max_cols_by_accum;
+          // Hardware-budgeted 1K FP16 + 3K FP8_143 hybrid prefill lowering:
+          // - Keep dual FP32 accumulators (c0 + c1) <= 512 MiB per (row_tile, col_tile)
+          //   so full-column GEMMs avoid split/concat while wide projections (e.g. N=44032
+          //   at M=4096) split into 2048-row tiles;
+          // - Chunk K-groups so each GEMM's activation operand stays <= 29 MiB (1K FP16)
+          //   and <= 27 MiB (3K FP8_143), allowing MantaRayBundlizer to bundle both MME
+          //   operands in on-chip SRAM with 3-input GEMM K-accumulation (P-RT-81, P-NUM-42).
+          constexpr uint64_t kMaxTileColumns = 65536;
+          constexpr uint64_t kMaxAccumElements = 4096ULL * 16384ULL;
+          constexpr uint64_t kMaxAct1kBytes = 29ULL << 20;
+          constexpr uint64_t kMaxAct3kBytes = 27ULL << 20;
+
+          const uint64_t raw_col_tiles = (columns + kMaxTileColumns - 1) / kMaxTileColumns;
           const uint64_t tile_columns = std::min<uint64_t>(
-              columns, std::min<uint64_t>(
-                           max_cols_by_accum,
-                           (((columns + raw_col_tiles - 1) / raw_col_tiles + 127) / 128) * 128));
+              columns, (((columns + raw_col_tiles - 1) / raw_col_tiles + 127) / 128) * 128);
           const uint64_t column_tiles = (columns + tile_columns - 1) / tile_columns;
+
+          uint64_t tile_rows = std::min<uint64_t>(token_rows, 4096ULL);
+          if (tile_rows > 2048 && tile_rows * tile_columns > kMaxAccumElements) {
+            tile_rows = 2048;
+          }
+          const uint64_t row_tiles = (token_rows + tile_rows - 1) / tile_rows;
+
+          const uint64_t gc1_max = std::max<uint64_t>(1, kMaxAct1kBytes / (256ULL * tile_rows));
+          const uint64_t k_chunks_1k = (groups + gc1_max - 1) / gc1_max;
+          const uint64_t gc1 = (groups + k_chunks_1k - 1) / k_chunks_1k;
+          const uint64_t g_cnt1 = (groups + gc1 - 1) / gc1;
+
+          const uint64_t pairs_max = std::max<uint64_t>(1, kMaxAct3kBytes / (768ULL * tile_rows));
+          const uint64_t gc2_max = 2 * pairs_max;
+          const uint64_t k_chunks_3k = (groups + gc2_max - 1) / gc2_max;
+          const uint64_t gc2 = k_chunks_3k == 1
+                                   ? groups
+                                   : 2 * ((groups + 2 * k_chunks_3k - 1) / (2 * k_chunks_3k));
+          const uint64_t g_cnt2 = (groups + gc2 - 1) / gc2;
 
           auto input = values[op.inputs[0]];
           if (input_spec.sizes.size() == 3) {
@@ -597,10 +615,14 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
               bias = wide_bias;
             }
           }
-          const synAxisParams feature_axis{1}, column_axis{0};
-          std::vector<synTensor> inputs, row_scales;
+          const synAxisParams column_axis{0}, feature_axis{1}, group_axis{2};
+          int32_t tag_seq = 0;
+
+          std::vector<synTensor> inputs, row_scales, q_rows, sn_rows;
           inputs.reserve(row_tiles);
           row_scales.reserve(row_tiles);
+          q_rows.reserve(row_tiles);
+          sn_rows.reserve(row_tiles);
           for (uint64_t r = 0; r < row_tiles; ++r) {
             const auto rows = std::min(tile_rows, token_rows - r * tile_rows);
             inputs.push_back(row_tiles == 1 ? input : local(syn_type_bf16, {input_width, rows}));
@@ -609,8 +631,13 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
           for (uint64_t r = 0; r < row_tiles; ++r) {
             const auto rows = std::min(tile_rows, token_rows - r * tile_rows);
             auto rs = local(syn_type_float, {1, rows});
-            node({inputs[r]}, rs, static_cast<int32_t>(r), "gk_fp8_act_row_scale_f32_v1");
+            node({inputs[r]}, rs, tag_seq++, "gk_fp8_act_row_scale_f32_v1");
             row_scales.push_back(rs);
+            auto qr = local(syn_type_bf16, {128, rows, groups});
+            auto snr = local(syn_type_float, {1, rows, groups});
+            builder.node(NodeSpec{"gk_fp8_prequant_act_bf16_v1", {inputs[r], rs}, {qr, snr}, tag_seq++});
+            q_rows.push_back(qr);
+            sn_rows.push_back(snr);
           }
 
           std::vector<synTensor> weights, weight_scales, blk_scales, biases;
@@ -634,8 +661,37 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
           for (uint64_t c = 0; c < column_tiles; ++c) {
             const auto width = std::min(tile_columns, columns - c * tile_columns);
             auto bs = local(syn_type_float, {1, width / 128});
-            node({weight_scales[c]}, bs, static_cast<int32_t>(c), "gk_fp8_weight_blk_scale_f32_v1");
+            node({weight_scales[c]}, bs, tag_seq++, "gk_fp8_weight_blk_scale_f32_v1");
             blk_scales.push_back(bs);
+          }
+
+          std::vector<std::vector<synTensor>> w_g1(column_tiles), ws_g1(column_tiles);
+          std::vector<std::vector<synTensor>> w_g2(column_tiles), ws_g2(column_tiles);
+          for (uint64_t c = 0; c < column_tiles; ++c) {
+            const auto width = std::min(tile_columns, columns - c * tile_columns);
+            for (uint64_t g = 0; g < g_cnt1; ++g) {
+              const auto gl = std::min(gc1, groups - g * gc1);
+              w_g1[c].push_back(g_cnt1 == 1 ? weights[c] : local(syn_type_fp8_143, {128, width, gl}));
+              ws_g1[c].push_back(g_cnt1 == 1 ? weight_scales[c] : local(syn_type_float, {gl, width / 128}));
+            }
+            if (g_cnt1 > 1) {
+              builder.node(NodeSpec{"split", {weights[c]}, w_g1[c], group_axis});
+              builder.node(NodeSpec{"split", {weight_scales[c]}, ws_g1[c], column_axis});
+            }
+            if (gc2 == gc1) {
+              w_g2[c] = w_g1[c];
+              ws_g2[c] = ws_g1[c];
+            } else {
+              for (uint64_t g = 0; g < g_cnt2; ++g) {
+                const auto gl = std::min(gc2, groups - g * gc2);
+                w_g2[c].push_back(g_cnt2 == 1 ? weights[c] : local(syn_type_fp8_143, {128, width, gl}));
+                ws_g2[c].push_back(g_cnt2 == 1 ? weight_scales[c] : local(syn_type_float, {gl, width / 128}));
+              }
+              if (g_cnt2 > 1) {
+                builder.node(NodeSpec{"split", {weights[c]}, w_g2[c], group_axis});
+                builder.node(NodeSpec{"split", {weight_scales[c]}, ws_g2[c], column_axis});
+              }
+            }
           }
 
           const auto flat_output =
@@ -645,29 +701,73 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
           row_products.reserve(row_tiles);
           for (uint64_t r = 0; r < row_tiles; ++r) {
             const auto rows = std::min(tile_rows, token_rows - r * tile_rows);
+            std::vector<synTensor> q_g1, sn_g1, q_g2, sn_g2;
+            for (uint64_t g = 0; g < g_cnt1; ++g) {
+              const auto gl = std::min(gc1, groups - g * gc1);
+              q_g1.push_back(g_cnt1 == 1 ? q_rows[r] : local(syn_type_bf16, {128, rows, gl}));
+              sn_g1.push_back(g_cnt1 == 1 ? sn_rows[r] : local(syn_type_float, {1, rows, gl}));
+            }
+            if (g_cnt1 > 1) {
+              builder.node(NodeSpec{"split", {q_rows[r]}, q_g1, group_axis});
+              builder.node(NodeSpec{"split", {sn_rows[r]}, sn_g1, group_axis});
+            }
+            if (gc2 == gc1) {
+              q_g2 = q_g1;
+              sn_g2 = sn_g1;
+            } else {
+              for (uint64_t g = 0; g < g_cnt2; ++g) {
+                const auto gl = std::min(gc2, groups - g * gc2);
+                q_g2.push_back(g_cnt2 == 1 ? q_rows[r] : local(syn_type_bf16, {128, rows, gl}));
+                sn_g2.push_back(g_cnt2 == 1 ? sn_rows[r] : local(syn_type_float, {1, rows, gl}));
+              }
+              if (g_cnt2 > 1) {
+                builder.node(NodeSpec{"split", {q_rows[r]}, q_g2, group_axis});
+                builder.node(NodeSpec{"split", {sn_rows[r]}, sn_g2, group_axis});
+              }
+            }
+
             std::vector<synTensor> col_products;
             col_products.reserve(column_tiles);
             for (uint64_t c = 0; c < column_tiles; ++c) {
               const auto width = std::min(tile_columns, columns - c * tile_columns);
-              // Distinct non-negative scalar tag per (row_tile, col_tile) prevents Synapse CSE
-              // from merging dedicated 1-output TPC producers across tiles, which would otherwise
-              // materialize full weights or shared activations in HBM (P-RT-81).
-              const int32_t tile_tag = static_cast<int32_t>(r * column_tiles + c);
-              auto act_1k = local(syn_type_fp16, {input_width, rows});
-              auto w_1k = local(syn_type_fp16, {input_width, width});
-              auto c0 = local(syn_type_float, {width, rows});
-              node({inputs[r], row_scales[r]}, act_1k, tile_tag, "gk_fp8_quant_act_fp16_1k_v1");
-              node({weights[c], weight_scales[c], blk_scales[c]}, w_1k, tile_tag,
-                   "gk_fp8_dequant_weight_fp16_1k_v1");
-              node({act_1k, w_1k}, c0, gemm, "gemm");
+              // Distinct non-negative scalar tag per GEMM prevents Synapse CSE from merging
+              // dedicated 1-output TPC producers across tiles or K-chunks (P-RT-81).
+              synTensor c0 = nullptr;
+              for (uint64_t g = 0; g < g_cnt1; ++g) {
+                const auto gl = std::min(gc1, groups - g * gc1);
+                const int32_t tile_tag = tag_seq++;
+                auto act_1k = local(syn_type_fp16, {gl * 128, rows});
+                auto w_1k = local(syn_type_fp16, {gl * 128, width});
+                auto next_c0 = local(syn_type_float, {width, rows});
+                node({q_g1[g], sn_g1[g]}, act_1k, tile_tag, "gk_fp8_quant_act_fp16_1k_v1");
+                node({w_g1[c][g], ws_g1[c][g], blk_scales[c]}, w_1k, tile_tag,
+                     "gk_fp8_dequant_weight_fp16_1k_v1");
+                if (g == 0) {
+                  node({act_1k, w_1k}, next_c0, gemm, "gemm");
+                } else {
+                  node({act_1k, w_1k, c0}, next_c0, gemm, "gemm");
+                }
+                c0 = next_c0;
+              }
 
-              auto act_2k = local(syn_type_fp8_143, {input_width * 2, rows});
-              auto w_2k = local(syn_type_fp8_143, {input_width * 2, width});
-              auto c1 = local(syn_type_float, {width, rows});
-              node({inputs[r], row_scales[r]}, act_2k, tile_tag, "gk_fp8_quant_act_fp8_2k_v1");
-              node({weights[c], weight_scales[c], blk_scales[c]}, w_2k, tile_tag,
-                   "gk_fp8_dequant_weight_fp8_2k_v1");
-              node({act_2k, w_2k}, c1, gemm, "gemm");
+              synTensor c1 = nullptr;
+              for (uint64_t g = 0; g < g_cnt2; ++g) {
+                const auto gl = std::min(gc2, groups - g * gc2);
+                const auto kw = ((gl + 1) / 2) * 768;
+                const int32_t tile_tag = tag_seq++;
+                auto act_3k = local(syn_type_fp8_143, {kw, rows});
+                auto w_3k = local(syn_type_fp8_143, {kw, width});
+                auto next_c1 = local(syn_type_float, {width, rows});
+                node({q_g2[g], sn_g2[g]}, act_3k, tile_tag, "gk_fp8_quant_act_fp8_3k_v1");
+                node({w_g2[c][g], ws_g2[c][g], blk_scales[c]}, w_3k, tile_tag,
+                     "gk_fp8_dequant_weight_fp8_3k_v1");
+                if (g == 0) {
+                  node({act_3k, w_3k}, next_c1, gemm, "gemm");
+                } else {
+                  node({act_3k, w_3k, c1}, next_c1, gemm, "gemm");
+                }
+                c1 = next_c1;
+              }
 
               auto tile_out = (row_tiles == 1 && column_tiles == 1)
                                   ? flat_output

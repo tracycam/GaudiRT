@@ -41,7 +41,7 @@ FxGeometry infer_fx_geometry(const std::vector<at::Tensor>& inputs, const std::v
                      ? "fx_program_rotary_static_v2;" : "fx_program_v16;");
   if (std::any_of(operations.begin(), operations.end(),
                   [](const FxNode& op) { return op.op == FxOp::block_fp8_linear; })) {
-    normalized << "block_fp8_fp16_fp8_v1;";
+    normalized << "block_fp8_fp16_3k_fp8_v1;";
   }
   for (size_t i = 0; i < inputs.size(); ++i) {
     const auto& tensor = inputs[i];
