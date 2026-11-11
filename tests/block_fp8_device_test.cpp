@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -19,6 +20,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace gaudirt::runtime;
@@ -258,18 +260,21 @@ int main(int argc, char** argv) {
         std::vector<size_t> col_outputs;
         for (uint64_t i = 0; i < count; ++i) {
           const auto width = std::min(col_tile, n - i * col_tile);
+          const int32_t tile_tag = static_cast<int32_t>(r * count + i);
           const auto act_1k = graph.tensor({k, rows}, syn_type_bf16);
           const auto w_1k = graph.tensor({k, width}, syn_type_bf16);
           const auto c0 = graph.tensor({width, rows}, syn_type_float);
-          graph.node("gk_fp8_quant_act_bf16_1k_v1", {xs[r]}, {act_1k});
-          graph.node("gk_fp8_dequant_weight_bf16_1k_v1", {weights[i], scales_tiled[i]}, {w_1k});
+          graph.node("gk_fp8_quant_act_bf16_1k_v1", {xs[r]}, {act_1k}, &tile_tag, sizeof(tile_tag));
+          graph.node("gk_fp8_dequant_weight_bf16_1k_v1", {weights[i], scales_tiled[i]}, {w_1k},
+                     &tile_tag, sizeof(tile_tag));
           graph.node("gemm", {act_1k, w_1k}, {c0}, &gemm, sizeof(gemm));
 
           const auto act_k32 = graph.tensor({k, rows}, syn_type_bf16);
           const auto w_k32 = graph.tensor({k, width}, syn_type_bf16);
           const auto cp = graph.tensor({width, rows}, syn_type_float);
-          graph.node("gk_fp8_quant_act_bf16_k32_v1", {xs[r]}, {act_k32});
-          graph.node("gk_fp8_dequant_weight_bf16_k32_v1", {weights[i], scales_tiled[i]}, {w_k32});
+          graph.node("gk_fp8_quant_act_bf16_k32_v1", {xs[r]}, {act_k32}, &tile_tag, sizeof(tile_tag));
+          graph.node("gk_fp8_dequant_weight_bf16_k32_v1", {weights[i], scales_tiled[i]}, {w_k32},
+                     &tile_tag, sizeof(tile_tag));
           graph.node("gemm", {act_k32, w_k32}, {cp}, &gemm, sizeof(gemm));
 
           const auto result = (row_count == 1 && count == 1) ? ty : graph.tensor({width, rows}, syn_type_bf16);
@@ -388,28 +393,69 @@ int main(int argc, char** argv) {
         }
       }
     }
+    std::vector<double> raw_x_f64(m * k);
+    for (size_t idx = 0; idx < x.size(); ++idx) raw_x_f64[idx] = double(widen(x[idx]));
+    std::vector<double> sq_err(m, 0.0), ref_energy(m, 0.0), id_err(m, 0.0), id_energy(m, 0.0);
+    const unsigned hw_threads = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+    constexpr uint64_t kColChunk = 256;
+    std::vector<double> decoded_w(kColChunk * k);
+    for (uint64_t c0_col = 0; c0_col < n; c0_col += kColChunk) {
+      const uint64_t c_width = std::min<uint64_t>(kColChunk, n - c0_col);
+      for (uint64_t dc = 0; dc < c_width; ++dc) {
+        const uint64_t col = c0_col + dc;
+        const float* scale_row = &original_scales[(col / 128) * groups];
+        const uint8_t* w_row = &original[col * k];
+        double* dst = &decoded_w[dc * k];
+        for (uint64_t g = 0; g < groups; ++g) {
+          const double ws = double(scale_row[g]);
+          for (uint64_t i = 0; i < 128; ++i) dst[g * 128 + i] = decoded[w_row[g * 128 + i]] * ws;
+        }
+      }
+      const unsigned workers = static_cast<unsigned>(std::min<uint64_t>(hw_threads, m));
+      std::vector<std::thread> pool;
+      pool.reserve(workers);
+      std::atomic<bool> nonfinite{false};
+      for (unsigned tid = 0; tid < workers; ++tid) {
+        const uint64_t r_begin = (m * tid) / workers;
+        const uint64_t r_end = (m * (tid + 1)) / workers;
+        pool.emplace_back([&, r_begin, r_end]() {
+          for (uint64_t row = r_begin; row < r_end; ++row) {
+            const double* qx_row = &quantized_x[row * k];
+            const double* rx_row = &raw_x_f64[row * k];
+            double se = 0, re = 0, ie = 0, ien = 0;
+            for (uint64_t dc = 0; dc < c_width; ++dc) {
+              const uint64_t col = c0_col + dc;
+              const double* dw = &decoded_w[dc * k];
+              double reference = bias[col], ideal = bias[col];
+              for (uint64_t inner = 0; inner < k; ++inner) {
+                reference += qx_row[inner] * dw[inner];
+                ideal += rx_row[inner] * dw[inner];
+              }
+              const double actual = widen(output[row * n + col]);
+              if (!std::isfinite(reference) || !std::isfinite(ideal) || !std::isfinite(actual)) {
+                nonfinite.store(true, std::memory_order_relaxed);
+                return;
+              }
+              se += (actual - reference) * (actual - reference);
+              re += reference * reference;
+              ie += (actual - ideal) * (actual - ideal);
+              ien += ideal * ideal;
+            }
+            sq_err[row] += se;
+            ref_energy[row] += re;
+            id_err[row] += ie;
+            id_energy[row] += ien;
+          }
+        });
+      }
+      for (auto& th : pool) th.join();
+      if (nonfinite.load()) throw std::runtime_error("nonfinite result");
+    }
     double max_row_error = 0, max_unquantized_error = 0;
     for (uint64_t row = 0; row < m; ++row) {
-      double squared_error = 0, reference_energy = 0, ideal_error = 0, ideal_energy = 0;
-      for (uint64_t col = 0; col < n; ++col) {
-        double reference = bias[col], ideal = bias[col];
-        for (uint64_t inner = 0; inner < k; ++inner) {
-          const double weight = decoded[original[col * k + inner]] *
-                                double(original_scales[(col / 128) * groups + inner / 128]);
-          reference += quantized_x[row * k + inner] * weight;
-          ideal += double(widen(x[row * k + inner])) * weight;
-        }
-        const double actual = widen(output[row * n + col]);
-        if (!std::isfinite(reference) || !std::isfinite(ideal) || !std::isfinite(actual))
-          throw std::runtime_error("nonfinite result");
-        squared_error += (actual - reference) * (actual - reference);
-        reference_energy += reference * reference;
-        ideal_error += (actual - ideal) * (actual - ideal);
-        ideal_energy += ideal * ideal;
-      }
-      if (!(reference_energy > 0.0) || !(ideal_energy > 0.0)) throw std::runtime_error("zero reference row");
-      max_row_error = std::max(max_row_error, std::sqrt(squared_error / reference_energy));
-      max_unquantized_error = std::max(max_unquantized_error, std::sqrt(ideal_error / ideal_energy));
+      if (!(ref_energy[row] > 0.0) || !(id_energy[row] > 0.0)) throw std::runtime_error("zero reference row");
+      max_row_error = std::max(max_row_error, std::sqrt(sq_err[row] / ref_energy[row]));
+      max_unquantized_error = std::max(max_unquantized_error, std::sqrt(id_err[row] / id_energy[row]));
     }
     std::ofstream out(argv[9], std::ios::binary);
     out.write(reinterpret_cast<const char*>(output.data()), output.size() * sizeof(output[0]));

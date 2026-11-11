@@ -648,6 +648,20 @@ void test_large_n_accum_budget_column_tiling() {
   assert(count_guid("gemm") == 16);
   assert(count_guid("gk_fp8_epilogue_k32_bias_bf16_v1") == 8);
   assert(count_guid("concat") == 5);
+  for (const char* guid : {"gk_fp8_quant_act_bf16_1k_v1", "gk_fp8_quant_act_bf16_k32_v1",
+                           "gk_fp8_dequant_weight_bf16_1k_v1", "gk_fp8_dequant_weight_bf16_k32_v1"}) {
+    std::vector<int32_t> tags;
+    for (const auto* nd : find_nodes(guid)) {
+      assert(nd->params.size() == sizeof(int32_t));
+      int32_t tag = -1;
+      std::memcpy(&tag, nd->params.data(), sizeof(int32_t));
+      assert(tag >= 0);
+      tags.push_back(tag);
+    }
+    assert(tags.size() == 8);
+    std::sort(tags.begin(), tags.end());
+    assert(std::adjacent_find(tags.begin(), tags.end()) == tags.end());
+  }
   for (const auto* dw : find_nodes("gk_fp8_dequant_weight_bf16_1k_v1")) {
     const auto& t = g_state.tensors.at(dw->outputs[0]);
     assert((t.sizes == std::vector<uint64_t>{7168, 22016}) && t.section == nullptr);

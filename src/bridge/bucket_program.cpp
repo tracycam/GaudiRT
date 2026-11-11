@@ -635,19 +635,23 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
             col_products.reserve(column_tiles);
             for (uint64_t c = 0; c < column_tiles; ++c) {
               const auto width = std::min(tile_columns, columns - c * tile_columns);
+              // Distinct non-negative scalar tag per (row_tile, col_tile) prevents Synapse CSE
+              // from merging dedicated 1-output TPC producers across tiles, which would otherwise
+              // materialize full BF16 weights or shared activations in HBM (P-RT-81).
+              const int32_t tile_tag = static_cast<int32_t>(r * column_tiles + c);
               auto act_1k = local(syn_type_bf16, {input_width, rows});
               auto w_1k = local(syn_type_bf16, {input_width, width});
               auto c0 = local(syn_type_float, {width, rows});
-              node({inputs[r]}, act_1k, std::monostate{}, "gk_fp8_quant_act_bf16_1k_v1");
-              node({weights[c], weight_scales[c]}, w_1k, std::monostate{},
+              node({inputs[r]}, act_1k, tile_tag, "gk_fp8_quant_act_bf16_1k_v1");
+              node({weights[c], weight_scales[c]}, w_1k, tile_tag,
                    "gk_fp8_dequant_weight_bf16_1k_v1");
               node({act_1k, w_1k}, c0, gemm, "gemm");
 
               auto act_k32 = local(syn_type_bf16, {input_width, rows});
               auto w_k32 = local(syn_type_bf16, {input_width, width});
               auto cp = local(syn_type_float, {width, rows});
-              node({inputs[r]}, act_k32, std::monostate{}, "gk_fp8_quant_act_bf16_k32_v1");
-              node({weights[c], weight_scales[c]}, w_k32, std::monostate{},
+              node({inputs[r]}, act_k32, tile_tag, "gk_fp8_quant_act_bf16_k32_v1");
+              node({weights[c], weight_scales[c]}, w_k32, tile_tag,
                    "gk_fp8_dequant_weight_bf16_k32_v1");
               node({act_k32, w_k32}, cp, gemm, "gemm");
 
