@@ -32,7 +32,7 @@ enum FusedSlot {
 ColdRecipe& fused_recipe(Context& ctx, const AttentionPlan& plan, const AttentionBlock& block, float scale,
                          bool write_kv) {
   std::ostringstream signature;
-  signature << (write_kv ? "paged_fused_v1:" : "paged_fused_read_v1:")
+  signature << (write_kv ? "paged_fused_v2:" : "paged_fused_read_v2:")
             << block.query_bucket << ':' << block.kv_bucket << ':'
             << plan.query_heads << ':' << plan.kv_heads << ':' << plan.head_dim << ':'
             << std::bit_cast<uint32_t>(scale);
@@ -89,20 +89,20 @@ ColdRecipe& fused_recipe(Context& ctx, const AttentionPlan& plan, const Attentio
     graph.node({"reshape", {gathered}, {tiles[i]}, {}});
   }
   const auto score4 = graph.tensor(syn_type_float, {kv, rows, group, kv_heads}, -1);
-  const auto score3 = graph.tensor(syn_type_float, {kv, rows, heads}, -1);
-  const auto probability3 = graph.tensor(syn_type_bf16, {kv, rows, heads}, -1);
   const auto probability4 = graph.tensor(syn_type_bf16, {kv, rows, group, kv_heads}, -1);
   graph.node({"batch_gemm", {query, tiles[0]}, {score4}, synGEMMParams{false, true}});
-  graph.node({"reshape", {score4}, {score3}, {}});
   if (kv <= 512) {
-    graph.node({"gk_attn_direct_softmax_bf16_v1", {score3, positions, header}, {probability3}, scale});
+    graph.node({"gk_attn_direct_softmax_bf16_v1", {score4, positions, header}, {probability4}, scale});
   } else {
+    const auto score3 = graph.tensor(syn_type_float, {kv, rows, heads}, -1);
+    const auto probability3 = graph.tensor(syn_type_bf16, {kv, rows, heads}, -1);
     const auto exponent = graph.tensor(syn_type_float, {kv, rows, heads}, -1);
     const auto sum = graph.tensor(syn_type_float, {64, heads}, -1);
+    graph.node({"reshape", {score4}, {score3}, {}});
     graph.node({"gk_attn_decode_exp_f32_v1", {score3, positions, header}, {exponent, sum}, scale});
     graph.node({"gk_attn_decode_normalize_bf16_v1", {exponent, sum}, {probability3}, {}});
+    graph.node({"reshape", {probability3}, {probability4}, {}});
   }
-  graph.node({"reshape", {probability3}, {probability4}, {}});
   if (rows == 1) {
     const auto output4 = graph.tensor(syn_type_bf16, {d, rows, group, kv_heads}, -1);
     graph.node({"batch_gemm", {probability4, tiles[1]}, {output4}, synGEMMParams{false, false}});

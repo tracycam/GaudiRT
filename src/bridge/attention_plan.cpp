@@ -24,8 +24,8 @@ using namespace runtime;
 namespace {
 constexpr uint64_t kAlignment = BlockCachingAllocator::kAlignment;
 constexpr uint32_t kTileKvBucket = 512;
-// Keep this limit consistent with the generic attention provider's Glue.
-constexpr uint64_t kMaxTileScoreElements = 8ULL * 1024 * 1024;
+// Keep this limit consistent with the 4D generic attention provider's Glue (kMaxScoreElements4d).
+constexpr uint64_t kMaxTileScoreElements = 16ULL * 1024 * 1024;
 uint64_t align(uint64_t size) { return (size + kAlignment - 1) & ~(kAlignment - 1); }
 
 void release_attention_plan(void* pointer) {
@@ -177,8 +177,9 @@ at::Tensor PagedMetadata::attention_plan(int64_t query_heads, int64_t kv_heads, 
       const bool short_prefill = end <= 512 &&
           uint64_t{q_bucket} * direct_kv * static_cast<uint64_t>(query_heads) <= 4 * 1024 * 1024;
       if (!single_decode && !short_prefill) {
+        const uint64_t row_cap = sequence.length >= 2048 ? 512ULL : 256ULL;
         const auto max_rows = std::bit_floor(static_cast<uint32_t>(std::min<uint64_t>(
-            256, kMaxTileScoreElements / (kTileKvBucket * static_cast<uint64_t>(query_heads)))));
+            row_cap, kMaxTileScoreElements / (kTileKvBucket * static_cast<uint64_t>(query_heads)))));
         count = std::min<int32_t>(remaining, static_cast<int32_t>(max_rows));
         q_bucket = std::bit_ceil(static_cast<uint32_t>(count));
       }

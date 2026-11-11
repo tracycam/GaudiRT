@@ -233,21 +233,25 @@ void verify_recipe_structure(const MockRecipe& recipe) {
   }
   if (!has_tile_softmax) return;
 
-  // Verify sequential multi-tile online-softmax DAG invariants.
+  // Verify sequential multi-tile 4D zero-reshape online-softmax DAG invariants.
+  std::vector<const MockNode*> inits;
   std::vector<const MockNode*> merges;
   std::vector<const MockNode*> softmaxes;
   std::vector<const MockNode*> packs;
   std::vector<const MockNode*> finalizes;
   std::vector<const MockNode*> constants;
+  std::vector<const MockNode*> reshapes;
   std::set<uint64_t> header_sections;
   std::set<uint64_t> key_index_sections;
 
   for (const auto& n : recipe.nodes) {
-    if (n.guid == "gk_attn_online_merge_f32_v1") merges.push_back(&n);
+    if (n.guid == "gk_attn_online_init_f32_v1") inits.push_back(&n);
+    else if (n.guid == "gk_attn_online_merge_f32_v1") merges.push_back(&n);
     else if (n.guid == "gk_attn_tile_softmax_bf16_v1") softmaxes.push_back(&n);
     else if (n.guid == "gk_attn_pack_stats_f32_v1") packs.push_back(&n);
     else if (n.guid == "gk_attn_online_finalize_bf16_v1") finalizes.push_back(&n);
     else if (n.guid == "constant_f32") constants.push_back(&n);
+    else if (n.guid == "reshape") reshapes.push_back(&n);
     else if (n.guid == "gather_fwd_bf16") {
       assert(n.inputs.size() == 2);
       const auto& idx_t = recipe.tensor_snapshots.at(n.inputs[1]);
@@ -257,67 +261,74 @@ void verify_recipe_structure(const MockRecipe& recipe) {
   }
 
   const size_t chunk_tiles = softmaxes.size();
+  const bool first_chunk = !inits.empty();
   assert(chunk_tiles >= 1 && chunk_tiles <= gaudirt::generic::kMaxFusedAttentionTiles);
-  assert(packs.empty() && "packed 2D tile stats eliminate redundant gk_attn_pack_stats_f32_v1 nodes");
-  assert(merges.size() == chunk_tiles);
+  assert(packs.empty() && "packed 3D tile stats eliminate redundant gk_attn_pack_stats_f32_v1 nodes");
+  assert(constants.empty() && "gk_attn_online_init_f32_v1 eliminates redundant constant_f32 zero nodes");
+  assert(reshapes.size() == 2 * chunk_tiles && "only 2 gather reshapes per KV tile; zero score/prob/output reshapes");
   assert(key_index_sections.size() == chunk_tiles && "each tile must use a distinct persistent index section");
+  if (first_chunk) {
+    assert(inits.size() == 1 && merges.size() + 1 == chunk_tiles);
+  } else {
+    assert(inits.empty() && merges.size() == chunk_tiles);
+  }
 
   const MockTensor* shared_positions = softmaxes[0]->inputs[1];
   for (size_t t = 0; t < chunk_tiles; ++t) {
     assert(softmaxes[t]->inputs.size() == 3 && softmaxes[t]->outputs.size() == 3);
+    assert(recipe.tensor_snapshots.at(softmaxes[t]->inputs[0]).dims == 4);
+    assert(recipe.tensor_snapshots.at(softmaxes[t]->outputs[0]).dims == 4);
     assert(softmaxes[t]->inputs[1] == shared_positions && "all tiles in chunk share block positions tensor");
     const auto& hdr = recipe.tensor_snapshots.at(softmaxes[t]->inputs[2]);
     assert(hdr.section && hdr.section->persistent);
     assert(header_sections.insert(hdr.section->id).second && "each tile must bind its own persistent header section");
+    assert(recipe.tensor_snapshots.at(softmaxes[t]->outputs[1]).dims == 3);
+    assert(recipe.tensor_snapshots.at(softmaxes[t]->outputs[2]).dims == 3);
 
-    // Softmax emits packed 2D {stats_rows, heads} tile_m, tile_l directly into merge[t] inputs 3, 4.
-    assert(merges[t]->inputs.size() == 6 && merges[t]->outputs.size() == 3);
-    assert(merges[t]->inputs[3] == softmaxes[t]->outputs[1]);
-    assert(merges[t]->inputs[4] == softmaxes[t]->outputs[2]);
-    assert(recipe.tensor_snapshots.at(softmaxes[t]->outputs[1]).dims == 2);
-    assert(recipe.tensor_snapshots.at(softmaxes[t]->outputs[2]).dims == 2);
-
-    // Sequential state chain: merge[t-1].outputs[0..2] == merge[t].inputs[0..2]!
-    if (t > 0) {
-      assert(merges[t]->inputs[0] == merges[t - 1]->outputs[0] && "tile k new_m must feed tile k+1 old_m");
-      assert(merges[t]->inputs[1] == merges[t - 1]->outputs[1] && "tile k new_l must feed tile k+1 old_l");
-      assert(merges[t]->inputs[2] == merges[t - 1]->outputs[2] && "tile k new_o must feed tile k+1 old_o");
-      for (int s = 0; s < 3; ++s) {
-        assert(recipe.tensor_snapshots.at(merges[t - 1]->outputs[s]).section == nullptr &&
-               "intermediate running state (m, l, o) inside fused chunk must be virtual (non-persistent)");
+    if (first_chunk && t == 0) {
+      assert(inits[0]->inputs.size() == 3 && inits[0]->outputs.size() == 3);
+      assert(inits[0]->inputs[0] == softmaxes[0]->outputs[1]);
+      assert(inits[0]->inputs[1] == softmaxes[0]->outputs[2]);
+    } else {
+      const size_t mi = first_chunk ? (t - 1) : t;
+      assert(merges[mi]->inputs.size() == 6 && merges[mi]->outputs.size() == 3);
+      assert(merges[mi]->inputs[3] == softmaxes[t]->outputs[1]);
+      assert(merges[mi]->inputs[4] == softmaxes[t]->outputs[2]);
+      const MockNode* prev = (first_chunk && t == 1) ? inits[0] : (t > 0 ? merges[mi - 1] : nullptr);
+      if (prev) {
+        assert(merges[mi]->inputs[0] == prev->outputs[0] && "tile k new_m must feed tile k+1 old_m");
+        assert(merges[mi]->inputs[1] == prev->outputs[1] && "tile k new_l must feed tile k+1 old_l");
+        assert(merges[mi]->inputs[2] == prev->outputs[2] && "tile k new_o must feed tile k+1 old_o");
+        for (int s = 0; s < 3; ++s) {
+          assert(recipe.tensor_snapshots.at(prev->outputs[s]).section == nullptr &&
+                 "intermediate running state (m, l, o) inside fused chunk must be virtual (non-persistent)");
+        }
+      } else {
+        for (int s = 0; s < 3; ++s) {
+          assert(recipe.tensor_snapshots.at(merges[0]->inputs[s]).section != nullptr &&
+                 recipe.tensor_snapshots.at(merges[0]->inputs[s]).section->persistent);
+        }
       }
     }
   }
 
-  const bool first_chunk = !constants.empty();
-  if (first_chunk) {
-    assert(constants.size() == 3);
-    assert(merges[0]->inputs[0] == constants[0]->outputs[0]);
-    assert(merges[0]->inputs[1] == constants[1]->outputs[0]);
-    assert(merges[0]->inputs[2] == constants[2]->outputs[0]);
-  } else {
-    for (int s = 0; s < 3; ++s) {
-      assert(recipe.tensor_snapshots.at(merges[0]->inputs[s]).section != nullptr &&
-             recipe.tensor_snapshots.at(merges[0]->inputs[s]).section->persistent);
-    }
-  }
-
+  const MockNode* last_state_node = (first_chunk && chunk_tiles == 1) ? inits[0] : merges.back();
   if (!finalizes.empty()) {
     assert(finalizes.size() == 1);
     const auto* fin = finalizes[0];
     assert(fin->inputs.size() == 2 && fin->outputs.size() == 1);
-    assert(fin->inputs[0] == merges.back()->outputs[1] && "finalize sums must come from last tile merge new_l");
-    assert(fin->inputs[1] == merges.back()->outputs[2] && "finalize acc must come from last tile merge new_o");
+    assert(fin->inputs[0] == last_state_node->outputs[1] && "finalize sums must come from last tile state new_l");
+    assert(fin->inputs[1] == last_state_node->outputs[2] && "finalize acc must come from last tile state new_o");
     const auto& out_spec = recipe.tensor_snapshots.at(fin->outputs[0]);
     assert(out_spec.section && out_spec.section->persistent && out_spec.dtype == syn_type_bf16);
     for (int s = 0; s < 3; ++s) {
-      assert(recipe.tensor_snapshots.at(merges.back()->outputs[s]).section == nullptr &&
+      assert(recipe.tensor_snapshots.at(last_state_node->outputs[s]).section == nullptr &&
              "finalized chunk must not write running (m, l, o) to persistent HBM");
     }
   } else {
     for (int s = 0; s < 3; ++s) {
-      assert(recipe.tensor_snapshots.at(merges.back()->outputs[s]).section != nullptr &&
-             recipe.tensor_snapshots.at(merges.back()->outputs[s]).section->persistent);
+      assert(recipe.tensor_snapshots.at(last_state_node->outputs[s]).section != nullptr &&
+             recipe.tensor_snapshots.at(last_state_node->outputs[s]).section->persistent);
     }
   }
 }
@@ -494,7 +505,8 @@ void execute_recipe_on_cpu(const MockRecipe& recipe, const synLaunchTensorInfo* 
       float scale = 0.f;
       std::memcpy(&scale, node.params.data(), sizeof(scale));
       const auto& s_spec = recipe.tensor_snapshots.at(node.inputs[0]);
-      const uint64_t keys = s_spec.sizes[0], rows = s_spec.sizes[1], heads = s_spec.sizes[2];
+      const uint64_t keys = s_spec.sizes[0], rows = s_spec.sizes[1];
+      const uint64_t heads = s_spec.dims == 4 ? (s_spec.sizes[2] * s_spec.sizes[3]) : s_spec.sizes[2];
       const auto* scores = reinterpret_cast<const float*>(load_tensor(node.inputs[0]).data());
       const auto* positions = reinterpret_cast<const int32_t*>(load_tensor(node.inputs[1]).data());
       const auto* hdr = reinterpret_cast<const int32_t*>(load_tensor(node.inputs[2]).data());
@@ -528,19 +540,22 @@ void execute_recipe_on_cpu(const MockRecipe& recipe, const synLaunchTensorInfo* 
       float scale = 0.f;
       std::memcpy(&scale, node.params.data(), sizeof(scale));
       const auto& s_spec = recipe.tensor_snapshots.at(node.inputs[0]);
-      const uint64_t keys = s_spec.sizes[0], rows = s_spec.sizes[1], heads = s_spec.sizes[2];
+      const uint64_t keys = s_spec.sizes[0], rows = s_spec.sizes[1];
+      const uint64_t heads = s_spec.dims == 4 ? (s_spec.sizes[2] * s_spec.sizes[3]) : s_spec.sizes[2];
       const auto* scores = reinterpret_cast<const float*>(load_tensor(node.inputs[0]).data());
       const auto* positions = reinterpret_cast<const int32_t*>(load_tensor(node.inputs[1]).data());
       const auto* hdr = reinterpret_cast<const int32_t*>(load_tensor(node.inputs[2]).data());
       auto* probs = reinterpret_cast<uint16_t*>(alloc_tensor(node.outputs[0]).data());
       const auto& stat_spec = recipe.tensor_snapshots.at(node.outputs[1]);
-      const bool packed_2d = (stat_spec.dims == 2);
       const uint64_t padded = (rows + 63) / 64 * 64;
+      const bool packed_stats = (stat_spec.dims == 2) ||
+                                (stat_spec.dims == 3 && stat_spec.sizes[0] == padded &&
+                                 stat_spec.sizes[1] * stat_spec.sizes[2] == heads);
       auto* out_m = reinterpret_cast<float*>(alloc_tensor(node.outputs[1]).data());
       auto* out_l = reinterpret_cast<float*>(alloc_tensor(node.outputs[2]).data());
       const int32_t valid_rows = hdr[0], valid_keys = hdr[1], key_start = hdr[2];
       for (uint64_t h = 0; h < heads; ++h) {
-        if (packed_2d) {
+        if (packed_stats) {
           for (uint64_t r = rows; r < padded; ++r) {
             out_m[h * padded + r] = -std::numeric_limits<float>::infinity();
             out_l[h * padded + r] = 0.f;
@@ -568,7 +583,7 @@ void execute_recipe_on_cpu(const MockRecipe& recipe, const synLaunchTensorInfo* 
           } else {
             std::fill_n(dst, keys, uint16_t{0});
           }
-          if (packed_2d) {
+          if (packed_stats) {
             out_m[h * padded + r] = m;
             out_l[h * padded + r] = sum;
           } else {
@@ -590,9 +605,34 @@ void execute_recipe_on_cpu(const MockRecipe& recipe, const synLaunchTensorInfo* 
           tile_m[h * padded + r] = r < rows ? exp_m[(h * rows + r) * 64] : -std::numeric_limits<float>::infinity();
           tile_l[h * padded + r] = r < rows ? exp_l[(h * rows + r) * 64] : 0.f;
         }
+    } else if (node.guid == "gk_attn_online_init_f32_v1") {
+      const auto& o_spec = recipe.tensor_snapshots.at(node.inputs[2]);
+      const uint64_t d = o_spec.sizes[0], rows = o_spec.sizes[1];
+      const uint64_t heads = o_spec.dims == 4 ? (o_spec.sizes[2] * o_spec.sizes[3]) : o_spec.sizes[2];
+      const uint64_t padded = (rows + 63) / 64 * 64;
+      const auto* tile_m = reinterpret_cast<const float*>(load_tensor(node.inputs[0]).data());
+      const auto* tile_l = reinterpret_cast<const float*>(load_tensor(node.inputs[1]).data());
+      const auto* tile_o = reinterpret_cast<const float*>(load_tensor(node.inputs[2]).data());
+      auto* new_m = reinterpret_cast<float*>(alloc_tensor(node.outputs[0]).data());
+      auto* new_l = reinterpret_cast<float*>(alloc_tensor(node.outputs[1]).data());
+      auto* new_o = reinterpret_cast<float*>(alloc_tensor(node.outputs[2]).data());
+      const float ni = -std::numeric_limits<float>::infinity();
+      for (uint64_t h = 0; h < heads; ++h)
+        for (uint64_t r = 0; r < padded; ++r) {
+          const uint64_t idx = h * padded + r;
+          const float m1 = tile_m[idx], l1 = tile_l[idx];
+          new_m[idx] = l1 > 0.f ? m1 : ni;
+          new_l[idx] = l1 > 0.f ? l1 : 0.f;
+          if (r < rows) {
+            const float bb = l1 > 0.f ? l1 : 0.f;
+            const uint64_t base = (h * rows + r) * d;
+            for (uint64_t c = 0; c < d; ++c) new_o[base + c] = bb * tile_o[base + c];
+          }
+        }
     } else if (node.guid == "gk_attn_online_merge_f32_v1") {
       const auto& o_spec = recipe.tensor_snapshots.at(node.inputs[2]);
-      const uint64_t d = o_spec.sizes[0], rows = o_spec.sizes[1], heads = o_spec.sizes[2];
+      const uint64_t d = o_spec.sizes[0], rows = o_spec.sizes[1];
+      const uint64_t heads = o_spec.dims == 4 ? (o_spec.sizes[2] * o_spec.sizes[3]) : o_spec.sizes[2];
       const uint64_t padded = (rows + 63) / 64 * 64;
       const auto* old_m = reinterpret_cast<const float*>(load_tensor(node.inputs[0]).data());
       const auto* old_l = reinterpret_cast<const float*>(load_tensor(node.inputs[1]).data());
@@ -625,7 +665,8 @@ void execute_recipe_on_cpu(const MockRecipe& recipe, const synLaunchTensorInfo* 
         }
     } else if (node.guid == "gk_attn_online_finalize_bf16_v1") {
       const auto& o_spec = recipe.tensor_snapshots.at(node.inputs[1]);
-      const uint64_t d = o_spec.sizes[0], rows = o_spec.sizes[1], heads = o_spec.sizes[2];
+      const uint64_t d = o_spec.sizes[0], rows = o_spec.sizes[1];
+      const uint64_t heads = o_spec.dims == 4 ? (o_spec.sizes[2] * o_spec.sizes[3]) : o_spec.sizes[2];
       const uint64_t padded = (rows + 63) / 64 * 64;
       const auto* sums = reinterpret_cast<const float*>(load_tensor(node.inputs[0]).data());
       const auto* acc = reinterpret_cast<const float*>(load_tensor(node.inputs[1]).data());
@@ -1437,14 +1478,14 @@ int main() {
     }
   }
 
-  // 3. Prefill M=4096 (q_bucket=256, kv_bucket=512, num_tiles in {1..8})
+  // 3. Prefill M=4096 (q_bucket=512, kv_bucket=512, num_tiles in {1..8})
   {
     auto sched = build_schedule(0, 4096, 65536, 32768, kQHeads, kKvHeads, kHeadDim);
     const auto& plan = attention_plan_data(sched.plan_tensor, ctx);
-    assert(plan.blocks.size() == 16);
-    for (size_t b = 0; b < 16; ++b) {
-      assert(plan.blocks[b].query_bucket == 256 && plan.blocks[b].kv_bucket == 512);
-      assert(plan.blocks[b].tiles.size() == b / 2 + 1);
+    assert(plan.blocks.size() == 8);
+    for (size_t b = 0; b < 8; ++b) {
+      assert(plan.blocks[b].query_bucket == 512 && plan.blocks[b].kv_bucket == 512);
+      assert(plan.blocks[b].tiles.size() == b + 1);
     }
     assert(plan.scratch_bytes == 0 && "M=4096 (num_tiles <= 8) must allocate 0 bytes of HBM tile scratch");
     auto q = make_device_tensor({4096, kQHeads * kHeadDim}, at::kBFloat16);
@@ -1454,8 +1495,7 @@ int main() {
     auto out = paged_attn_validated(q, k, v, k_pool, v_pool, sched.locations, sched.requests,
                                     sched.positions, sched.plan_tensor, sched.header, kHeadDim, scale);
     assert(out.sizes() == at::IntArrayRef({4096, kQHeads * kHeadDim}));
-    // Exact launch count drops from 89 (1 + 72 + 16) down to 17 (1 kv_store + 16 query blocks)!
-    assert(mock().launches.size() == 17 && "M=4096 must launch exactly 17 recipes (1 kv_store + 16 blocks)");
+    assert(mock().launches.size() == 9 && "M=4096 must launch exactly 9 recipes (1 kv_store + 8 blocks)");
     for (const auto& l : mock().launches) {
       assert(l.persistent_fp32_state_bindings == 0 &&
              "M=4096 (num_tiles <= 8) must have zero persistent HBM (m, l, o) tensor bindings");
@@ -1464,21 +1504,21 @@ int main() {
 
   // 4. Long-context M=4096 with cached prefix up to 32768 (num_tiles = 64) + non-multiple tails {9, 11, 15, 17}
   {
-    const size_t launches_64 = run_synthetic_block(ctx, 64, 256, 256, 512, kQHeads, kKvHeads, kHeadDim);
+    const size_t launches_64 = run_synthetic_block(ctx, 64, 512, 512, 512, kQHeads, kKvHeads, kHeadDim);
     assert(launches_64 == 8 && "64 KV tiles (32768 context) must fuse into 8 chunk launches");
     assert(mock().launches[0].persistent_fp32_state_bindings == 3);  // out_m, out_l, out_o only
     for (size_t i = 1; i < 7; ++i) assert(mock().launches[i].persistent_fp32_state_bindings == 6);  // old + out
     assert(mock().launches[7].persistent_fp32_state_bindings == 3);  // old_m, old_l, old_o only -> BF16 output
 
     assert(run_synthetic_block(ctx, 9, 256, 256, 512, kQHeads, kKvHeads, kHeadDim) == 2);
-    assert(run_synthetic_block(ctx, 11, 256, 256, 512, kQHeads, kKvHeads, kHeadDim) == 2);
+    assert(run_synthetic_block(ctx, 11, 512, 512, 512, kQHeads, kKvHeads, kHeadDim) == 2);
     assert(run_synthetic_block(ctx, 15, 256, 256, 512, kQHeads, kKvHeads, kHeadDim) == 2);
-    assert(run_synthetic_block(ctx, 17, 256, 256, 512, kQHeads, kKvHeads, kHeadDim) == 3);
+    assert(run_synthetic_block(ctx, 17, 512, 512, 512, kQHeads, kKvHeads, kHeadDim) == 3);
 
-    // Full end-to-end 32768 context schedule (prefix=28672, M=4096 -> 16 blocks with 57..64 tiles, 8 launches/block)
+    // Full end-to-end 32768 context schedule (prefix=28672, M=4096 -> 8 blocks with 57..64 tiles, 8 launches/block)
     auto sched32k = build_schedule(28672, 4096, 65536, 32768, kQHeads, kKvHeads, kHeadDim);
     const auto& plan32k = attention_plan_data(sched32k.plan_tensor, ctx);
-    assert(plan32k.blocks.size() == 16 && plan32k.blocks.back().tiles.size() == 64);
+    assert(plan32k.blocks.size() == 8 && plan32k.blocks.back().tiles.size() == 64);
     assert(plan32k.scratch_bytes > 0);
     auto q = make_device_tensor({4096, kQHeads * kHeadDim}, at::kBFloat16);
     auto k = make_device_tensor({4096, kKvHeads * kHeadDim}, at::kBFloat16);
@@ -1487,7 +1527,7 @@ int main() {
     auto out32k = paged_attn_validated(q, k, v, k_pool, v_pool, sched32k.locations, sched32k.requests,
                                        sched32k.positions, sched32k.plan_tensor, sched32k.header, kHeadDim, scale);
     assert(out32k.sizes() == at::IntArrayRef({4096, kQHeads * kHeadDim}));
-    assert(mock().launches.size() == 1 + 16 * 8 && "28672+4096=32768 prefill must take 1 + 16*8 = 129 launches");
+    assert(mock().launches.size() == 1 + 8 * 8 && "28672+4096=32768 prefill must take 1 + 8*8 = 65 launches");
   }
 
   // 5. Steady-state zero synEventCreate / synEventDestroy check across repeated warm runs (P-RT-78)
@@ -1616,7 +1656,7 @@ int main() {
   pool = at::Tensor{};
   g_ctx.reset();
   std::cout << "multitile_paged_attention_unit_test PASSED: "
-            << "M=4096 launches=17 (0 HBM state bindings), 64-tile launches=8, "
+            << "M=4096 launches=9 (0 HBM state bindings), 64-tile launches=8, "
             << "tails {9,11,15,17}->{2,2,2,3}, CPU ref max_abs=0.0 (0 ULP), steady_events=0\n";
   return 0;
 }

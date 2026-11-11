@@ -56,7 +56,7 @@ ColdRecipe& chunk_recipe(Context& ctx, const AttentionPlan& plan, const Attentio
   const uint64_t d = plan.head_dim, heads = plan.query_heads, kv_heads = plan.kv_heads;
   const uint64_t group = heads / kv_heads, stats_rows = (rows + 63) / 64 * 64;
   std::ostringstream signature;
-  signature << "chunk_v2:" << rows << ':' << kv << ':' << d << ':' << heads << ':' << kv_heads << ':'
+  signature << "chunk_v3:" << rows << ':' << kv << ':' << d << ':' << heads << ':' << kv_heads << ':'
             << std::bit_cast<uint32_t>(scale) << ':' << chunk_tiles << ':'
             << (first_chunk ? 1 : 0) << ':' << (finalize_last ? 1 : 0);
   GraphKey graph_key(signature.str(), rows);
@@ -87,35 +87,21 @@ ColdRecipe& chunk_recipe(Context& ctx, const AttentionPlan& plan, const Attentio
 
   synTensor cur_m = nullptr, cur_l = nullptr, cur_o = nullptr;
   if (!first_chunk) {
-    cur_m = graph.tensor(syn_type_float, {stats_rows, heads}, slot++);
-    cur_l = graph.tensor(syn_type_float, {stats_rows, heads}, slot++);
-    cur_o = graph.tensor(syn_type_float, {d, rows, heads}, slot++);
+    cur_m = graph.tensor(syn_type_float, {stats_rows, group, kv_heads}, slot++);
+    cur_l = graph.tensor(syn_type_float, {stats_rows, group, kv_heads}, slot++);
+    cur_o = graph.tensor(syn_type_float, {d, rows, group, kv_heads}, slot++);
   }
 
   synTensor final_out = nullptr, out_m = nullptr, out_l = nullptr, out_o = nullptr;
   if (finalize_last) {
-    final_out = graph.tensor(syn_type_bf16, {d, rows, heads}, slot++);
-    synTensorPermutation out_perm{};
-    out_perm.dims = 3;
-    out_perm.permutation[0] = 0; out_perm.permutation[1] = 2; out_perm.permutation[2] = 1;
-    graph.permutation(final_out, out_perm);
+    final_out = graph.tensor(syn_type_bf16, {d, rows, group, kv_heads}, slot++);
+    if (rows > 1) graph.permutation(final_out, q_perm);
   } else {
-    out_m = graph.tensor(syn_type_float, {stats_rows, heads}, slot++);
-    out_l = graph.tensor(syn_type_float, {stats_rows, heads}, slot++);
-    out_o = graph.tensor(syn_type_float, {d, rows, heads}, slot++);
+    out_m = graph.tensor(syn_type_float, {stats_rows, group, kv_heads}, slot++);
+    out_l = graph.tensor(syn_type_float, {stats_rows, group, kv_heads}, slot++);
+    out_o = graph.tensor(syn_type_float, {d, rows, group, kv_heads}, slot++);
   }
   TORCH_CHECK(static_cast<size_t>(slot) == slot_count, "GaudiRT attention: chunk slot count mismatch");
-
-  if (first_chunk) {
-    cur_m = graph.tensor(syn_type_float, {stats_rows, heads}, -1);
-    cur_l = graph.tensor(syn_type_float, {stats_rows, heads}, -1);
-    cur_o = graph.tensor(syn_type_float, {d, rows, heads}, -1);
-    ns_ConstantKernel::ParamsV3 zero{};
-    zero.constant.f = 0.f;
-    graph.node({"constant_f32", {}, {cur_m}, zero});
-    graph.node({"constant_f32", {}, {cur_l}, zero});
-    graph.node({"constant_f32", {}, {cur_o}, zero});
-  }
 
   ns_GatherKernel::ParamsV2 gather{};
   gather.axis = 1;
@@ -128,26 +114,25 @@ ColdRecipe& chunk_recipe(Context& ctx, const AttentionPlan& plan, const Attentio
       graph.node({"reshape", {gathered}, {kv_tiles[i]}, {}});
     }
     auto score4 = graph.tensor(syn_type_float, {kv, rows, group, kv_heads}, -1);
-    auto score3 = graph.tensor(syn_type_float, {kv, rows, heads}, -1);
-    auto probability3 = graph.tensor(syn_type_bf16, {kv, rows, heads}, -1);
     auto probability4 = graph.tensor(syn_type_bf16, {kv, rows, group, kv_heads}, -1);
-    auto tile_m = graph.tensor(syn_type_float, {stats_rows, heads}, -1);
-    auto tile_l = graph.tensor(syn_type_float, {stats_rows, heads}, -1);
+    auto tile_m = graph.tensor(syn_type_float, {stats_rows, group, kv_heads}, -1);
+    auto tile_l = graph.tensor(syn_type_float, {stats_rows, group, kv_heads}, -1);
     auto tile_o4 = graph.tensor(syn_type_float, {d, rows, group, kv_heads}, -1);
-    auto tile_o = graph.tensor(syn_type_float, {d, rows, heads}, -1);
     graph.node({"batch_gemm", {query, kv_tiles[0]}, {score4}, synGEMMParams{false, true}});
-    graph.node({"reshape", {score4}, {score3}, {}});
-    graph.node({"gk_attn_tile_softmax_bf16_v1", {score3, positions, headers[t]},
-                {probability3, tile_m, tile_l}, scale});
-    graph.node({"reshape", {probability3}, {probability4}, {}});
+    graph.node({"gk_attn_tile_softmax_bf16_v1", {score4, positions, headers[t]},
+                {probability4, tile_m, tile_l}, scale});
     graph.node({"batch_gemm", {probability4, kv_tiles[1]}, {tile_o4}, synGEMMParams{false, false}});
-    graph.node({"reshape", {tile_o4}, {tile_o}, {}});
     const bool write_persistent_state = (t + 1 == chunk_tiles) && !finalize_last;
-    auto next_m = write_persistent_state ? out_m : graph.tensor(syn_type_float, {stats_rows, heads}, -1);
-    auto next_l = write_persistent_state ? out_l : graph.tensor(syn_type_float, {stats_rows, heads}, -1);
-    auto next_o = write_persistent_state ? out_o : graph.tensor(syn_type_float, {d, rows, heads}, -1);
-    graph.node({"gk_attn_online_merge_f32_v1", {cur_m, cur_l, cur_o, tile_m, tile_l, tile_o},
-                {next_m, next_l, next_o}, {}});
+    auto next_m = write_persistent_state ? out_m : graph.tensor(syn_type_float, {stats_rows, group, kv_heads}, -1);
+    auto next_l = write_persistent_state ? out_l : graph.tensor(syn_type_float, {stats_rows, group, kv_heads}, -1);
+    auto next_o = write_persistent_state ? out_o : graph.tensor(syn_type_float, {d, rows, group, kv_heads}, -1);
+    if (first_chunk && t == 0) {
+      graph.node({"gk_attn_online_init_f32_v1", {tile_m, tile_l, tile_o4},
+                  {next_m, next_l, next_o}, {}});
+    } else {
+      graph.node({"gk_attn_online_merge_f32_v1", {cur_m, cur_l, cur_o, tile_m, tile_l, tile_o4},
+                  {next_m, next_l, next_o}, {}});
+    }
     cur_m = next_m;
     cur_l = next_l;
     cur_o = next_o;
