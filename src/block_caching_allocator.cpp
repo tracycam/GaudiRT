@@ -21,17 +21,47 @@ void check(synStatus status, const char* action) {
 }  // namespace
 
 BlockCachingAllocator::BlockCachingAllocator(synDeviceId device, uint64_t budget_bytes)
-    : device_(device), capacity_(budget_bytes & ~uint64_t{255}), events_(device) {
+    : device_(device),
+      capacity_(budget_bytes & ~uint64_t{255}),
+      owned_events_(std::make_unique<EventPool>(device)),
+      events_(*owned_events_) {
   if (!capacity_) throw std::invalid_argument("BlockCachingAllocator: budget below 256 bytes");
   reserve_slab();
 }
 
 BlockCachingAllocator::BlockCachingAllocator(synDeviceId device, uint64_t address,
-                                             uint64_t bytes, BorrowedSlab)
-    : device_(device), capacity_(bytes), base_(address), owns_slab_(false), events_(device) {
+                                             uint64_t bytes, BorrowedSlab borrowed)
+    : device_(device),
+      capacity_(bytes),
+      base_(address),
+      owns_slab_(false),
+      owned_events_(borrowed.shared_events ? nullptr : std::make_unique<EventPool>(device)),
+      events_(borrowed.shared_events ? *borrowed.shared_events : *owned_events_) {
   if (!address || address % kAlignment || !bytes || bytes % kAlignment)
     throw std::invalid_argument("BlockCachingAllocator: invalid graph pool region");
   blocks_.emplace(base_, Block{capacity_, false, {}, {}});
+}
+
+bool BlockCachingAllocator::release_idle_borrowed_slab(
+    std::vector<synStreamHandle>& pending_out) {
+  std::lock_guard lock(mutex_);
+  if (owns_slab_ || allocated_ != 0) return false;
+  pending_out.clear();
+  const auto retain = [&](const std::vector<synStreamHandle>& src) {
+    for (auto stream : src) {
+      if (std::find(pending_out.begin(), pending_out.end(), stream) == pending_out.end())
+        pending_out.push_back(stream);
+    }
+  };
+  for (const auto& [address, block] : blocks_) {
+    (void)address;
+    retain(block.streams);
+    retain(block.pending_streams);
+  }
+  blocks_.clear();
+  base_ = 0;
+  capacity_ = 0;
+  return true;
 }
 
 void BlockCachingAllocator::reserve_slab() {
@@ -203,7 +233,7 @@ bool BlockCachingAllocator::contains_live_range(uint64_t address, uint64_t bytes
 }
 
 GraphPool::GraphPool(BlockCachingAllocator& parent, uint64_t bytes, synStreamHandle stream)
-    : parent_(parent) {
+    : parent_(parent), extra_events_(parent.device_) {
   const uint64_t size = aligned(bytes);
   reservation_ = parent_.allocate(size, stream);
   try {
@@ -229,6 +259,7 @@ GraphPool::~GraphPool() {
 void GraphPool::prepare_stream_locked(synStreamHandle stream) {
   if (std::find(streams_.begin(), streams_.end(), stream) != streams_.end()) return;
   pool_->prepare_stream(stream);
+  extra_events_.prepare(stream);
   for (auto& region : extra_regions_) region.pool->prepare_stream(stream);
   streams_.push_back(stream);
 }
@@ -255,13 +286,25 @@ uint64_t GraphPool::allocate(uint64_t bytes, synStreamHandle stream) {
   consider(*pool_);
   for (auto& region : extra_regions_) consider(*region.pool);
   if (!best) {
+    std::vector<synStreamHandle> pending;
+    for (auto it = extra_regions_.begin(); it != extra_regions_.end();) {
+      if (it->pool->release_idle_borrowed_slab(pending)) {
+        for (auto pending_stream : pending) parent_.record_stream(it->reservation, pending_stream);
+        it->pool.reset();
+        parent_.free(it->reservation);
+        it = extra_regions_.erase(it);
+      } else {
+        ++it;
+      }
+    }
     const auto available = parent_.largest_free_block();
     if (available < size) throw std::runtime_error("GraphPool: out of HBM for graph temporaries");
     const auto region_bytes = std::min(available, std::max(size, pool_->capacity_bytes()));
     const auto reservation = parent_.allocate(region_bytes, stream);
     try {
       auto pool = std::unique_ptr<BlockCachingAllocator>(new BlockCachingAllocator(
-          parent_.device_, reservation, region_bytes, BlockCachingAllocator::BorrowedSlab{}));
+          parent_.device_, reservation, region_bytes,
+          BlockCachingAllocator::BorrowedSlab{&extra_events_}));
       for (auto known_stream : streams_) pool->prepare_stream(known_stream);
       extra_regions_.push_back(Region{reservation, std::move(pool)});
       best = extra_regions_.back().pool.get();

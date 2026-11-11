@@ -41,9 +41,12 @@ class BlockCachingAllocator {
 
  private:
   friend class GraphPool;
-  struct BorrowedSlab {};
+  struct BorrowedSlab {
+    EventPool* shared_events = nullptr;
+  };
   BlockCachingAllocator(synDeviceId device, uint64_t address, uint64_t bytes,
-                        BorrowedSlab);
+                        BorrowedSlab borrowed);
+  bool release_idle_borrowed_slab(std::vector<synStreamHandle>& pending_out);
   struct Block {
     uint64_t bytes = 0;
     bool allocated = false;
@@ -60,7 +63,8 @@ class BlockCachingAllocator {
   uint64_t allocated_ = 0;
   uint64_t peak_ = 0;
   bool owns_slab_ = true;
-  EventPool events_;
+  std::unique_ptr<EventPool> owned_events_;
+  EventPool& events_;
   Blocks blocks_;
   mutable std::mutex mutex_;
 };
@@ -87,6 +91,7 @@ class GraphPool {
     std::unique_ptr<BlockCachingAllocator> pool;
   };
   BlockCachingAllocator& parent_;
+  EventPool extra_events_;
   uint64_t reservation_ = 0;
   std::unique_ptr<BlockCachingAllocator> pool_;
   std::vector<Region> extra_regions_;

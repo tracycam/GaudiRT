@@ -157,6 +157,43 @@ int main() {
     p = pool.allocate(256, stream(1));
     pool.free(p);
   }
+  reset();
+  {
+    using gaudirt::runtime::GraphPool;
+    BlockCachingAllocator pool(0, 4096);
+    pool.prepare_stream(stream(1));
+    GraphPool graph(pool, 512, stream(1));
+    const auto steady_events = created_events;
+    auto g1 = graph.allocate(1024, stream(1));
+    assert(g1 == 4608);
+    graph.free(g1);
+    auto g2 = graph.allocate(3072, stream(1));
+    assert(g2 == 4608);
+    assert(created_events == steady_events && live_events == steady_events);
+    assert(recorded.empty() && waited.empty() && synchronized.empty());
+    graph.free(g2);
+    auto g3 = graph.allocate(1024, stream(1));
+    assert(g3 == 4608 && recorded.empty() && waited.empty() && synchronized.empty());
+    graph.free(g3);
+  }
+  reset();
+  {
+    using gaudirt::runtime::GraphPool;
+    BlockCachingAllocator pool(0, 4096);
+    for (unsigned id : {1u, 2u, 3u}) pool.prepare_stream(stream(id));
+    GraphPool graph(pool, 512, stream(1));
+    for (unsigned id : {1u, 2u, 3u}) graph.prepare_stream(stream(id));
+    const auto steady_events = created_events;
+    auto g1 = graph.allocate(1024, stream(1));
+    graph.record_stream(g1, stream(2));
+    graph.free(g1);
+    auto g2 = graph.allocate(3072, stream(3));
+    assert(g2 == g1);
+    assert(created_events == steady_events && live_events == steady_events);
+    assert(synchronized.empty() && waited.size() == 2);
+    assert(waited[0].stream == stream(1) && waited[1].stream == stream(2));
+    graph.free(g2);
+  }
   assert(live_events == 0);
   std::cout << "Same-stream reuse has no event records; cross-stream dependencies survive split and merge\n";
 }
