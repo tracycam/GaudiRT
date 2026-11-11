@@ -151,12 +151,15 @@ int main(int argc, char** argv) {
     if (tile_width && (tile_width > n || tile_width % 128))
       throw std::invalid_argument("N tile must be zero or an aligned width no larger than N");
     const uint64_t tile_rows = std::stoul(argv[7]);
-    if (tile_rows > m || (!tile_width && tile_rows))
-      throw std::invalid_argument("M tile must be zero or no larger than M when N tiling is enabled");
-    const uint64_t rows_per_tile = tile_rows ? tile_rows : m;
+    if (tile_rows > m || (m < 512 && !tile_width && tile_rows))
+      throw std::invalid_argument("M tile must be zero or no larger than M");
+    const uint64_t sram_rows = (22ULL << 20) / (k * sizeof(uint16_t));
+    const uint64_t default_hybrid_rows =
+        std::min<uint64_t>(m, std::max<uint64_t>(128, std::bit_floor(sram_rows)));
+    const uint64_t rows_per_tile = tile_rows ? tile_rows : (m >= 512 ? default_hybrid_rows : m);
     const std::string pattern = argv[8];
-    if (pattern != "exact" && pattern != "normal")
-      throw std::invalid_argument("input pattern must be exact or normal");
+    if (pattern != "exact" && pattern != "normal" && pattern != "tiny")
+      throw std::invalid_argument("input pattern must be exact, normal or tiny");
     const float values[] = {448, -448, 224, -224, 128, -128, 64, -64, 32, -32,
                             16, -16, 8, -8, 4, -4, 2, -2, 1, -1, 0.5f, -0.5f};
     std::vector<uint16_t> x(m * k), output(m * n, 0x7fc0);
@@ -165,9 +168,12 @@ int main(int argc, char** argv) {
     std::mt19937 random(12345);
     std::normal_distribution<float> normal;
     for (uint64_t row = 0; row < m; ++row)
-      for (uint64_t col = 0; col < k; ++col)
-        x[row * k + col] = bf16(pattern == "normal" ? normal(random) :
-            col % 128 ? values[(row * 19 + col * 7) % std::size(values)] : 448.f);
+      for (uint64_t col = 0; col < k; ++col) {
+        const float raw = pattern == "normal" ? normal(random)
+                        : pattern == "tiny"   ? normal(random) * (((col / 128) & 1) ? 1e-15f : 1e-12f)
+                        : (col % 128 ? values[(row * 19 + col * 7) % std::size(values)] : 448.f);
+        x[row * k + col] = bf16(raw);
+      }
     for (uint64_t row = 0; row < n; ++row) {
       bias[row] = has_bias ? static_cast<float>(static_cast<int>(row % 19) - 9) * 0.125f : 0.f;
       for (uint64_t col = 0; col < k; ++col) {
@@ -197,7 +203,7 @@ int main(int argc, char** argv) {
       throw std::invalid_argument("untiled partial exceeds the device-test memory budget");
     const uint64_t arena_bytes = prepared.size() + x.size() * sizeof(x[0]) +
         output.size() * sizeof(output[0]) +
-        (use_hybrid ? 2ULL * 1024 * 1024 * 1024
+        (use_hybrid ? 2560ULL * 1024 * 1024
                     : (tile_width ? 512ULL * 1024 * 1024 : 2 * partial_bytes + 256ULL * 1024 * 1024));
     HbmArena arena(runtime.device_id(), arena_bytes);
     RecipeCache cache(argv[1]);
@@ -216,7 +222,7 @@ int main(int argc, char** argv) {
     upload(output.data(), ya, output.size() * sizeof(output[0]));
     Graph graph("block_fp8_m" + std::to_string(m) + "_n" + std::to_string(n) +
                 "_k" + std::to_string(k) + "_bias" + bias_flag + "_tile" + std::to_string(tile_width) +
-                "_rows" + std::to_string(rows_per_tile) + (use_hybrid ? "_hybrid1k2k" : ""));
+                "_rows" + std::to_string(rows_per_tile) + (use_hybrid ? "_k32" : ""));
     if (!use_hybrid && tile_width) graph.enable_rmw();
     const auto tx = graph.tensor({k, m}, syn_type_bf16, xa);
     const auto tw = graph.tensor({128, n, groups}, syn_type_fp8_143, wa);
@@ -224,52 +230,66 @@ int main(int argc, char** argv) {
     const auto ty = graph.tensor({n, m}, syn_type_bf16, ya);
     const synGEMMParams gemm{false, true};
     if (use_hybrid) {
-      const auto row_scale = graph.tensor({1, m}, syn_type_float);
-      graph.node("gk_fp8_act_row_scale_f32_v1", {tx}, {row_scale});
-      const auto act_1k = graph.tensor({k, m}, syn_type_bf16);
-      const auto act_2k = graph.tensor({k * 2, m}, syn_type_fp8_143);
-      graph.node("gk_fp8_quant_act_hybrid_v1", {tx, row_scale}, {act_1k, act_2k});
       const size_t tb = has_bias ? graph.tensor({n}, syn_type_float, ba) : 0;
       const uint64_t col_tile = tile_width ? tile_width : n;
       const uint64_t count = (n + col_tile - 1) / col_tile;
-      std::vector<size_t> weights, scales_tiled, biases, outputs;
+      const uint64_t row_count = (m + rows_per_tile - 1) / rows_per_tile;
+      const synSplitParams split_features{1}, split_bias{0};
+      const synConcatenateParams concat_width{0}, concat_rows{1};
+      std::vector<size_t> xs, weights, scales_tiled, biases, row_outputs;
+      for (uint64_t r = 0; r < row_count; ++r) {
+        const auto rows = std::min(rows_per_tile, m - r * rows_per_tile);
+        xs.push_back(row_count == 1 ? tx : graph.tensor({k, rows}, syn_type_bf16));
+      }
+      if (row_count > 1) graph.node("split", std::vector<size_t>{tx}, xs, &split_features, sizeof(split_features));
       for (uint64_t i = 0; i < count; ++i) {
         const auto width = std::min(col_tile, n - i * col_tile);
         weights.push_back(count == 1 ? tw : graph.tensor({128, width, groups}, syn_type_fp8_143));
         scales_tiled.push_back(count == 1 ? ts : graph.tensor({groups, width / 128}, syn_type_float));
         if (has_bias) biases.push_back(count == 1 ? tb : graph.tensor({width}, syn_type_float));
       }
-      const synSplitParams split_features{1}, split_bias{0};
       if (count > 1) {
         graph.node("split", std::vector<size_t>{tw}, weights, &split_features, sizeof(split_features));
         graph.node("split", std::vector<size_t>{ts}, scales_tiled, &split_features, sizeof(split_features));
         if (has_bias) graph.node("split", std::vector<size_t>{tb}, biases, &split_bias, sizeof(split_bias));
       }
-      for (uint64_t i = 0; i < count; ++i) {
-        const auto width = std::min(col_tile, n - i * col_tile);
-        const auto w_1k = graph.tensor({k, width}, syn_type_bf16);
-        graph.node("gk_fp8_dequant_weight_bf16_1k_v1", {weights[i], scales_tiled[i]}, {w_1k});
-        const auto blk_scale = graph.tensor({1, width / 128}, syn_type_float);
-        graph.node("gk_fp8_weight_blk_scale_f32_v1", {scales_tiled[i]}, {blk_scale});
-        const auto w_2k = graph.tensor({k * 2, width}, syn_type_fp8_143);
-        graph.node("gk_fp8_dequant_weight_fp8_2k_v1",
-                   {weights[i], scales_tiled[i], blk_scale}, {w_2k});
-        const auto c0 = graph.tensor({width, m}, syn_type_float);
-        graph.node("gemm", {act_1k, w_1k}, {c0}, &gemm, sizeof(gemm));
-        const auto c1 = graph.tensor({width, m}, syn_type_float);
-        graph.node("gemm", {act_2k, w_2k}, {c1}, &gemm, sizeof(gemm));
-        const auto result = count == 1 ? ty : graph.tensor({width, m}, syn_type_bf16);
-        if (!has_bias) {
-          graph.node("gk_fp8_hybrid_epilogue_bf16_v1",
-                     {c0, c1, row_scale, blk_scale}, {result});
-        } else {
-          graph.node("gk_fp8_hybrid_epilogue_bias_bf16_v1",
-                     {c0, c1, row_scale, blk_scale, biases[i]}, {result});
+      for (uint64_t r = 0; r < row_count; ++r) {
+        const auto rows = std::min(rows_per_tile, m - r * rows_per_tile);
+        std::vector<size_t> col_outputs;
+        for (uint64_t i = 0; i < count; ++i) {
+          const auto width = std::min(col_tile, n - i * col_tile);
+          const auto act_1k = graph.tensor({k, rows}, syn_type_bf16);
+          const auto w_1k = graph.tensor({k, width}, syn_type_bf16);
+          const auto c0 = graph.tensor({width, rows}, syn_type_float);
+          graph.node("gk_fp8_quant_act_bf16_1k_v1", {xs[r]}, {act_1k});
+          graph.node("gk_fp8_dequant_weight_bf16_1k_v1", {weights[i], scales_tiled[i]}, {w_1k});
+          graph.node("gemm", {act_1k, w_1k}, {c0}, &gemm, sizeof(gemm));
+
+          const auto act_k32 = graph.tensor({k, rows}, syn_type_bf16);
+          const auto w_k32 = graph.tensor({k, width}, syn_type_bf16);
+          const auto cp = graph.tensor({width, rows}, syn_type_float);
+          graph.node("gk_fp8_quant_act_bf16_k32_v1", {xs[r]}, {act_k32});
+          graph.node("gk_fp8_dequant_weight_bf16_k32_v1", {weights[i], scales_tiled[i]}, {w_k32});
+          graph.node("gemm", {act_k32, w_k32}, {cp}, &gemm, sizeof(gemm));
+
+          const auto result = (row_count == 1 && count == 1) ? ty : graph.tensor({width, rows}, syn_type_bf16);
+          if (!has_bias) {
+            graph.node("gk_fp8_epilogue_k32_bf16_v1", {c0, cp}, {result});
+          } else {
+            graph.node("gk_fp8_epilogue_k32_bias_bf16_v1", {c0, cp, biases[i]}, {result});
+          }
+          col_outputs.push_back(result);
         }
-        outputs.push_back(result);
+        if (count == 1) {
+          row_outputs.push_back(col_outputs[0]);
+        } else {
+          const auto row_out = row_count == 1 ? ty : graph.tensor({n, rows}, syn_type_bf16);
+          graph.node("concat", col_outputs, std::vector<size_t>{row_out}, &concat_width, sizeof(concat_width));
+          row_outputs.push_back(row_out);
+        }
       }
-      const synConcatenateParams concat_width{0};
-      if (count > 1) graph.node("concat", outputs, std::vector<size_t>{ty}, &concat_width, sizeof(concat_width));
+      if (row_count > 1)
+        graph.node("concat", row_outputs, std::vector<size_t>{ty}, &concat_rows, sizeof(concat_rows));
     } else {
       const auto tb = graph.tensor({n}, syn_type_float, ba);
       const auto tq = graph.tensor({128, m, groups}, syn_type_fp8_143);
@@ -350,10 +370,10 @@ int main(int argc, char** argv) {
     std::vector<double> quantized_x(m * k);
     for (uint64_t row = 0; row < m; ++row) {
       for (uint64_t group = 0; group < groups; ++group) {
-        float max_abs = 1e-10f;
+        float max_abs = 0.0f;
         for (uint64_t i = 0; i < 128; ++i)
           max_abs = std::max(max_abs, std::abs(widen(x[row * k + group * 128 + i])));
-        const float activation_scale = max_abs / 448.0f;
+        const float activation_scale = max_abs == 0.0f ? 1.0f : max_abs / 448.0f;
         for (uint64_t i = 0; i < 128; ++i) {
           const auto index = row * k + group * 128 + i;
           const float input = widen(x[index]);

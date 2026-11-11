@@ -562,25 +562,30 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
           return builder.tensor(dtype, dimensions, -1, -1, 0, false, {}, rmw);
         };
         if (token_rows >= 512) {
-          constexpr uint64_t kMaxTileAccumBytes = 384ULL << 20;
-          const uint64_t max_cols_by_accum =
-              std::max<uint64_t>(128, ((kMaxTileAccumBytes / (token_rows * 2 * sizeof(float))) / 128) * 128);
-          const uint64_t raw_tiles = (columns + max_cols_by_accum - 1) / max_cols_by_accum;
+          // MantaRayBundlizer single-MME SRAM invariant: each GEMM needs its own dedicated
+          // 1-output TPC producers and an activation row tile whose unsliced [K, tile_rows]
+          // BF16 footprint fits in SRAM alongside double-buffered weight slices (~22 MiB).
+          constexpr uint64_t kMaxSramActBytes = 22ULL << 20;
+          constexpr uint64_t kMaxTotalAccumBytes = 768ULL << 20;
+          const uint64_t sram_rows = kMaxSramActBytes / (input_width * sizeof(uint16_t));
+          const uint64_t tile_rows =
+              std::min<uint64_t>(token_rows, std::max<uint64_t>(128, std::bit_floor(sram_rows)));
+          const uint64_t row_tiles = (token_rows + tile_rows - 1) / tile_rows;
+          const uint64_t max_cols_by_accum = std::max<uint64_t>(
+              128, ((kMaxTotalAccumBytes / (token_rows * 2 * sizeof(float))) / 128) * 128);
+          const uint64_t raw_col_tiles = (columns + max_cols_by_accum - 1) / max_cols_by_accum;
           const uint64_t tile_columns = std::min<uint64_t>(
-              columns,
-              std::min<uint64_t>(max_cols_by_accum, (((columns + raw_tiles - 1) / raw_tiles + 127) / 128) * 128));
+              columns, std::min<uint64_t>(
+                           max_cols_by_accum,
+                           (((columns + raw_col_tiles - 1) / raw_col_tiles + 127) / 128) * 128));
           const uint64_t column_tiles = (columns + tile_columns - 1) / tile_columns;
+
           auto input = values[op.inputs[0]];
           if (input_spec.sizes.size() == 3) {
             auto flat = local(syn_type_bf16, {input_width, token_rows});
             node({input}, flat, std::monostate{}, "reshape");
             input = flat;
           }
-          auto row_scale = local(syn_type_float, {1, token_rows});
-          node({input}, row_scale, std::monostate{}, "gk_fp8_act_row_scale_f32_v1");
-          auto act_1k = local(syn_type_bf16, {input_width, token_rows});
-          auto act_2k = local(syn_type_fp8_143, {input_width * 2, token_rows});
-          builder.node(NodeSpec{"gk_fp8_quant_act_hybrid_v1", {input, row_scale}, {act_1k, act_2k}, std::monostate{}});
           synTensor bias = nullptr;
           if (op.inputs.size() == 4) {
             bias = values[op.inputs[3]];
@@ -592,55 +597,81 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
               bias = wide_bias;
             }
           }
-          std::vector<synTensor> weights, weight_scales, biases, products;
+          const synAxisParams feature_axis{1}, column_axis{0};
+          std::vector<synTensor> inputs;
+          inputs.reserve(row_tiles);
+          for (uint64_t r = 0; r < row_tiles; ++r) {
+            const auto rows = std::min(tile_rows, token_rows - r * tile_rows);
+            inputs.push_back(row_tiles == 1 ? input : local(syn_type_bf16, {input_width, rows}));
+          }
+          if (row_tiles > 1) builder.node(NodeSpec{"split", {input}, inputs, feature_axis});
+
+          std::vector<synTensor> weights, weight_scales, biases;
           weights.reserve(column_tiles);
           weight_scales.reserve(column_tiles);
           if (bias) biases.reserve(column_tiles);
-          products.reserve(column_tiles);
-          for (uint64_t i = 0; i < column_tiles; ++i) {
-            const auto width = std::min(tile_columns, columns - i * tile_columns);
-            weights.push_back(column_tiles == 1 ? values[op.inputs[1]] :
-                              local(syn_type_fp8_143, {128, width, groups}));
-            weight_scales.push_back(column_tiles == 1 ? values[op.inputs[2]] :
-                                    local(syn_type_float, {groups, width / 128}));
+          for (uint64_t c = 0; c < column_tiles; ++c) {
+            const auto width = std::min(tile_columns, columns - c * tile_columns);
+            weights.push_back(column_tiles == 1 ? values[op.inputs[1]]
+                                                : local(syn_type_fp8_143, {128, width, groups}));
+            weight_scales.push_back(column_tiles == 1 ? values[op.inputs[2]]
+                                                      : local(syn_type_float, {groups, width / 128}));
             if (bias) biases.push_back(column_tiles == 1 ? bias : local(syn_type_float, {width}));
           }
-          const synAxisParams feature_axis{1}, column_axis{0};
           if (column_tiles > 1) {
             builder.node(NodeSpec{"split", {values[op.inputs[1]]}, weights, feature_axis});
             builder.node(NodeSpec{"split", {values[op.inputs[2]]}, weight_scales, feature_axis});
             if (bias) builder.node(NodeSpec{"split", {bias}, biases, column_axis});
           }
+
           const auto flat_output =
               input_spec.sizes.size() == 3 ? local(syn_type_bf16, {columns, token_rows}) : values[id];
           const synGEMMParams gemm{false, true};
-          for (uint64_t i = 0; i < column_tiles; ++i) {
-            const auto width = std::min(tile_columns, columns - i * tile_columns);
-            auto w_1k = local(syn_type_bf16, {input_width, width});
-            node({weights[i], weight_scales[i]}, w_1k, std::monostate{},
-                 "gk_fp8_dequant_weight_bf16_1k_v1");
-            auto blk_scale = local(syn_type_float, {1, width / 128});
-            node({weight_scales[i]}, blk_scale, std::monostate{},
-                 "gk_fp8_weight_blk_scale_f32_v1");
-            auto w_2k = local(syn_type_fp8_143, {input_width * 2, width});
-            node({weights[i], weight_scales[i], blk_scale}, w_2k, std::monostate{},
-                 "gk_fp8_dequant_weight_fp8_2k_v1");
-            auto c0 = local(syn_type_float, {width, token_rows});
-            node({act_1k, w_1k}, c0, gemm, "gemm");
-            auto c1 = local(syn_type_float, {width, token_rows});
-            node({act_2k, w_2k}, c1, gemm, "gemm");
-            auto result = column_tiles == 1 ? flat_output : local(syn_type_bf16, {width, token_rows});
-            if (bias) {
-              node({c0, c1, row_scale, blk_scale, biases[i]}, result, std::monostate{},
-                   "gk_fp8_hybrid_epilogue_bias_bf16_v1");
-            } else {
-              node({c0, c1, row_scale, blk_scale}, result, std::monostate{},
-                   "gk_fp8_hybrid_epilogue_bf16_v1");
+          std::vector<synTensor> row_products;
+          row_products.reserve(row_tiles);
+          for (uint64_t r = 0; r < row_tiles; ++r) {
+            const auto rows = std::min(tile_rows, token_rows - r * tile_rows);
+            std::vector<synTensor> col_products;
+            col_products.reserve(column_tiles);
+            for (uint64_t c = 0; c < column_tiles; ++c) {
+              const auto width = std::min(tile_columns, columns - c * tile_columns);
+              auto act_1k = local(syn_type_bf16, {input_width, rows});
+              auto w_1k = local(syn_type_bf16, {input_width, width});
+              auto c0 = local(syn_type_float, {width, rows});
+              node({inputs[r]}, act_1k, std::monostate{}, "gk_fp8_quant_act_bf16_1k_v1");
+              node({weights[c], weight_scales[c]}, w_1k, std::monostate{},
+                   "gk_fp8_dequant_weight_bf16_1k_v1");
+              node({act_1k, w_1k}, c0, gemm, "gemm");
+
+              auto act_k32 = local(syn_type_bf16, {input_width, rows});
+              auto w_k32 = local(syn_type_bf16, {input_width, width});
+              auto cp = local(syn_type_float, {width, rows});
+              node({inputs[r]}, act_k32, std::monostate{}, "gk_fp8_quant_act_bf16_k32_v1");
+              node({weights[c], weight_scales[c]}, w_k32, std::monostate{},
+                   "gk_fp8_dequant_weight_bf16_k32_v1");
+              node({act_k32, w_k32}, cp, gemm, "gemm");
+
+              auto tile_out = (row_tiles == 1 && column_tiles == 1)
+                                  ? flat_output
+                                  : local(syn_type_bf16, {width, rows});
+              if (bias) {
+                node({c0, cp, biases[c]}, tile_out, std::monostate{},
+                     "gk_fp8_epilogue_k32_bias_bf16_v1");
+              } else {
+                node({c0, cp}, tile_out, std::monostate{}, "gk_fp8_epilogue_k32_bf16_v1");
+              }
+              col_products.push_back(tile_out);
             }
-            products.push_back(result);
+            if (column_tiles == 1) {
+              row_products.push_back(col_products[0]);
+            } else {
+              auto row_out = row_tiles == 1 ? flat_output : local(syn_type_bf16, {columns, rows});
+              builder.node(NodeSpec{"concat", col_products, {row_out}, column_axis});
+              row_products.push_back(row_out);
+            }
           }
-          if (column_tiles > 1)
-            builder.node(NodeSpec{"concat", products, {flat_output}, column_axis});
+          if (row_tiles > 1)
+            builder.node(NodeSpec{"concat", row_products, {flat_output}, feature_axis});
           if (input_spec.sizes.size() == 3) node({flat_output}, values[id], std::monostate{}, "reshape");
           continue;
         }
