@@ -564,7 +564,7 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
         if (token_rows >= 512) {
           // MantaRayBundlizer single-MME SRAM invariant: each GEMM needs its own dedicated
           // 1-output TPC producers and an activation row tile whose unsliced [K, tile_rows]
-          // BF16 footprint fits in SRAM alongside double-buffered weight slices (~22 MiB).
+          // FP16 / [2*K, tile_rows] FP8_143 footprint fits in SRAM (~22 MiB).
           constexpr uint64_t kMaxSramActBytes = 22ULL << 20;
           constexpr uint64_t kMaxTotalAccumBytes = 768ULL << 20;
           const uint64_t sram_rows = kMaxSramActBytes / (input_width * sizeof(uint16_t));
@@ -598,17 +598,25 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
             }
           }
           const synAxisParams feature_axis{1}, column_axis{0};
-          std::vector<synTensor> inputs;
+          std::vector<synTensor> inputs, row_scales;
           inputs.reserve(row_tiles);
+          row_scales.reserve(row_tiles);
           for (uint64_t r = 0; r < row_tiles; ++r) {
             const auto rows = std::min(tile_rows, token_rows - r * tile_rows);
             inputs.push_back(row_tiles == 1 ? input : local(syn_type_bf16, {input_width, rows}));
           }
           if (row_tiles > 1) builder.node(NodeSpec{"split", {input}, inputs, feature_axis});
+          for (uint64_t r = 0; r < row_tiles; ++r) {
+            const auto rows = std::min(tile_rows, token_rows - r * tile_rows);
+            auto rs = local(syn_type_float, {1, rows});
+            node({inputs[r]}, rs, static_cast<int32_t>(r), "gk_fp8_act_row_scale_f32_v1");
+            row_scales.push_back(rs);
+          }
 
-          std::vector<synTensor> weights, weight_scales, biases;
+          std::vector<synTensor> weights, weight_scales, blk_scales, biases;
           weights.reserve(column_tiles);
           weight_scales.reserve(column_tiles);
+          blk_scales.reserve(column_tiles);
           if (bias) biases.reserve(column_tiles);
           for (uint64_t c = 0; c < column_tiles; ++c) {
             const auto width = std::min(tile_columns, columns - c * tile_columns);
@@ -622,6 +630,12 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
             builder.node(NodeSpec{"split", {values[op.inputs[1]]}, weights, feature_axis});
             builder.node(NodeSpec{"split", {values[op.inputs[2]]}, weight_scales, feature_axis});
             if (bias) builder.node(NodeSpec{"split", {bias}, biases, column_axis});
+          }
+          for (uint64_t c = 0; c < column_tiles; ++c) {
+            const auto width = std::min(tile_columns, columns - c * tile_columns);
+            auto bs = local(syn_type_float, {1, width / 128});
+            node({weight_scales[c]}, bs, static_cast<int32_t>(c), "gk_fp8_weight_blk_scale_f32_v1");
+            blk_scales.push_back(bs);
           }
 
           const auto flat_output =
@@ -637,32 +651,33 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
               const auto width = std::min(tile_columns, columns - c * tile_columns);
               // Distinct non-negative scalar tag per (row_tile, col_tile) prevents Synapse CSE
               // from merging dedicated 1-output TPC producers across tiles, which would otherwise
-              // materialize full BF16 weights or shared activations in HBM (P-RT-81).
+              // materialize full weights or shared activations in HBM (P-RT-81).
               const int32_t tile_tag = static_cast<int32_t>(r * column_tiles + c);
-              auto act_1k = local(syn_type_bf16, {input_width, rows});
-              auto w_1k = local(syn_type_bf16, {input_width, width});
+              auto act_1k = local(syn_type_fp16, {input_width, rows});
+              auto w_1k = local(syn_type_fp16, {input_width, width});
               auto c0 = local(syn_type_float, {width, rows});
-              node({inputs[r]}, act_1k, tile_tag, "gk_fp8_quant_act_bf16_1k_v1");
-              node({weights[c], weight_scales[c]}, w_1k, tile_tag,
-                   "gk_fp8_dequant_weight_bf16_1k_v1");
+              node({inputs[r], row_scales[r]}, act_1k, tile_tag, "gk_fp8_quant_act_fp16_1k_v1");
+              node({weights[c], weight_scales[c], blk_scales[c]}, w_1k, tile_tag,
+                   "gk_fp8_dequant_weight_fp16_1k_v1");
               node({act_1k, w_1k}, c0, gemm, "gemm");
 
-              auto act_k32 = local(syn_type_bf16, {input_width, rows});
-              auto w_k32 = local(syn_type_bf16, {input_width, width});
-              auto cp = local(syn_type_float, {width, rows});
-              node({inputs[r]}, act_k32, tile_tag, "gk_fp8_quant_act_bf16_k32_v1");
-              node({weights[c], weight_scales[c]}, w_k32, tile_tag,
-                   "gk_fp8_dequant_weight_bf16_k32_v1");
-              node({act_k32, w_k32}, cp, gemm, "gemm");
+              auto act_2k = local(syn_type_fp8_143, {input_width * 2, rows});
+              auto w_2k = local(syn_type_fp8_143, {input_width * 2, width});
+              auto c1 = local(syn_type_float, {width, rows});
+              node({inputs[r], row_scales[r]}, act_2k, tile_tag, "gk_fp8_quant_act_fp8_2k_v1");
+              node({weights[c], weight_scales[c], blk_scales[c]}, w_2k, tile_tag,
+                   "gk_fp8_dequant_weight_fp8_2k_v1");
+              node({act_2k, w_2k}, c1, gemm, "gemm");
 
               auto tile_out = (row_tiles == 1 && column_tiles == 1)
                                   ? flat_output
                                   : local(syn_type_bf16, {width, rows});
               if (bias) {
-                node({c0, cp, biases[c]}, tile_out, std::monostate{},
-                     "gk_fp8_epilogue_k32_bias_bf16_v1");
+                node({c0, c1, row_scales[r], blk_scales[c], biases[c]}, tile_out, std::monostate{},
+                     "gk_fp8_hybrid_epilogue_bias_bf16_v1");
               } else {
-                node({c0, cp}, tile_out, std::monostate{}, "gk_fp8_epilogue_k32_bf16_v1");
+                node({c0, c1, row_scales[r], blk_scales[c]}, tile_out, std::monostate{},
+                     "gk_fp8_hybrid_epilogue_bf16_v1");
               }
               col_products.push_back(tile_out);
             }
