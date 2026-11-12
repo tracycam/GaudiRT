@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "gaudirt/runtime/recipe_registry.hpp"
+#include "gaudirt/runtime/recipe_cache.hpp"
 #include "gaudirt/common/sha256.hpp"
 
 #include <algorithm>

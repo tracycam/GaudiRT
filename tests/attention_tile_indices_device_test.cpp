@@ -1,7 +1,7 @@
 // Check dynamic request maps and complete vector writes by the tile-index kernel.
 #include "gaudirt/runtime/device_runtime.hpp"
 #include "test_device_slab.hpp"
-#include "gaudirt/runtime/recipe_registry.hpp"
+#include "gaudirt/runtime/recipe_cache.hpp"
 
 #include <array>
 #include <cstdint>

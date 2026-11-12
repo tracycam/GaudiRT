@@ -2,7 +2,7 @@
 // Exercise BF16 midpoint rounding of a compensated reduction on Gaudi2.
 #include "gaudirt/runtime/device_runtime.hpp"
 #include "test_device_slab.hpp"
-#include "gaudirt/runtime/recipe_registry.hpp"
+#include "gaudirt/runtime/recipe_cache.hpp"
 
 #include <array>
 #include <cmath>

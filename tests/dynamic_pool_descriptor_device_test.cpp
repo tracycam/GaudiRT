@@ -2,7 +2,7 @@
 // The optional invalid index bypasses runtime validation solely to test device bounds.
 #include "gaudirt/runtime/device_runtime.hpp"
 #include "test_device_slab.hpp"
-#include "gaudirt/runtime/recipe_registry.hpp"
+#include "gaudirt/runtime/recipe_cache.hpp"
 #include <perf_lib_layer_params.h>
 
 #include <array>

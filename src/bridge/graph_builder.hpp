@@ -2,7 +2,7 @@
 #pragma once
 
 #include "cold_recipe.hpp"
-#include "gaudirt/runtime/recipe_registry.hpp"
+#include "gaudirt/runtime/recipe_cache.hpp"
 
 #include <perf_lib_layer_params.h>
 #include <synapse_common_types.hpp>

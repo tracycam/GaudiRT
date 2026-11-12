@@ -3,7 +3,7 @@
 // FP8 batch GEMM, and FP32 block-scale/bias reduction to BF16.
 #include "gaudirt/runtime/device_runtime.hpp"
 #include "test_device_slab.hpp"
-#include "gaudirt/runtime/recipe_registry.hpp"
+#include "gaudirt/runtime/recipe_cache.hpp"
 
 #include <perf_lib_layer_params.h>
 #include <synapse_common_types.hpp>

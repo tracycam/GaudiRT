@@ -22,7 +22,7 @@ add_library(gaudirt STATIC
     src/block_caching_allocator.cpp
     src/device_runtime.cpp
     src/pinned_host_pool.cpp
-    src/recipe_registry.cpp
+    src/recipe_cache.cpp
     src/sha256.cpp
 )
 target_link_libraries(gaudirt PUBLIC Synapse pthread ${CMAKE_DL_LIBS})
@@ -91,7 +91,7 @@ if(GAUDIRT_BUILD_TORCH)
         src/block_caching_allocator.cpp
         src/device_runtime.cpp
         src/pinned_host_pool.cpp
-        src/recipe_registry.cpp
+        src/recipe_cache.cpp
         src/sha256.cpp
     )
     target_include_directories(multitile_paged_attention_unit_test BEFORE PRIVATE tests/mock_synapse src/bridge)

@@ -2,7 +2,7 @@
 // Head-major KV write + multi-tile fused MME/TPC KV-chunk attention + online-state finalization.
 #include "gaudirt/runtime/device_runtime.hpp"
 #include "test_device_slab.hpp"
-#include "gaudirt/runtime/recipe_registry.hpp"
+#include "gaudirt/runtime/recipe_cache.hpp"
 
 #include <perf_lib_layer_params.h>
 #include <synapse_common_types.hpp>

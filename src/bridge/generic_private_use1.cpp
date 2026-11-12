@@ -2,7 +2,7 @@
 #include "gaudirt/runtime/block_caching_allocator.hpp"
 #include "gaudirt/runtime/device_runtime.hpp"
 #include "gaudirt/runtime/pinned_host_pool.hpp"
-#include "gaudirt/runtime/recipe_registry.hpp"
+#include "gaudirt/runtime/recipe_cache.hpp"
 #include "gaudirt/common/sha256.hpp"
 #include "cold_recipe.hpp"
 #include "bridge_internal.hpp"
