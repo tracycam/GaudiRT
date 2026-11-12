@@ -405,7 +405,7 @@ int main(int argc, char** argv) {
         out_l = g.tensor({stats_rows, heads}, syn_type_float, state[1].sum);
         out_o = g.tensor({d, rows, heads}, syn_type_float, state[1].output);
       }
-      if (first_c) {
+      if (first_c && c_tiles == 1) {
         cur_m = g.tensor({stats_rows, heads}, syn_type_float);
         cur_l = g.tensor({stats_rows, heads}, syn_type_float);
         cur_o = g.tensor({d, rows, heads}, syn_type_float);
@@ -430,22 +430,33 @@ int main(int argc, char** argv) {
         const auto score3 = g.tensor({kv, rows, heads}, syn_type_float);
         const auto prob3 = g.tensor({kv, rows, heads}, syn_type_bf16);
         const auto prob4 = g.tensor({kv, rows, group, kvh}, syn_type_bf16);
-        const auto tile_m = g.tensor({stats_rows, heads}, syn_type_float);
-        const auto tile_l = g.tensor({stats_rows, heads}, syn_type_float);
-        const auto tile_o4 = g.tensor({d, rows, group, kvh}, syn_type_float);
-        const auto tile_o = g.tensor({d, rows, heads}, syn_type_float);
-        g.node("batch_gemm", {tq, kv_tiles[0]}, {score4}, &qk, sizeof(qk));
-        g.node("reshape", {score4}, {score3});
-        g.node("gk_attn_tile_softmax_bf16_v1", {score3, tp, t_hdr[t]}, {prob3, tile_m, tile_l}, &scale, sizeof(scale));
-        g.node("reshape", {prob3}, {prob4});
-        g.node("batch_gemm", {prob4, kv_tiles[1]}, {tile_o4}, &pv, sizeof(pv));
-        g.node("reshape", {tile_o4}, {tile_o});
         const bool persist_out = (t + 1 == c_tiles) && !fin_last;
         const auto next_m = persist_out ? out_m : g.tensor({stats_rows, heads}, syn_type_float);
         const auto next_l = persist_out ? out_l : g.tensor({stats_rows, heads}, syn_type_float);
         const auto next_o = persist_out ? out_o : g.tensor({d, rows, heads}, syn_type_float);
-        g.node("gk_attn_online_merge_f32_v1", {cur_m, cur_l, cur_o, tile_m, tile_l, tile_o},
-               {next_m, next_l, next_o});
+        if (first_c && c_tiles >= 2 && t == 0) {
+          const auto next_o4 = g.tensor({d, rows, group, kvh}, syn_type_float);
+          g.node("batch_gemm", {tq, kv_tiles[0]}, {score4}, &qk, sizeof(qk));
+          g.node("reshape", {score4}, {score3});
+          g.node("gk_attn_tile_softmax_bf16_v1", {score3, tp, t_hdr[t]}, {prob3, next_m, next_l}, &scale, sizeof(scale));
+          g.node("reshape", {prob3}, {prob4});
+          g.node("batch_gemm", {prob4, kv_tiles[1]}, {next_o4}, &pv, sizeof(pv));
+          g.node("reshape", {next_o4}, {next_o});
+        } else {
+          const int32_t prev_unscaled = (first_c && c_tiles >= 2 && t == 1) ? 1 : 0;
+          const auto tile_m = g.tensor({stats_rows, heads}, syn_type_float);
+          const auto tile_l = g.tensor({stats_rows, heads}, syn_type_float);
+          const auto tile_o4 = g.tensor({d, rows, group, kvh}, syn_type_float);
+          const auto tile_o = g.tensor({d, rows, heads}, syn_type_float);
+          g.node("batch_gemm", {tq, kv_tiles[0]}, {score4}, &qk, sizeof(qk));
+          g.node("reshape", {score4}, {score3});
+          g.node("gk_attn_tile_softmax_bf16_v1", {score3, tp, t_hdr[t]}, {prob3, tile_m, tile_l}, &scale, sizeof(scale));
+          g.node("reshape", {prob3}, {prob4});
+          g.node("batch_gemm", {prob4, kv_tiles[1]}, {tile_o4}, &pv, sizeof(pv));
+          g.node("reshape", {tile_o4}, {tile_o});
+          g.node("gk_attn_online_merge_f32_v1", {cur_m, cur_l, cur_o, tile_m, tile_l, tile_o},
+                 {next_m, next_l, next_o}, &prev_unscaled, sizeof(prev_unscaled));
+        }
         cur_m = next_m;
         cur_l = next_l;
         cur_o = next_o;
@@ -591,6 +602,9 @@ int main(int argc, char** argv) {
       return static_cast<uint32_t>(std::clamp<int64_t>(count, 0, kv));
     };
     for (uint32_t row : checked_rows) {
+      const uint32_t block = row / rows;
+      const uint32_t active_tiles =
+          std::min(tiles, static_cast<uint32_t>(positions[block * rows + valid - 1]) / kv + 1);
       double err64 = 0, norm64 = 0, err_tiled = 0, norm_tiled = 0;
       for (uint32_t head = 0; head < heads; ++head) {
         std::vector<double> scores64(tiles * kv);
@@ -636,13 +650,19 @@ int main(int argc, char** argv) {
             for (uint32_t t = 0; t < count; ++t) {
               const float v = widen(expected_value[static_cast<size_t>(indices[tile][t]) * width + (head / group) * d + col]);
               out64 += p64[tile * kv + t] * v;
-              tile_acc += widen(bf16(p32[tile * kv + t] / tile_sum[tile])) * v;
+              const float p_bf16 = widen(bf16(p32[tile * kv + t] / tile_sum[tile]));
+              tile_acc += p_bf16 * v;
+            }
+            if (active_tiles == 1) {
+              acc = tile_acc;
+              sum = 1.f;
+              break;
             }
             const float next_m = sum > 0 ? std::max(m, tile_max[tile]) : tile_max[tile];
             const float a = sum > 0 ? std::exp(m - next_m) : 0;
             const float b = std::exp(tile_max[tile] - next_m);
             sum = a * sum + b * tile_sum[tile];
-            acc = a * acc + b * tile_sum[tile] * tile_acc;
+            acc = a * acc + (b * tile_sum[tile]) * tile_acc;
             m = next_m;
           }
           const double truth = widen(direct_bf16(out64 / den64));

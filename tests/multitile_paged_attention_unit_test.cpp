@@ -235,10 +235,11 @@ void verify_recipe_structure(const MockRecipe& recipe) {
   }
   if (!has_tile_softmax) return;
 
-  // Verify sequential multi-tile 4D zero-reshape online-softmax DAG invariants.
+  // Verify sequential multi-tile 4D zero-reshape FlashAttention-2 DAG invariants.
   std::vector<const MockNode*> inits;
   std::vector<const MockNode*> merges;
   std::vector<const MockNode*> softmaxes;
+  std::vector<const MockNode*> bgemms;
   std::vector<const MockNode*> packs;
   std::vector<const MockNode*> finalizes;
   std::vector<const MockNode*> constants;
@@ -253,6 +254,7 @@ void verify_recipe_structure(const MockRecipe& recipe) {
     if (n.guid == "gk_attn_online_init_f32_v1") inits.push_back(&n);
     else if (n.guid == "gk_attn_online_merge_f32_v1") merges.push_back(&n);
     else if (n.guid == "gk_attn_tile_softmax_bf16_v1") softmaxes.push_back(&n);
+    else if (n.guid == "batch_gemm") bgemms.push_back(&n);
     else if (n.guid == "gk_attn_pack_stats_f32_v1") packs.push_back(&n);
     else if (n.guid == "gk_attn_online_finalize_bf16_v1") finalizes.push_back(&n);
     else if (n.guid == "constant_f32") constants.push_back(&n);
@@ -268,14 +270,16 @@ void verify_recipe_structure(const MockRecipe& recipe) {
   }
 
   const size_t chunk_tiles = softmaxes.size();
-  const bool first_chunk = !inits.empty();
+  const bool first_chunk = (merges.size() + 1 == chunk_tiles);
   const bool finalize_last = !finalizes.empty();
   const bool direct_kv = gathers.empty();
   const uint64_t rows = recipe.tensor_snapshots.at(softmaxes[0]->inputs[0]).sizes[1];
   const size_t io_transforms = (rows > 1 ? 1U : 0U) + (finalize_last && rows > 1 ? 1U : 0U);
   assert(chunk_tiles >= 1 && chunk_tiles <= gaudirt::generic::kMaxFusedAttentionTiles);
+  assert(bgemms.size() == 2 * chunk_tiles && "2 batch_gemm nodes (Q@K^T and P@V) per tile");
+  assert(inits.empty() && "tile-0 MME output + prev_unscaled merge eliminates online_init");
   assert(packs.empty() && "packed 3D tile stats eliminate redundant gk_attn_pack_stats_f32_v1 nodes");
-  assert(constants.empty() && "gk_attn_online_init_f32_v1 eliminates redundant constant_f32 zero nodes");
+  assert(constants.empty() && "FA2 tile-0 MME output eliminates redundant constant_f32 zero nodes");
   assert(reshapes.size() == 2 * chunk_tiles + io_transforms &&
          "only 2 KV reshapes per tile plus query/output 3D<->4D reshapes; zero score/prob reshapes");
   assert(transposes.size() == (direct_kv ? 2 * chunk_tiles : 0) + io_transforms &&
@@ -294,11 +298,7 @@ void verify_recipe_structure(const MockRecipe& recipe) {
     assert(gathers.size() == 2 * chunk_tiles);
     assert(key_index_sections.size() == chunk_tiles && "each tile must use a distinct persistent index section");
   }
-  if (first_chunk) {
-    assert(inits.size() == 1 && merges.size() + 1 == chunk_tiles);
-  } else {
-    assert(inits.empty() && merges.size() == chunk_tiles);
-  }
+  assert(first_chunk ? (merges.size() + 1 == chunk_tiles) : (merges.size() == chunk_tiles));
 
   const MockTensor* shared_positions = softmaxes[0]->inputs[1];
   for (size_t t = 0; t < chunk_tiles; ++t) {
@@ -313,16 +313,28 @@ void verify_recipe_structure(const MockRecipe& recipe) {
     assert(recipe.tensor_snapshots.at(softmaxes[t]->outputs[2]).dims == 3);
 
     if (first_chunk && t == 0) {
-      assert(inits[0]->inputs.size() == 3 && inits[0]->outputs.size() == 3);
-      assert(inits[0]->inputs[0] == softmaxes[0]->outputs[1]);
-      assert(inits[0]->inputs[1] == softmaxes[0]->outputs[2]);
+      assert(bgemms[1]->inputs[0] == softmaxes[0]->outputs[0]);
     } else {
       const size_t mi = first_chunk ? (t - 1) : t;
       assert(merges[mi]->inputs.size() == 6 && merges[mi]->outputs.size() == 3);
+      int32_t merge_prev_unscaled = 0;
+      if (merges[mi]->params.size() == sizeof(int32_t)) {
+        std::memcpy(&merge_prev_unscaled, merges[mi]->params.data(), sizeof(int32_t));
+      }
+      assert(merge_prev_unscaled == ((first_chunk && t == 1) ? 1 : 0));
       assert(merges[mi]->inputs[3] == softmaxes[t]->outputs[1]);
       assert(merges[mi]->inputs[4] == softmaxes[t]->outputs[2]);
-      const MockNode* prev = (first_chunk && t == 1) ? inits[0] : (t > 0 ? merges[mi - 1] : nullptr);
-      if (prev) {
+      assert(merges[mi]->inputs[5] == bgemms[2 * t + 1]->outputs[0]);
+      if (first_chunk && t == 1) {
+        std::array<MockTensor*, 3> tile0_state{
+            softmaxes[0]->outputs[1], softmaxes[0]->outputs[2], bgemms[1]->outputs[0]};
+        for (int s = 0; s < 3; ++s) {
+          assert(merges[0]->inputs[s] == tile0_state[s] && "tile 0 (m, l, MME o) must feed tile 1 merge directly");
+          assert(recipe.tensor_snapshots.at(tile0_state[s]).section == nullptr &&
+                 "tile 0 running state inside fused chunk must be virtual (non-persistent)");
+        }
+      } else if (t > 0) {
+        const MockNode* prev = merges[mi - 1];
         assert(merges[mi]->inputs[0] == prev->outputs[0] && "tile k new_m must feed tile k+1 old_m");
         assert(merges[mi]->inputs[1] == prev->outputs[1] && "tile k new_l must feed tile k+1 old_l");
         assert(merges[mi]->inputs[2] == prev->outputs[2] && "tile k new_o must feed tile k+1 old_o");
@@ -339,13 +351,15 @@ void verify_recipe_structure(const MockRecipe& recipe) {
     }
   }
 
-  const MockNode* last_state_node = (first_chunk && chunk_tiles == 1) ? inits[0] : merges.back();
+  std::array<MockTensor*, 3> last_state = (first_chunk && chunk_tiles == 1)
+      ? std::array<MockTensor*, 3>{softmaxes[0]->outputs[1], softmaxes[0]->outputs[2], bgemms[1]->outputs[0]}
+      : std::array<MockTensor*, 3>{merges.back()->outputs[0], merges.back()->outputs[1], merges.back()->outputs[2]};
   if (!finalizes.empty()) {
     assert(finalizes.size() == 1);
     const auto* fin = finalizes[0];
     assert(fin->inputs.size() == 2 && fin->outputs.size() == 1);
-    assert(fin->inputs[0] == last_state_node->outputs[1] && "finalize sums must come from last tile state new_l");
-    assert(fin->inputs[1] == last_state_node->outputs[2] && "finalize acc must come from last tile state new_o");
+    assert(fin->inputs[0] == last_state[1] && "finalize sums must come from last tile state new_l");
+    assert(fin->inputs[1] == last_state[2] && "finalize acc must come from last tile state new_o");
     const auto& out_spec = recipe.tensor_snapshots.at(fin->outputs[0]);
     assert(out_spec.dtype == syn_type_bf16);
     if (rows == 1) {
@@ -356,13 +370,13 @@ void verify_recipe_structure(const MockRecipe& recipe) {
       assert(out_t_spec.section && out_t_spec.section->persistent && out_t_spec.dtype == syn_type_bf16);
     }
     for (int s = 0; s < 3; ++s) {
-      assert(recipe.tensor_snapshots.at(last_state_node->outputs[s]).section == nullptr &&
+      assert(recipe.tensor_snapshots.at(last_state[s]).section == nullptr &&
              "finalized chunk must not write running (m, l, o) to persistent HBM");
     }
   } else {
     for (int s = 0; s < 3; ++s) {
-      assert(recipe.tensor_snapshots.at(last_state_node->outputs[s]).section != nullptr &&
-             recipe.tensor_snapshots.at(last_state_node->outputs[s]).section->persistent);
+      assert(recipe.tensor_snapshots.at(last_state[s]).section != nullptr &&
+             recipe.tensor_snapshots.at(last_state[s]).section->persistent);
     }
   }
 }
@@ -667,44 +681,11 @@ void execute_recipe_on_cpu(const MockRecipe& recipe, const synLaunchTensorInfo* 
           }
         }
       }
-    } else if (node.guid == "gk_attn_pack_stats_f32_v1") {
-      const auto& in_spec = recipe.tensor_snapshots.at(node.inputs[0]);
-      const uint64_t rows = in_spec.sizes[1], heads = in_spec.sizes[2];
-      const uint64_t padded = (rows + 63) / 64 * 64;
-      const auto* exp_m = reinterpret_cast<const float*>(load_tensor(node.inputs[0]).data());
-      const auto* exp_l = reinterpret_cast<const float*>(load_tensor(node.inputs[1]).data());
-      auto* tile_m = reinterpret_cast<float*>(alloc_tensor(node.outputs[0]).data());
-      auto* tile_l = reinterpret_cast<float*>(alloc_tensor(node.outputs[1]).data());
-      for (uint64_t h = 0; h < heads; ++h)
-        for (uint64_t r = 0; r < padded; ++r) {
-          tile_m[h * padded + r] = r < rows ? exp_m[(h * rows + r) * 64] : -std::numeric_limits<float>::infinity();
-          tile_l[h * padded + r] = r < rows ? exp_l[(h * rows + r) * 64] : 0.f;
-        }
-    } else if (node.guid == "gk_attn_online_init_f32_v1") {
-      const auto& o_spec = recipe.tensor_snapshots.at(node.inputs[2]);
-      const uint64_t d = o_spec.sizes[0], rows = o_spec.sizes[1];
-      const uint64_t heads = o_spec.dims == 4 ? (o_spec.sizes[2] * o_spec.sizes[3]) : o_spec.sizes[2];
-      const uint64_t padded = (rows + 63) / 64 * 64;
-      const auto* tile_m = reinterpret_cast<const float*>(load_tensor(node.inputs[0]).data());
-      const auto* tile_l = reinterpret_cast<const float*>(load_tensor(node.inputs[1]).data());
-      const auto* tile_o = reinterpret_cast<const float*>(load_tensor(node.inputs[2]).data());
-      auto* new_m = reinterpret_cast<float*>(alloc_tensor(node.outputs[0]).data());
-      auto* new_l = reinterpret_cast<float*>(alloc_tensor(node.outputs[1]).data());
-      auto* new_o = reinterpret_cast<float*>(alloc_tensor(node.outputs[2]).data());
-      const float ni = -std::numeric_limits<float>::infinity();
-      for (uint64_t h = 0; h < heads; ++h)
-        for (uint64_t r = 0; r < padded; ++r) {
-          const uint64_t idx = h * padded + r;
-          const float m1 = tile_m[idx], l1 = tile_l[idx];
-          new_m[idx] = l1 > 0.f ? m1 : ni;
-          new_l[idx] = l1 > 0.f ? l1 : 0.f;
-          if (r < rows) {
-            const float bb = l1 > 0.f ? l1 : 0.f;
-            const uint64_t base = (h * rows + r) * d;
-            for (uint64_t c = 0; c < d; ++c) new_o[base + c] = bb * tile_o[base + c];
-          }
-        }
     } else if (node.guid == "gk_attn_online_merge_f32_v1") {
+      int32_t prev_unscaled = 0;
+      if (node.params.size() == sizeof(int32_t)) {
+        std::memcpy(&prev_unscaled, node.params.data(), sizeof(int32_t));
+      }
       const auto& o_spec = recipe.tensor_snapshots.at(node.inputs[2]);
       const uint64_t d = o_spec.sizes[0], rows = o_spec.sizes[1];
       const uint64_t heads = o_spec.dims == 4 ? (o_spec.sizes[2] * o_spec.sizes[3]) : o_spec.sizes[2];
@@ -730,12 +711,13 @@ void execute_recipe_on_cpu(const MockRecipe& recipe, const synLaunchTensorInfo* 
           const float origin = (m == ni) ? 0.f : m;
           const float a = l0 > 0.f ? std::exp(m0 - origin) : 0.f;
           const float b = l1 > 0.f ? std::exp(m1 - origin) : 0.f;
+          const float wa = prev_unscaled ? (a * l0) : a;
+          const float wb = b * l1;
           new_m[idx] = m;
           new_l[idx] = a * l0 + b * l1;
           if (r < rows) {
-            const float bb = b * l1;
             const uint64_t base = (h * rows + r) * d;
-            for (uint64_t c = 0; c < d; ++c) new_o[base + c] = a * old_o[base + c] + bb * tile_o[base + c];
+            for (uint64_t c = 0; c < d; ++c) new_o[base + c] = wa * old_o[base + c] + wb * tile_o[base + c];
           }
         }
     } else if (node.guid == "gk_attn_online_finalize_bf16_v1") {
@@ -1481,14 +1463,21 @@ std::vector<uint16_t> cpu_reference_paged_attention(
               }
               tile_o[c] = acc;
             }
+            if (t == 0) {
+              run_m = tm;
+              run_l = tl;
+              run_o = std::move(tile_o);
+              continue;
+            }
             const float v0 = run_l > 0.f ? run_m : ni;
             const float v1 = tl > 0.f ? tm : ni;
             const float next_m = std::max(v0, v1);
             const float origin = (next_m == ni) ? 0.f : next_m;
             const float a = run_l > 0.f ? std::exp(run_m - origin) : 0.f;
             const float b = tl > 0.f ? std::exp(tm - origin) : 0.f;
-            const float bb = b * tl;
-            for (int32_t c = 0; c < d; ++c) run_o[c] = a * run_o[c] + bb * tile_o[c];
+            const float wa = (t == 1) ? (a * run_l) : a;
+            const float wb = b * tl;
+            for (int32_t c = 0; c < d; ++c) run_o[c] = wa * run_o[c] + wb * tile_o[c];
             run_l = a * run_l + b * tl;
             run_m = next_m;
           }

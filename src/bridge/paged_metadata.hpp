@@ -11,6 +11,8 @@
 
 namespace gaudirt::generic {
 
+inline constexpr uint32_t kTileKvBucket = 512;
+
 class PagedMetadata : public torch::CustomClassHolder {
  public:
   PagedMetadata(const at::Tensor& locations, const at::Tensor& requests,

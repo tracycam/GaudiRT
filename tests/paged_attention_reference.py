@@ -1,6 +1,23 @@
-"""Independent CPU reference for the isolated tiled BF16-PV attention gate."""
+"""Independent CPU references for isolated single-tile and multi-tile BF16-PV attention gates."""
 
 import torch
+
+
+def direct_bf16_pv(query, key_pool, value_pool, requests, positions, mapping,
+                   heads, kv_heads, head_dim, scale):
+    assert heads % kv_heads == 0
+    query = query.reshape(-1, heads, head_dim).float()
+    head_map = torch.arange(heads) // (heads // kv_heads)
+    outputs = []
+    for row in range(query.size(0)):
+        indices = mapping[requests[row], :positions[row] + 1].long()
+        assert indices.numel() > 0
+        keys = key_pool[indices][:, head_map, :].float()
+        values = value_pool[indices][:, head_map, :].float()
+        scores = torch.einsum("hd,thd->ht", query[row], keys) * scale
+        probabilities = torch.softmax(scores, dim=-1).to(torch.bfloat16).float()
+        outputs.append(torch.einsum("ht,thd->hd", probabilities, values))
+    return torch.stack(outputs).reshape(query.size(0), heads * head_dim).to(torch.bfloat16).double()
 
 
 def tiled_bf16_pv(query, key_pool, value_pool, requests, positions, mapping,
@@ -21,17 +38,19 @@ def tiled_bf16_pv(query, key_pool, value_pool, requests, positions, mapping,
             tile_max = scores.amax(dim=-1)
             probabilities = torch.exp(scores - tile_max[:, None])
             tile_sum = probabilities.sum(dim=-1)
+            normalized = (probabilities / tile_sum[:, None]).to(torch.bfloat16).float()
             # This is a separate isolated-operator reference, not the pure
             # FP32 baseline used to determine a complete decoder-layer gate.
-            normalized = (probabilities / tile_sum[:, None]).to(torch.bfloat16).float()
-            tile_output = torch.einsum("ht,thd->hd", normalized, values) * tile_sum[:, None]
+            tile_output = torch.einsum("ht,thd->hd", normalized, values)
             if running_max is None:
-                running_max, running_sum, running_output = tile_max, tile_sum, tile_output
+                running_max, running_sum = tile_max, tile_sum
+                running_output = tile_output * tile_sum[:, None]
                 continue
             next_max = torch.maximum(running_max, tile_max)
             old_scale = torch.exp(running_max - next_max)
             tile_scale = torch.exp(tile_max - next_max)
-            running_output = running_output * old_scale[:, None] + tile_output * tile_scale[:, None]
+            running_output = (running_output * old_scale[:, None] +
+                              tile_output * (tile_scale * tile_sum)[:, None])
             running_sum = running_sum * old_scale + tile_sum * tile_scale
             running_max = next_max
         outputs.append(running_output / running_sum[:, None])

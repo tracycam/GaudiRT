@@ -50,13 +50,13 @@ ColdRecipe& store_recipe(Context& ctx, const AttentionPlan& plan, uint32_t rows)
 ColdRecipe& chunk_recipe(Context& ctx, const AttentionPlan& plan, const AttentionBlock& block, float scale,
                          uint32_t chunk_tiles, bool first_chunk, bool finalize_last, bool direct_kv) {
   TORCH_CHECK(chunk_tiles >= 1 && chunk_tiles <= kMaxFusedAttentionTiles &&
-              !(first_chunk && finalize_last && chunk_tiles < 2),
+              (!first_chunk || chunk_tiles >= 2),
               "GaudiRT attention: invalid fused tile chunk");
   const uint64_t rows = block.query_bucket, kv = block.kv_bucket;
   const uint64_t d = plan.head_dim, heads = plan.query_heads, kv_heads = plan.kv_heads;
   const uint64_t group = heads / kv_heads, stats_rows = (rows + 63) / 64 * 64;
   std::ostringstream signature;
-  signature << (direct_kv ? "chunk_direct_v4:" : "chunk_paged_v4:")
+  signature << (direct_kv ? "chunk_direct_v6:" : "chunk_paged_v6:")
             << rows << ':' << kv << ':' << d << ':' << heads << ':' << kv_heads << ':'
             << std::bit_cast<uint32_t>(scale) << ':' << chunk_tiles << ':'
             << (first_chunk ? 1 : 0) << ':' << (finalize_last ? 1 : 0);
@@ -141,23 +141,26 @@ ColdRecipe& chunk_recipe(Context& ctx, const AttentionPlan& plan, const Attentio
     }
     auto score4 = graph.tensor(syn_type_float, {kv, rows, group, kv_heads}, -1);
     auto probability4 = graph.tensor(syn_type_bf16, {kv, rows, group, kv_heads}, -1);
-    auto tile_m = graph.tensor(syn_type_float, {stats_rows, group, kv_heads}, -1);
-    auto tile_l = graph.tensor(syn_type_float, {stats_rows, group, kv_heads}, -1);
-    auto tile_o4 = graph.tensor(syn_type_float, {d, rows, group, kv_heads}, -1);
-    graph.node({"batch_gemm", {query, kv_tiles[0]}, {score4}, synGEMMParams{false, true}});
-    graph.node({"gk_attn_tile_softmax_bf16_v1", {score4, positions, headers[t]},
-                {probability4, tile_m, tile_l}, scale});
-    graph.node({"batch_gemm", {probability4, kv_tiles[1]}, {tile_o4}, synGEMMParams{false, false}});
     const bool write_persistent_state = (t + 1 == chunk_tiles) && !finalize_last;
     auto next_m = write_persistent_state ? out_m : graph.tensor(syn_type_float, {stats_rows, group, kv_heads}, -1);
     auto next_l = write_persistent_state ? out_l : graph.tensor(syn_type_float, {stats_rows, group, kv_heads}, -1);
     auto next_o = write_persistent_state ? out_o : graph.tensor(syn_type_float, {d, rows, group, kv_heads}, -1);
     if (first_chunk && t == 0) {
-      graph.node({"gk_attn_online_init_f32_v1", {tile_m, tile_l, tile_o4},
-                  {next_m, next_l, next_o}, {}});
+      graph.node({"batch_gemm", {query, kv_tiles[0]}, {score4}, synGEMMParams{false, true}});
+      graph.node({"gk_attn_tile_softmax_bf16_v1", {score4, positions, headers[t]},
+                  {probability4, next_m, next_l}, scale});
+      graph.node({"batch_gemm", {probability4, kv_tiles[1]}, {next_o}, synGEMMParams{false, false}});
     } else {
+      auto tile_m = graph.tensor(syn_type_float, {stats_rows, group, kv_heads}, -1);
+      auto tile_l = graph.tensor(syn_type_float, {stats_rows, group, kv_heads}, -1);
+      auto tile_o4 = graph.tensor(syn_type_float, {d, rows, group, kv_heads}, -1);
+      const int32_t prev_unscaled = (first_chunk && t == 1) ? 1 : 0;
+      graph.node({"batch_gemm", {query, kv_tiles[0]}, {score4}, synGEMMParams{false, true}});
+      graph.node({"gk_attn_tile_softmax_bf16_v1", {score4, positions, headers[t]},
+                  {probability4, tile_m, tile_l}, scale});
+      graph.node({"batch_gemm", {probability4, kv_tiles[1]}, {tile_o4}, synGEMMParams{false, false}});
       graph.node({"gk_attn_online_merge_f32_v1", {cur_m, cur_l, cur_o, tile_m, tile_l, tile_o4},
-                  {next_m, next_l, next_o}, {}});
+                  {next_m, next_l, next_o}, prev_unscaled});
     }
     cur_m = next_m;
     cur_l = next_l;

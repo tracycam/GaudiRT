@@ -23,7 +23,6 @@ namespace gaudirt::generic {
 using namespace runtime;
 namespace {
 constexpr uint64_t kAlignment = BlockCachingAllocator::kAlignment;
-constexpr uint32_t kTileKvBucket = 512;
 // Keep this limit consistent with the 4D generic attention provider's Glue (kMaxScoreElements4d).
 constexpr uint64_t kMaxTileScoreElements = 16ULL * 1024 * 1024;
 uint64_t align(uint64_t size) { return (size + kAlignment - 1) & ~(kAlignment - 1); }
