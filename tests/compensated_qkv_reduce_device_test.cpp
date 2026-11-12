@@ -2,7 +2,6 @@
 // Exercise BF16 midpoint rounding of a compensated reduction on Gaudi2.
 #include "gaudirt/runtime/device_runtime.hpp"
 #include "test_device_slab.hpp"
-#include "gaudirt/runtime/prepared_launch.hpp"
 #include "gaudirt/runtime/recipe_registry.hpp"
 
 #include <array>
@@ -104,9 +103,8 @@ int main(int argc, char** argv) {
     bindings[i].pTensorAddress = arena.allocate(bytes[i]);
     if (i < 4) arena.copy_h2d_sync(runtime.h2d_stream(), inputs[i], bindings[i].pTensorAddress, bytes[i]);
   }
-  PreparedLaunch launch{recipe, arena.ensure_workspace(workspace), {bindings.begin(), bindings.end()}, 0};
-  launch.validate();
-  launch.execute(runtime.compute_stream());
+  check(synLaunch(runtime.compute_stream(), bindings.data(), bindings.size(),
+                  arena.ensure_workspace(workspace), recipe, 0));
   runtime.synchronize_compute();
   arena.copy_d2h_sync(runtime.d2h_stream(), bindings[4].pTensorAddress, output.data(), bytes[4]);
   check(synRecipeDestroy(recipe));

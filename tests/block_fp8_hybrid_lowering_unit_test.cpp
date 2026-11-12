@@ -223,9 +223,7 @@ DeviceRuntime::DeviceRuntime(const Config& cfg)
       device_id_(0),
       compute_stream_(mock_stream(1)),
       h2d_stream_(mock_stream(2)),
-      d2h_stream_(mock_stream(3)),
-      owns_device_(false),
-      owns_compute_stream_(false) {}
+      d2h_stream_(mock_stream(3)) {}
 
 DeviceRuntime::~DeviceRuntime() = default;
 
@@ -275,7 +273,7 @@ std::vector<synStreamHandle> StreamRegistry::handles() { return {primary_->handl
 
 Context::Context(uint32_t module, uint64_t hbm_bytes, uint64_t pinned_bytes)
     : generation(1),
-      device(runtime::DeviceRuntime::Config{module, 0, 1, 1024, 1024, -1, 0}),
+      device(runtime::DeviceRuntime::Config{module}),
       streams(device.device_id(), device.compute_stream()),
       allocator(device.device_id(), hbm_bytes),
       pinned(device.device_id(), pinned_bytes) {
