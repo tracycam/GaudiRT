@@ -2,6 +2,7 @@
 #include "paged_metadata.hpp"
 
 #include "bridge_internal.hpp"
+#include "graph_builder.hpp"
 #include "layout_copy.hpp"
 #include "temporaries.hpp"
 #include "gaudirt/common/sha256.hpp"
@@ -48,74 +49,30 @@ static ColdRecipe& device_metadata_recipe(Context& ctx, uint32_t bucket, uint64_
     shapes.push_back({bucket});
   }
   auto compiled = std::make_unique<ColdRecipe>(shapes.size() - static_cast<size_t>(scheduler_owned));
-  synGraphHandle graph = nullptr;
-  std::vector<synSectionHandle> sections(shapes.size(), nullptr);
-  std::vector<synTensor> tensors(shapes.size(), nullptr);
-  const auto binding_index = [scheduler_owned](size_t index) {
-    return index - static_cast<size_t>(scheduler_owned && index > 3);
-  };
-  const auto dummy_name = prefix + "_t" + std::to_string(shapes.size());
-  const auto check = [](synStatus status, const char* message) {
-    TORCH_CHECK(status == synSuccess, "GaudiRT device metadata: ", message,
-                " status=", static_cast<int>(status));
-  };
-  auto cleanup = [&] {
-    if (graph) synGraphDestroy(graph);
-    for (auto tensor : tensors) if (tensor) synTensorDestroy(tensor);
-    for (auto section : sections) if (section) synSectionDestroy(section);
-  };
-  try {
-    check(synGraphCreate(&graph, synDeviceGaudi2), "graph creation failed");
+  {
+    SynapseGraphBuilder builder(prefix, *compiled);
+    std::vector<synTensor> tensors(shapes.size(), nullptr);
     for (size_t i = 0; i < shapes.size(); ++i) {
       const bool dummy = scheduler_owned && i == 3;
-      const auto slot = binding_index(i);
-      if (!dummy) {
-        compiled->names[slot] = prefix + "_t" + std::to_string(i);
-        check(synSectionCreate(&sections[i], 0, graph), "section creation failed");
-        check(synSectionSetPersistent(sections[i], true), "section setup failed");
-      }
-      synTensorDescriptor desc{};
-      desc.m_name = dummy ? dummy_name.c_str() : compiled->names[slot].c_str();
-      desc.m_dataType = syn_type_int32;
-      desc.m_dims = shapes[i].size();
-      for (size_t dim = 0; dim < shapes[i].size(); ++dim) {
-        desc.m_sizes[dim] = desc.m_minSizes[dim] = shapes[i][dim];
-        if (!dummy) compiled->tensors[slot].tensorSize[dim] = shapes[i][dim];
-      }
-      check(synTensorCreate(&tensors[i], &desc, sections[i], 0), "tensor creation failed");
-      if (!dummy) {
-        compiled->tensors[slot].tensorName = compiled->names[slot].c_str();
-        compiled->tensors[slot].tensorType = DATA_TENSOR;
-      }
+      const int slot = dummy ? -1 : static_cast<int>(i - static_cast<size_t>(scheduler_owned && i > 3));
+      tensors[i] = builder.tensor(syn_type_int32, shapes[i], slot);
     }
-    unsigned next_node = 0;
     if (scheduler_owned) {
-      const auto reshape = prefix + "_n" + std::to_string(next_node++);
-      check(synNodeCreate(graph, &tensors[4], &tensors[3], 1, 1, nullptr, 0,
-                          "reshape", reshape.c_str(), nullptr, nullptr), "metadata reshape failed");
+      builder.node(NodeSpec{"reshape", {tensors[4]}, {tensors[3]}, {}});
     }
-    const auto node = prefix + "_n" + std::to_string(next_node++);
-    const int32_t kernel_slots = scheduler_owned ? 1 : slots;
-    check(synNodeCreate(graph, tensors.data(), tensors.data() + 6, 6, 4, &kernel_slots, sizeof(kernel_slots),
-                        scheduler_owned ? "gk_scheduler_metadata_i32_v1" : "gk_paged_metadata_i32_v1",
-                        node.c_str(), nullptr, nullptr), "node creation failed");
+    builder.node(NodeSpec{
+        scheduler_owned ? "gk_scheduler_metadata_i32_v1" : "gk_paged_metadata_i32_v1",
+        {tensors[0], tensors[1], tensors[2], tensors[3], tensors[4], tensors[5]},
+        {tensors[6], tensors[7], tensors[8], tensors[9]},
+        scheduler_owned ? int32_t{1} : slots});
     if (vocabulary) {
-      const std::array<synTensor, 2> token_inputs{tensors[10], tensors[4]};
-      const std::array<synTensor, 2> token_outputs{tensors[11], tensors[12]};
-      const auto token_node = prefix + "_n" + std::to_string(next_node++);
-      check(synNodeCreate(graph, token_inputs.data(), token_outputs.data(), token_inputs.size(), token_outputs.size(),
-                          &vocabulary, sizeof(vocabulary),
-                          scheduler_owned ? "gk_scheduler_tokens_i32_v1" : "gk_token_indices_i32_v1",
-                          token_node.c_str(),
-                          nullptr, nullptr), "token validation node creation failed");
+      builder.node(NodeSpec{
+          scheduler_owned ? "gk_scheduler_tokens_i32_v1" : "gk_token_indices_i32_v1",
+          {tensors[10], tensors[4]},
+          {tensors[11], tensors[12]},
+          vocabulary});
     }
-    compiled->recipe = compile_cached(graph, prefix, key, &ctx.cache);
-    check(synWorkspaceGetSize(&compiled->workspace, compiled->recipe), "workspace query failed");
-    initialize_launch_tensor_ids(compiled->recipe, compiled->tensors.data(), compiled->tensors.size());
-    cleanup();
-  } catch (...) {
-    cleanup();
-    throw;
+    builder.compile(ctx.cache, key);
   }
   auto [it, inserted] = ctx.cold_recipes.emplace(key, std::move(compiled));
   TORCH_CHECK(inserted, "GaudiRT device metadata: duplicate recipe");

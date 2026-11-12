@@ -8,6 +8,7 @@
 #include <synapse_api.h>
 
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -52,13 +53,15 @@ class TestDeviceSlab {
   void copy_h2d_sync(synStreamHandle stream, const void* host_src,
                      uint64_t dev_dst, uint64_t bytes) {
     if (bytes == 0) return;
-    const uint64_t host_va = reinterpret_cast<uint64_t>(host_src);
-    if (synHostMap(device_, bytes, host_src) != synSuccess) {
-      throw std::runtime_error("TestDeviceSlab: synHostMap H2D failed");
+    void* pinned = nullptr;
+    if (synHostMalloc(device_, align_up(bytes), 0, &pinned) != synSuccess) {
+      throw std::runtime_error("TestDeviceSlab: synHostMalloc H2D failed");
     }
-    const synStatus copy = synMemCopyAsync(stream, host_va, bytes, dev_dst, HOST_TO_DRAM);
+    std::memcpy(pinned, host_src, bytes);
+    const synStatus copy =
+        synMemCopyAsync(stream, reinterpret_cast<uint64_t>(pinned), bytes, dev_dst, HOST_TO_DRAM);
     const synStatus sync = copy == synSuccess ? synStreamSynchronize(stream) : copy;
-    synHostUnmap(device_, host_src);
+    synHostFree(device_, pinned, 0);
     if (sync != synSuccess) {
       throw std::runtime_error("TestDeviceSlab: H2D transfer failed");
     }
@@ -67,13 +70,15 @@ class TestDeviceSlab {
   void copy_d2h_sync(synStreamHandle stream, uint64_t dev_src,
                      void* host_dst, uint64_t bytes) {
     if (bytes == 0) return;
-    const uint64_t host_va = reinterpret_cast<uint64_t>(host_dst);
-    if (synHostMap(device_, bytes, host_dst) != synSuccess) {
-      throw std::runtime_error("TestDeviceSlab: synHostMap D2H failed");
+    void* pinned = nullptr;
+    if (synHostMalloc(device_, align_up(bytes), 0, &pinned) != synSuccess) {
+      throw std::runtime_error("TestDeviceSlab: synHostMalloc D2H failed");
     }
-    const synStatus copy = synMemCopyAsync(stream, dev_src, bytes, host_va, DRAM_TO_HOST);
+    const synStatus copy =
+        synMemCopyAsync(stream, dev_src, bytes, reinterpret_cast<uint64_t>(pinned), DRAM_TO_HOST);
     const synStatus sync = copy == synSuccess ? synStreamSynchronize(stream) : copy;
-    synHostUnmap(device_, host_dst);
+    if (sync == synSuccess) std::memcpy(host_dst, pinned, bytes);
+    synHostFree(device_, pinned, 0);
     if (sync != synSuccess) {
       throw std::runtime_error("TestDeviceSlab: D2H transfer failed");
     }

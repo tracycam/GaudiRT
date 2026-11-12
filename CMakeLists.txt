@@ -49,6 +49,7 @@ if(GAUDIRT_BUILD_TORCH)
         src/bridge/eager_scheduler.cpp
         src/bridge/argmax_vocab.cpp
         src/bridge/bucket_program.cpp
+        src/bridge/fx_op_lowering.cpp
         src/bridge/segmented_runner.cpp
         src/bridge/communicator.cpp
         src/bridge/process_group.cpp
@@ -64,6 +65,7 @@ if(GAUDIRT_BUILD_TORCH)
 
     add_executable(block_fp8_hybrid_lowering_unit_test
         src/bridge/bucket_program.cpp
+        src/bridge/fx_op_lowering.cpp
         src/bridge/fx_geometry.cpp
         src/bridge/fx_node.cpp
         src/bridge/tensor_spec.cpp

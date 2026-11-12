@@ -253,8 +253,8 @@ void test_foundation_on_hardware() {
   uint64_t addr_a = allocator.allocate(kBytes, rt.compute_stream());
   uint64_t addr_b = allocator.allocate(kBytes, rt.compute_stream());
   uint64_t addr_out = allocator.allocate(kBytes, rt.compute_stream());
-  uint64_t addr_ws = disk_entry.workspace_size > 0
-                         ? allocator.allocate(disk_entry.workspace_size, rt.compute_stream())
+  uint64_t addr_ws = disk_entry.workspace_bytes > 0
+                         ? allocator.allocate(disk_entry.workspace_bytes, rt.compute_stream())
                          : 0;
   auto* host_a = static_cast<float*>(pinned.allocate(kBytes));
   auto* host_b = static_cast<float*>(pinned.allocate(kBytes));

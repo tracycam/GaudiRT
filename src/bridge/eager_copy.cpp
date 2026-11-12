@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "bridge_internal.hpp"
 #include "eager_copy.hpp"
+#include "graph_builder.hpp"
 #include "layout_copy.hpp"
 #include "temporaries.hpp"
 #include "gaudirt/common/sha256.hpp"
@@ -32,55 +33,20 @@ namespace gaudirt::generic {
 using namespace runtime;
 
 ColdRecipe& broadcast_recipe(Context& ctx, uint64_t count, uint64_t width) {
+  TORCH_CHECK(width == 1 || width == 2 || width == 4 || width == 8,
+              "GaudiRT: unsupported fill width");
   const std::string key = "cold_broadcast_" + std::to_string(width) + "_" + std::to_string(count);
   auto found = ctx.cold_recipes.find(key);
   if (found != ctx.cold_recipes.end()) return *found->second;
   auto recipe = std::make_unique<ColdRecipe>();
-  synGraphHandle graph = nullptr;
-  std::array<synSectionHandle, 2> sections{};
-  std::array<synTensor, 2> tensors{};
-  const auto check = [](synStatus status, const char* message) {
-    TORCH_CHECK(status == synSuccess, "GaudiRT: ", message, " status=", static_cast<int>(status));
-  };
-  auto cleanup = [&] {
-    if (graph) synGraphDestroy(graph);
-    for (auto tensor : tensors) if (tensor) synTensorDestroy(tensor);
-    for (auto section : sections) if (section) synSectionDestroy(section);
-  };
-  try {
-    check(synGraphCreate(&graph, synDeviceGaudi2), "graph creation failed");
-    TORCH_CHECK(width == 1 || width == 2 || width == 4 || width == 8,
-                "GaudiRT: unsupported fill width");
+  {
+    SynapseGraphBuilder builder(key, *recipe);
     const uint64_t lanes = width == 8 ? 2 : 1;
     const uint64_t output_columns = width == 8 ? count : (count * width + 3) / 4;
-    for (size_t i = 0; i < tensors.size(); ++i) {
-      recipe->names[i] = key + "_t" + std::to_string(i);
-      check(synSectionCreate(&sections[i], 0, graph), "section creation failed");
-      check(synSectionSetPersistent(sections[i], true), "section setup failed");
-      synTensorDescriptor desc{};
-      desc.m_name = recipe->names[i].c_str();
-      desc.m_dataType = syn_type_uint32;
-      desc.m_dims = 2;
-      desc.m_sizes[0] = desc.m_minSizes[0] = lanes;
-      desc.m_sizes[1] = desc.m_minSizes[1] = i == 0 ? 1 : output_columns;
-      check(synTensorCreate(&tensors[i], &desc, sections[i], 0), "tensor creation failed");
-      recipe->tensors[i].tensorName = recipe->names[i].c_str();
-      recipe->tensors[i].tensorType = DATA_TENSOR;
-      recipe->tensors[i].tensorSize[0] = desc.m_sizes[0];
-      recipe->tensors[i].tensorSize[1] = desc.m_sizes[1];
-    }
-    const std::string guid = "broadcast_non_fcd_u32";
-    const auto node = key + "_n0";
-    ns_BroadcastNonFcd::Params params{1};
-    check(synNodeCreate(graph, &tensors[0], &tensors[1], 1, 1, &params, sizeof(params),
-                        guid.c_str(), node.c_str(), nullptr, nullptr), "broadcast node creation failed");
-    recipe->recipe = compile_cached(graph, key, key, &ctx.cache);
-    check(synWorkspaceGetSize(&recipe->workspace, recipe->recipe), "workspace query failed");
-    initialize_launch_tensor_ids(recipe->recipe, recipe->tensors.data(), recipe->tensors.size());
-    cleanup();
-  } catch (...) {
-    cleanup();
-    throw;
+    auto in = builder.tensor(syn_type_uint32, {lanes, 1}, 0);
+    auto out = builder.tensor(syn_type_uint32, {lanes, output_columns}, 1);
+    builder.node(NodeSpec{"broadcast_non_fcd_u32", {in}, {out}, ns_BroadcastNonFcd::Params{1}});
+    builder.compile(ctx.cache, key);
   }
   auto [it, inserted] = ctx.cold_recipes.emplace(key, std::move(recipe));
   TORCH_CHECK(inserted, "GaudiRT: duplicate cold recipe");
@@ -118,121 +84,46 @@ ColdRecipe& cast_recipe(Context& ctx, uint64_t count, at::ScalarType from, at::S
   auto found = ctx.cold_recipes.find(key);
   if (found != ctx.cold_recipes.end()) return *found->second;
   auto recipe = std::make_unique<ColdRecipe>();
-  synGraphHandle graph = nullptr;
-  std::array<synSectionHandle, 2> sections{};
-  std::array<synTensor, 9> tensors{};
-  std::array<std::string, 7> internal_names{};
-  const auto check = [](synStatus status, const char* message) {
-    TORCH_CHECK(status == synSuccess, "GaudiRT: ", message, " status=", static_cast<int>(status));
-  };
-  auto cleanup = [&] {
-    if (graph) synGraphDestroy(graph);
-    for (auto tensor : tensors) if (tensor) synTensorDestroy(tensor);
-    for (auto section : sections) if (section) synSectionDestroy(section);
-  };
-  try {
-    check(synGraphCreate(&graph, synDeviceGaudi2), "cast graph creation failed");
-    for (size_t i = 0; i < recipe->tensors.size(); ++i) {
-      recipe->names[i] = key + "_t" + std::to_string(i);
-      check(synSectionCreate(&sections[i], 0, graph), "cast section creation failed");
-      check(synSectionSetPersistent(sections[i], true), "cast section setup failed");
-      synTensorDescriptor desc{};
-      desc.m_name = recipe->names[i].c_str();
-      desc.m_dataType = i == 0 ? input_type.syn : output_type.syn;
-      desc.m_dims = 1;
-      desc.m_sizes[0] = desc.m_minSizes[0] = count;
-      check(synTensorCreate(&tensors[i], &desc, sections[i], 0), "cast tensor creation failed");
-      recipe->tensors[i].tensorName = recipe->names[i].c_str();
-      recipe->tensors[i].tensorType = DATA_TENSOR;
-      recipe->tensors[i].tensorSize[0] = count;
-    }
+  {
+    SynapseGraphBuilder builder(key, *recipe);
+    auto in = builder.tensor(input_type.syn, {count}, 0);
+    auto out = builder.tensor(output_type.syn, {count}, 1);
     if (to == at::kBool) {
-      for (size_t i = 2; i < 4; ++i) {
-        internal_names[i - 2] = key + "_t" + std::to_string(i);
-        synTensorDescriptor desc{};
-        desc.m_name = internal_names[i - 2].c_str();
-        desc.m_dataType = i == 2 ? input_type.syn : syn_type_uint8;
-        desc.m_dims = 1;
-        desc.m_sizes[0] = desc.m_minSizes[0] = count;
-        check(synTensorCreate(&tensors[i], &desc, nullptr, 0), "comparison tensor creation failed");
-      }
+      auto zero_val = builder.tensor(input_type.syn, {count}, -1);
+      auto is_zero = builder.tensor(syn_type_uint8, {count}, -1);
       ns_ConstantKernel::ParamsV3 zero{};
-      const auto zero_guid = "constant_" + std::string(input_type.name);
-      const auto zero_node = key + "_n0";
-      check(synNodeCreate(graph, nullptr, &tensors[2], 0, 1, &zero, sizeof(zero),
-                          zero_guid.c_str(), zero_node.c_str(), nullptr, nullptr), "zero node creation failed");
-      const auto equal_guid = "equal_fwd_" + std::string(input_type.name);
-      const auto equal_node = key + "_n1";
-      synTensor inputs[] = {tensors[0], tensors[2]};
-      check(synNodeCreate(graph, inputs, &tensors[3], 2, 1, nullptr, 0,
-                          equal_guid.c_str(), equal_node.c_str(), nullptr, nullptr), "equal node creation failed");
-      const auto not_node = key + "_n2";
-      check(synNodeCreate(graph, &tensors[3], &tensors[1], 1, 1, nullptr, 0,
-                          "not_fwd_u8", not_node.c_str(), nullptr, nullptr), "not node creation failed");
+      builder.node(NodeSpec{"constant_" + std::string(input_type.name), {}, {zero_val}, zero});
+      builder.node(NodeSpec{"equal_fwd_" + std::string(input_type.name), {in, zero_val}, {is_zero}, {}});
+      builder.node(NodeSpec{"not_fwd_u8", {is_zero}, {out}, {}});
     } else if (to == at::kInt && (from == at::kFloat || from == at::kBFloat16)) {
-      const synDataType types[] = {syn_type_int32, input_type.syn, syn_type_uint8,
-                                   syn_type_uint8, syn_type_uint8, syn_type_float, syn_type_int32};
-      for (size_t i = 2; i < tensors.size(); ++i) {
-        internal_names[i - 2] = key + "_t" + std::to_string(i);
-        synTensorDescriptor desc{};
-        desc.m_name = internal_names[i - 2].c_str();
-        desc.m_dataType = types[i - 2];
-        desc.m_dims = 1;
-        desc.m_sizes[0] = desc.m_minSizes[0] = count;
-        check(synTensorCreate(&tensors[i], &desc, nullptr, 0), "safe cast tensor creation failed");
-      }
+      auto raw_i32 = builder.tensor(syn_type_int32, {count}, -1);
+      auto pos_thr = builder.tensor(input_type.syn, {count}, -1);
+      auto ovf_u8 = builder.tensor(syn_type_uint8, {count}, -1);
+      auto nan_u8 = builder.tensor(syn_type_uint8, {count}, -1);
+      auto bad_u8 = builder.tensor(syn_type_uint8, {count}, -1);
+      auto neg_f32 = builder.tensor(syn_type_float, {count}, -1);
+      auto sen_i32 = builder.tensor(syn_type_int32, {count}, -1);
       ns_CastKernel::ParamsV3 cast{};
       cast.round_mode = CAST_ROUND_ZERO;
-      const auto cast_guid = "cast_" + std::string(input_type.name) + "_to_i32";
-      const auto cast_node = key + "_n0";
-      check(synNodeCreate(graph, &tensors[0], &tensors[2], 1, 1, &cast, sizeof(cast),
-                          cast_guid.c_str(), cast_node.c_str(), nullptr, nullptr), "safe cast node creation failed");
+      builder.node(NodeSpec{"cast_" + std::string(input_type.name) + "_to_i32", {in}, {raw_i32}, cast});
       ns_ConstantKernel::ParamsV3 positive{};
       positive.constant.f = 2147483648.0f;
-      const auto constant_guid = "constant_" + std::string(input_type.name);
-      const auto positive_node = key + "_n1";
-      check(synNodeCreate(graph, nullptr, &tensors[3], 0, 1, &positive, sizeof(positive),
-                          constant_guid.c_str(), positive_node.c_str(), nullptr, nullptr), "threshold node creation failed");
-      synTensor comparison_inputs[] = {tensors[0], tensors[3]};
-      const auto compare_guid = "greater_equal_fwd_" + std::string(input_type.name);
-      const auto compare_node = key + "_n2";
-      check(synNodeCreate(graph, comparison_inputs, &tensors[4], 2, 1, nullptr, 0,
-                          compare_guid.c_str(), compare_node.c_str(), nullptr, nullptr), "overflow node creation failed");
-      const auto isnan_guid = "isnan_fwd_" + std::string(input_type.name);
-      const auto isnan_node = key + "_n3";
-      check(synNodeCreate(graph, &tensors[0], &tensors[5], 1, 1, nullptr, 0,
-                          isnan_guid.c_str(), isnan_node.c_str(), nullptr, nullptr), "isnan node creation failed");
-      synTensor masks[] = {tensors[4], tensors[5]};
-      const auto or_node = key + "_n4";
-      check(synNodeCreate(graph, masks, &tensors[6], 2, 1, nullptr, 0,
-                          "or_fwd_u8", or_node.c_str(), nullptr, nullptr), "mask node creation failed");
+      builder.node(NodeSpec{"constant_" + std::string(input_type.name), {}, {pos_thr}, positive});
+      builder.node(NodeSpec{"greater_equal_fwd_" + std::string(input_type.name), {in, pos_thr}, {ovf_u8}, {}});
+      builder.node(NodeSpec{"isnan_fwd_" + std::string(input_type.name), {in}, {nan_u8}, {}});
+      builder.node(NodeSpec{"or_fwd_u8", {ovf_u8, nan_u8}, {bad_u8}, {}});
       ns_ConstantKernel::ParamsV3 negative{};
       negative.constant.f = -2147483648.0f;
-      const auto negative_node = key + "_n5";
-      check(synNodeCreate(graph, nullptr, &tensors[7], 0, 1, &negative, sizeof(negative),
-                          "constant_f32", negative_node.c_str(), nullptr, nullptr), "sentinel node creation failed");
-      const auto sentinel_node = key + "_n6";
-      check(synNodeCreate(graph, &tensors[7], &tensors[8], 1, 1, &cast, sizeof(cast),
-                          "cast_f32_to_i32", sentinel_node.c_str(), nullptr, nullptr), "sentinel cast creation failed");
-      synTensor choices[] = {tensors[6], tensors[8], tensors[2]};
-      const auto where_node = key + "_n7";
-      check(synNodeCreate(graph, choices, &tensors[1], 3, 1, nullptr, 0,
-                          "where_fwd_i32", where_node.c_str(), nullptr, nullptr), "safe cast selection failed");
+      builder.node(NodeSpec{"constant_f32", {}, {neg_f32}, negative});
+      builder.node(NodeSpec{"cast_f32_to_i32", {neg_f32}, {sen_i32}, cast});
+      builder.node(NodeSpec{"where_fwd_i32", {bad_u8, sen_i32, raw_i32}, {out}, {}});
     } else {
-      const auto guid = "cast_" + std::string(input_type.name) + "_to_" + output_type.name;
-      const auto node = key + "_n0";
       ns_CastKernel::ParamsV3 params{};
       params.round_mode = (to == at::kInt || to == at::kLong) ? CAST_ROUND_ZERO : CAST_ROUND_HALF_NE;
-      check(synNodeCreate(graph, &tensors[0], &tensors[1], 1, 1, &params, sizeof(params),
-                          guid.c_str(), node.c_str(), nullptr, nullptr), "cast node creation failed");
+      builder.node(NodeSpec{"cast_" + std::string(input_type.name) + "_to_" + output_type.name,
+                            {in}, {out}, params});
     }
-    recipe->recipe = compile_cached(graph, key, key, &ctx.cache);
-    check(synWorkspaceGetSize(&recipe->workspace, recipe->recipe), "cast workspace query failed");
-    initialize_launch_tensor_ids(recipe->recipe, recipe->tensors.data(), recipe->tensors.size());
-    cleanup();
-  } catch (...) {
-    cleanup();
-    throw;
+    builder.compile(ctx.cache, key);
   }
   auto [it, inserted] = ctx.cold_recipes.emplace(key, std::move(recipe));
   TORCH_CHECK(inserted, "GaudiRT: duplicate cold cast recipe");

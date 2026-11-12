@@ -2,6 +2,7 @@
 #include "bridge_internal.hpp"
 #include "eager_copy.hpp"
 #include "eager_index.hpp"
+#include "graph_builder.hpp"
 #include "layout_copy.hpp"
 #include "temporaries.hpp"
 #include "gaudirt/common/sha256.hpp"
@@ -46,49 +47,23 @@ ColdRecipe& cat_recipe(Context& ctx, const std::vector<at::Tensor>& inputs,
   auto found = ctx.cold_recipes.find(key);
   if (found != ctx.cold_recipes.end()) return *found->second;
   auto recipe = std::make_unique<ColdRecipe>(inputs.size() + 1);
-  synGraphHandle graph = nullptr;
-  std::vector<synSectionHandle> sections(recipe->tensors.size(), nullptr);
-  std::vector<synTensor> tensors(recipe->tensors.size(), nullptr);
-  const auto check = [](synStatus status, const char* message) {
-    TORCH_CHECK(status == synSuccess, "GaudiRT: ", message, " status=", static_cast<int>(status));
-  };
-  auto cleanup = [&] {
-    if (graph) synGraphDestroy(graph);
-    for (auto tensor : tensors) if (tensor) synTensorDestroy(tensor);
-    for (auto section : sections) if (section) synSectionDestroy(section);
-  };
-  try {
-    check(synGraphCreate(&graph, synDeviceGaudi2), "cat graph creation failed");
-    for (size_t i = 0; i < tensors.size(); ++i) {
+  {
+    SynapseGraphBuilder builder(key, *recipe);
+    std::vector<synTensor> cat_inputs;
+    cat_inputs.reserve(inputs.size());
+    synTensor out_tensor = nullptr;
+    for (size_t i = 0; i <= inputs.size(); ++i) {
       const auto& tensor = i < inputs.size() ? inputs[i] : output;
-      recipe->names[i] = key + "_t" + std::to_string(i);
-      check(synSectionCreate(&sections[i], 0, graph), "cat section creation failed");
-      check(synSectionSetPersistent(sections[i], true), "cat section setup failed");
-      synTensorDescriptor desc{};
-      desc.m_name = recipe->names[i].c_str();
-      desc.m_dataType = cast_type(tensor.scalar_type()).syn;
-      desc.m_dims = tensor.dim();
-      for (int64_t dim = 0; dim < tensor.dim(); ++dim) {
-        auto size = tensor.size(tensor.dim() - dim - 1);
-        desc.m_sizes[dim] = desc.m_minSizes[dim] = size;
-        recipe->tensors[i].tensorSize[dim] = size;
-      }
-      check(synTensorCreate(&tensors[i], &desc, sections[i], 0), "cat tensor creation failed");
-      recipe->tensors[i].tensorName = recipe->names[i].c_str();
-      recipe->tensors[i].tensorType = DATA_TENSOR;
+      std::vector<uint64_t> dims(tensor.dim());
+      for (int64_t dim = 0; dim < tensor.dim(); ++dim)
+        dims[dim] = static_cast<uint64_t>(tensor.size(tensor.dim() - dim - 1));
+      auto handle = builder.tensor(cast_type(tensor.scalar_type()).syn, dims, static_cast<int>(i));
+      if (i < inputs.size()) cat_inputs.push_back(handle);
+      else out_tensor = handle;
     }
     synConcatenateParams params{static_cast<unsigned>(output.dim() - axis - 1)};
-    const auto node = key + "_n0";
-    check(synNodeCreate(graph, tensors.data(), &tensors.back(), inputs.size(), 1,
-                        &params, sizeof(params), "concat", node.c_str(), nullptr, nullptr),
-          "cat node creation failed");
-    recipe->recipe = compile_cached(graph, key, key, &ctx.cache);
-    check(synWorkspaceGetSize(&recipe->workspace, recipe->recipe), "cat workspace query failed");
-    initialize_launch_tensor_ids(recipe->recipe, recipe->tensors.data(), recipe->tensors.size());
-    cleanup();
-  } catch (...) {
-    cleanup();
-    throw;
+    builder.node(NodeSpec{"concat", std::move(cat_inputs), {out_tensor}, params});
+    builder.compile(ctx.cache, key);
   }
   auto [it, inserted] = ctx.cold_recipes.emplace(key, std::move(recipe));
   TORCH_CHECK(inserted, "GaudiRT: duplicate cold cat recipe");
@@ -190,101 +165,39 @@ ColdRecipe& range_recipe(Context& ctx, uint32_t count, at::ScalarType dtype, boo
   auto found = ctx.cold_recipes.find(key);
   if (found != ctx.cold_recipes.end()) return *found->second;
   auto recipe = std::make_unique<ColdRecipe>(3);
-  synGraphHandle graph = nullptr;
-  std::array<synSectionHandle, 3> sections{};
-  std::array<synTensor, 9> tensors{};
-  std::array<std::string, 6> internal_names{};
-  const auto check = [](synStatus status, const char* message) {
-    TORCH_CHECK(status == synSuccess, "GaudiRT: ", message, " status=", static_cast<int>(status));
-  };
-  auto cleanup = [&] {
-    if (graph) synGraphDestroy(graph);
-    for (auto tensor : tensors) if (tensor) synTensorDestroy(tensor);
-    for (auto section : sections) if (section) synSectionDestroy(section);
-  };
-  try {
-    check(synGraphCreate(&graph, synDeviceGaudi2), "range graph creation failed");
-    for (size_t i = 0; i < 3; ++i) {
-      recipe->names[i] = key + "_t" + std::to_string(i);
-      check(synSectionCreate(&sections[i], 0, graph), "range section creation failed");
-      check(synSectionSetPersistent(sections[i], true), "range section setup failed");
-      synTensorDescriptor desc{};
-      desc.m_name = recipe->names[i].c_str();
-      desc.m_dataType = i < 2 ? syn_type_int32 : type.syn;
-      desc.m_dims = 1;
-      desc.m_sizes[0] = desc.m_minSizes[0] = i < 2 ? 1 : count;
-      check(synTensorCreate(&tensors[i], &desc, sections[i], 0), "range tensor creation failed");
-      recipe->tensors[i].tensorName = recipe->names[i].c_str();
-      recipe->tensors[i].tensorType = DATA_TENSOR;
-      recipe->tensors[i].tensorSize[0] = i < 2 ? 1 : count;
-    }
-    const size_t internal_count = wide ? (dtype == at::kInt ? 6 : 5) :
-                                         (dtype == at::kLong ? 3 : 2);
-    for (size_t i = 0; i < internal_count; ++i) {
-      internal_names[i] = key + "_t" + std::to_string(i + 3);
-      synTensorDescriptor desc{};
-      desc.m_name = internal_names[i].c_str();
-      desc.m_dataType = wide && i > 0 ? syn_type_int64 : syn_type_int32;
-      desc.m_dims = 1;
-      desc.m_sizes[0] = desc.m_minSizes[0] = wide && (i == 2 || i == 3) ? 1 : count;
-      check(synTensorCreate(&tensors[i + 3], &desc, nullptr, 0), "range intermediate creation failed");
-    }
+  {
+    SynapseGraphBuilder builder(key, *recipe);
+    auto start = builder.tensor(syn_type_int32, {1}, 0);
+    auto step = builder.tensor(syn_type_int32, {1}, 1);
+    auto out = builder.tensor(type.syn, {count}, 2);
+    auto idx_i32 = builder.tensor(syn_type_int32, {count}, -1);
     ns_RangeKernel::Params params{};
     params.start.i = 0;
     params.limit.i = count;
     params.delta.i = 1;
-    const auto node = key + "_n0";
-    check(synNodeCreate(graph, nullptr, &tensors[3], 0, 1, &params, sizeof(params),
-                        "range_i32", node.c_str(), nullptr, nullptr), "range node creation failed");
+    builder.node(NodeSpec{"range_i32", {}, {idx_i32}, params});
+    ns_CastKernel::ParamsV3 cast{};
+    cast.round_mode = CAST_ROUND_ZERO;
     if (wide) {
-      ns_CastKernel::ParamsV3 cast{};
-      cast.round_mode = CAST_ROUND_ZERO;
-      for (size_t i = 0; i < 3; ++i) {
-        const size_t input = i == 0 ? 3 : i - 1;
-        const size_t output = i + 4;
-        const auto cast_node = key + "_n" + std::to_string(i + 1);
-        check(synNodeCreate(graph, &tensors[input], &tensors[output], 1, 1, &cast, sizeof(cast),
-                            "cast_i32_to_i64", cast_node.c_str(), nullptr, nullptr), "wide range cast failed");
-      }
-      synTensor multiply[] = {tensors[4], tensors[6]};
-      const auto multiply_node = key + "_n4";
-      check(synNodeCreate(graph, multiply, &tensors[7], 2, 1, nullptr, 0,
-                          "mult_fwd_i64", multiply_node.c_str(), nullptr, nullptr), "wide range multiply failed");
-      synTensor add[] = {tensors[7], tensors[5]};
-      auto* sum = dtype == at::kInt ? &tensors[8] : &tensors[2];
-      const auto add_node = key + "_n5";
-      check(synNodeCreate(graph, add, sum, 2, 1, nullptr, 0,
-                          "add_fwd_i64", add_node.c_str(), nullptr, nullptr), "wide range add failed");
-      if (dtype == at::kInt) {
-        const auto cast_node = key + "_n6";
-        check(synNodeCreate(graph, &tensors[8], &tensors[2], 1, 1, &cast, sizeof(cast),
-                            "cast_i64_to_i32", cast_node.c_str(), nullptr, nullptr), "wide range output cast failed");
-      }
+      auto idx_i64 = builder.tensor(syn_type_int64, {count}, -1);
+      auto start_i64 = builder.tensor(syn_type_int64, {1}, -1);
+      auto step_i64 = builder.tensor(syn_type_int64, {1}, -1);
+      auto prod_i64 = builder.tensor(syn_type_int64, {count}, -1);
+      auto sum_i64 = dtype == at::kInt ? builder.tensor(syn_type_int64, {count}, -1) : out;
+      builder.node(NodeSpec{"cast_i32_to_i64", {idx_i32}, {idx_i64}, cast});
+      builder.node(NodeSpec{"cast_i32_to_i64", {start}, {start_i64}, cast});
+      builder.node(NodeSpec{"cast_i32_to_i64", {step}, {step_i64}, cast});
+      builder.node(NodeSpec{"mult_fwd_i64", {idx_i64, step_i64}, {prod_i64}, {}});
+      builder.node(NodeSpec{"add_fwd_i64", {prod_i64, start_i64}, {sum_i64}, {}});
+      if (dtype == at::kInt) builder.node(NodeSpec{"cast_i64_to_i32", {sum_i64}, {out}, cast});
     } else {
-      synTensor multiply[] = {tensors[3], tensors[1]};
-      const auto multiply_node = key + "_n1";
-      check(synNodeCreate(graph, multiply, &tensors[4], 2, 1, nullptr, 0,
-                          "mult_fwd_i32", multiply_node.c_str(), nullptr, nullptr), "range multiply creation failed");
-      synTensor add[] = {tensors[4], tensors[0]};
-      auto* sum = dtype == at::kLong ? &tensors[5] : &tensors[2];
-      const auto add_node = key + "_n2";
-      check(synNodeCreate(graph, add, sum, 2, 1, nullptr, 0,
-                          "add_fwd_i32", add_node.c_str(), nullptr, nullptr), "range add creation failed");
-      if (dtype == at::kLong) {
-        ns_CastKernel::ParamsV3 cast{};
-        cast.round_mode = CAST_ROUND_ZERO;
-        const auto cast_node = key + "_n3";
-        check(synNodeCreate(graph, &tensors[5], &tensors[2], 1, 1, &cast, sizeof(cast),
-                            "cast_i32_to_i64", cast_node.c_str(), nullptr, nullptr), "range cast creation failed");
-      }
+      auto prod_i32 = builder.tensor(syn_type_int32, {count}, -1);
+      auto sum_i32 = dtype == at::kLong ? builder.tensor(syn_type_int32, {count}, -1) : out;
+      builder.node(NodeSpec{"mult_fwd_i32", {idx_i32, step}, {prod_i32}, {}});
+      builder.node(NodeSpec{"add_fwd_i32", {prod_i32, start}, {sum_i32}, {}});
+      if (dtype == at::kLong) builder.node(NodeSpec{"cast_i32_to_i64", {sum_i32}, {out}, cast});
     }
-    recipe->recipe = compile_cached(graph, key, key, &ctx.cache);
-    check(synWorkspaceGetSize(&recipe->workspace, recipe->recipe), "range workspace query failed");
-    initialize_launch_tensor_ids(recipe->recipe, recipe->tensors.data(), recipe->tensors.size());
-    cleanup();
-  } catch (...) {
-    cleanup();
-    throw;
+    builder.compile(ctx.cache, key);
   }
   auto [it, inserted] = ctx.cold_recipes.emplace(key, std::move(recipe));
   TORCH_CHECK(inserted, "GaudiRT: duplicate cold range recipe");
@@ -297,77 +210,27 @@ ColdRecipe& range64_recipe(Context& ctx, uint32_t count, at::ScalarType dtype) {
   auto found = ctx.cold_recipes.find(key);
   if (found != ctx.cold_recipes.end()) return *found->second;
   auto recipe = std::make_unique<ColdRecipe>(3);
-  synGraphHandle graph = nullptr;
-  std::array<synSectionHandle, 3> sections{};
-  std::array<synTensor, 7> tensors{};
-  std::array<std::string, 4> internal_names{};
-  const auto check = [](synStatus status, const char* message) {
-    TORCH_CHECK(status == synSuccess, "GaudiRT: ", message, " status=", static_cast<int>(status));
-  };
-  auto cleanup = [&] {
-    if (graph) synGraphDestroy(graph);
-    for (auto tensor : tensors) if (tensor) synTensorDestroy(tensor);
-    for (auto section : sections) if (section) synSectionDestroy(section);
-  };
-  try {
-    check(synGraphCreate(&graph, synDeviceGaudi2), "wide-parameter range graph creation failed");
-    for (size_t i = 0; i < 3; ++i) {
-      recipe->names[i] = key + "_t" + std::to_string(i);
-      check(synSectionCreate(&sections[i], 0, graph), "wide-parameter range section creation failed");
-      check(synSectionSetPersistent(sections[i], true), "wide-parameter range section setup failed");
-      synTensorDescriptor desc{};
-      desc.m_name = recipe->names[i].c_str();
-      desc.m_dataType = i < 2 ? syn_type_int64 : type.syn;
-      desc.m_dims = 1;
-      desc.m_sizes[0] = desc.m_minSizes[0] = i < 2 ? 1 : count;
-      check(synTensorCreate(&tensors[i], &desc, sections[i], 0), "wide-parameter range tensor creation failed");
-      recipe->tensors[i].tensorName = recipe->names[i].c_str();
-      recipe->tensors[i].tensorType = DATA_TENSOR;
-      recipe->tensors[i].tensorSize[0] = i < 2 ? 1 : count;
-    }
-    const size_t internal_count = dtype == at::kInt ? 4 : 3;
-    for (size_t i = 0; i < internal_count; ++i) {
-      internal_names[i] = key + "_t" + std::to_string(i + 3);
-      synTensorDescriptor desc{};
-      desc.m_name = internal_names[i].c_str();
-      desc.m_dataType = i == 0 ? syn_type_int32 : syn_type_int64;
-      desc.m_dims = 1;
-      desc.m_sizes[0] = desc.m_minSizes[0] = count;
-      check(synTensorCreate(&tensors[i + 3], &desc, nullptr, 0), "wide-parameter range intermediate failed");
-    }
+  {
+    SynapseGraphBuilder builder(key, *recipe);
+    auto start = builder.tensor(syn_type_int64, {1}, 0);
+    auto step = builder.tensor(syn_type_int64, {1}, 1);
+    auto out = builder.tensor(type.syn, {count}, 2);
+    auto idx_i32 = builder.tensor(syn_type_int32, {count}, -1);
+    auto idx_i64 = builder.tensor(syn_type_int64, {count}, -1);
+    auto prod_i64 = builder.tensor(syn_type_int64, {count}, -1);
+    auto sum_i64 = dtype == at::kInt ? builder.tensor(syn_type_int64, {count}, -1) : out;
     ns_RangeKernel::Params params{};
     params.start.i = 0;
     params.limit.i = count;
     params.delta.i = 1;
-    const auto range_node = key + "_n0";
-    check(synNodeCreate(graph, nullptr, &tensors[3], 0, 1, &params, sizeof(params),
-                        "range_i32", range_node.c_str(), nullptr, nullptr), "range node creation failed");
+    builder.node(NodeSpec{"range_i32", {}, {idx_i32}, params});
     ns_CastKernel::ParamsV3 cast{};
     cast.round_mode = CAST_ROUND_ZERO;
-    const auto cast_node = key + "_n1";
-    check(synNodeCreate(graph, &tensors[3], &tensors[4], 1, 1, &cast, sizeof(cast),
-                        "cast_i32_to_i64", cast_node.c_str(), nullptr, nullptr), "range index cast failed");
-    synTensor multiply[] = {tensors[4], tensors[1]};
-    const auto multiply_node = key + "_n2";
-    check(synNodeCreate(graph, multiply, &tensors[5], 2, 1, nullptr, 0,
-                        "mult_fwd_i64", multiply_node.c_str(), nullptr, nullptr), "range multiply failed");
-    synTensor add[] = {tensors[5], tensors[0]};
-    auto* sum = dtype == at::kInt ? &tensors[6] : &tensors[2];
-    const auto add_node = key + "_n3";
-    check(synNodeCreate(graph, add, sum, 2, 1, nullptr, 0,
-                        "add_fwd_i64", add_node.c_str(), nullptr, nullptr), "range add failed");
-    if (dtype == at::kInt) {
-      const auto output_node = key + "_n4";
-      check(synNodeCreate(graph, &tensors[6], &tensors[2], 1, 1, &cast, sizeof(cast),
-                          "cast_i64_to_i32", output_node.c_str(), nullptr, nullptr), "range output cast failed");
-    }
-    recipe->recipe = compile_cached(graph, key, key, &ctx.cache);
-    check(synWorkspaceGetSize(&recipe->workspace, recipe->recipe), "range workspace query failed");
-    initialize_launch_tensor_ids(recipe->recipe, recipe->tensors.data(), recipe->tensors.size());
-    cleanup();
-  } catch (...) {
-    cleanup();
-    throw;
+    builder.node(NodeSpec{"cast_i32_to_i64", {idx_i32}, {idx_i64}, cast});
+    builder.node(NodeSpec{"mult_fwd_i64", {idx_i64, step}, {prod_i64}, {}});
+    builder.node(NodeSpec{"add_fwd_i64", {prod_i64, start}, {sum_i64}, {}});
+    if (dtype == at::kInt) builder.node(NodeSpec{"cast_i64_to_i32", {sum_i64}, {out}, cast});
+    builder.compile(ctx.cache, key);
   }
   auto [it, inserted] = ctx.cold_recipes.emplace(key, std::move(recipe));
   TORCH_CHECK(inserted, "GaudiRT: duplicate wide-parameter range recipe");
@@ -545,63 +408,25 @@ ColdRecipe& pointwise_recipe(Context& ctx, const std::string& op,
   auto found = ctx.cold_recipes.find(key);
   if (found != ctx.cold_recipes.end()) return *found->second;
   auto recipe = std::make_unique<ColdRecipe>(types.size());
-  synGraphHandle graph = nullptr;
-  const bool negate_equal = op.rfind("not_equal_fwd_", 0) == 0;
-  std::vector<synSectionHandle> sections(types.size(), nullptr);
-  std::vector<synTensor> tensors(types.size() + (negate_equal ? 1 : 0), nullptr);
-  const std::string intermediate_name = key + "_t" + std::to_string(types.size());
-  const auto check = [](synStatus status, const char* message) {
-    TORCH_CHECK(status == synSuccess, "GaudiRT: ", message, " status=", static_cast<int>(status));
-  };
-  auto cleanup = [&] {
-    if (graph) synGraphDestroy(graph);
-    for (auto tensor : tensors) if (tensor) synTensorDestroy(tensor);
-    for (auto section : sections) if (section) synSectionDestroy(section);
-  };
-  try {
-    check(synGraphCreate(&graph, synDeviceGaudi2), "pointwise graph creation failed");
+  {
+    SynapseGraphBuilder builder(key, *recipe);
+    std::vector<synTensor> inputs;
+    inputs.reserve(types.size() - 1);
+    synTensor out = nullptr;
     for (size_t i = 0; i < types.size(); ++i) {
-      recipe->names[i] = key + "_t" + std::to_string(i);
-      check(synSectionCreate(&sections[i], 0, graph), "pointwise section creation failed");
-      check(synSectionSetPersistent(sections[i], true), "pointwise section setup failed");
-      synTensorDescriptor desc{};
-      desc.m_name = recipe->names[i].c_str();
-      desc.m_dataType = types[i];
-      desc.m_dims = 1;
-      desc.m_sizes[0] = desc.m_minSizes[0] = count;
-      check(synTensorCreate(&tensors[i], &desc, sections[i], 0), "pointwise tensor creation failed");
-      recipe->tensors[i].tensorName = recipe->names[i].c_str();
-      recipe->tensors[i].tensorType = DATA_TENSOR;
-      recipe->tensors[i].tensorSize[0] = count;
+      auto handle = builder.tensor(types[i], {count}, static_cast<int>(i));
+      if (i + 1 < types.size()) inputs.push_back(handle);
+      else out = handle;
     }
-    const auto node = key + "_n0";
-    if (negate_equal) {
-      synTensorDescriptor desc{};
-      desc.m_name = intermediate_name.c_str();
-      desc.m_dataType = syn_type_uint8;
-      desc.m_dims = 1;
-      desc.m_sizes[0] = desc.m_minSizes[0] = count;
-      check(synTensorCreate(&tensors.back(), &desc, nullptr, 0), "comparison intermediate creation failed");
-      const auto equal_op = "equal_fwd_" + op.substr(std::strlen("not_equal_fwd_"));
-      check(synNodeCreate(graph, tensors.data(), &tensors.back(), types.size() - 1, 1,
-                          nullptr, 0, equal_op.c_str(), node.c_str(), nullptr, nullptr),
-            "equality node creation failed");
-      const auto not_node = key + "_n1";
-      check(synNodeCreate(graph, &tensors.back(), &tensors[types.size() - 1], 1, 1,
-                          nullptr, 0, "not_fwd_u8", not_node.c_str(), nullptr, nullptr),
-            "inequality node creation failed");
+    if (op.rfind("not_equal_fwd_", 0) == 0) {
+      auto eq_u8 = builder.tensor(syn_type_uint8, {count}, -1);
+      builder.node(NodeSpec{"equal_fwd_" + op.substr(std::strlen("not_equal_fwd_")),
+                            std::move(inputs), {eq_u8}, {}});
+      builder.node(NodeSpec{"not_fwd_u8", {eq_u8}, {out}, {}});
     } else {
-      check(synNodeCreate(graph, tensors.data(), &tensors.back(), types.size() - 1, 1,
-                          nullptr, 0, op.c_str(), node.c_str(), nullptr, nullptr),
-            "pointwise node creation failed");
+      builder.node(NodeSpec{op, std::move(inputs), {out}, {}});
     }
-    recipe->recipe = compile_cached(graph, key, key, &ctx.cache);
-    check(synWorkspaceGetSize(&recipe->workspace, recipe->recipe), "pointwise workspace query failed");
-    initialize_launch_tensor_ids(recipe->recipe, recipe->tensors.data(), recipe->tensors.size());
-    cleanup();
-  } catch (...) {
-    cleanup();
-    throw;
+    builder.compile(ctx.cache, key);
   }
   auto [it, inserted] = ctx.cold_recipes.emplace(key, std::move(recipe));
   TORCH_CHECK(inserted, "GaudiRT: duplicate cold pointwise recipe");

@@ -13,6 +13,7 @@
 #include "context.hpp"
 #include "fx_node.hpp"
 #include "fx_geometry.hpp"
+#include "graph_builder.hpp"
 #include "layout_copy.hpp"
 #include "eager_copy.hpp"
 #include "eager_index.hpp"
@@ -47,109 +48,6 @@
 
 namespace gaudirt::generic {
 using namespace runtime;
-
-ColdRecipe& bucket_linear_recipe(Context& ctx, at::ScalarType dtype, uint64_t k,
-                                 uint64_t n, uint32_t bucket, bool has_bias) {
-  const auto type = cast_type(dtype);
-  const std::string structure = "fx_mm_transpose_weight_v1_" + std::string(type.name) +
-                                "_" + std::to_string(k) + "_" + std::to_string(n) +
-                                (has_bias ? "_bias" : "");
-  const auto digest = gaudirt::common::sha256_bytes(
-      reinterpret_cast<const uint8_t*>(structure.data()), structure.size());
-  const auto prefix = "g" + digest.substr(0, 12) + "_b" + std::to_string(bucket);
-  const auto key = "fx_" + digest + "_b" + std::to_string(bucket);
-  auto found = ctx.cold_recipes.find(key);
-  if (found != ctx.cold_recipes.end()) return *found->second;
-  const size_t external_count = has_bias ? 4 : 3;
-  auto recipe = std::make_unique<ColdRecipe>(external_count);
-  synGraphHandle graph = nullptr;
-  std::array<synSectionHandle, 4> sections{};
-  std::array<synTensor, 7> tensors{};
-  std::array<std::string, 3> intermediate_names{};
-  const auto check = [](synStatus status, const char* message) {
-    TORCH_CHECK(status == synSuccess, "GaudiRT: ", message, " status=", static_cast<int>(status));
-  };
-  auto cleanup = [&] {
-    if (graph) synGraphDestroy(graph);
-    for (auto tensor : tensors) if (tensor) synTensorDestroy(tensor);
-    for (auto section : sections) if (section) synSectionDestroy(section);
-  };
-  try {
-    check(synGraphCreate(&graph, synDeviceGaudi2), "bucket graph creation failed");
-    const std::array<std::array<uint64_t, 2>, 4> shapes = has_bias ?
-        std::array<std::array<uint64_t, 2>, 4>{{{k, bucket}, {k, n}, {n, 1}, {n, bucket}}} :
-        std::array<std::array<uint64_t, 2>, 4>{{{k, bucket}, {k, n}, {n, bucket}, {0, 0}}};
-    for (size_t i = 0; i < external_count; ++i) {
-      recipe->names[i] = prefix + "_t" + std::to_string(i);
-      check(synSectionCreate(&sections[i], 0, graph), "bucket section creation failed");
-      check(synSectionSetPersistent(sections[i], true), "bucket section setup failed");
-      synTensorDescriptor desc{};
-      desc.m_name = recipe->names[i].c_str();
-      desc.m_dataType = type.syn;
-      desc.m_dims = 2;
-      for (size_t dim = 0; dim < 2; ++dim)
-        desc.m_sizes[dim] = desc.m_minSizes[dim] = shapes[i][dim];
-      check(synTensorCreate(&tensors[i], &desc, sections[i], 0), "bucket tensor creation failed");
-      recipe->tensors[i].tensorName = recipe->names[i].c_str();
-      recipe->tensors[i].tensorType = DATA_TENSOR;
-      recipe->tensors[i].tensorSize[0] = shapes[i][0];
-      recipe->tensors[i].tensorSize[1] = shapes[i][1];
-    }
-    synTensor inputs[] = {tensors[0], tensors[1]};
-    synGEMMParams params{false, true};
-    const auto node = prefix + "_n0";
-    if (has_bias) {
-      const bool bf16 = dtype == at::kBFloat16;
-      const size_t intermediate_count = bf16 ? 3 : 1;
-      for (size_t i = 0; i < intermediate_count; ++i) {
-        intermediate_names[i] = prefix + "_t" + std::to_string(i + external_count);
-        synTensorDescriptor desc{};
-        desc.m_name = intermediate_names[i].c_str();
-        desc.m_dataType = syn_type_float;
-        desc.m_dims = 2;
-        desc.m_sizes[0] = desc.m_minSizes[0] = n;
-        desc.m_sizes[1] = desc.m_minSizes[1] = bf16 && i == 1 ? 1 : bucket;
-        check(synTensorCreate(&tensors[external_count + i], &desc, nullptr, 0),
-              "bucket intermediate creation failed");
-      }
-    }
-    auto* gemm_output = has_bias ? &tensors[external_count] : &tensors[2];
-    check(synNodeCreate(graph, inputs, gemm_output, 2, 1, &params, sizeof(params),
-                        "gemm", node.c_str(), nullptr, nullptr), "bucket GEMM node creation failed");
-    if (has_bias) {
-      const bool bf16 = dtype == at::kBFloat16;
-      ns_CastKernel::ParamsV3 cast{};
-      cast.round_mode = CAST_ROUND_HALF_NE;
-      if (bf16) {
-        const auto cast_node = prefix + "_n1";
-        check(synNodeCreate(graph, &tensors[2], &tensors[5], 1, 1, &cast, sizeof(cast),
-                            "cast_bf16_to_f32", cast_node.c_str(), nullptr, nullptr),
-              "bucket bias cast failed");
-      }
-      synTensor add_inputs[] = {tensors[4], bf16 ? tensors[5] : tensors[2]};
-      auto* add_output = bf16 ? &tensors[6] : &tensors[3];
-      const auto add_node = prefix + "_n2";
-      check(synNodeCreate(graph, add_inputs, add_output, 2, 1, nullptr, 0,
-                          "add_fwd_f32", add_node.c_str(), nullptr, nullptr), "bucket bias add failed");
-      if (bf16) {
-        const auto output_node = prefix + "_n3";
-        check(synNodeCreate(graph, &tensors[6], &tensors[3], 1, 1, &cast, sizeof(cast),
-                            "cast_f32_to_bf16", output_node.c_str(), nullptr, nullptr),
-              "bucket output cast failed");
-      }
-    }
-    recipe->recipe = compile_cached(graph, prefix, key, &ctx.cache);
-    check(synWorkspaceGetSize(&recipe->workspace, recipe->recipe), "bucket workspace query failed");
-    initialize_launch_tensor_ids(recipe->recipe, recipe->tensors.data(), recipe->tensors.size());
-    cleanup();
-  } catch (...) {
-    cleanup();
-    throw;
-  }
-  auto [it, inserted] = ctx.cold_recipes.emplace(key, std::move(recipe));
-  TORCH_CHECK(inserted, "GaudiRT: duplicate bucket recipe");
-  return *it->second;
-}
 
 std::optional<at::Tensor> prepare_strided_input(const at::Tensor& input) {
   const auto active = current_device_index();
@@ -333,73 +231,16 @@ at::Tensor bucket_linear(const at::Tensor& input, const at::Tensor& weight,
                 bias->dim() == 1 && bias->size(0) == n,
                 "GaudiRT: bucket GEMM bias must be a same-device [N] tensor of matching dtype");
   }
-  const uint32_t bucket = std::bit_ceil(static_cast<uint32_t>(m));
-  const uint64_t item = input.element_size();
-  TORCH_CHECK(static_cast<uint64_t>(k) <= UINT64_MAX / bucket / item,
-              "GaudiRT: bucket GEMM input is too large");
-  const uint64_t bucket_bytes = static_cast<uint64_t>(bucket) * k * item;
-  auto ctx = current();
-  auto stream = ctx->stream();
-  const auto input_address = address_of(input, *ctx);
-  auto weight_value = weight;
-  auto weight_address = address_of(weight_value, *ctx);
-  const uint64_t offset = static_cast<uint64_t>(input.storage_offset()) * item;
-  const uint64_t storage_bytes = input.storage().nbytes();
-  const bool direct = input.is_contiguous() && input_address % BlockCachingAllocator::kAlignment == 0 &&
-                      offset <= storage_bytes && bucket_bytes <= storage_bytes - offset;
-  const bool overlaps = direct && input_address < weight_address + weight.nbytes() &&
-                        weight_address < input_address + bucket_bytes;
-  if (!weight_value.is_contiguous() || weight_address % BlockCachingAllocator::kAlignment || overlaps) {
-    weight_value = at::empty(weight.sizes(), weight.options());
-    copy(weight_value, weight, true);
-    weight_address = address_of(weight_value, *ctx);
-  }
-  at::Tensor bias_value;
-  uint64_t bias_address = 0;
+  std::vector<int64_t> roles{1, 0};
+  std::vector<at::Tensor> inputs{input, weight};
   if (bias) {
-    bias_value = *bias;
-    bias_address = address_of(bias_value, *ctx);
-    const auto bytes = bias_value.nbytes();
-    const bool input_overlap = direct && input_address < bias_address + bytes &&
-                               bias_address < input_address + bucket_bytes;
-    const bool weight_overlap = weight_address < bias_address + bytes &&
-                                bias_address < weight_address + weight_value.nbytes();
-    if (!bias_value.is_contiguous() || bias_address % BlockCachingAllocator::kAlignment ||
-        input_overlap || weight_overlap) {
-      bias_value = at::empty(bias->sizes(), bias->options());
-      copy(bias_value, *bias, true);
-      bias_address = address_of(bias_value, *ctx);
-    }
+    roles.push_back(0);
+    inputs.push_back(*bias);
   }
-  auto result = bucket_output(input, input.scalar_type(), bucket, m, n);
-  const auto output_address = address_of(result, *ctx);
-  std::lock_guard lock(ctx->cold_mutex);
-  auto& recipe = bucket_linear_recipe(*ctx, input.scalar_type(), k, n, bucket, bias.has_value());
-  if ((!direct || recipe.workspace) && !ctx->graph_pool) {
-    const uint64_t budget = std::min<uint64_t>(ctx->allocator.capacity_bytes() / 8, uint64_t{1} << 30);
-    TORCH_CHECK(budget >= 256, "GaudiRT: HBM budget is too small for graph temporaries");
-    ctx->ensure_graph_pool(budget, stream);
-  }
-  std::unique_ptr<GraphTemporary> staged, workspace;
-  ctx->allocator.record_stream(input_address, stream);
-  ctx->allocator.record_stream(weight_address, stream);
-  if (bias) ctx->allocator.record_stream(bias_address, stream);
-  ctx->allocator.record_stream(output_address, stream);
-  if (!direct) {
-    staged = std::make_unique<GraphTemporary>(*ctx->graph_pool, stream, bucket_bytes);
-    const Layout layout(input);
-    dma_copy(staged->address, nullptr, input_address, &layout, 0, input.numel(), item, stream, DRAM_TO_DRAM);
-  }
-  if (recipe.workspace)
-    workspace = std::make_unique<GraphTemporary>(*ctx->graph_pool, stream, recipe.workspace);
-  auto bindings = recipe.tensors;
-  bindings[0].pTensorAddress = staged ? staged->address : input_address;
-  bindings[1].pTensorAddress = weight_address;
-  if (bias) bindings[2].pTensorAddress = bias_address;
-  bindings.back().pTensorAddress = output_address;
-  TORCH_CHECK(synLaunch(stream, bindings.data(), bindings.size(), workspace ? workspace->address : 0,
-                        recipe.recipe, 0) == synSuccess, "GaudiRT: bucket GEMM launch failed");
-  return result;
+  BucketProgram program(
+      std::move(roles),
+      {FxNode::linear(0, 1, bias ? std::optional<int64_t>(2) : std::nullopt, true)});
+  return program.run(inputs)[0];
 }
 
 at::Tensor bucket_rms_norm(const at::Tensor& input, const at::Tensor& weight, double epsilon) {
@@ -480,46 +321,16 @@ ColdRecipe& rotary_recipe(Context& ctx, uint32_t bucket, uint64_t q_width,
       {syn_type_int32, {bucket}}, {syn_type_bf16, {static_cast<uint64_t>(rotary_dim), cache_rows}},
       {syn_type_int32, {1}}, {syn_type_bf16, {q_width, bucket}}, {syn_type_bf16, {k_width, bucket}}}};
   auto compiled = std::make_unique<ColdRecipe>(shapes.size());
-  synGraphHandle graph = nullptr;
-  std::array<synSectionHandle, 7> sections{};
-  std::array<synTensor, 7> tensors{};
-  const auto check = [](synStatus status, const char* message) {
-    TORCH_CHECK(status == synSuccess, "GaudiRT rotary: ", message, " status=", static_cast<int>(status));
-  };
-  auto cleanup = [&] {
-    if (graph) synGraphDestroy(graph);
-    for (auto tensor : tensors) if (tensor) synTensorDestroy(tensor);
-    for (auto section : sections) if (section) synSectionDestroy(section);
-  };
-  try {
-    check(synGraphCreate(&graph, synDeviceGaudi2), "graph creation failed");
-    for (size_t i = 0; i < shapes.size(); ++i) {
-      compiled->names[i] = prefix + "_t" + std::to_string(i);
-      check(synSectionCreate(&sections[i], 0, graph), "section creation failed");
-      check(synSectionSetPersistent(sections[i], true), "persistent section setup failed");
-      synTensorDescriptor desc{};
-      desc.m_name = compiled->names[i].c_str();
-      desc.m_dataType = shapes[i].type;
-      desc.m_dims = shapes[i].dims.size();
-      for (size_t dim = 0; dim < shapes[i].dims.size(); ++dim) {
-        desc.m_sizes[dim] = desc.m_minSizes[dim] = shapes[i].dims[dim];
-        compiled->tensors[i].tensorSize[dim] = shapes[i].dims[dim];
-      }
-      check(synTensorCreate(&tensors[i], &desc, sections[i], 0), "tensor creation failed");
-      compiled->tensors[i].tensorName = compiled->names[i].c_str();
-      compiled->tensors[i].tensorType = DATA_TENSOR;
-    }
-    struct Params { int32_t head_dim, rotary_dim, is_neox; } params{head_dim, rotary_dim, is_neox};
-    const auto node = prefix + "_n0";
-    check(synNodeCreate(graph, tensors.data(), tensors.data() + 5, 5, 2, &params, sizeof(params),
-                        "gk_rotary_bf16_v1", node.c_str(), nullptr, nullptr), "node creation failed");
-    compiled->recipe = compile_cached(graph, prefix, key, &ctx.cache);
-    check(synWorkspaceGetSize(&compiled->workspace, compiled->recipe), "workspace query failed");
-    initialize_launch_tensor_ids(compiled->recipe, compiled->tensors.data(), compiled->tensors.size());
-    cleanup();
-  } catch (...) {
-    cleanup();
-    throw;
+  {
+    SynapseGraphBuilder builder(prefix, *compiled);
+    std::array<synTensor, 7> tensors{};
+    for (size_t i = 0; i < shapes.size(); ++i)
+      tensors[i] = builder.tensor(shapes[i].type, shapes[i].dims, static_cast<int>(i));
+    builder.node(NodeSpec{"gk_rotary_bf16_v1",
+                          {tensors[0], tensors[1], tensors[2], tensors[3], tensors[4]},
+                          {tensors[5], tensors[6]},
+                          RotaryParameters{head_dim, rotary_dim, is_neox}});
+    builder.compile(ctx.cache, key);
   }
   auto [it, inserted] = ctx.cold_recipes.emplace(key, std::move(compiled));
   TORCH_CHECK(inserted, "GaudiRT rotary: duplicate recipe");

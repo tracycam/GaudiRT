@@ -46,3 +46,17 @@ struct Params {
   int axis = 0;
 };
 }  // namespace ns_BroadcastNonFcd
+
+namespace ns_RangeKernel {
+struct Params {
+  fint_t start{};
+  fint_t limit{};
+  fint_t delta{};
+};
+}  // namespace ns_RangeKernel
+
+namespace ns_Reduction {
+struct Params {
+  unsigned int reductionDimension = 0;
+};
+}  // namespace ns_Reduction

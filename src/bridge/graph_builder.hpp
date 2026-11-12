@@ -29,7 +29,8 @@ struct ArgmaxParameters {
 using NodeParameters = std::variant<std::monostate, synTransposeParams, synGEMMParams,
                                     ns_GatherKernel::ParamsV2, ns_CastKernel::ParamsV3,
                                     synAxisParams, RotaryParameters, ArgmaxParameters, float, int32_t,
-                                    ns_ConstantKernel::ParamsV3, ns_BroadcastNonFcd::Params>;
+                                    ns_ConstantKernel::ParamsV3, ns_BroadcastNonFcd::Params,
+                                    ns_RangeKernel::Params, ns_Reduction::Params>;
 
 struct NodeSpec {
   std::string guid;
