@@ -457,15 +457,15 @@ void test_small_buckets_keep_batch_gemm() {
     assert(count_guid("batch_gemm") == 1);
     assert(count_guid("gk_fp8_block_reduce_bf16_v1") == 1);
     assert(count_guid("gk_fp8_quant_act_fp16_1k_v1") == 0);
-    assert(count_guid("gk_fp8_hybrid_epilogue_bf16_v1") == 0);
+    assert(count_guid("gk_fp8_epilogue_bf16_v1") == 0);
   }
 }
 
-void test_prefill_fp16_fp8_unbiased_and_sram_row_tiling() {
+void test_prefill_fp16_1k_unbiased_and_sram_row_tiling() {
   // K = 7168 (56 groups), N = 9216:
-  // - M in {512, 1024} -> row_tiles = 1, column_tiles = 1, g_cnt1 = 1, g_cnt2 = 1 (10 nodes, 0 splits/concats)
-  // - M = 4096 -> row_tiles = 1 (tile_rows = 4096), column_tiles = 1, g_cnt1 = 2 (gc1=28), g_cnt2 = 4 (gc2=14),
-  //   with 3-input GEMM K-accumulation (zero add_fwd_f32 nodes)
+  // - M in {512, 1024} -> row_tiles = 1, column_tiles = 1, g_cnt = 1 (6 nodes, 0 splits/concats)
+  // - M = 4096 -> row_tiles = 1 (tile_rows = 4096), column_tiles = 1, g_cnt = 2 (gc = 28),
+  //   with col_offset K-slicing on activation and 3-input GEMM K-accumulation
   BucketProgram prog({1, 0, 0}, {FxNode{FxOp::block_fp8_linear, {0, 1, 2}, std::monostate{}}});
   auto w = make_dev_tensor({56, 9216, 128}, at::kFloat8_e4m3fn);
   auto s = make_dev_tensor({72, 56}, at::kFloat);
@@ -475,58 +475,48 @@ void test_prefill_fp16_fp8_unbiased_and_sram_row_tiling() {
     auto x = make_dev_tensor({static_cast<int64_t>(m), 7168}, at::kBFloat16);
     auto out = prog.run({x, w, s});
     assert(out.size() == 1 && out[0].sizes().equals({static_cast<int64_t>(m), 9216}));
-    assert(g_state.nodes.size() == 10);
+    assert(g_state.nodes.size() == 6);
     assert(count_guid("batch_gemm") == 0);
     assert(count_guid("split") == 0);
     assert(count_guid("concat") == 0);
     assert(count_guid("add_fwd_f32") == 0);
-    assert(count_guid("gk_fp8_hybrid_epilogue_bias_bf16_v1") == 0);
+    assert(count_guid("gk_fp8_prequant_act_bf16_v1") == 0);
+    assert(count_guid("gk_fp8_quant_act_fp8_3k_v1") == 0);
+    assert(count_guid("gk_fp8_dequant_weight_fp8_3k_v1") == 0);
+    assert(count_guid("gk_fp8_epilogue_bias_bf16_v1") == 0);
 
     const auto& ars = find_single_node("gk_fp8_act_row_scale_f32_v1");
-    const auto& preq = find_single_node("gk_fp8_prequant_act_bf16_v1");
     const auto& wbs = find_single_node("gk_fp8_weight_blk_scale_f32_v1");
     const auto& rs_rec = g_state.tensors.at(ars.outputs[0]);
     const auto& bs_rec = g_state.tensors.at(wbs.outputs[0]);
     assert(rs_rec.dtype == syn_type_float && (rs_rec.sizes == std::vector<uint64_t>{1, m}) && rs_rec.section == nullptr);
     assert(bs_rec.dtype == syn_type_float && (bs_rec.sizes == std::vector<uint64_t>{1, 72}) && bs_rec.section == nullptr);
-    assert(preq.inputs.size() == 2 && preq.inputs[1] == ars.outputs[0] && preq.outputs.size() == 2);
-    const auto& sn_rec = g_state.tensors.at(preq.outputs[1]);
-    assert(sn_rec.dtype == syn_type_float && (sn_rec.sizes == std::vector<uint64_t>{1, m, 56}) && sn_rec.section == nullptr);
 
     const auto& qa1 = find_single_node("gk_fp8_quant_act_fp16_1k_v1");
-    const auto& qa3 = find_single_node("gk_fp8_quant_act_fp8_3k_v1");
     const auto& dw1 = find_single_node("gk_fp8_dequant_weight_fp16_1k_v1");
-    const auto& dw3 = find_single_node("gk_fp8_dequant_weight_fp8_3k_v1");
-    assert(qa1.inputs == preq.outputs && qa3.inputs == preq.outputs);
-    assert(qa1.outputs[0] != qa3.outputs[0]);
-    assert(dw1.inputs == dw3.inputs && dw1.inputs.size() == 3 && dw1.inputs[2] == wbs.outputs[0]);
-    assert(dw1.outputs[0] != dw3.outputs[0]);
+    assert(qa1.inputs.size() == 2 && qa1.inputs[0] == ars.inputs[0] && qa1.inputs[1] == ars.outputs[0]);
+    assert(qa1.params.size() == sizeof(Fp8QuantActParameters));
+    Fp8QuantActParameters qa_p{};
+    std::memcpy(&qa_p, qa1.params.data(), sizeof(qa_p));
+    assert(qa_p.col_offset == 0 && qa_p.tile_tag >= 0);
+    assert(dw1.inputs.size() == 3 && dw1.inputs[2] == wbs.outputs[0]);
 
     const auto& act1 = g_state.tensors.at(qa1.outputs[0]);
-    const auto& act3 = g_state.tensors.at(qa3.outputs[0]);
     const auto& w1 = g_state.tensors.at(dw1.outputs[0]);
-    const auto& w3 = g_state.tensors.at(dw3.outputs[0]);
     assert(act1.dtype == syn_type_fp16 && (act1.sizes == std::vector<uint64_t>{7168, m}) && act1.section == nullptr);
-    assert((act3.sizes == std::vector<uint64_t>{21504, m}) && act3.section == nullptr);
-    assert_fp8_143_metadata(act3);
     assert(w1.dtype == syn_type_fp16 && (w1.sizes == std::vector<uint64_t>{7168, 9216}) && w1.section == nullptr);
-    assert((w3.sizes == std::vector<uint64_t>{21504, 9216}) && w3.section == nullptr);
-    assert_fp8_143_metadata(w3);
     assert_fp8_143_metadata(g_state.tensors.at(dw1.inputs[0]));
 
     const auto gemms = find_nodes("gemm");
-    assert(gemms.size() == 2);
+    assert(gemms.size() == 1);
     assert_gemm_nt(*gemms[0]);
-    assert_gemm_nt(*gemms[1]);
     assert(gemms[0]->inputs.size() == 2 && gemms[0]->inputs[0] == qa1.outputs[0] && gemms[0]->inputs[1] == dw1.outputs[0]);
-    assert(gemms[1]->inputs.size() == 2 && gemms[1]->inputs[0] == qa3.outputs[0] && gemms[1]->inputs[1] == dw3.outputs[0]);
 
-    const auto& epi_node = find_single_node("gk_fp8_hybrid_epilogue_bf16_v1");
-    assert(epi_node.inputs.size() == 4 && epi_node.outputs.size() == 1);
+    const auto& epi_node = find_single_node("gk_fp8_epilogue_bf16_v1");
+    assert(epi_node.inputs.size() == 3 && epi_node.outputs.size() == 1);
     assert(epi_node.inputs[0] == gemms[0]->outputs[0] &&
-           epi_node.inputs[1] == gemms[1]->outputs[0] &&
-           epi_node.inputs[2] == ars.outputs[0] &&
-           epi_node.inputs[3] == wbs.outputs[0]);
+           epi_node.inputs[1] == ars.outputs[0] &&
+           epi_node.inputs[2] == wbs.outputs[0]);
     const auto& epi_out = g_state.tensors.at(epi_node.outputs[0]);
     assert(epi_out.dtype == syn_type_bf16 &&
            (epi_out.sizes == std::vector<uint64_t>{9216, m}) &&
@@ -536,36 +526,29 @@ void test_prefill_fp16_fp8_unbiased_and_sram_row_tiling() {
   g_state.clear_graph_records();
   auto out4096 = prog.run({make_dev_tensor({4096, 7168}, at::kBFloat16), w, s});
   assert(out4096.size() == 1 && out4096[0].sizes().equals({4096, 9216}));
-  assert(count_guid("split") == 8);
+  assert(count_guid("split") == 2);
   assert(count_guid("gk_fp8_act_row_scale_f32_v1") == 1);
-  assert(count_guid("gk_fp8_prequant_act_bf16_v1") == 1);
   assert(count_guid("gk_fp8_weight_blk_scale_f32_v1") == 1);
   assert(count_guid("gk_fp8_quant_act_fp16_1k_v1") == 2);
-  assert(count_guid("gk_fp8_quant_act_fp8_3k_v1") == 4);
   assert(count_guid("gk_fp8_dequant_weight_fp16_1k_v1") == 2);
-  assert(count_guid("gk_fp8_dequant_weight_fp8_3k_v1") == 4);
-  assert(count_guid("gemm") == 6);
+  assert(count_guid("gemm") == 2);
   assert(count_guid("add_fwd_f32") == 0);
-  assert(count_guid("gk_fp8_hybrid_epilogue_bf16_v1") == 1);
+  assert(count_guid("gk_fp8_epilogue_bf16_v1") == 1);
   assert(count_guid("concat") == 0);
-  for (const auto* qa : find_nodes("gk_fp8_quant_act_fp16_1k_v1")) {
-    const auto& t = g_state.tensors.at(qa->outputs[0]);
+  const auto qa_4k = find_nodes("gk_fp8_quant_act_fp16_1k_v1");
+  for (size_t idx = 0; idx < qa_4k.size(); ++idx) {
+    const auto& t = g_state.tensors.at(qa_4k[idx]->outputs[0]);
     assert(t.dtype == syn_type_fp16 && (t.sizes == std::vector<uint64_t>{3584, 4096}) && t.section == nullptr);
-  }
-  for (const auto* qa : find_nodes("gk_fp8_quant_act_fp8_3k_v1")) {
-    const auto& t = g_state.tensors.at(qa->outputs[0]);
-    assert((t.sizes == std::vector<uint64_t>{5376, 4096}) && t.section == nullptr);
-    assert_fp8_143_metadata(t);
+    Fp8QuantActParameters qa_p{};
+    std::memcpy(&qa_p, qa_4k[idx]->params.data(), sizeof(qa_p));
+    assert(qa_p.col_offset == static_cast<int32_t>(idx * 3584) && qa_p.tile_tag >= 0);
   }
   const auto gemms4k = find_nodes("gemm");
+  assert(gemms4k.size() == 2);
   assert(gemms4k[0]->inputs.size() == 2 && gemms4k[1]->inputs.size() == 3 &&
          gemms4k[1]->inputs[2] == gemms4k[0]->outputs[0]);
-  assert(gemms4k[2]->inputs.size() == 2);
-  for (size_t gi = 3; gi < 6; ++gi) {
-    assert(gemms4k[gi]->inputs.size() == 3 && gemms4k[gi]->inputs[2] == gemms4k[gi - 1]->outputs[0]);
-  }
 
-  // K = 22016 (172 groups, Down): M=1024 -> gc1=86 (2 chunks), gc2=58 (3 chunks -> [58, 58, 56]).
+  // K = 22016 (172 groups, Down): M=1024 -> gc=86 (2 chunks).
   BucketProgram prog_down({1, 0, 0}, {FxNode{FxOp::block_fp8_linear, {0, 1, 2}, std::monostate{}}});
   auto w_down = make_dev_tensor({172, 7168, 128}, at::kFloat8_e4m3fn);
   auto s_down = make_dev_tensor({56, 172}, at::kFloat);
@@ -573,17 +556,13 @@ void test_prefill_fp16_fp8_unbiased_and_sram_row_tiling() {
   auto down1024 = prog_down.run({make_dev_tensor({1024, 22016}, at::kBFloat16), w_down, s_down});
   assert(down1024[0].sizes().equals({1024, 7168}));
   assert(count_guid("gk_fp8_quant_act_fp16_1k_v1") == 2);
-  assert(count_guid("gk_fp8_quant_act_fp8_3k_v1") == 3);
-  assert(count_guid("gemm") == 5);
+  assert(count_guid("gk_fp8_dequant_weight_fp16_1k_v1") == 2);
+  assert(count_guid("gemm") == 2);
   assert(count_guid("add_fwd_f32") == 0);
   for (const auto* qa : find_nodes("gk_fp8_quant_act_fp16_1k_v1")) {
     const auto& t = g_state.tensors.at(qa->outputs[0]);
     assert(t.dtype == syn_type_fp16 && (t.sizes == std::vector<uint64_t>{11008, 1024}) && t.section == nullptr);
   }
-  const auto qa3_down = find_nodes("gk_fp8_quant_act_fp8_3k_v1");
-  assert((g_state.tensors.at(qa3_down[0]->outputs[0]).sizes == std::vector<uint64_t>{22272, 1024}));
-  assert((g_state.tensors.at(qa3_down[1]->outputs[0]).sizes == std::vector<uint64_t>{22272, 1024}));
-  assert((g_state.tensors.at(qa3_down[2]->outputs[0]).sizes == std::vector<uint64_t>{21504, 1024}));
 
   assert(!g_state.compiled_keys.empty());
   auto geom = infer_fx_geometry(
@@ -592,7 +571,7 @@ void test_prefill_fp16_fp8_unbiased_and_sram_row_tiling() {
   assert(!geom.digest.empty());
 }
 
-void test_prefill_fp16_fp8_biased_bf16_and_fp32() {
+void test_prefill_fp16_1k_biased_bf16_and_fp32() {
   for (at::ScalarType bias_dtype : {at::kBFloat16, at::kFloat}) {
     BucketProgram prog({1, 0, 0, 0},
                        {FxNode{FxOp::block_fp8_linear, {0, 1, 2, 3}, std::monostate{}}});
@@ -607,18 +586,15 @@ void test_prefill_fp16_fp8_biased_bf16_and_fp32() {
       assert(out.size() == 1 && out[0].sizes().equals({static_cast<int64_t>(m), 512}));
       assert(count_guid("cast_bf16_to_f32") == (bias_dtype == at::kBFloat16 ? 1 : 0));
       assert(count_guid("gk_fp8_act_row_scale_f32_v1") == 1);
-      assert(count_guid("gk_fp8_prequant_act_bf16_v1") == 1);
       assert(count_guid("gk_fp8_weight_blk_scale_f32_v1") == 1);
       assert(count_guid("gk_fp8_quant_act_fp16_1k_v1") == 1);
-      assert(count_guid("gk_fp8_quant_act_fp8_3k_v1") == 1);
       assert(count_guid("gk_fp8_dequant_weight_fp16_1k_v1") == 1);
-      assert(count_guid("gk_fp8_dequant_weight_fp8_3k_v1") == 1);
-      assert(count_guid("gemm") == 2);
-      assert(count_guid("gk_fp8_hybrid_epilogue_bf16_v1") == 0);
+      assert(count_guid("gemm") == 1);
+      assert(count_guid("gk_fp8_epilogue_bf16_v1") == 0);
 
-      const auto& epi_node = find_single_node("gk_fp8_hybrid_epilogue_bias_bf16_v1");
-      assert(epi_node.inputs.size() == 5 && epi_node.outputs.size() == 1);
-      const auto& bias_in = g_state.tensors.at(epi_node.inputs[4]);
+      const auto& epi_node = find_single_node("gk_fp8_epilogue_bias_bf16_v1");
+      assert(epi_node.inputs.size() == 4 && epi_node.outputs.size() == 1);
+      const auto& bias_in = g_state.tensors.at(epi_node.inputs[3]);
       assert(bias_in.dtype == syn_type_float && (bias_in.sizes == std::vector<uint64_t>{512}));
       const auto& final_out = g_state.tensors.at(epi_node.outputs[0]);
       assert(final_out.dtype == syn_type_bf16 &&
@@ -640,27 +616,24 @@ void test_3d_activation_threshold_and_reshapes() {
   assert(count_guid("batch_gemm") == 1);
   assert(count_guid("gk_fp8_quant_act_fp16_1k_v1") == 0);
 
-  // [256, 2, 256] -> bucket=256, token_rows=512 -> takes 1K FP16 + 3K FP8_143 with 2 reshapes
+  // [256, 2, 256] -> bucket=256, token_rows=512 -> takes single-pass 1K FP16 with 2 reshapes
   g_state.clear_graph_records();
   auto out512 = prog.run({make_dev_tensor({256, 2, 256}, at::kBFloat16), w, s});
   assert(out512[0].sizes().equals({256, 2, 256}));
   assert(count_guid("reshape") == 2);
   assert(count_guid("gk_fp8_act_row_scale_f32_v1") == 1);
-  assert(count_guid("gk_fp8_prequant_act_bf16_v1") == 1);
   assert(count_guid("gk_fp8_weight_blk_scale_f32_v1") == 1);
   assert(count_guid("gk_fp8_quant_act_fp16_1k_v1") == 1);
-  assert(count_guid("gk_fp8_quant_act_fp8_3k_v1") == 1);
   assert(count_guid("gk_fp8_dequant_weight_fp16_1k_v1") == 1);
-  assert(count_guid("gk_fp8_dequant_weight_fp8_3k_v1") == 1);
-  assert(count_guid("gemm") == 2);
-  assert(count_guid("gk_fp8_hybrid_epilogue_bf16_v1") == 1);
+  assert(count_guid("gemm") == 1);
+  assert(count_guid("gk_fp8_epilogue_bf16_v1") == 1);
 }
 
 void test_large_n_accum_budget_column_tiling() {
   // K = 7168 (56 groups), N = 44032 (gate_up):
-  // - At M <= 1024: row_tiles = 1, column_tiles = 1, g_cnt1 = 1, g_cnt2 = 1.
+  // - At M <= 1024: row_tiles = 1, column_tiles = 1, g_cnt = 1.
   // - At M = 4096: 4096 * 44032 > 4096 * 16384 -> tile_rows = 2048 (row_tiles = 2),
-  //   column_tiles = 1 (tile_columns = 44032), gc1 = 56 (g_cnt1 = 1), gc2 = 28 (g_cnt2 = 2),
+  //   column_tiles = 1 (tile_columns = 44032), gc = 56 (g_cnt = 1),
   //   with dedicated 1-output TPC producers and unique tags per GEMM.
   BucketProgram prog({1, 0, 0, 0},
                      {FxNode{FxOp::block_fp8_linear, {0, 1, 2, 3}, std::monostate{}}});
@@ -675,14 +648,11 @@ void test_large_n_accum_budget_column_tiling() {
     assert(out[0].sizes().equals({static_cast<int64_t>(m), 44032}));
     assert(count_guid("split") == 0);
     assert(count_guid("gk_fp8_act_row_scale_f32_v1") == 1);
-    assert(count_guid("gk_fp8_prequant_act_bf16_v1") == 1);
     assert(count_guid("gk_fp8_weight_blk_scale_f32_v1") == 1);
     assert(count_guid("gk_fp8_quant_act_fp16_1k_v1") == 1);
-    assert(count_guid("gk_fp8_quant_act_fp8_3k_v1") == 1);
     assert(count_guid("gk_fp8_dequant_weight_fp16_1k_v1") == 1);
-    assert(count_guid("gk_fp8_dequant_weight_fp8_3k_v1") == 1);
-    assert(count_guid("gemm") == 2);
-    assert(count_guid("gk_fp8_hybrid_epilogue_bias_bf16_v1") == 1);
+    assert(count_guid("gemm") == 1);
+    assert(count_guid("gk_fp8_epilogue_bias_bf16_v1") == 1);
     assert(count_guid("concat") == 0);
   }
 
@@ -690,44 +660,40 @@ void test_large_n_accum_budget_column_tiling() {
   auto x4096 = make_dev_tensor({4096, 7168}, at::kBFloat16);
   auto out4096 = prog.run({x4096, w, s, b});
   assert(out4096[0].sizes().equals({4096, 44032}));
-  assert(count_guid("split") == 7);
+  assert(count_guid("split") == 1);
   assert(count_guid("gk_fp8_act_row_scale_f32_v1") == 2);
-  assert(count_guid("gk_fp8_prequant_act_bf16_v1") == 2);
   assert(count_guid("gk_fp8_weight_blk_scale_f32_v1") == 1);
   assert(count_guid("gk_fp8_quant_act_fp16_1k_v1") == 2);
-  assert(count_guid("gk_fp8_quant_act_fp8_3k_v1") == 4);
   assert(count_guid("gk_fp8_dequant_weight_fp16_1k_v1") == 2);
-  assert(count_guid("gk_fp8_dequant_weight_fp8_3k_v1") == 4);
-  assert(count_guid("gemm") == 6);
+  assert(count_guid("gemm") == 2);
   assert(count_guid("add_fwd_f32") == 0);
-  assert(count_guid("gk_fp8_hybrid_epilogue_bias_bf16_v1") == 2);
+  assert(count_guid("gk_fp8_epilogue_bias_bf16_v1") == 2);
   assert(count_guid("concat") == 1);
-  for (const auto& [guid, expected_count] :
-       std::initializer_list<std::pair<const char*, size_t>>{
-           {"gk_fp8_quant_act_fp16_1k_v1", 2},
-           {"gk_fp8_dequant_weight_fp16_1k_v1", 2},
-           {"gk_fp8_quant_act_fp8_3k_v1", 4},
-           {"gk_fp8_dequant_weight_fp8_3k_v1", 4}}) {
-    std::vector<int32_t> tags;
-    for (const auto* nd : find_nodes(guid)) {
+  {
+    std::vector<int32_t> qa_tags, dw_tags;
+    for (const auto* nd : find_nodes("gk_fp8_quant_act_fp16_1k_v1")) {
+      assert(nd->params.size() == sizeof(Fp8QuantActParameters));
+      Fp8QuantActParameters p{};
+      std::memcpy(&p, nd->params.data(), sizeof(p));
+      assert(p.col_offset == 0 && p.tile_tag >= 0);
+      qa_tags.push_back(p.tile_tag);
+    }
+    for (const auto* nd : find_nodes("gk_fp8_dequant_weight_fp16_1k_v1")) {
       assert(nd->params.size() == sizeof(int32_t));
       int32_t tag = -1;
       std::memcpy(&tag, nd->params.data(), sizeof(int32_t));
       assert(tag >= 0);
-      tags.push_back(tag);
+      dw_tags.push_back(tag);
     }
-    assert(tags.size() == expected_count);
-    std::sort(tags.begin(), tags.end());
-    assert(std::adjacent_find(tags.begin(), tags.end()) == tags.end());
+    assert(qa_tags.size() == 2 && dw_tags.size() == 2);
+    std::sort(qa_tags.begin(), qa_tags.end());
+    std::sort(dw_tags.begin(), dw_tags.end());
+    assert(std::adjacent_find(qa_tags.begin(), qa_tags.end()) == qa_tags.end());
+    assert(std::adjacent_find(dw_tags.begin(), dw_tags.end()) == dw_tags.end());
   }
   for (const auto* dw : find_nodes("gk_fp8_dequant_weight_fp16_1k_v1")) {
     const auto& t = g_state.tensors.at(dw->outputs[0]);
     assert(t.dtype == syn_type_fp16 && (t.sizes == std::vector<uint64_t>{7168, 44032}) && t.section == nullptr);
-  }
-  for (const auto* dw : find_nodes("gk_fp8_dequant_weight_fp8_3k_v1")) {
-    const auto& t = g_state.tensors.at(dw->outputs[0]);
-    assert((t.sizes == std::vector<uint64_t>{10752, 44032}) && t.section == nullptr);
-    assert_fp8_143_metadata(t);
   }
 }
 
@@ -739,8 +705,8 @@ int main() {
       std::make_shared<gaudirt::generic::Context>(0, 32ULL << 30, 4ULL << 20);
 
   test_small_buckets_keep_batch_gemm();
-  test_prefill_fp16_fp8_unbiased_and_sram_row_tiling();
-  test_prefill_fp16_fp8_biased_bf16_and_fp32();
+  test_prefill_fp16_1k_unbiased_and_sram_row_tiling();
+  test_prefill_fp16_1k_biased_bf16_and_fp32();
   test_3d_activation_threshold_and_reshapes();
   test_large_n_accum_budget_column_tiling();
 

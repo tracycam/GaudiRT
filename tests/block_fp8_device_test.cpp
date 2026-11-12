@@ -226,7 +226,7 @@ int main(int argc, char** argv) {
     upload(output.data(), ya, output.size() * sizeof(output[0]));
     Graph graph("block_fp8_m" + std::to_string(m) + "_n" + std::to_string(n) +
                 "_k" + std::to_string(k) + "_bias" + bias_flag + "_tile" + std::to_string(tile_width) +
-                "_rows" + std::to_string(rows_per_tile) + (use_hybrid ? "_fp16_3k_fp8" : ""));
+                "_rows" + std::to_string(rows_per_tile) + (use_hybrid ? "_fp16_1k" : ""));
     if (!use_hybrid && tile_width) graph.enable_rmw();
     const auto tx = graph.tensor({k, m}, syn_type_bf16, xa);
     const auto tw = graph.tensor({128, n, groups}, syn_type_fp8_143, wa);
@@ -235,19 +235,10 @@ int main(int argc, char** argv) {
     const synGEMMParams gemm{false, true};
     if (use_hybrid) {
       constexpr uint64_t kMaxAct1kBytes = 29ULL << 20;
-      constexpr uint64_t kMaxAct3kBytes = 27ULL << 20;
-      const uint64_t gc1_max = std::max<uint64_t>(1, kMaxAct1kBytes / (256ULL * rows_per_tile));
-      const uint64_t k_chunks_1k = (groups + gc1_max - 1) / gc1_max;
-      const uint64_t gc1 = (groups + k_chunks_1k - 1) / k_chunks_1k;
-      const uint64_t g_cnt1 = (groups + gc1 - 1) / gc1;
-
-      const uint64_t pairs_max = std::max<uint64_t>(1, kMaxAct3kBytes / (768ULL * rows_per_tile));
-      const uint64_t gc2_max = 2 * pairs_max;
-      const uint64_t k_chunks_3k = (groups + gc2_max - 1) / gc2_max;
-      const uint64_t gc2 = k_chunks_3k == 1
-                               ? groups
-                               : 2 * ((groups + 2 * k_chunks_3k - 1) / (2 * k_chunks_3k));
-      const uint64_t g_cnt2 = (groups + gc2 - 1) / gc2;
+      const uint64_t gc_max = std::max<uint64_t>(1, kMaxAct1kBytes / (256ULL * rows_per_tile));
+      const uint64_t k_chunks = (groups + gc_max - 1) / gc_max;
+      const uint64_t gc = (groups + k_chunks - 1) / k_chunks;
+      const uint64_t g_cnt = (groups + gc - 1) / gc;
 
       const size_t tb = has_bias ? graph.tensor({n}, syn_type_float, ba) : 0;
       const uint64_t count = (n + col_tile - 1) / col_tile;
@@ -255,7 +246,7 @@ int main(int argc, char** argv) {
       const synSplitParams split_bias{0}, split_features{1}, split_groups{2};
       const synConcatenateParams concat_width{0}, concat_rows{1};
       int32_t tag_seq = 0;
-      std::vector<size_t> xs, row_scales, q_rows, sn_rows;
+      std::vector<size_t> xs, row_scales;
       std::vector<size_t> weights, scales_tiled, blk_scales, biases, row_outputs;
       for (uint64_t r = 0; r < row_count; ++r) {
         const auto rows = std::min(rows_per_tile, m - r * rows_per_tile);
@@ -268,12 +259,6 @@ int main(int argc, char** argv) {
         const auto rs = graph.tensor({1, rows}, syn_type_float);
         graph.node("gk_fp8_act_row_scale_f32_v1", {xs[r]}, {rs}, &r_tag, sizeof(r_tag));
         row_scales.push_back(rs);
-        const int32_t p_tag = tag_seq++;
-        const auto qr = graph.tensor({128, rows, groups}, syn_type_bf16);
-        const auto snr = graph.tensor({1, rows, groups}, syn_type_float);
-        graph.node("gk_fp8_prequant_act_bf16_v1", {xs[r], rs}, {qr, snr}, &p_tag, sizeof(p_tag));
-        q_rows.push_back(qr);
-        sn_rows.push_back(snr);
       }
       for (uint64_t i = 0; i < count; ++i) {
         const auto width = std::min(col_tile, n - i * col_tile);
@@ -293,74 +278,36 @@ int main(int argc, char** argv) {
         graph.node("gk_fp8_weight_blk_scale_f32_v1", {scales_tiled[i]}, {bs}, &c_tag, sizeof(c_tag));
         blk_scales.push_back(bs);
       }
-      std::vector<std::vector<size_t>> w_g1(count), ws_g1(count), w_g2(count), ws_g2(count);
+      std::vector<std::vector<size_t>> w_g(count), ws_g(count);
       for (uint64_t i = 0; i < count; ++i) {
         const auto width = std::min(col_tile, n - i * col_tile);
-        for (uint64_t g = 0; g < g_cnt1; ++g) {
-          const auto gl = std::min(gc1, groups - g * gc1);
-          w_g1[i].push_back(g_cnt1 == 1 ? weights[i] : graph.tensor({128, width, gl}, syn_type_fp8_143));
-          ws_g1[i].push_back(g_cnt1 == 1 ? scales_tiled[i] : graph.tensor({gl, width / 128}, syn_type_float));
+        for (uint64_t g = 0; g < g_cnt; ++g) {
+          const auto gl = std::min(gc, groups - g * gc);
+          w_g[i].push_back(g_cnt == 1 ? weights[i] : graph.tensor({128, width, gl}, syn_type_fp8_143));
+          ws_g[i].push_back(g_cnt == 1 ? scales_tiled[i] : graph.tensor({gl, width / 128}, syn_type_float));
         }
-        if (g_cnt1 > 1) {
-          graph.node("split", std::vector<size_t>{weights[i]}, w_g1[i], &split_groups, sizeof(split_groups));
-          graph.node("split", std::vector<size_t>{scales_tiled[i]}, ws_g1[i], &split_bias, sizeof(split_bias));
-        }
-        if (gc2 == gc1) {
-          w_g2[i] = w_g1[i];
-          ws_g2[i] = ws_g1[i];
-        } else {
-          for (uint64_t g = 0; g < g_cnt2; ++g) {
-            const auto gl = std::min(gc2, groups - g * gc2);
-            w_g2[i].push_back(g_cnt2 == 1 ? weights[i] : graph.tensor({128, width, gl}, syn_type_fp8_143));
-            ws_g2[i].push_back(g_cnt2 == 1 ? scales_tiled[i] : graph.tensor({gl, width / 128}, syn_type_float));
-          }
-          if (g_cnt2 > 1) {
-            graph.node("split", std::vector<size_t>{weights[i]}, w_g2[i], &split_groups, sizeof(split_groups));
-            graph.node("split", std::vector<size_t>{scales_tiled[i]}, ws_g2[i], &split_bias, sizeof(split_bias));
-          }
+        if (g_cnt > 1) {
+          graph.node("split", std::vector<size_t>{weights[i]}, w_g[i], &split_groups, sizeof(split_groups));
+          graph.node("split", std::vector<size_t>{scales_tiled[i]}, ws_g[i], &split_bias, sizeof(split_bias));
         }
       }
       for (uint64_t r = 0; r < row_count; ++r) {
         const auto rows = std::min(rows_per_tile, m - r * rows_per_tile);
-        std::vector<size_t> q_g1, sn_g1, q_g2, sn_g2;
-        for (uint64_t g = 0; g < g_cnt1; ++g) {
-          const auto gl = std::min(gc1, groups - g * gc1);
-          q_g1.push_back(g_cnt1 == 1 ? q_rows[r] : graph.tensor({128, rows, gl}, syn_type_bf16));
-          sn_g1.push_back(g_cnt1 == 1 ? sn_rows[r] : graph.tensor({1, rows, gl}, syn_type_float));
-        }
-        if (g_cnt1 > 1) {
-          graph.node("split", std::vector<size_t>{q_rows[r]}, q_g1, &split_groups, sizeof(split_groups));
-          graph.node("split", std::vector<size_t>{sn_rows[r]}, sn_g1, &split_groups, sizeof(split_groups));
-        }
-        if (gc2 == gc1) {
-          q_g2 = q_g1;
-          sn_g2 = sn_g1;
-        } else {
-          for (uint64_t g = 0; g < g_cnt2; ++g) {
-            const auto gl = std::min(gc2, groups - g * gc2);
-            q_g2.push_back(g_cnt2 == 1 ? q_rows[r] : graph.tensor({128, rows, gl}, syn_type_bf16));
-            sn_g2.push_back(g_cnt2 == 1 ? sn_rows[r] : graph.tensor({1, rows, gl}, syn_type_float));
-          }
-          if (g_cnt2 > 1) {
-            graph.node("split", std::vector<size_t>{q_rows[r]}, q_g2, &split_groups, sizeof(split_groups));
-            graph.node("split", std::vector<size_t>{sn_rows[r]}, sn_g2, &split_groups, sizeof(split_groups));
-          }
-        }
-
         std::vector<size_t> col_outputs;
         for (uint64_t i = 0; i < count; ++i) {
           const auto width = std::min(col_tile, n - i * col_tile);
           size_t c0 = 0;
-          for (uint64_t g = 0; g < g_cnt1; ++g) {
-            const auto gl = std::min(gc1, groups - g * gc1);
+          for (uint64_t g = 0; g < g_cnt; ++g) {
+            const auto gl = std::min(gc, groups - g * gc);
             const int32_t tile_tag = tag_seq++;
+            const int32_t qa_params[2]{static_cast<int32_t>(g * gc * 128), tile_tag};
             const auto act_1k = graph.tensor({gl * 128, rows}, syn_type_fp16);
             const auto w_1k = graph.tensor({gl * 128, width}, syn_type_fp16);
             const auto next_c0 = graph.tensor({width, rows}, syn_type_float);
-            graph.node("gk_fp8_quant_act_fp16_1k_v1", {q_g1[g], sn_g1[g]}, {act_1k},
-                       &tile_tag, sizeof(tile_tag));
+            graph.node("gk_fp8_quant_act_fp16_1k_v1", {xs[r], row_scales[r]}, {act_1k},
+                       qa_params, sizeof(qa_params));
             graph.node("gk_fp8_dequant_weight_fp16_1k_v1",
-                       {w_g1[i][g], ws_g1[i][g], blk_scales[i]}, {w_1k},
+                       {w_g[i][g], ws_g[i][g], blk_scales[i]}, {w_1k},
                        &tile_tag, sizeof(tile_tag));
             if (g == 0) {
               graph.node("gemm", {act_1k, w_1k}, {next_c0}, &gemm, sizeof(gemm));
@@ -370,34 +317,13 @@ int main(int argc, char** argv) {
             c0 = next_c0;
           }
 
-          size_t c1 = 0;
-          for (uint64_t g = 0; g < g_cnt2; ++g) {
-            const auto gl = std::min(gc2, groups - g * gc2);
-            const auto kw = ((gl + 1) / 2) * 768;
-            const int32_t tile_tag = tag_seq++;
-            const auto act_3k = graph.tensor({kw, rows}, syn_type_fp8_143);
-            const auto w_3k = graph.tensor({kw, width}, syn_type_fp8_143);
-            const auto next_c1 = graph.tensor({width, rows}, syn_type_float);
-            graph.node("gk_fp8_quant_act_fp8_3k_v1", {q_g2[g], sn_g2[g]}, {act_3k},
-                       &tile_tag, sizeof(tile_tag));
-            graph.node("gk_fp8_dequant_weight_fp8_3k_v1",
-                       {w_g2[i][g], ws_g2[i][g], blk_scales[i]}, {w_3k},
-                       &tile_tag, sizeof(tile_tag));
-            if (g == 0) {
-              graph.node("gemm", {act_3k, w_3k}, {next_c1}, &gemm, sizeof(gemm));
-            } else {
-              graph.node("gemm", {act_3k, w_3k, c1}, {next_c1}, &gemm, sizeof(gemm));
-            }
-            c1 = next_c1;
-          }
-
           const auto result = (row_count == 1 && count == 1) ? ty : graph.tensor({width, rows}, syn_type_bf16);
           if (!has_bias) {
-            graph.node("gk_fp8_hybrid_epilogue_bf16_v1",
-                       {c0, c1, row_scales[r], blk_scales[i]}, {result});
+            graph.node("gk_fp8_epilogue_bf16_v1",
+                       {c0, row_scales[r], blk_scales[i]}, {result});
           } else {
-            graph.node("gk_fp8_hybrid_epilogue_bias_bf16_v1",
-                       {c0, c1, row_scales[r], blk_scales[i], biases[i]}, {result});
+            graph.node("gk_fp8_epilogue_bias_bf16_v1",
+                       {c0, row_scales[r], blk_scales[i], biases[i]}, {result});
           }
           col_outputs.push_back(result);
         }

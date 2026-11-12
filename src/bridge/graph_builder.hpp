@@ -26,9 +26,15 @@ struct ArgmaxParameters {
   int32_t blocks_per_part;
 };
 
+struct Fp8QuantActParameters {
+  int32_t col_offset;
+  int32_t tile_tag;
+};
+
 using NodeParameters = std::variant<std::monostate, synTransposeParams, synGEMMParams,
                                     ns_GatherKernel::ParamsV2, ns_CastKernel::ParamsV3,
-                                    synAxisParams, RotaryParameters, ArgmaxParameters, float, int32_t,
+                                    synAxisParams, RotaryParameters, ArgmaxParameters,
+                                    Fp8QuantActParameters, float, int32_t,
                                     ns_ConstantKernel::ParamsV3, ns_BroadcastNonFcd::Params,
                                     ns_RangeKernel::Params, ns_Reduction::Params>;
 
