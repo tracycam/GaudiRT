@@ -244,8 +244,9 @@ void check_factory(const std::optional<at::Layout>& layout,
                    const std::optional<bool>& pin_memory) {
   TORCH_CHECK(!layout || *layout == at::kStrided, "GaudiRT: only strided layout is supported");
   TORCH_CHECK(!pin_memory.value_or(false), "GaudiRT: pin_memory applies to CPU allocations");
+  const auto active = current_device_index();
   TORCH_CHECK(!device || (device->type() == c10::kPrivateUse1 &&
-              (device->index() < 0 || device->index() == 0)), "GaudiRT: invalid device");
+              (device->index() < 0 || device->index() == active)), "GaudiRT: invalid device");
 }
 at::Tensor empty(at::IntArrayRef size, std::optional<at::ScalarType> dtype,
                  std::optional<at::Layout> layout, std::optional<at::Device> device,
@@ -263,7 +264,8 @@ at::Tensor empty_strided(at::IntArrayRef size, at::IntArrayRef stride,
 }
 at::Tensor& set_storage(at::Tensor& tensor, at::Storage storage, int64_t storage_offset,
                         at::IntArrayRef size, at::IntArrayRef stride) {
-  TORCH_CHECK(storage.device().type() == c10::kPrivateUse1 && storage.device().index() == 0,
+  TORCH_CHECK(storage.device().type() == c10::kPrivateUse1 &&
+              storage.device().index() == current_device_index(),
               "GaudiRT: invalid storage device");
   TORCH_CHECK(storage_offset >= 0 && (stride.empty() || stride.size() == size.size()),
               "GaudiRT: invalid storage view");

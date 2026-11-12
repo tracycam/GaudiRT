@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 
 namespace gaudirt::generic {
 namespace {
@@ -77,10 +78,19 @@ Context::Context(uint32_t module, uint64_t hbm_bytes, uint64_t pinned_bytes)
 }
 
 Context::~Context() {
-  try { streams.synchronize(); } catch (...) {}
-  synStreamSynchronize(device.h2d_stream());
-  synStreamSynchronize(device.d2h_stream());
+  const bool unwinding = std::uncaught_exceptions() > 0;
+  if (!unwinding) {
+    try { streams.synchronize(); } catch (...) {}
+    synStreamSynchronize(device.h2d_stream());
+    synStreamSynchronize(device.d2h_stream());
+  }
   trim_segment_outputs();
+  if (comm_teardown) {
+    try { comm_teardown(unwinding); } catch (...) {}
+    comm_teardown = nullptr;
+    comm_trim = nullptr;
+    comm_state.reset();
+  }
   std::lock_guard lock(event_mutex);
   for (auto* event : events) {
     if (event->handle) synEventDestroy(event->handle);

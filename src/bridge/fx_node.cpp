@@ -24,6 +24,9 @@ void FxNode::append_normalized(std::ostream& output) const {
     } else if constexpr (std::is_same_v<T, FxTranspose>) output << ":p" << value.dim0 << ":" << value.dim1;
     else if constexpr (std::is_same_v<T, FxScalar>)
       output << ":s" << std::bit_cast<uint32_t>(value.value) << ":" << value.reversed;
+    else if constexpr (std::is_same_v<T, FxShardEmbedding>)
+      output << ":se" << value.org_start << ":" << value.org_end << ":"
+             << value.added_start << ":" << value.added_end << ":" << value.added_offset;
   }, parameters);
   output << ";";
 }

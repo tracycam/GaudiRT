@@ -34,7 +34,7 @@ at::Tensor allocate_paged_kv(int64_t layers, int64_t slots, int64_t heads, int64
   auto data = allocation_data_ptr(ctx, address, storage_bytes, stream, AllocationKind::device);
   const std::array<int64_t, 5> shape{layers, 2, heads, slots, head_dim};
   auto result = tensor_from_allocation(std::move(data), storage_bytes, shape,
-      at::TensorOptions().device(c10::Device(c10::kPrivateUse1, 0)).dtype(at::kBFloat16));
+      at::TensorOptions().device(c10::Device(c10::kPrivateUse1, ctx->device_index)).dtype(at::kBFloat16));
   TORCH_CHECK(synMemsetD32Async(address, 0, actual_bytes / 4, stream) == synSuccess,
               "GaudiRT: failed to initialize KV pool");
   return result;

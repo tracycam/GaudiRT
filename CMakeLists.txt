@@ -43,6 +43,7 @@ if(GAUDIRT_BUILD_TORCH)
         src/bridge/paged_kv_pool.cpp src/bridge/paged_slot_allocator.cpp src/bridge/eager_copy.cpp src/bridge/eager_ops.cpp
         src/bridge/eager_index.cpp src/bridge/eager_scheduler.cpp src/bridge/argmax_vocab.cpp
         src/bridge/bucket_program.cpp src/bridge/segmented_runner.cpp
+        src/bridge/communicator.cpp src/bridge/process_group.cpp
         src/bridge/tensor_spec.cpp src/bridge/fx_node.cpp
         src/bridge/fx_geometry.cpp src/bridge/graph_builder.cpp)
     target_compile_definitions(_gaudirt_C PRIVATE TORCH_EXTENSION_NAME=_gaudirt_C)

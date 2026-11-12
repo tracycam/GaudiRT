@@ -47,8 +47,8 @@ ColdRecipe& slot_recipe(Context& ctx, bool release, uint32_t requests, uint32_t 
   return *it->second;
 }
 
-void require_indices(const at::Tensor& tensor) {
-  TORCH_CHECK(tensor.device().type() == c10::kPrivateUse1 && tensor.device().index() == 0 &&
+void require_indices(const at::Tensor& tensor, const Context& ctx) {
+  TORCH_CHECK(tensor.device().type() == c10::kPrivateUse1 && tensor.device().index() == ctx.device_index &&
               tensor.scalar_type() == at::kLong && tensor.dim() == 1 && tensor.is_contiguous(),
               "GaudiRT paged allocator: expected contiguous device int64 indices");
 }
@@ -77,8 +77,9 @@ void launch(Context& ctx, ColdRecipe& recipe, const std::array<uint64_t, 4>& add
 std::tuple<at::Tensor, int64_t> allocate_paged_slots(
     const at::Tensor& last_slots, const at::Tensor& free_pages,
     const std::vector<int64_t>& prefixes, const std::vector<int64_t>& lengths, int64_t page_size) {
-  require_indices(last_slots);
-  require_indices(free_pages);
+  auto ctx = current();
+  require_indices(last_slots, *ctx);
+  require_indices(free_pages, *ctx);
   TORCH_CHECK((page_size == 16 || page_size == 64) && !prefixes.empty() && prefixes.size() <= 256 &&
               prefixes.size() == lengths.size() && last_slots.numel() == static_cast<int64_t>(prefixes.size()),
               "GaudiRT paged allocator: unsupported page size or request count");
@@ -99,7 +100,6 @@ std::tuple<at::Tensor, int64_t> allocate_paged_slots(
   TORCH_CHECK(total > 0 && total <= 4096 && num_pages <= 512 && num_pages <= free_pages.numel(),
               "GaudiRT paged allocator: invalid token count or insufficient free pages");
   const auto bucket = std::bit_ceil(static_cast<uint32_t>(total));
-  auto ctx = current();
   const auto stream = ctx->stream();
   TemporaryDevice last(*ctx, requests * sizeof(int64_t)), pages(*ctx, 512 * sizeof(int64_t));
   TemporaryDevice meta(*ctx, metadata.size() * sizeof(int32_t));
@@ -124,12 +124,12 @@ std::tuple<at::Tensor, int64_t> allocate_paged_slots(
 }
 
 at::Tensor release_paged_slots(const at::Tensor& slots, int64_t page_size, int64_t max_pages) {
-  require_indices(slots);
+  auto ctx = current();
+  require_indices(slots, *ctx);
   TORCH_CHECK((page_size == 16 || page_size == 64) && max_pages > 0 && max_pages <= 8192 &&
               slots.numel() > 0 && slots.numel() <= 131072,
               "GaudiRT paged allocator: invalid release geometry");
   const auto bucket = std::bit_ceil(static_cast<uint32_t>(slots.numel()));
-  auto ctx = current();
   const auto compute = ctx->stream();
   TemporaryDevice staged(*ctx, bucket * sizeof(int64_t)), meta(*ctx, 256), count(*ctx, 256);
   const auto input = address_of(slots, *ctx);

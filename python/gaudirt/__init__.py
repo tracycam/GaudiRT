@@ -1,4 +1,4 @@
-"""Single-device GaudiRT PyTorch backend."""
+"""GaudiRT PyTorch PrivateUse1 & c10d distributed backend."""
 
 import atexit
 import os
@@ -23,32 +23,72 @@ def _audit_legacy_bridge():
 
 _audit_legacy_bridge()
 import torch
+import torch.distributed as _dist
 import _gaudirt_C as _C
 _audit_legacy_bridge()
 
+
+def _resolve_device_index(device=None) -> int:
+    count = _C.device_count()
+    if device is None:
+        idx = _C.current_device()
+    elif isinstance(device, bool):
+        raise ValueError(f"GaudiRT: invalid device {device!r}")
+    elif isinstance(device, int):
+        idx = device
+    elif isinstance(device, str):
+        if device == "gaudirt":
+            idx = _C.current_device()
+        elif device.startswith("gaudirt:"):
+            tail = device.split(":", 1)[1]
+            if not tail.isdigit():
+                raise ValueError(f"GaudiRT: invalid device {device!r}")
+            idx = int(tail)
+        else:
+            raise ValueError(f"GaudiRT: invalid device {device!r}")
+    elif isinstance(device, torch.device):
+        if device.type != "gaudirt":
+            raise ValueError(f"GaudiRT: invalid device {device!r}")
+        idx = _C.current_device() if device.index is None else int(device.index)
+    else:
+        raise ValueError(f"GaudiRT: invalid device {device!r}")
+    if idx < 0 or idx >= count:
+        raise ValueError(f"GaudiRT: device index {idx} out of range for visible count {count}")
+    return idx
+
+
+def _check_active_device(device=None) -> int:
+    idx = _resolve_device_index(device)
+    active = _C.current_device()
+    if idx != active:
+        raise ValueError(
+            f"GaudiRT: process active device is gaudirt:{active}, cannot query gaudirt:{idx}"
+        )
+    return idx
+
+
 class Stream(torch.Stream):
     def __new__(cls, device=None, priority=0):
-        if device not in (None, 0, "gaudirt", "gaudirt:0", torch.device("gaudirt:0")):
-            raise ValueError("GaudiRT: invalid device")
-        return super().__new__(cls, device="gaudirt:0", priority=priority)
+        idx = _resolve_device_index(device)
+        return super().__new__(cls, device=f"gaudirt:{idx}", priority=priority)
 
 
 class Event:
     def __new__(cls, enable_timing=False, blocking=False, interprocess=False):
         if blocking or interprocess:
             raise ValueError("GaudiRT: blocking and interprocess events are unsupported")
-        return torch.Event(device="gaudirt:0", enable_timing=enable_timing)
+        idx = _C.current_device()
+        return torch.Event(device=f"gaudirt:{idx}", enable_timing=enable_timing)
 
 
 def set_device(device):
-    if device not in (0, "gaudirt", "gaudirt:0", torch.device("gaudirt:0")):
-        raise ValueError("GaudiRT: invalid device")
+    idx = _resolve_device_index(device)
+    _C.set_device(idx)
 
 
 def current_stream(device=None):
-    if device not in (None, 0, "gaudirt", "gaudirt:0", torch.device("gaudirt:0")):
-        raise ValueError("GaudiRT: invalid device")
-    return torch.accelerator.current_stream(0)
+    idx = _resolve_device_index(device)
+    return torch.accelerator.current_stream(idx)
 
 
 def stream(value):
@@ -115,8 +155,39 @@ torch._register_device_module("gaudirt", sys.modules[__name__])
 torch.utils.generate_methods_for_privateuse1_backend(for_packed_sequence=False)
 
 
-def initialize(module_id=0, hbm_bytes=256 * 1024 * 1024, pinned_bytes=8 * 1024 * 1024):
-    _C.initialize(module_id, hbm_bytes, pinned_bytes)
+def _create_gaudirt_process_group(dist_opts, pg_opts=None):
+    del pg_opts
+    group_id = getattr(dist_opts, "group_id", "") or ""
+    return _C._create_process_group_gaudirt(
+        dist_opts.store,
+        int(dist_opts.group_rank),
+        int(dist_opts.group_size),
+        str(group_id),
+    )
+
+
+if "gaudirt" not in _dist.Backend.backend_list:
+    _dist.Backend.register_backend(
+        "gaudirt",
+        _create_gaudirt_process_group,
+        extended_api=True,
+        devices=["gaudirt"],
+    )
+
+
+def configure_default_runtime(hbm_bytes=256 * 1024 * 1024, pinned_bytes=8 * 1024 * 1024):
+    _C.configure_default_runtime(hbm_bytes, pinned_bytes)
+
+
+def initialize_current_device(hbm_bytes=256 * 1024 * 1024, pinned_bytes=8 * 1024 * 1024):
+    _C.initialize_current_device(hbm_bytes, pinned_bytes)
+
+
+def initialize(module_id=None, hbm_bytes=256 * 1024 * 1024, pinned_bytes=8 * 1024 * 1024):
+    if module_id is None:
+        _C.initialize_current_device(hbm_bytes, pinned_bytes)
+    else:
+        _C.initialize(module_id, hbm_bytes, pinned_bytes)
 
 
 def _reserve_rotary_cache(cache):
@@ -125,7 +196,11 @@ def _reserve_rotary_cache(cache):
             cache.ndim != 2 or not cache.is_contiguous() or min(cache.shape) <= 0):
         raise ValueError("GaudiRT: rotary cache must be a contiguous BF16 matrix")
     rows = max(cache.shape[0], _C._rotary_static_rows)
-    storage = torch.empty((rows, cache.shape[1]), device="gaudirt:0", dtype=cache.dtype)
+    target_device = (
+        cache.device if cache.device.type == "gaudirt"
+        else torch.device(f"gaudirt:{_C.current_device()}")
+    )
+    storage = torch.empty((rows, cache.shape[1]), device=target_device, dtype=cache.dtype)
     visible = storage.narrow(0, 0, cache.shape[0])
     visible.copy_(cache, non_blocking=True)
     return visible
@@ -153,14 +228,12 @@ def is_initialized():
 
 
 def mem_get_info(device=None):
-    if device not in (None, 0, "gaudirt:0", torch.device("gaudirt:0")):
-        raise ValueError("GaudiRT: invalid device")
+    _check_active_device(device)
     return _C.memory_info()
 
 
 def physical_mem_get_info(device=None):
-    if device not in (None, 0, "gaudirt:0", torch.device("gaudirt:0")):
-        raise ValueError("GaudiRT: invalid device")
+    _check_active_device(device)
     return _C.physical_memory_info()
 
 
@@ -169,8 +242,7 @@ def shutdown():
 
 
 def synchronize(device=None):
-    if device not in (None, 0, "gaudirt:0", torch.device("gaudirt:0")):
-        raise ValueError("GaudiRT: invalid device")
+    _check_active_device(device)
     _C.synchronize()
 
 
@@ -179,11 +251,15 @@ def is_available():
 
 
 def device_count():
-    return 1
+    return _C.device_count()
 
 
 def current_device():
-    return 0
+    return _C.current_device()
+
+
+def visible_module_for_device(device=None):
+    return _C.visible_module_for_device(_resolve_device_index(device))
 
 
 def _is_in_bad_fork():
@@ -191,10 +267,14 @@ def _is_in_bad_fork():
 
 
 def memory_allocated(device=None):
+    if device is not None:
+        _check_active_device(device)
     return _C.memory_allocated()
 
 
 def max_memory_allocated(device=None):
+    if device is not None:
+        _check_active_device(device)
     return _C.max_memory_allocated()
 
 
@@ -206,10 +286,23 @@ def recipe_cache_stats():
     return _C.recipe_cache_stats()
 
 
+_unhandled_exception = False
+_prev_excepthook = sys.excepthook
+
+
+def _gaudirt_excepthook(exc_type, exc_value, exc_tb):
+    global _unhandled_exception
+    _unhandled_exception = True
+    _prev_excepthook(exc_type, exc_value, exc_tb)
+
+
+sys.excepthook = _gaudirt_excepthook
+
+
 def _exit_audit():
     try:
         _audit_legacy_bridge()
-        _C._shutdown_at_exit()
+        _C._shutdown_at_exit(_unhandled_exception)
     except Exception as error:
         print(error, file=sys.stderr, flush=True)
         os._exit(1)

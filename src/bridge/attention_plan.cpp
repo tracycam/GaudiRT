@@ -127,7 +127,7 @@ void AttentionStagingPool::release(size_t index, synStreamHandle compute) {
 }
 
 const AttentionPlan& attention_plan_data(const at::Tensor& tensor, const Context& ctx) {
-  TORCH_CHECK(tensor.device().type() == c10::kPrivateUse1 && tensor.device().index() == 0,
+  TORCH_CHECK(tensor.device().type() == c10::kPrivateUse1 && tensor.device().index() == ctx.device_index,
               "GaudiRT attention: expected a device metadata plan");
   const auto* plan = tensor.storage().data_ptr().cast_context<AttentionPlan>(release_attention_plan);
   TORCH_CHECK(plan && plan->owner.lock().get() == &ctx &&
@@ -263,9 +263,9 @@ at::Tensor PagedMetadata::attention_plan(int64_t query_heads, int64_t kv_heads, 
   const auto address = plan->address;
   const auto bytes = plan->bytes;
   c10::DataPtr data(reinterpret_cast<void*>(address), plan.release(), release_attention_plan,
-                    c10::Device(c10::kPrivateUse1, 0));
+                    c10::Device(c10::kPrivateUse1, ctx->device_index));
   auto tensor = tensor_from_allocation(std::move(data), bytes, {static_cast<int64_t>(bytes / 4)},
-      at::TensorOptions().device(c10::Device(c10::kPrivateUse1, 0)).dtype(at::kInt));
+      at::TensorOptions().device(c10::Device(c10::kPrivateUse1, ctx->device_index)).dtype(at::kInt));
   auto& stream_state = ctx->streams.state(active_stream_id);
   const auto h2d = ctx->device.h2d_stream();
   {

@@ -2,6 +2,8 @@
 #pragma once
 
 #include "bucket_program.hpp"
+#include "communicator.hpp"
+
 #include <ATen/core/Tensor.h>
 #include <c10/util/intrusive_ptr.h>
 #include <synapse_api.h>
@@ -10,6 +12,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -50,14 +53,17 @@ struct SegmentRoute {
   std::vector<SegmentView> views;
 };
 
-// Runs a sequence of independent FX programs and stateful attention operators.
-// Slots are assigned from the captured FX graph; no model geometry is embedded.
+// Runs a DAG-scheduled sequence of independent FX programs, stateful attention
+// operators, and split-phase HCCL collectives (CollectiveStart / CollectiveWait).
 class SegmentedRunner {
  public:
   explicit SegmentedRunner(size_t input_count);
   std::vector<size_t> add_program(std::shared_ptr<BucketProgram> program, std::vector<size_t> inputs,
                                   std::vector<SegmentRoute> outputs);
   size_t add_attention(std::vector<size_t> inputs, int64_t head_dim, double scale);
+  uint32_t add_collective_start(uint32_t comm_id, CollectiveKind collective_kind,
+                                size_t input_slot, bool dynamic_output);
+  size_t add_collective_wait(uint32_t coll_id);
   void set_outputs(std::vector<size_t> outputs);
   void bind_static(const std::vector<size_t>& slots, const std::vector<at::Tensor>& inputs);
   std::vector<at::Tensor> run(const std::vector<at::Tensor>& inputs) const;
@@ -70,8 +76,28 @@ class SegmentedRunner {
   ProfiledResult run_profiled(const std::vector<at::Tensor>& inputs, const std::vector<uint64_t>& events) const;
   ProfiledResult run_bound_profiled(const std::vector<at::Tensor>& inputs, const std::vector<uint64_t>& events) const;
 
+  using ScheduleItem = std::tuple<std::string, uint32_t, bool>;
+  std::vector<ScheduleItem> schedule_summary() const;
+
  private:
+  enum class StepKind : uint8_t {
+    Program = 0,
+    Attention = 1,
+    CollectiveStart = 2,
+    CollectiveWait = 3,
+  };
+
+  struct CollectiveDescriptor {
+    uint32_t comm_id = 0;
+    CollectiveKind kind = CollectiveKind::AllReduce;
+    size_t src_slot = 0;
+    size_t start_step_index = 0;
+    bool dynamic_output = false;
+    bool waited = false;
+  };
+
   struct Instruction {
+    StepKind kind = StepKind::Program;
     std::shared_ptr<BucketProgram> program;
     std::vector<size_t> inputs;
     std::vector<bool> trusted;
@@ -80,16 +106,24 @@ class SegmentedRunner {
     std::vector<size_t> outputs;
     int64_t head_dim = 0;
     double scale = 0;
-    bool attention = false;
+    uint32_t coll_id = 0;
+    uint32_t comm_id = 0;
+    CollectiveKind collective_kind = CollectiveKind::AllReduce;
+    bool dynamic_output = false;
+    bool reusable_collective = false;
+    bool use_comm_stream = false;
   };
+
   TracedResult execute(const std::vector<at::Tensor>& inputs, const std::vector<bool>& trace,
                        const std::vector<synEventHandle>* events = nullptr, std::vector<double>* host_ms = nullptr,
                        bool bound = false) const;
   TracedResult traced(const std::vector<at::Tensor>& inputs, const std::vector<size_t>& traced, bool bound) const;
   ProfiledResult profiled(const std::vector<at::Tensor>& inputs, const std::vector<uint64_t>& events, bool bound) const;
+
   size_t input_count_;
   size_t slots_;
   std::vector<Instruction> instructions_;
+  std::vector<CollectiveDescriptor> collectives_;
   std::vector<bool> trusted_slots_;
   std::vector<size_t> outputs_;
   std::vector<size_t> uses_;

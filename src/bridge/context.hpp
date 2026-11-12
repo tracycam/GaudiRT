@@ -7,10 +7,12 @@
 #include "gaudirt/runtime/pinned_host_pool.hpp"
 #include "gaudirt/runtime/recipe_registry.hpp"
 
+#include <c10/core/Device.h>
 #include <c10/core/Stream.h>
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -73,6 +75,7 @@ struct Context {
   static runtime::DeviceRuntime::Config config(uint32_t module);
 
   const uint64_t generation;
+  c10::DeviceIndex device_index = 0;
   runtime::DeviceRuntime device;
   StreamRegistry streams;
   runtime::BlockCachingAllocator allocator;
@@ -81,6 +84,9 @@ struct Context {
   std::unique_ptr<AttentionStagingPool> attention_staging_pool;
   std::mutex segment_outputs_mutex;
   std::vector<std::weak_ptr<SegmentOutputPool>> segment_outputs;
+  std::shared_ptr<void> comm_state;
+  std::function<void()> comm_trim;
+  std::function<void(bool)> comm_teardown;
   std::once_flag row_count_once;
   uint64_t row_count_table = 0;
   runtime::RecipeCache cache;

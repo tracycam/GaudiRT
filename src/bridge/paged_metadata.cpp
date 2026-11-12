@@ -181,7 +181,7 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& requ
                   "GaudiRT: output KV slot aliases another visible prefix position");
     }
   }
-  const auto options = at::TensorOptions().device(c10::Device(c10::kPrivateUse1, 0)).dtype(at::kInt);
+  const auto options = at::TensorOptions().device(c10::Device(c10::kPrivateUse1, ctx->device_index)).dtype(at::kInt);
   locations_ = at::empty({bucket}, options);
   requests_ = at::empty({bucket}, options);
   positions_ = at::empty({bucket}, options);
@@ -223,25 +223,27 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
                              bool fuse_scheduler_plan) {
   TORCH_CHECK(!fuse_scheduler_plan || scheduler_owned,
               "GaudiRT device metadata: fused plan requires scheduler-owned inputs");
+  auto ctx = current();
+  const auto expected_dev = ctx->device_index;
   for (const auto& tensor : {locations, batch_requests})
-    TORCH_CHECK(tensor.device().type() == c10::kPrivateUse1 && tensor.device().index() == 0 &&
+    TORCH_CHECK(tensor.device().type() == c10::kPrivateUse1 && tensor.device().index() == expected_dev &&
                 tensor.dim() == 1 && (tensor.scalar_type() == at::kInt || tensor.scalar_type() == at::kLong),
                 "GaudiRT device metadata: expected gaudirt int32 or int64 vectors");
   TORCH_CHECK(positions.dim() == 1 &&
               ((fuse_scheduler_plan && positions.device().is_cpu() && positions.scalar_type() == at::kLong &&
                 positions.is_contiguous()) ||
                (!fuse_scheduler_plan && positions.device().type() == c10::kPrivateUse1 &&
-                positions.device().index() == 0 &&
+                positions.device().index() == expected_dev &&
                 (positions.scalar_type() == at::kInt || positions.scalar_type() == at::kLong))),
               "GaudiRT device metadata: invalid position input");
-  TORCH_CHECK(mapping.device().type() == c10::kPrivateUse1 && mapping.device().index() == 0 &&
+  TORCH_CHECK(mapping.device().type() == c10::kPrivateUse1 && mapping.device().index() == expected_dev &&
               mapping.scalar_type() == at::kInt && mapping.dim() == 2 && mapping.is_contiguous(),
               "GaudiRT device metadata: expected a contiguous gaudirt int32 request map");
   const int64_t m = locations.numel(), batch = batch_requests.numel();
   const int64_t request_count = mapping.size(0), context = mapping.size(1);
   const bool has_tokens = token_ids.defined();
   TORCH_CHECK(!scheduler_owned || has_tokens, "GaudiRT: scheduler metadata requires token IDs");
-  TORCH_CHECK((has_tokens && token_ids.device().type() == c10::kPrivateUse1 && token_ids.device().index() == 0 &&
+  TORCH_CHECK((has_tokens && token_ids.device().type() == c10::kPrivateUse1 && token_ids.device().index() == expected_dev &&
                token_ids.dim() == 1 && token_ids.numel() == m &&
                (token_ids.scalar_type() == at::kInt || token_ids.scalar_type() == at::kLong) &&
                vocabulary > 0 && vocabulary <= INT32_MAX) || (!has_tokens && vocabulary == 0),
@@ -276,11 +278,10 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
       TORCH_CHECK(host_positions[row] == info[1 + bucket + row],
                   "GaudiRT device metadata: host position does not match scheduler lengths");
   }
-  auto ctx = current();
   auto& stream_state = ctx->streams.state(active_stream_id);
   auto compute = stream_state.handle;
   auto h2d = ctx->device.h2d_stream();
-  const auto options = at::TensorOptions().device(c10::Device(c10::kPrivateUse1, 0)).dtype(at::kInt);
+  const auto options = at::TensorOptions().device(c10::Device(c10::kPrivateUse1, ctx->device_index)).dtype(at::kInt);
   // Give each graph input/output its own aligned range while sharing one
   // allocation and one lifetime across the metadata streams.
   constexpr int64_t alignment = BlockCachingAllocator::kAlignment / sizeof(int32_t);

@@ -355,6 +355,8 @@ void init_mock_backend() {
 
 }  // namespace
 
+c10::DeviceIndex device_count() { return 1; }
+c10::DeviceIndex current_device_index() { return 0; }
 std::shared_ptr<Context> current() { return g_ctx; }
 
 const AllocationContext& validated_program_input(const at::Tensor& tensor, const Context& ctx) {

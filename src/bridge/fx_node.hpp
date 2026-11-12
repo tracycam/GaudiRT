@@ -14,7 +14,7 @@ enum class FxOp {
   linear, add, rms_norm, silu_and_mul, feature_slice, fused_add_rms_norm,
   fused_residual, rotary, rotary_key, embedding, gather_rows, cast, sub, mul,
   div, concat, bmm, reshape, transpose, copy, scalar_add, scalar_sub,
-  scalar_mul, scalar_div, block_fp8_linear, fp8_linear,
+  scalar_mul, scalar_div, block_fp8_linear, fp8_linear, shard_embedding,
 };
 
 struct FxLinear { bool transpose_weight; };
@@ -25,8 +25,10 @@ struct FxCast { bool to_float; };
 struct FxShape { std::vector<int64_t> dimensions; };
 struct FxTranspose { int64_t dim0, dim1; };
 struct FxScalar { float value; bool reversed; };
+struct FxShardEmbedding { int64_t org_start, org_end, added_start, added_end, added_offset; };
 using FxParameters = std::variant<std::monostate, FxLinear, FxSlice, FxEpsilon,
-                                  FxRotary, FxCast, FxShape, FxTranspose, FxScalar>;
+                                  FxRotary, FxCast, FxShape, FxTranspose, FxScalar,
+                                  FxShardEmbedding>;
 
 struct FxNode {
   FxOp op;
@@ -73,6 +75,13 @@ struct FxNode {
   }
   static FxNode scalar(FxOp op, int64_t input, float value, bool reversed) {
     return {op, {input}, FxScalar{value, reversed}};
+  }
+  static FxNode shard_embedding(int64_t input, int64_t weight,
+                                int64_t org_start, int64_t org_end,
+                                int64_t added_start, int64_t added_end,
+                                int64_t added_offset) {
+    return {FxOp::shard_embedding, {input, weight},
+            FxShardEmbedding{org_start, org_end, added_start, added_end, added_offset}};
   }
   void append_normalized(std::ostream& output) const;
 };

@@ -7,7 +7,10 @@
 #include <c10/util/Exception.h>
 
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -37,8 +40,8 @@ c10::DataPtr allocation_data_ptr(const std::shared_ptr<Context>& ctx, uint64_t a
     free_allocation(*ctx, address, kind);
     throw;
   }
-  const auto device = kind == AllocationKind::pinned ? c10::Device(c10::kCPU) :
-                                                      c10::Device(c10::kPrivateUse1, 0);
+  const auto device = kind == AllocationKind::pinned ?
+      c10::Device(c10::kCPU) : c10::Device(c10::kPrivateUse1, ctx->device_index);
   return {reinterpret_cast<void*>(address), allocation, release_allocation, device};
 }
 
@@ -51,6 +54,60 @@ at::Tensor tensor_from_allocation(c10::DataPtr data, uint64_t bytes, at::IntArra
   return result;
 }
 
+namespace {
+
+std::vector<uint32_t> parse_visible_modules_env() {
+  const char* raw = std::getenv("HABANA_VISIBLE_MODULES");
+  if (!raw || *raw == '\0') return {0};
+  std::vector<uint32_t> modules;
+  std::string text(raw);
+  size_t cursor = 0;
+  while (cursor < text.size()) {
+    size_t comma = text.find(',', cursor);
+    std::string token = comma == std::string::npos ? text.substr(cursor)
+                                                   : text.substr(cursor, comma - cursor);
+    size_t first = 0;
+    while (first < token.size() && std::isspace(static_cast<unsigned char>(token[first]))) ++first;
+    size_t last = token.size();
+    while (last > first && std::isspace(static_cast<unsigned char>(token[last - 1]))) --last;
+    token = token.substr(first, last - first);
+    TORCH_CHECK(!token.empty(), "GaudiRT: malformed HABANA_VISIBLE_MODULES='", raw, "'");
+    for (char ch : token) {
+      TORCH_CHECK(std::isdigit(static_cast<unsigned char>(ch)),
+                  "GaudiRT: invalid module ID '", token, "' in HABANA_VISIBLE_MODULES");
+    }
+    unsigned long val = std::stoul(token);
+    TORCH_CHECK(val < 8, "GaudiRT: HABANA_VISIBLE_MODULES module ID ", val, " outside 0..7");
+    const auto mod = static_cast<uint32_t>(val);
+    TORCH_CHECK(std::find(modules.begin(), modules.end(), mod) == modules.end(),
+                "GaudiRT: duplicate module ID ", mod, " in HABANA_VISIBLE_MODULES");
+    modules.push_back(mod);
+    if (comma == std::string::npos) break;
+    cursor = comma + 1;
+    TORCH_CHECK(cursor < text.size(), "GaudiRT: trailing comma in HABANA_VISIBLE_MODULES='", raw, "'");
+  }
+  TORCH_CHECK(!modules.empty(), "GaudiRT: HABANA_VISIBLE_MODULES cannot be empty");
+  return modules;
+}
+
+c10::DeviceIndex active_device_idx = 0;
+uint64_t configured_hbm_bytes = 0;
+uint64_t configured_pinned_bytes = 0;
+std::vector<uint32_t> locked_visible_modules;
+
+const std::vector<uint32_t>& get_visible_modules_locked(bool lock_list) {
+  if (!locked_visible_modules.empty()) return locked_visible_modules;
+  static thread_local std::vector<uint32_t> scratch;
+  scratch = parse_visible_modules_env();
+  if (lock_list) {
+    locked_visible_modules = scratch;
+    return locked_visible_modules;
+  }
+  return scratch;
+}
+
+}  // namespace
+
 std::mutex context_mutex;
 std::shared_ptr<Context> context;
 thread_local std::shared_ptr<Context> scoped_context;
@@ -61,12 +118,65 @@ ContextScope::ContextScope(std::shared_ptr<Context> value) : previous_(std::move
 
 ContextScope::~ContextScope() { scoped_context = std::move(previous_); }
 
+c10::DeviceIndex device_count() {
+  std::lock_guard lock(context_mutex);
+  return static_cast<c10::DeviceIndex>(get_visible_modules_locked(static_cast<bool>(context)).size());
+}
+
+c10::DeviceIndex current_device_index() {
+  if (scoped_context) return scoped_context->device_index;
+  std::lock_guard lock(context_mutex);
+  return context ? context->device_index : active_device_idx;
+}
+
+void set_device_index(c10::DeviceIndex index) {
+  std::lock_guard lock(context_mutex);
+  const auto& modules = get_visible_modules_locked(static_cast<bool>(context));
+  TORCH_CHECK(index >= 0 && static_cast<size_t>(index) < modules.size(),
+              "GaudiRT: invalid device index ", static_cast<int>(index),
+              " for visible device count ", modules.size());
+  if (context) {
+    TORCH_CHECK(context->device_index == index,
+                "GaudiRT: process is bound to gaudirt:", static_cast<int>(context->device_index),
+                " and cannot switch to gaudirt:", static_cast<int>(index));
+  }
+  active_device_idx = index;
+}
+
+uint32_t visible_module_for_device(c10::DeviceIndex index) {
+  std::lock_guard lock(context_mutex);
+  const auto& modules = get_visible_modules_locked(static_cast<bool>(context));
+  TORCH_CHECK(index >= 0 && static_cast<size_t>(index) < modules.size(),
+              "GaudiRT: invalid device index ", static_cast<int>(index));
+  return modules[static_cast<size_t>(index)];
+}
+
+void configure_default_runtime(uint64_t hbm_bytes, uint64_t pinned_bytes) {
+  TORCH_CHECK(hbm_bytes && pinned_bytes >= 256, "GaudiRT: invalid allocation budget");
+  std::lock_guard lock(context_mutex);
+  configured_hbm_bytes = hbm_bytes;
+  configured_pinned_bytes = pinned_bytes;
+}
+
 std::shared_ptr<Context> current() {
   if (scoped_context) return scoped_context;
   std::lock_guard lock(context_mutex);
+  if (!context && configured_hbm_bytes > 0) {
+    const auto& modules = get_visible_modules_locked(true);
+    TORCH_CHECK(active_device_idx >= 0 && static_cast<size_t>(active_device_idx) < modules.size(),
+                "GaudiRT: active device index ", static_cast<int>(active_device_idx),
+                " outside visible count ", modules.size());
+    auto created = std::make_shared<Context>(
+        modules[static_cast<size_t>(active_device_idx)],
+        configured_hbm_bytes, configured_pinned_bytes);
+    created->device_index = active_device_idx;
+    context = std::move(created);
+    active_stream_id = 0;
+  }
   TORCH_CHECK(context, "GaudiRT: device is not initialized");
   return context;
 }
+
 uint64_t span_bytes(const at::Tensor& tensor) {
   uint64_t extent = 0;
   for (int64_t dim = 0; dim < tensor.dim(); ++dim) {
@@ -83,9 +193,11 @@ uint64_t span_bytes(const at::Tensor& tensor) {
               "GaudiRT: tensor extent overflow");
   return (extent + 1) * itemsize;
 }
+
 uint64_t address_of(const at::Tensor& tensor, const Context& ctx) {
-  TORCH_CHECK(tensor.device().type() == c10::kPrivateUse1 && tensor.device().index() == 0,
-              "GaudiRT: expected gaudirt:0 tensor");
+  TORCH_CHECK(tensor.device().type() == c10::kPrivateUse1 &&
+              tensor.device().index() == ctx.device_index,
+              "GaudiRT: expected gaudirt:", static_cast<int>(ctx.device_index), " tensor");
   auto address = reinterpret_cast<uint64_t>(tensor.data_ptr());
   TORCH_CHECK(ctx.allocator.contains_live_range(address, span_bytes(tensor)),
               "GaudiRT: tensor is outside a live allocation");
@@ -109,8 +221,9 @@ const AllocationContext& validated_program_input(const at::Tensor& tensor, const
 
 void record_stream(at::Tensor& tensor, c10::Stream stream) {
   auto ctx = current();
-  TORCH_CHECK(stream.device_type() == c10::kPrivateUse1 && stream.device_index() == 0,
-              "GaudiRT: record_stream requires a gaudirt:0 stream");
+  TORCH_CHECK(stream.device_type() == c10::kPrivateUse1 &&
+              stream.device_index() == ctx->device_index,
+              "GaudiRT: record_stream requires a matching gaudirt stream");
   if (tensor.numel()) {
     const auto address = address_of(tensor, *ctx);
     auto handle = ctx->streams.get(stream.id());
@@ -128,13 +241,14 @@ class Hooks final : public at::PrivateUse1HooksInterface {
   bool isBuilt() const override { return true; }
   bool isAvailable() const override { return true; }
   at::Device getDeviceFromPtr(void* ptr) const override {
-    TORCH_CHECK(current()->allocator.contains_live_range(reinterpret_cast<uint64_t>(ptr), 1),
+    auto ctx = current();
+    TORCH_CHECK(ctx->allocator.contains_live_range(reinterpret_cast<uint64_t>(ptr), 1),
                 "GaudiRT: unknown device pointer");
-    return {c10::kPrivateUse1, 0};
+    return {c10::kPrivateUse1, ctx->device_index};
   }
   bool hasPrimaryContext(c10::DeviceIndex index) const override {
     std::lock_guard lock(context_mutex);
-    return index == 0 && static_cast<bool>(context);
+    return static_cast<bool>(context) && index == context->device_index;
   }
   bool isPinnedPtr(const void* ptr) const override {
     std::lock_guard lock(context_mutex);
@@ -147,7 +261,7 @@ class Allocator final : public c10::Allocator {
  public:
   c10::DataPtr allocate(size_t bytes) override {
     auto ctx = current();
-    if (!bytes) return {nullptr, c10::Device(c10::kPrivateUse1, 0)};
+    if (!bytes) return {nullptr, c10::Device(c10::kPrivateUse1, ctx->device_index)};
     const auto stream = ctx->stream();
     const uint64_t address = ctx->allocator.allocate(bytes, stream);
     return allocation_data_ptr(ctx, address, bytes, stream, AllocationKind::device);
@@ -182,25 +296,36 @@ c10::Allocator* pinned_allocator() {
 class Guard final : public c10::impl::DeviceGuardImplInterface {
  public:
   c10::DeviceType type() const override { return c10::kPrivateUse1; }
-  c10::Device exchangeDevice(c10::Device device) const override { checked(device); return {type(), 0}; }
-  c10::Device getDevice() const override { current(); return {type(), 0}; }
-  void setDevice(c10::Device device) const override { checked(device); }
-  void uncheckedSetDevice(c10::Device) const noexcept override {}
+  c10::Device exchangeDevice(c10::Device device) const override {
+    const auto prev = current_device_index();
+    setDevice(device);
+    return {type(), prev};
+  }
+  c10::Device getDevice() const override { return {type(), current_device_index()}; }
+  void setDevice(c10::Device device) const override {
+    TORCH_CHECK(device.type() == c10::kPrivateUse1, "GaudiRT: invalid device type");
+    if (device.index() >= 0) set_device_index(device.index());
+  }
+  void uncheckedSetDevice(c10::Device device) const noexcept override {
+    if (device.type() == c10::kPrivateUse1 && device.index() >= 0) {
+      try { set_device_index(device.index()); } catch (...) {}
+    }
+  }
   c10::Stream getStream(c10::Device device) const override {
     auto ctx = checked(device);
     ctx->streams.get(active_stream_id);
-    return c10::Stream(c10::Stream::UNSAFE, c10::Device(type(), 0), active_stream_id);
+    return c10::Stream(c10::Stream::UNSAFE, c10::Device(type(), ctx->device_index), active_stream_id);
   }
   c10::Stream getDefaultStream(c10::Device device) const override {
-    checked(device);
-    return c10::Stream(c10::Stream::DEFAULT, c10::Device(type(), 0));
+    auto ctx = checked(device);
+    return c10::Stream(c10::Stream::DEFAULT, c10::Device(type(), ctx->device_index));
   }
   c10::Stream getNewStream(c10::Device device, int priority) const override {
     TORCH_CHECK(priority == 0, "GaudiRT: stream priorities are unsupported");
     auto ctx = checked(device);
     const auto id = ctx->streams.create();
     ctx->prepare_stream(ctx->streams.get(id));
-    return c10::Stream(c10::Stream::UNSAFE, c10::Device(type(), 0), id);
+    return c10::Stream(c10::Stream::UNSAFE, c10::Device(type(), ctx->device_index), id);
   }
   c10::Stream getStreamFromGlobalPool(c10::Device device, bool high_priority) const override {
     TORCH_CHECK(!high_priority, "GaudiRT: stream priorities are unsupported");
@@ -211,17 +336,17 @@ class Guard final : public c10::impl::DeviceGuardImplInterface {
     ctx->streams.get(stream.id());
     const auto previous = active_stream_id;
     active_stream_id = stream.id();
-    return c10::Stream(c10::Stream::UNSAFE, c10::Device(type(), 0), previous);
+    return c10::Stream(c10::Stream::UNSAFE, c10::Device(type(), ctx->device_index), previous);
   }
   void* getStreamNativeHandle(const c10::Stream stream) const override {
     return checked(stream.device())->streams.get(stream.id());
   }
   void record(void** event, const c10::Stream& stream, c10::DeviceIndex index,
               c10::EventFlag flag) const override {
-    TORCH_CHECK(index < 0 || index == 0, "GaudiRT: invalid event device");
+    auto ctx = checked(stream.device());
+    TORCH_CHECK(index < 0 || index == ctx->device_index, "GaudiRT: invalid event device");
     TORCH_CHECK(flag == c10::EventFlag::PYTORCH_DEFAULT || flag == c10::EventFlag::BACKEND_DEFAULT,
                 "GaudiRT: unsupported event flags");
-    auto ctx = checked(stream.device());
     auto native = ctx->streams.get(stream.id());
     std::lock_guard lock(event_mutex);
     if (!*event) {
@@ -279,7 +404,8 @@ class Guard final : public c10::impl::DeviceGuardImplInterface {
     TORCH_CHECK(synEventSynchronize(state->handle) == synSuccess, "GaudiRT: event synchronization failed");
   }
   double elapsedTime(void* first, void* second, c10::DeviceIndex index) const override {
-    TORCH_CHECK((index < 0 || index == 0) && first && second, "GaudiRT: invalid timing events");
+    auto ctx = current();
+    TORCH_CHECK((index < 0 || index == ctx->device_index) && first && second, "GaudiRT: invalid timing events");
     std::lock_guard lock(event_mutex);
     auto* start = static_cast<EventState*>(first);
     auto* end = static_cast<EventState*>(second);
@@ -290,7 +416,9 @@ class Guard final : public c10::impl::DeviceGuardImplInterface {
                 "GaudiRT: event elapsed time failed");
     return static_cast<double>(ns) * 1e-6;
   }
-  c10::DeviceIndex deviceCount() const noexcept override { return 1; }
+  c10::DeviceIndex deviceCount() const noexcept override {
+    try { return device_count(); } catch (...) { return 1; }
+  }
   bool queryStream(const c10::Stream& stream) const override {
     auto ctx = checked(stream.device());
     auto status = synStreamQuery(ctx->streams.get(stream.id()));
@@ -310,9 +438,11 @@ class Guard final : public c10::impl::DeviceGuardImplInterface {
   }
  private:
   static std::shared_ptr<Context> checked(c10::Device device) {
-    TORCH_CHECK(device.type() == c10::kPrivateUse1 && (device.index() < 0 || device.index() == 0),
+    auto ctx = current();
+    TORCH_CHECK(device.type() == c10::kPrivateUse1 &&
+                (device.index() < 0 || device.index() == ctx->device_index),
                 "GaudiRT: invalid device");
-    return current();
+    return ctx;
   }
 };
 
@@ -332,18 +462,38 @@ void initialize(uint32_t module, uint64_t hbm_bytes, uint64_t pinned_bytes) {
   TORCH_CHECK(hbm_bytes && pinned_bytes >= 256, "GaudiRT: invalid allocation budget");
   std::lock_guard lock(context_mutex);
   TORCH_CHECK(!context, "GaudiRT: device already initialized");
-  context = std::make_shared<Context>(module, hbm_bytes, pinned_bytes);
+  get_visible_modules_locked(true);
+  auto created = std::make_shared<Context>(module, hbm_bytes, pinned_bytes);
+  created->device_index = active_device_idx;
+  context = std::move(created);
   active_stream_id = 0;
 }
+
+void initialize_current_device(uint64_t hbm_bytes, uint64_t pinned_bytes) {
+  TORCH_CHECK(hbm_bytes && pinned_bytes >= 256, "GaudiRT: invalid allocation budget");
+  std::lock_guard lock(context_mutex);
+  TORCH_CHECK(!context, "GaudiRT: device already initialized");
+  const auto& modules = get_visible_modules_locked(true);
+  TORCH_CHECK(active_device_idx >= 0 && static_cast<size_t>(active_device_idx) < modules.size(),
+              "GaudiRT: invalid active device index");
+  auto created = std::make_shared<Context>(
+      modules[static_cast<size_t>(active_device_idx)], hbm_bytes, pinned_bytes);
+  created->device_index = active_device_idx;
+  context = std::move(created);
+  active_stream_id = 0;
+}
+
 bool is_initialized() {
   std::lock_guard lock(context_mutex);
   return static_cast<bool>(context);
 }
+
 std::tuple<uint64_t, uint64_t> memory_info() {
   auto ctx = current();
   const auto capacity = ctx->allocator.capacity_bytes();
   return {capacity - ctx->allocator.memory_allocated(), capacity};
 }
+
 std::tuple<uint64_t, uint64_t> physical_memory_info() {
   auto ctx = current();
   uint64_t free = 0, total = 0;
@@ -351,6 +501,7 @@ std::tuple<uint64_t, uint64_t> physical_memory_info() {
               "GaudiRT: physical device memory query failed");
   return {free, total};
 }
+
 void shutdown() {
   std::shared_ptr<Context> old;
   {
@@ -358,6 +509,13 @@ void shutdown() {
     TORCH_CHECK(context, "GaudiRT: device is not initialized");
     TORCH_CHECK(context->attention_staging().trim(), "GaudiRT: attention metadata must be destroyed before shutdown");
     TORCH_CHECK(context->trim_segment_outputs(), "GaudiRT: segment execution is still active during shutdown");
+    if (context->comm_trim) context->comm_trim();
+    if (context->comm_teardown) {
+      context->comm_teardown(false);
+      context->comm_teardown = nullptr;
+      context->comm_trim = nullptr;
+      context->comm_state.reset();
+    }
     const uint64_t graph_reservation = context->graph_pool ?
         context->graph_pool->capacity_bytes() : 0;
     TORCH_CHECK(!context->graph_pool || context->graph_pool->memory_allocated() == 0,
@@ -373,28 +531,43 @@ void shutdown() {
     TORCH_CHECK(context->pinned.memory_allocated() == 0,
                 "GaudiRT: pinned tensors must be destroyed before shutdown");
     old = std::move(context);
+    locked_visible_modules.clear();
   }
   old->synchronize_all();
   old.reset();
 }
-void shutdown_at_exit() {
+
+void shutdown_at_exit(bool abnormal) {
   std::shared_ptr<Context> old;
   {
     std::lock_guard lock(context_mutex);
     old = std::move(context);
+    locked_visible_modules.clear();
   }
   if (!old) return;
-  old->synchronize_all();
+  const bool abort_mode = abnormal || std::uncaught_exceptions() > 0;
+  if (!abort_mode) {
+    try { old->synchronize_all(); } catch (...) {}
+  }
+  if (old->comm_teardown) {
+    try { old->comm_teardown(abort_mode); } catch (...) {}
+    old->comm_teardown = nullptr;
+    old->comm_trim = nullptr;
+    old->comm_state.reset();
+  }
   old.reset();
 }
+
 uint64_t memory_allocated() { return current()->allocator.memory_allocated(); }
 uint64_t max_memory_allocated() { return current()->allocator.max_memory_allocated(); }
+
 std::vector<uint64_t> recipe_cache_stats() {
   auto ctx = current();
   std::lock_guard lock(ctx->cold_mutex);
   const auto [loaded, saved] = ctx->cache.stats();
   return {loaded, saved, ctx->cold_recipes.size()};
 }
+
 std::vector<std::string> recipe_cache_keys() {
   auto ctx = current();
   std::lock_guard lock(ctx->cold_mutex);
@@ -407,14 +580,17 @@ std::vector<std::string> recipe_cache_keys() {
   std::sort(keys.begin(), keys.end());
   return keys;
 }
+
 void empty_cache() {
   auto ctx = current();
   ctx->attention_staging().trim();
   ctx->trim_segment_outputs();
+  if (ctx->comm_trim) ctx->comm_trim();
   std::lock_guard lock(ctx->cold_mutex);
   if (ctx->graph_pool && !ctx->graph_pool->memory_allocated()) ctx->graph_pool.reset();
   ctx->allocator.empty_cache();
 }
+
 void synchronize() { current()->synchronize_all(); }
 
 }  // namespace gaudirt::generic

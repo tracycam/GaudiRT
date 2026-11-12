@@ -48,7 +48,8 @@ FxGeometry infer_fx_geometry(const std::vector<at::Tensor>& inputs, const std::v
     const bool floating = tensor.scalar_type() == at::kBFloat16 || tensor.scalar_type() == at::kFloat;
     const bool prepared_fp8 = tensor.scalar_type() == at::kFloat8_e4m3fn;
     const bool integer_vector = tensor.scalar_type() == at::kInt && tensor.dim() == 1;
-    TORCH_CHECK(tensor.device().type() == c10::kPrivateUse1 && tensor.device().index() == 0 &&
+    TORCH_CHECK(tensor.device().type() == c10::kPrivateUse1 && tensor.device().index() >= 0 &&
+                tensor.device().index() == inputs[0].device().index() &&
                 (floating || integer_vector || prepared_fp8), "GaudiRT FX: unsupported input device or dtype");
     TORCH_CHECK(((floating || (prepared_fp8 && !roles[i])) && tensor.dim() >= 1 && tensor.dim() <= 5) || integer_vector,
                 "GaudiRT FX: unsupported input rank");
@@ -143,6 +144,19 @@ FxGeometry infer_fx_geometry(const std::vector<at::Tensor>& inputs, const std::v
                   (weight.dtype == at::kBFloat16 || weight.dtype == at::kFloat) &&
                   !weight.dynamic() && weight.sizes.size() == 2,
                   "GaudiRT FX: invalid validated embedding geometry");
+      specs.push_back({weight.dtype, {-1, weight.sizes[1]}, true});
+      continue;
+    }
+    if (op.op == FxOp::shard_embedding) {
+      const auto& weight = specs[op.inputs[1]];
+      const auto& p = std::get<FxShardEmbedding>(op.parameters);
+      const int64_t min_rows =
+          (p.added_end > p.added_start) ? (p.added_end - p.added_offset) : (p.org_end - p.org_start);
+      TORCH_CHECK(a.dtype == at::kInt && a.dynamic() && a.sizes.size() == 1 &&
+                  (weight.dtype == at::kBFloat16 || weight.dtype == at::kFloat) &&
+                  !weight.dynamic() && weight.sizes.size() == 2 &&
+                  weight.sizes[0] > 0 && weight.sizes[0] >= min_rows,
+                  "GaudiRT FX: invalid shard_embedding geometry");
       specs.push_back({weight.dtype, {-1, weight.sizes[1]}, true});
       continue;
     }

@@ -7,6 +7,8 @@
 #include "cold_recipe.hpp"
 #include "bridge_internal.hpp"
 #include "bucket_program.hpp"
+#include "communicator.hpp"
+#include "process_group.hpp"
 #include "segmented_runner.hpp"
 #include "context.hpp"
 #include "fx_node.hpp"
@@ -150,7 +152,8 @@ ColdRecipe& bucket_linear_recipe(Context& ctx, at::ScalarType dtype, uint64_t k,
 }
 
 std::optional<at::Tensor> prepare_strided_input(const at::Tensor& input) {
-  TORCH_CHECK(input.device().type() == c10::kPrivateUse1 && input.device().index() == 0 &&
+  const auto active = current_device_index();
+  TORCH_CHECK(input.device().type() == c10::kPrivateUse1 && input.device().index() == active &&
               input.dim() >= 1 && input.dim() <= 5 && input.size(0) > 0 && input.size(0) <= 4096,
               "GaudiRT FX: invalid dynamic input");
   if (input.is_contiguous()) {
@@ -528,8 +531,9 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_validated(const at::Tensor& 
     int64_t head_dim, int64_t rotary_dim, bool is_neox) {
   TORCH_CHECK(head_dim > 0 && head_dim <= INT32_MAX && rotary_dim > 0 && rotary_dim <= head_dim &&
               rotary_dim % 2 == 0, "GaudiRT rotary: invalid head or rotary dimension");
+  auto ctx = current();
   for (const auto& tensor : {query, key, cache})
-    TORCH_CHECK(tensor.device().type() == c10::kPrivateUse1 && tensor.device().index() == 0 &&
+    TORCH_CHECK(tensor.device().type() == c10::kPrivateUse1 && tensor.device().index() == ctx->device_index &&
                 tensor.scalar_type() == at::kBFloat16, "GaudiRT rotary: expected gaudirt BF16 tensors");
   TORCH_CHECK(query.dim() == 2 && key.dim() == 2 && query.size(0) > 0 && query.size(0) <= 4096 &&
               key.size(0) == query.size(0) && query.size(1) > 0 && key.size(1) > 0 &&
@@ -549,7 +553,6 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_validated(const at::Tensor& 
               header.device() == query.device() && header.scalar_type() == at::kInt &&
               header.dim() == 1 && header.size(0) == 1 && header.is_contiguous(),
               "GaudiRT rotary: invalid validated metadata tensors");
-  auto ctx = current();
   auto stream = ctx->stream();
   auto cache_value = cache;
   auto cache_address = address_of(cache_value, *ctx);
@@ -682,12 +685,25 @@ TORCH_LIBRARY_IMPL(gaudirt, PrivateUse1, m) {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   gaudirt::generic::register_backend();
+  pybind11::module_::import("torch.distributed");
+  m.def("device_count", []() { return static_cast<int>(gaudirt::generic::device_count()); });
+  m.def("current_device", []() { return static_cast<int>(gaudirt::generic::current_device_index()); });
+  m.def("set_device", [](int index) {
+    TORCH_CHECK(index >= 0 && index <= 127, "GaudiRT: invalid device index ", index);
+    gaudirt::generic::set_device_index(static_cast<c10::DeviceIndex>(index));
+  });
+  m.def("visible_module_for_device", [](int index) {
+    TORCH_CHECK(index >= 0 && index <= 127, "GaudiRT: invalid device index ", index);
+    return gaudirt::generic::visible_module_for_device(static_cast<c10::DeviceIndex>(index));
+  });
+  m.def("configure_default_runtime", &gaudirt::generic::configure_default_runtime);
+  m.def("initialize_current_device", &gaudirt::generic::initialize_current_device);
   m.def("initialize", &gaudirt::generic::initialize);
   m.def("is_initialized", &gaudirt::generic::is_initialized);
   m.def("memory_info", &gaudirt::generic::memory_info);
   m.def("physical_memory_info", &gaudirt::generic::physical_memory_info);
   m.def("shutdown", &gaudirt::generic::shutdown);
-  m.def("_shutdown_at_exit", &gaudirt::generic::shutdown_at_exit);
+  m.def("_shutdown_at_exit", &gaudirt::generic::shutdown_at_exit, pybind11::arg("abnormal") = false);
   m.def("synchronize", &gaudirt::generic::synchronize);
   m.def("empty_cache", &gaudirt::generic::empty_cache);
   m.def("memory_allocated", &gaudirt::generic::memory_allocated);
@@ -705,14 +721,29 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.attr("_rotary_static_rows") = gaudirt::generic::kRotaryStaticRows;
   m.def("bucket_linear", &gaudirt::generic::bucket_linear,
         pybind11::arg("input"), pybind11::arg("weight"), pybind11::arg("bias") = pybind11::none());
+  using gaudirt::generic::CollectiveKind;
   using gaudirt::generic::FxNode;
   using gaudirt::generic::FxOp;
+  using gaudirt::generic::ProcessGroupGaudiRT;
+  pybind11::enum_<CollectiveKind>(m, "CollectiveKind")
+      .value("AllReduce", CollectiveKind::AllReduce)
+      .value("AllGather", CollectiveKind::AllGather)
+      .value("AllGatherDimLast", CollectiveKind::AllGatherDimLast)
+      .value("ReduceScatter", CollectiveKind::ReduceScatter)
+      .value("AllToAll", CollectiveKind::AllToAll);
+  pybind11::class_<ProcessGroupGaudiRT, c10d::Backend, c10::intrusive_ptr<ProcessGroupGaudiRT>>(
+      m, "ProcessGroupGaudiRT")
+      .def("ensure_initialized", &ProcessGroupGaudiRT::ensure_initialized)
+      .def("comm_id", &ProcessGroupGaudiRT::comm_id)
+      .def("device_index", &ProcessGroupGaudiRT::device_index);
+  m.def("_create_process_group_gaudirt", &gaudirt::generic::create_process_group_gaudirt);
   pybind11::enum_<FxOp>(m, "FxOp")
       .value("linear", FxOp::linear).value("add", FxOp::add).value("rms_norm", FxOp::rms_norm)
       .value("silu_and_mul", FxOp::silu_and_mul).value("feature_slice", FxOp::feature_slice)
       .value("fused_add_rms_norm", FxOp::fused_add_rms_norm).value("fused_residual", FxOp::fused_residual)
       .value("rotary", FxOp::rotary).value("rotary_key", FxOp::rotary_key)
-      .value("embedding", FxOp::embedding).value("gather_rows", FxOp::gather_rows).value("cast", FxOp::cast)
+      .value("embedding", FxOp::embedding).value("shard_embedding", FxOp::shard_embedding)
+      .value("gather_rows", FxOp::gather_rows).value("cast", FxOp::cast)
       .value("sub", FxOp::sub).value("mul", FxOp::mul).value("div", FxOp::div)
       .value("concat", FxOp::concat).value("bmm", FxOp::bmm).value("reshape", FxOp::reshape)
       .value("transpose", FxOp::transpose).value("copy", FxOp::copy)
@@ -728,7 +759,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_static("norm", &FxNode::norm).def_static("fused_norm", &FxNode::fused_norm)
       .def_static("rotary", &FxNode::rotary).def_static("cast", &FxNode::cast)
       .def_static("concat", &FxNode::concat).def_static("reshape", &FxNode::reshape)
-      .def_static("transpose", &FxNode::transpose).def_static("scalar", &FxNode::scalar);
+      .def_static("transpose", &FxNode::transpose).def_static("scalar", &FxNode::scalar)
+      .def_static("shard_embedding", &FxNode::shard_embedding);
   pybind11::class_<gaudirt::generic::BucketProgram, std::shared_ptr<gaudirt::generic::BucketProgram>>(m, "BucketProgram")
       .def(pybind11::init<std::vector<int64_t>, std::vector<FxNode>, std::vector<int64_t>>())
       .def("run", &gaudirt::generic::BucketProgram::run,
@@ -748,6 +780,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def(pybind11::init<size_t>())
       .def("add_program", &SegmentedRunner::add_program)
       .def("add_attention", &SegmentedRunner::add_attention)
+      .def("add_collective_start", &SegmentedRunner::add_collective_start)
+      .def("add_collective_wait", &SegmentedRunner::add_collective_wait)
+      .def("schedule_summary", &SegmentedRunner::schedule_summary)
       .def("set_outputs", &SegmentedRunner::set_outputs)
       .def("bind_static", &SegmentedRunner::bind_static)
       .def("run", &SegmentedRunner::run, pybind11::call_guard<pybind11::gil_scoped_release>())

@@ -5,6 +5,7 @@ import functools
 import math
 import operator
 import struct
+import sys
 import threading
 import types
 import weakref
@@ -13,6 +14,432 @@ import torch
 import torch.fx.experimental._config
 
 from . import _C
+
+
+def _fx_shard_embedding(tokens, weight, org_start, org_end, added_start, added_end, added_offset):
+    raise RuntimeError("GaudiRT FX: internal _fx_shard_embedding must be lowered")
+
+
+def _fx_collective(source, comm_id, kind):
+    raise RuntimeError("GaudiRT FX: internal _fx_collective must be lowered")
+
+
+class _CollectiveStartStub:
+    def forward(self, *args):
+        return None
+
+
+def _resolve_comm_group(group_name: str):
+    if not isinstance(group_name, str) or not group_name:
+        raise RuntimeError(f"GaudiRT FX: invalid collective group_name {group_name!r}")
+    pg = None
+    ps_mod = sys.modules.get("sglang.srt.distributed.parallel_state")
+    if ps_mod is not None:
+        groups = getattr(ps_mod, "_groups", None)
+        if isinstance(groups, dict) and group_name in groups:
+            entry = groups[group_name]
+            coord = entry() if callable(entry) else entry
+            if coord is None:
+                raise RuntimeError(f"GaudiRT FX: collective group {group_name!r} was destroyed")
+            pg = coord.device_group
+    if pg is None:
+        from torch.distributed.distributed_c10d import _resolve_process_group
+
+        pg = _resolve_process_group(group_name)
+    world_size = int(pg.size())
+    if world_size <= 1:
+        return -1, 1
+    dev = torch.device(f"gaudirt:{_C.current_device()}")
+    backend = pg._get_backend(dev)
+    if not isinstance(backend, _C.ProcessGroupGaudiRT):
+        raise RuntimeError(
+            f"GaudiRT FX: group {group_name!r} uses unsupported backend {type(backend).__name__}"
+        )
+    backend.ensure_initialized()
+    return int(backend.comm_id()), world_size
+
+
+def _fold_vocab_parallel_embedding(graph: torch.fx.Graph) -> None:
+    emb_targets = (torch.nn.functional.embedding, torch.ops.aten.embedding.default)
+    ge_ops = (operator.ge, torch.ge, torch.ops.aten.ge.Scalar)
+    lt_ops = (operator.lt, torch.lt, torch.ops.aten.lt.Scalar)
+    and_ops = (operator.and_, torch.bitwise_and, torch.ops.aten.bitwise_and.Tensor)
+    or_ops = (operator.or_, torch.bitwise_or, torch.ops.aten.bitwise_or.Tensor)
+    inv_ops = (operator.invert, torch.bitwise_not, torch.ops.aten.bitwise_not.default)
+    mul_ops = (operator.mul, torch.mul, torch.ops.aten.mul.Tensor, torch.ops.aten.mul.Scalar)
+    add_ops = (operator.add, torch.add, torch.ops.aten.add.Tensor)
+    sub_ops = (operator.sub, torch.sub, torch.ops.aten.sub.Tensor)
+
+    def _const_int(x):
+        if isinstance(x, int) and not isinstance(x, bool):
+            return x
+        if isinstance(x, torch.SymInt):
+            return int(x)
+        if isinstance(x, torch.fx.Node):
+            ex = x.meta.get("example_value", x.meta.get("val"))
+            if isinstance(ex, (int, torch.SymInt)) and not isinstance(ex, bool):
+                return int(ex)
+        return None
+
+    def _is_bin(n, ops):
+        return (isinstance(n, torch.fx.Node) and n.op == "call_function" and
+                n.target in ops and len(n.args) == 2 and not n.kwargs)
+
+    def _match_range_mask(mask_node):
+        if not _is_bin(mask_node, and_ops):
+            return None
+        a, b = mask_node.args
+        if _is_bin(b, ge_ops) and _is_bin(a, lt_ops):
+            a, b = b, a
+        if not (_is_bin(a, ge_ops) and _is_bin(b, lt_ops)):
+            return None
+        tok_a, lo_raw = a.args
+        tok_b, hi_raw = b.args
+        lo = _const_int(lo_raw)
+        hi = _const_int(hi_raw)
+        if (tok_a is not tok_b or not isinstance(tok_a, torch.fx.Node) or
+                lo is None or hi is None):
+            return None
+        return tok_a, lo, hi, a, b
+
+    def _match_scalar_mask_mul(node, expected_mask):
+        if not _is_bin(node, mul_ops):
+            return None
+        x, y = node.args
+        if x is expected_mask:
+            return _const_int(y)
+        if y is expected_mask:
+            return _const_int(x)
+        return None
+
+    for emb_node in list(graph.nodes):
+        if emb_node.op != "call_function" or emb_node.target not in emb_targets:
+            continue
+        if emb_node.target is torch.nn.functional.embedding:
+            if len(emb_node.args) != 2:
+                continue
+            idx_arg, weight_arg = emb_node.args
+        else:
+            if len(emb_node.args) < 2:
+                continue
+            weight_arg, idx_arg = emb_node.args[:2]
+        if not isinstance(idx_arg, torch.fx.Node) or not isinstance(weight_arg, torch.fx.Node):
+            continue
+
+        pattern_nodes = set()
+        masked_node = idx_arg
+        if (idx_arg.op == "call_method" and idx_arg.target == "long" and
+                len(idx_arg.args) == 1 and not idx_arg.kwargs and isinstance(idx_arg.args[0], torch.fx.Node)):
+            pattern_nodes.add(idx_arg)
+            masked_node = idx_arg.args[0]
+
+        if not _is_bin(masked_node, mul_ops):
+            continue
+        m_left, m_right = masked_node.args
+        if _is_bin(m_left, sub_ops):
+            sub_node, vocab_mask = m_left, m_right
+        elif _is_bin(m_right, sub_ops):
+            vocab_mask, sub_node = m_left, m_right
+        else:
+            continue
+
+        if not (_is_bin(vocab_mask, or_ops) and _is_bin(sub_node, sub_ops)):
+            continue
+        org_mask, add_mask = vocab_mask.args
+        org_info = _match_range_mask(org_mask)
+        add_info = _match_range_mask(add_mask)
+        if org_info is None or add_info is None:
+            continue
+        tokens_node, org_start, org_end, ge_org, lt_org = org_info
+        tokens_add, add_start, add_end, ge_add, lt_add = add_info
+        if tokens_node is not tokens_add:
+            continue
+
+        sub_tok, valid_off = sub_node.args
+        if sub_tok is not tokens_node or not _is_bin(valid_off, add_ops):
+            continue
+        mul_a, mul_b = valid_off.args
+        off_org = _match_scalar_mask_mul(mul_a, org_mask)
+        off_add = _match_scalar_mask_mul(mul_b, add_mask)
+        if off_org is None or off_add is None:
+            off_org = _match_scalar_mask_mul(mul_b, org_mask)
+            off_add = _match_scalar_mask_mul(mul_a, add_mask)
+        if off_org != org_start or off_add is None:
+            continue
+
+        mf_node = unsq_node = inv_node = None
+        for user in list(emb_node.users):
+            is_mf = ((user.op == "call_method" and user.target in ("masked_fill_", "masked_fill")) or
+                     (user.op == "call_function" and user.target in (
+                         torch.ops.aten.masked_fill_.Scalar, torch.ops.aten.masked_fill.Scalar)))
+            if not is_mf or len(user.args) != 3 or user.kwargs or user.args[0] is not emb_node or user.args[2] != 0:
+                continue
+            cand_unsq = user.args[1]
+            is_unsq = (isinstance(cand_unsq, torch.fx.Node) and (
+                (cand_unsq.op == "call_method" and cand_unsq.target == "unsqueeze") or
+                (cand_unsq.op == "call_function" and cand_unsq.target in (
+                    torch.unsqueeze, torch.ops.aten.unsqueeze.default))
+            ) and len(cand_unsq.args) == 2 and not cand_unsq.kwargs and cand_unsq.args[1] in (-1, 1))
+            if not is_unsq:
+                continue
+            cand_inv = cand_unsq.args[0]
+            is_inv = (isinstance(cand_inv, torch.fx.Node) and cand_inv.op == "call_function" and
+                      cand_inv.target in inv_ops and len(cand_inv.args) == 1 and
+                      not cand_inv.kwargs and cand_inv.args[0] is vocab_mask)
+            if is_inv:
+                mf_node, unsq_node, inv_node = user, cand_unsq, cand_inv
+                break
+        if mf_node is None:
+            continue
+
+        pattern_nodes.update({
+            ge_org, lt_org, org_mask, ge_add, lt_add, add_mask,
+            mul_a, mul_b, valid_off, vocab_mask, sub_node, masked_node,
+            inv_node, unsq_node,
+        })
+        full_group = pattern_nodes | {emb_node, mf_node}
+        if any(any(u not in full_group for u in n.users) for n in pattern_nodes):
+            continue
+
+        with graph.inserting_before(emb_node):
+            shard_node = graph.call_function(
+                _fx_shard_embedding,
+                args=(tokens_node, weight_arg, int(org_start), int(org_end),
+                      int(add_start), int(add_end), int(off_add)),
+            )
+        shard_node.meta.update(emb_node.meta)
+        if mf_node.users:
+            mf_node.replace_all_uses_with(shard_node)
+        graph.erase_node(mf_node)
+        emb_node.replace_all_uses_with(shard_node)
+        graph.erase_node(emb_node)
+        for n in reversed(list(graph.nodes)):
+            if n in pattern_nodes and not n.users:
+                graph.erase_node(n)
+
+
+def _normalize_collectives(graph: torch.fx.Graph) -> None:
+    c10d_ns = getattr(torch.ops, "_c10d_functional", None)
+    sgl_ns = getattr(torch.ops, "sglang", None)
+
+    def _overloads(ns, name):
+        if ns is None or not hasattr(ns, name):
+            return ()
+        pkt = getattr(ns, name)
+        default = getattr(pkt, "default", None)
+        return (pkt, default) if default is not None else (pkt,)
+
+    wait_targets = _overloads(c10d_ns, "wait_tensor")
+    c10d_ar = _overloads(c10d_ns, "all_reduce")
+    c10d_ag = _overloads(c10d_ns, "all_gather_into_tensor")
+    c10d_rs = _overloads(c10d_ns, "reduce_scatter_tensor")
+    c10d_a2a = _overloads(c10d_ns, "all_to_all_single")
+
+    sgl_out_ar = _overloads(sgl_ns, "outplace_all_reduce")
+    sgl_in_ar = _overloads(sgl_ns, "inplace_all_reduce")
+    sgl_ag = _overloads(sgl_ns, "reg_all_gather_into_tensor")
+    sgl_rs = _overloads(sgl_ns, "reg_reduce_scatter_tensor")
+    sgl_a2a = _overloads(sgl_ns, "reg_all_to_all_single")
+    empty_targets = (torch.empty, torch.ops.aten.empty.memory_format)
+
+    for node in list(graph.nodes):
+        if node.op == "call_function" and node.target in wait_targets:
+            node.replace_all_uses_with(node.args[0])
+            graph.erase_node(node)
+
+    ordered = list(graph.nodes)
+    pos = {n: i for i, n in enumerate(ordered)}
+
+    def _replace_uses_after(target_tensor, replacement, pivot_idx):
+        for user in list(target_tensor.users):
+            if pos.get(user, -1) > pivot_idx:
+                user.replace_input_with(target_tensor, replacement)
+
+    for idx, node in enumerate(ordered):
+        if node.op != "call_function":
+            continue
+        tgt = node.target
+
+        if tgt in c10d_ar or tgt in sgl_out_ar:
+            src = node.args[0]
+            if tgt in c10d_ar:
+                reduce_op = node.args[1] if len(node.args) > 1 else node.kwargs.get("reduceOp", "sum")
+                if str(reduce_op).lower() != "sum":
+                    raise RuntimeError(f"GaudiRT FX: unsupported all_reduce op {reduce_op!r}")
+                group_name = node.args[2] if len(node.args) > 2 else node.kwargs["group_name"]
+            else:
+                group_name = node.args[1] if len(node.args) > 1 else node.kwargs["group_name"]
+            comm_id, world_size = _resolve_comm_group(group_name)
+            if world_size == 1:
+                node.replace_all_uses_with(src)
+            else:
+                with graph.inserting_before(node):
+                    coll = graph.call_function(_fx_collective, args=(src, comm_id, int(_C.CollectiveKind.AllReduce)))
+                coll.meta.update(node.meta)
+                node.replace_all_uses_with(coll)
+            graph.erase_node(node)
+            continue
+
+        if tgt in c10d_ag:
+            src = node.args[0]
+            group_name = node.args[2] if len(node.args) > 2 else node.kwargs["group_name"]
+            comm_id, world_size = _resolve_comm_group(group_name)
+            if world_size == 1:
+                node.replace_all_uses_with(src)
+            else:
+                with graph.inserting_before(node):
+                    coll = graph.call_function(_fx_collective, args=(src, comm_id, int(_C.CollectiveKind.AllGather)))
+                coll.meta.update(node.meta)
+                node.replace_all_uses_with(coll)
+            graph.erase_node(node)
+            continue
+
+        if tgt in c10d_rs:
+            src = node.args[0]
+            reduce_op = node.args[1] if len(node.args) > 1 else node.kwargs.get("reduceOp", "sum")
+            if str(reduce_op).lower() != "sum":
+                raise RuntimeError(f"GaudiRT FX: unsupported reduce_scatter op {reduce_op!r}")
+            group_name = node.args[3] if len(node.args) > 3 else node.kwargs["group_name"]
+            comm_id, world_size = _resolve_comm_group(group_name)
+            if world_size == 1:
+                node.replace_all_uses_with(src)
+            else:
+                with graph.inserting_before(node):
+                    coll = graph.call_function(_fx_collective, args=(src, comm_id, int(_C.CollectiveKind.ReduceScatter)))
+                coll.meta.update(node.meta)
+                node.replace_all_uses_with(coll)
+            graph.erase_node(node)
+            continue
+
+        if tgt in c10d_a2a:
+            src = node.args[0]
+            out_sp = node.args[1] if len(node.args) > 1 else node.kwargs.get("output_split_sizes", [])
+            in_sp = node.args[2] if len(node.args) > 2 else node.kwargs.get("input_split_sizes", [])
+            group_name = node.args[3] if len(node.args) > 3 else node.kwargs["group_name"]
+            comm_id, world_size = _resolve_comm_group(group_name)
+            for sp in (out_sp, in_sp):
+                if sp and (len(sp) != world_size or any(s != sp[0] for s in sp)):
+                    raise RuntimeError("GaudiRT FX: variable-split all_to_all is unsupported in compiled graphs")
+            if world_size == 1:
+                node.replace_all_uses_with(src)
+            else:
+                with graph.inserting_before(node):
+                    coll = graph.call_function(_fx_collective, args=(src, comm_id, int(_C.CollectiveKind.AllToAll)))
+                coll.meta.update(node.meta)
+                node.replace_all_uses_with(coll)
+            graph.erase_node(node)
+            continue
+
+        if tgt in sgl_in_ar:
+            src = node.args[0]
+            group_name = node.args[1] if len(node.args) > 1 else node.kwargs["group_name"]
+            comm_id, world_size = _resolve_comm_group(group_name)
+            if world_size > 1:
+                with graph.inserting_before(node):
+                    coll = graph.call_function(_fx_collective, args=(src, comm_id, int(_C.CollectiveKind.AllReduce)))
+                coll.meta.update(src.meta)
+                pos[coll] = idx
+                _replace_uses_after(src, coll, idx)
+                if node.users:
+                    node.replace_all_uses_with(coll)
+            elif node.users:
+                node.replace_all_uses_with(src)
+            graph.erase_node(node)
+            continue
+
+        if tgt in sgl_ag or tgt in sgl_rs or tgt in sgl_a2a:
+            out_buf, src = node.args[0], node.args[1]
+            group_name = node.args[2] if len(node.args) > 2 else node.kwargs["group_name"]
+            comm_id, world_size = _resolve_comm_group(group_name)
+            kind = int(_C.CollectiveKind.AllGather if tgt in sgl_ag else
+                       _C.CollectiveKind.ReduceScatter if tgt in sgl_rs else
+                       _C.CollectiveKind.AllToAll)
+            if world_size == 1:
+                _replace_uses_after(out_buf, src, idx)
+            else:
+                with graph.inserting_before(node):
+                    coll = graph.call_function(_fx_collective, args=(src, comm_id, kind))
+                coll.meta.update(out_buf.meta)
+                pos[coll] = idx
+                _replace_uses_after(out_buf, coll, idx)
+            graph.erase_node(node)
+            if (isinstance(out_buf, torch.fx.Node) and not out_buf.users and
+                    out_buf.op == "call_function" and out_buf.target in empty_targets):
+                graph.erase_node(out_buf)
+            continue
+
+    reshape_fns = (torch.reshape, torch.ops.aten.view.default, torch.ops.aten.reshape.default)
+    movedim_fns = (torch.movedim, torch.ops.aten.movedim.int, torch.transpose, torch.ops.aten.transpose.int)
+
+    def _is_reshape(n):
+        return ((n.op == "call_method" and n.target in ("reshape", "view")) or
+                (n.op == "call_function" and n.target in reshape_fns))
+
+    def _is_swap01(n):
+        if ((n.op == "call_method" and n.target in ("movedim", "transpose")) or
+                (n.op == "call_function" and n.target in movedim_fns)):
+            if len(n.args) == 3 and not n.kwargs:
+                ex = n.args[0].meta.get("example_value")
+                ndim = ex.ndim if isinstance(ex, torch.Tensor) else 3
+                d0, d1 = n.args[1] % ndim, n.args[2] % ndim
+                return (d0, d1) in ((0, 1), (1, 0))
+        if ((n.op == "call_method" and n.target == "permute") or
+                (n.op == "call_function" and n.target in (torch.permute, torch.ops.aten.permute.default))):
+            dims = n.args[1] if len(n.args) == 2 and isinstance(n.args[1], (tuple, list)) else n.args[1:]
+            return tuple(dims) == (1, 0, 2)
+        return False
+
+    for coll in list(graph.nodes):
+        if (coll.op != "call_function" or coll.target is not _fx_collective or
+                coll.args[2] != int(_C.CollectiveKind.AllGather) or len(coll.users) != 1):
+            continue
+        r1 = next(iter(coll.users))
+        if not _is_reshape(r1) or len(r1.users) != 1:
+            continue
+        m1 = next(iter(r1.users))
+        if not _is_swap01(m1) or len(m1.users) != 1:
+            continue
+        r2 = next(iter(m1.users))
+        if not _is_reshape(r2):
+            continue
+        src_ex = coll.args[0].meta.get("example_value")
+        r1_ex = r1.meta.get("example_value")
+        r2_ex = r2.meta.get("example_value")
+        if not (isinstance(src_ex, torch.Tensor) and isinstance(r1_ex, torch.Tensor) and
+                isinstance(r2_ex, torch.Tensor) and src_ex.ndim == 2 and r1_ex.ndim == 3 and r2_ex.ndim == 2):
+            continue
+        if (str(r1_ex.shape[1]) != str(src_ex.shape[0]) or
+                str(r1_ex.shape[2]) != str(src_ex.shape[1]) or
+                str(r2_ex.shape[0]) != str(src_ex.shape[0]) or
+                not isinstance(r1_ex.shape[0], (int, torch.SymInt)) or
+                not isinstance(src_ex.shape[1], (int, torch.SymInt)) or
+                not isinstance(r2_ex.shape[1], (int, torch.SymInt)) or
+                int(r2_ex.shape[1]) != int(r1_ex.shape[0]) * int(src_ex.shape[1])):
+            continue
+        with graph.inserting_before(r2):
+            folded = graph.call_function(
+                _fx_collective, args=(coll.args[0], coll.args[1], int(_C.CollectiveKind.AllGatherDimLast))
+            )
+        folded.meta.update(r2.meta)
+        r2.replace_all_uses_with(folded)
+        graph.erase_node(r2)
+        graph.erase_node(m1)
+        graph.erase_node(r1)
+        graph.erase_node(coll)
+
+    impure = {
+        _fx_collective,
+        _fx_shard_embedding,
+        torch.ops.gaudirt._paged_attn_validated,
+        torch.ops.gaudirt._paged_attn_validated.default,
+    }
+    graph.eliminate_dead_code(is_impure_node=lambda n: n.op in ("placeholder", "output") or n.target in impure)
+
+
+def _normalize_fx_graph(graph_module: torch.fx.GraphModule) -> None:
+    _fold_vocab_parallel_embedding(graph_module.graph)
+    _normalize_collectives(graph_module.graph)
+    graph_module.recompile()
 
 
 def _finite_float32(value):
@@ -301,6 +728,21 @@ def _program_backend(graph_module, example_inputs, compact_outputs=()):
                 raise RuntimeError("GaudiRT FX: invalid feature slice arguments")
             feature_slice(node, node.args[0], slice(start, end, step))
             continue
+        if node.target is _fx_shard_embedding:
+            if len(node.args) != 7 or node.kwargs:
+                raise RuntimeError("GaudiRT FX: invalid _fx_shard_embedding arguments")
+            indices, weight, org_start, org_end, add_start, add_end, add_offset = node.args
+            indices = index_casts.get(indices, indices)
+            index_id, weight_id_value = tensor_id(indices), tensor_id(weight)
+            if index_id >= len(tensor_indices) or weight_id_value >= len(tensor_indices):
+                raise RuntimeError("GaudiRT FX: shard_embedding requires validated external IDs and weights")
+            validated_token_bindings.append((index_id, weight_id_value, True))
+            ids[node] = len(tensor_indices) + len(operations)
+            operations.append(Node.shard_embedding(
+                index_id, weight_id_value,
+                int(org_start), int(org_end), int(add_start), int(add_end), int(add_offset),
+            ))
+            continue
         if node.target in embedding_targets:
             if node.target is torch.nn.functional.embedding:
                 if len(node.args) != 2 or set(node.kwargs) - {
@@ -318,7 +760,7 @@ def _program_backend(graph_module, example_inputs, compact_outputs=()):
             index_id, weight_id_value = tensor_id(indices), tensor_id(weight)
             if index_id >= len(tensor_indices) or weight_id_value >= len(tensor_indices):
                 raise RuntimeError("GaudiRT FX: embedding requires validated external IDs and weights")
-            validated_token_bindings.append((index_id, weight_id_value))
+            validated_token_bindings.append((index_id, weight_id_value, False))
             ids[node] = len(tensor_indices) + len(operations)
             operations.append(Node.binary(Op.embedding, index_id, weight_id_value))
             continue
@@ -492,11 +934,12 @@ def _program_backend(graph_module, example_inputs, compact_outputs=()):
     dynamic_argument = tensor_indices[roles.index(1)] if validated_row_bindings else None
 
     def execute(*args):
-        for index_id, weight_id_value in validated_token_bindings:
+        for index_id, weight_id_value, is_sharded in validated_token_bindings:
             index = args[tensor_indices[index_id]]
             weight = args[tensor_indices[weight_id_value]]
             vocabulary = getattr(index, "_gaudirt_validated_vocab", None)
-            if not isinstance(vocabulary, int) or vocabulary <= 0 or vocabulary > weight.shape[0]:
+            if (not isinstance(vocabulary, int) or vocabulary <= 0 or
+                    (not is_sharded and vocabulary > weight.shape[0])):
                 raise RuntimeError("GaudiRT FX: embedding token IDs must pass batch metadata validation")
         for index_id in validated_row_bindings:
             index = args[tensor_indices[index_id]]
@@ -519,11 +962,24 @@ def _program_backend(graph_module, example_inputs, compact_outputs=()):
         return result[0] if single_output else result
 
     execute._gaudirt_segment = (program, tuple(tensor_indices), result_routes, single_output,
-                                tuple((tensor_indices[index], tensor_indices[weight])
-                                      for index, weight in validated_token_bindings),
+                                tuple((tensor_indices[index], tensor_indices[weight], is_sharded)
+                                      for index, weight, is_sharded in validated_token_bindings),
                                 tuple((tensor_indices[index], dynamic_argument)
                                       for index in validated_row_bindings))
     return execute
+
+
+def _restore_segment_output(template, result, args):
+    kind, value = template
+    if kind == "tensor":
+        return result[value]
+    if kind == "input":
+        return args[value]
+    if kind == "tuple":
+        return tuple(_restore_segment_output(item, result, args) for item in value)
+    if kind == "list":
+        return [_restore_segment_output(item, result, args) for item in value]
+    return value
 
 
 class _SegmentExecution:
@@ -579,9 +1035,10 @@ class _SegmentExecution:
         self.trace_result = None
 
     def forward(self, *args):
-        for index, weight in self.token_checks:
+        for index, weight, is_sharded in self.token_checks:
             vocabulary = getattr(args[index], "_gaudirt_validated_vocab", None)
-            if not isinstance(vocabulary, int) or vocabulary <= 0 or vocabulary > args[weight].shape[0]:
+            if (not isinstance(vocabulary, int) or vocabulary <= 0 or
+                    (not is_sharded and vocabulary > args[weight].shape[0])):
                 raise RuntimeError("GaudiRT FX: embedding token IDs must pass batch metadata validation")
         for index, dynamic in self.row_checks:
             if getattr(args[index], "_gaudirt_validated_rows", None) != args[dynamic].shape[0]:
@@ -598,19 +1055,7 @@ class _SegmentExecution:
         if not self._binding_attempted and self._first_args is None:
             self._first_args, self._first_outputs = args, result
 
-        def restore(template):
-            kind, value = template
-            if kind == "tensor":
-                return result[value]
-            if kind == "input":
-                return args[value]
-            if kind == "tuple":
-                return tuple(restore(item) for item in value)
-            if kind == "list":
-                return [restore(item) for item in value]
-            return value
-
-        return restore(self.output_template)
+        return _restore_segment_output(self.output_template, result, args)
 
 
 def _segment_executor(split, example_inputs, paged):
@@ -672,49 +1117,105 @@ def _segment_executor(split, example_inputs, paged):
                 eligible.add(user.args[1])
         return tuple(sorted(eligible))
 
+    call_modules = []
+    getitem_children = {}
+    output_node = None
     for node in graph_nodes:
         if node.op == "placeholder":
             continue
         if node.op == "call_function" and node.target is operator.getitem:
             source, index = node.args
-            if source not in values or not isinstance(values[source], tuple) or not isinstance(index, int):
+            if not isinstance(source, torch.fx.Node) or source.op != "call_module" or not isinstance(index, int):
                 raise RuntimeError("GaudiRT FX: unsupported split graph indexing")
-            values[node] = values[source][index]
+            getitem_children.setdefault(source, []).append(node)
             continue
         if node.op == "output":
-            output_ids = []
-
-            def output_template(value):
-                if isinstance(value, torch.fx.Node):
-                    if value in values:
-                        slots = values[value]
-                        if isinstance(slots, tuple):
-                            return ("tuple", tuple(output_template_slot(slot) for slot in slots))
-                        return output_template_slot(slots)
-                    return ("input", external_index(value))
-                if isinstance(value, (tuple, list)):
-                    return ("tuple" if isinstance(value, tuple) else "list",
-                            tuple(output_template(item) for item in value))
-                return ("literal", value)
-
-            def output_template_slot(slot):
-                output_ids.append(slot)
-                return ("tensor", len(output_ids) - 1)
-
-            template = output_template(node.args[0])
-            runner.set_outputs(output_ids)
-            sources = tuple(getattr(node.meta.get("gaudirt_source"), "name", None) for node in placeholders)
-            return _SegmentExecution(split, runner, input_indices, sources, template,
-                                     (tuple(sorted(token_checks)), tuple(sorted(row_checks))), records).forward
+            output_node = node
+            continue
         if node.op != "call_module" or node.kwargs:
             raise RuntimeError("GaudiRT FX: unsupported operation between segments")
+        call_modules.append(node)
+
+    if output_node is None:
+        raise RuntimeError("GaudiRT FX: split graph has no output")
+
+    topo_index = {node: idx for idx, node in enumerate(call_modules)}
+    mod_kind = {}
+    mod_deps = {}
+    mod_consumers = {node: set() for node in call_modules}
+    for node in call_modules:
+        segment = split.get_submodule(node.target)
+        seg_nodes = tuple(segment.graph.nodes)
+        if any(item.op == "call_function" and item.target is _fx_collective for item in seg_nodes):
+            mod_kind[node] = "collective"
+        elif any(item.op == "call_function" and item.target in paged for item in seg_nodes):
+            mod_kind[node] = "attention"
+        else:
+            mod_kind[node] = "program"
+        deps = set()
+        for arg in node.args:
+            if isinstance(arg, torch.fx.Node):
+                if arg.op == "call_module":
+                    deps.add(arg)
+                elif arg.op == "call_function" and arg.target is operator.getitem:
+                    deps.add(arg.args[0])
+        mod_deps[node] = deps
+        for dep in deps:
+            mod_consumers[dep].add(node)
+
+    available = set()
+    started_collectives = {}  # node -> (segment, tensor_arguments)
+    in_flight_order = []
+
+    def emit_getitem_children(node):
+        for child in getitem_children.get(node, ()):
+            source, index = child.args
+            if source not in values or not isinstance(values[source], tuple):
+                raise RuntimeError("GaudiRT FX: unsupported split graph indexing")
+            values[child] = values[source][index]
+
+    def emit_collective_start(node):
+        segment = split.get_submodule(node.target)
+        segment_nodes = tuple(segment.graph.nodes)
+        segment_inputs = tuple(item for item in segment_nodes if item.op == "placeholder")
+        if len(segment_inputs) != len(node.args):
+            raise RuntimeError("GaudiRT FX: collective segment argument count mismatch")
+        colls = [item for item in segment_nodes if item.op == "call_function" and item.target is _fx_collective]
+        if len(colls) != 1 or any(item.op not in ("placeholder", "output") and item is not colls[0]
+                                  for item in segment_nodes):
+            raise RuntimeError("GaudiRT FX: invalid collective partition")
+        coll = colls[0]
+        src_ph, comm_id, kind = coll.args
+        try:
+            src_arg_idx = segment_inputs.index(src_ph)
+        except ValueError as error:
+            raise RuntimeError("GaudiRT FX: collective input must be a segment input") from error
+        tensor_arguments = (src_arg_idx,)
+        src_slot = tensor_slot(node.args[src_arg_idx])
+        dynamic_out = bool(coll.meta.get("gaudirt_dynamic", False))
+        coll_id = runner.add_collective_start(
+            int(comm_id), _C.CollectiveKind(int(kind)), src_slot, dynamic_out
+        )
+        records.append((_CollectiveStartStub(), host_arguments(node.args, tensor_arguments),
+                        tensor_arguments, True))
+        started_collectives[node] = (segment, tensor_arguments, coll_id)
+        in_flight_order.append(node)
+
+    def emit_collective_wait(node):
+        segment, tensor_arguments, coll_id = started_collectives[node]
+        values[node] = runner.add_collective_wait(coll_id)
+        records.append((segment, host_arguments(node.args, tensor_arguments), tensor_arguments, True))
+        emit_getitem_children(node)
+        available.add(node)
+
+    def emit_compute_or_attention(node):
         segment = split.get_submodule(node.target)
         segment_nodes = tuple(segment.graph.nodes)
         segment_inputs = tuple(item for item in segment_nodes if item.op == "placeholder")
         if len(segment_inputs) != len(node.args):
             raise RuntimeError("GaudiRT FX: segment argument count mismatch")
-        stateful = [item for item in segment_nodes if item.op == "call_function" and item.target in paged]
-        if stateful:
+        if mod_kind[node] == "attention":
+            stateful = [item for item in segment_nodes if item.op == "call_function" and item.target in paged]
             if len(stateful) != 1 or any(item.op not in ("placeholder", "output") and item is not stateful[0]
                                          for item in segment_nodes):
                 raise RuntimeError("GaudiRT FX: invalid paged-attention partition")
@@ -731,7 +1232,18 @@ def _segment_executor(split, example_inputs, paged):
             slots = [tensor_slot(node.args[index]) for index in tensor_arguments]
             values[node] = runner.add_attention(slots, head_dim, float(scale))
             records.append((segment, host_arguments(node.args, tensor_arguments), tensor_arguments, True))
-            continue
+            emit_getitem_children(node)
+            available.add(node)
+            return
+
+        if not any(item.meta.get("gaudirt_dynamic") for item in segment_inputs):
+            for idx_in, item in enumerate(segment_inputs):
+                ex = item.meta.get("example_value")
+                if (node.args[idx_in] not in positions and isinstance(ex, torch.Tensor) and
+                        ex.ndim >= 1 and isinstance(ex.shape[0], int) and 0 < ex.shape[0] <= 4096):
+                    item.meta["gaudirt_dynamic"] = True
+                    break
+
         examples = [item.meta.get("example_value") for item in segment_inputs]
         program, tensor_arguments, routes, single, token_bindings, row_bindings = \
             _program_backend(segment, examples, compact_attention_outputs(node, segment))._gaudirt_segment
@@ -747,21 +1259,115 @@ def _segment_executor(split, example_inputs, paged):
             compiled_routes.append(_C.SegmentRoute(is_input, source, views))
         emitted = tuple(runner.add_program(program, slots, compiled_routes))
         values[node] = emitted[0] if single else emitted
-        for index, weight in token_bindings:
-            token_checks.add((external_index(node.args[index]), external_index(node.args[weight])))
+        for index, weight, is_sharded in token_bindings:
+            token_checks.add((external_index(node.args[index]), external_index(node.args[weight]), is_sharded))
         for index, _ in row_bindings:
             if dynamic_input is None:
                 raise RuntimeError("GaudiRT FX: missing dynamic input for validated row indices")
             row_checks.add((external_index(node.args[index]), dynamic_input))
         records.append((segment, host_arguments(node.args, tensor_arguments), tensor_arguments, single))
-    raise RuntimeError("GaudiRT FX: split graph has no output")
+        emit_getitem_children(node)
+        available.add(node)
+
+    def feeds_unstarted_collective(node):
+        return any(mod_kind[c] == "collective" and c not in started_collectives
+                   for c in mod_consumers[node])
+
+    while len(available) < len(call_modules):
+        ready_collectives = [
+            n for n in call_modules
+            if mod_kind[n] == "collective" and n not in started_collectives and mod_deps[n] <= available
+        ]
+        if ready_collectives:
+            emit_collective_start(ready_collectives[0])
+            continue
+
+        ready_compute = [
+            n for n in call_modules
+            if mod_kind[n] != "collective" and n not in available and mod_deps[n] <= available
+        ]
+        if ready_compute:
+            best = min(ready_compute, key=lambda n: (not feeds_unstarted_collective(n), topo_index[n]))
+            emit_compute_or_attention(best)
+            continue
+
+        if not in_flight_order:
+            raise RuntimeError("GaudiRT FX: cyclic or unresolvable segment schedule")
+        coll_to_wait = in_flight_order.pop(0)
+        emit_collective_wait(coll_to_wait)
+
+    output_ids = []
+
+    def output_template(value):
+        if isinstance(value, torch.fx.Node):
+            if value in values:
+                slots = values[value]
+                if isinstance(slots, tuple):
+                    return ("tuple", tuple(output_template_slot(slot) for slot in slots))
+                return output_template_slot(slots)
+            return ("input", external_index(value))
+        if isinstance(value, (tuple, list)):
+            return ("tuple" if isinstance(value, tuple) else "list",
+                    tuple(output_template(item) for item in value))
+        return ("literal", value)
+
+    def output_template_slot(slot):
+        output_ids.append(slot)
+        return ("tensor", len(output_ids) - 1)
+
+    template = output_template(output_node.args[0])
+    runner.set_outputs(output_ids)
+    sources = tuple(getattr(node.meta.get("gaudirt_source"), "name", None) for node in placeholders)
+    return _SegmentExecution(split, runner, input_indices, sources, template,
+                             (tuple(sorted(token_checks)), tuple(sorted(row_checks))), records).forward
 
 
 def _partition_backend(graph_module, example_inputs):
-    """Split a fully captured graph only at the stateful paged-attention operator."""
+    """Convex DAG partitioner across stateful paged-attention and collective boundaries."""
     from torch.fx.passes.split_module import split_module
 
-    nodes = tuple(graph_module.graph.nodes)
+    graph = graph_module.graph
+    transpose_targets = (torch.transpose, torch.ops.aten.transpose.int)
+    split_targets = (torch.split, torch.ops.aten.split_with_sizes.default)
+    rotary_targets = (torch.ops.gaudirt._rotary_embedding_validated,
+                      torch.ops.gaudirt._rotary_embedding_validated.default)
+    fused_norm_targets = (torch.ops.gaudirt.fused_add_rms_norm,
+                          torch.ops.gaudirt.fused_add_rms_norm.default)
+    paged = (torch.ops.gaudirt._paged_attn_validated, torch.ops.gaudirt._paged_attn_validated.default)
+    boundary_targets = (*paged, _fx_collective)
+
+    def is_consumer_helper(n):
+        if n.op == "call_method" and n.target in ("t", "long") and len(n.args) == 1 and not n.kwargs:
+            return True
+        if (n.op == "call_function" and n.target is builtins.getattr and
+                len(n.args) == 2 and n.args[1] == "T" and not n.kwargs):
+            return True
+        if ((n.op == "call_method" and n.target == "transpose") or
+                (n.op == "call_function" and n.target in transpose_targets)):
+            if len(n.args) == 3 and not n.kwargs:
+                ex = n.args[0].meta.get("example_value")
+                if isinstance(ex, torch.Tensor) and ex.ndim == 2 and (n.args[1] % 2) != (n.args[2] % 2):
+                    return True
+        return False
+
+    def is_tuple_producer(n):
+        if (n.op == "call_method" and n.target == "split") or (
+                n.op == "call_function" and n.target in split_targets):
+            return True
+        return n.op == "call_function" and (n.target in rotary_targets or n.target in fused_norm_targets)
+
+    # Clone shared consumer helpers (.t(), .T, 2D transpose, .long()) per user so each
+    # stays local to its consuming BucketProgram without cross-partition edges.
+    for n in list(graph.nodes):
+        if is_consumer_helper(n) and len(n.users) > 1:
+            users = list(n.users)
+            for user in users[1:]:
+                with graph.inserting_before(user):
+                    clone = graph.node_copy(n)
+                clone.meta.update(n.meta)
+                user.replace_input_with(n, clone)
+
+    nodes = tuple(graph.nodes)
     placeholders = [node for node in nodes if node.op == "placeholder"]
     if len(placeholders) != len(example_inputs):
         raise RuntimeError("GaudiRT FX: placeholder count mismatch")
@@ -779,32 +1385,117 @@ def _partition_backend(graph_module, example_inputs):
             extents.add(str(example.shape[0]))
     if not extents:
         raise RuntimeError("GaudiRT FX: mark each dynamic token input before capture")
+
     for node in nodes:
         example = node.meta.get("example_value")
         if isinstance(example, torch.Tensor) and example.ndim:
+            if node.op == "call_function" and node.target is _fx_collective and not isinstance(example.shape[0], int):
+                extents.add(str(example.shape[0]))
             node.meta["gaudirt_dynamic"] = str(example.shape[0]) in extents
 
-    paged = (torch.ops.gaudirt._paged_attn_validated, torch.ops.gaudirt._paged_attn_validated.default)
-    partitions, partition = {}, 0
-    for node in nodes:
-        if node.op in ("placeholder", "output"):
+    def is_boundary(n):
+        return n.op == "call_function" and n.target in boundary_targets
+
+    anc = {}
+    for n in nodes:
+        if n.op in ("placeholder", "output"):
+            anc[n] = frozenset()
             continue
-        if node.op == "call_function" and node.target in paged:
-            partition += 1
-            partitions[node] = partition
-            partition += 1
+        acc = set()
+        for inp in n.all_input_nodes:
+            acc |= anc.get(inp, frozenset())
+            if is_boundary(inp):
+                acc.add(inp)
+        anc[n] = frozenset(acc)
+
+    desc = {n: frozenset() for n in nodes}
+    for n in reversed(nodes):
+        if n.op in ("placeholder", "output"):
+            continue
+        acc = set()
+        for user in n.users:
+            if user.op == "output":
+                continue
+            acc |= desc.get(user, frozenset())
+            if is_boundary(user):
+                acc.add(user)
+        desc[n] = frozenset(acc)
+
+    raw_key = {}
+    tuple_getitems = []
+    helpers = []
+    for n in nodes:
+        if n.op in ("placeholder", "output"):
+            continue
+        if is_boundary(n):
+            raw_key[n] = ("boundary", n)
+        elif (n.op == "call_function" and n.target is operator.getitem and
+              len(n.args) == 2 and isinstance(n.args[1], int) and
+              isinstance(n.args[0], torch.fx.Node) and is_tuple_producer(n.args[0])):
+            tuple_getitems.append(n)
+        elif is_consumer_helper(n):
+            helpers.append(n)
         else:
-            partitions[node] = partition
-    split = split_module(graph_module, graph_module, lambda node: partitions[node], keep_original_order=True)
-    for target, source in zip((node for node in split.graph.nodes if node.op == "placeholder"), placeholders):
-        target.meta["gaudirt_source"] = getattr(source.meta.get("grapharg"), "source", None)
+            raw_key[n] = ("compute", anc[n], desc[n])
+
+    for n in tuple_getitems:
+        raw_key[n] = raw_key[n.args[0]]
+    for n in reversed(helpers):
+        if len(n.users) != 1:
+            raise RuntimeError("GaudiRT FX: unconsumed or multi-user helper node in partitioner")
+        user = next(iter(n.users))
+        if user not in raw_key:
+            raise RuntimeError("GaudiRT FX: helper node cannot feed graph output directly")
+        raw_key[n] = raw_key[user]
+
+    node_order = {n: i for i, n in enumerate(nodes)}
+    all_keys = {}
+    for n, k in raw_key.items():
+        if k not in all_keys or node_order[n] < all_keys[k]:
+            all_keys[k] = node_order[n]
+
+    adj = {k: set() for k in all_keys}
+    indeg = {k: 0 for k in all_keys}
+    for n, k in raw_key.items():
+        for inp in n.all_input_nodes:
+            pk = raw_key.get(inp)
+            if pk is not None and pk != k and k not in adj[pk]:
+                adj[pk].add(k)
+                indeg[k] += 1
+
+    topo_keys = []
+    ready_keys = [k for k, d in indeg.items() if d == 0]
+    while ready_keys:
+        ready_keys.sort(key=lambda k: all_keys[k])
+        cur = ready_keys.pop(0)
+        topo_keys.append(cur)
+        for nxt in adj[cur]:
+            indeg[nxt] -= 1
+            if indeg[nxt] == 0:
+                ready_keys.append(nxt)
+    if len(topo_keys) != len(all_keys):
+        raise RuntimeError("GaudiRT FX: partition quotient graph contains a cycle")
+
+    key_to_id = {k: idx for idx, k in enumerate(topo_keys)}
+    partitions = {n: key_to_id[k] for n, k in raw_key.items()}
+
+    split = split_module(graph_module, graph_module, lambda node: partitions[node], keep_original_order=False)
+    split_placeholders = [node for node in split.graph.nodes if node.op == "placeholder"]
+    ph_by_name = {node.name: node for node in placeholders}
+    for target in split_placeholders:
+        source = ph_by_name.get(target.name)
+        if source is not None:
+            target.meta["gaudirt_source"] = getattr(source.meta.get("grapharg"), "source", None)
     return _segment_executor(split, example_inputs, paged)
 
 
 def gaudirt_backend(graph_module, example_inputs):
+    _normalize_fx_graph(graph_module)
     nodes = tuple(graph_module.graph.nodes)
     if any(node.op == "call_function" and node.target in (
-        torch.ops.gaudirt._paged_attn_validated, torch.ops.gaudirt._paged_attn_validated.default
+        torch.ops.gaudirt._paged_attn_validated,
+        torch.ops.gaudirt._paged_attn_validated.default,
+        _fx_collective,
     ) for node in nodes):
         return _partition_backend(graph_module, example_inputs)
     return _program_backend(graph_module, example_inputs)
@@ -890,7 +1581,7 @@ def compile(module, dynamic_arg_indices=(0,), prepare_capture=None):
             original = args[index]
             if id(original) not in staged_inputs:
                 if (isinstance(original, torch.Tensor) and original.ndim == 1 and original.stride(0) == 1 and
-                        original.device.type == "gaudirt" and original.device.index == 0 and
+                        original.device.type == "gaudirt" and original.device.index == _C.current_device() and
                         0 < original.shape[0] <= 4096):
                     staged = None
                 else:
@@ -992,6 +1683,7 @@ def compile(module, dynamic_arg_indices=(0,), prepare_capture=None):
                     finally:
                         capture.enabled = False
                 captured_signatures.add(key)
+                execute._gaudirt_last_execution = getattr(capture, "execution", None)
                 remember_segmented_path(prepared_args, kwargs, result)
                 break
             try:

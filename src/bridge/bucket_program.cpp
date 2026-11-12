@@ -58,6 +58,20 @@ BucketProgram::BucketProgram(std::vector<int64_t> roles, std::vector<FxNode> ope
                 op.inputs[1] < static_cast<int64_t>(roles_.size());
         if (valid) has_embedding_ = true;
         break;
+      case FxOp::shard_embedding: {
+        const auto* params = std::get_if<FxShardEmbedding>(&op.parameters);
+        valid = op.inputs.size() == 2 && params &&
+                op.inputs[0] < static_cast<int64_t>(roles_.size()) &&
+                op.inputs[1] < static_cast<int64_t>(roles_.size()) &&
+                params->org_start >= 0 && params->org_end >= params->org_start &&
+                params->added_start >= params->org_end && params->added_end >= params->added_start &&
+                params->added_end <= INT32_MAX &&
+                params->added_offset >= INT32_MIN && params->added_offset <= INT32_MAX &&
+                (params->added_end == params->added_start ||
+                 params->added_start - params->added_offset >= params->org_end - params->org_start);
+        if (valid) has_embedding_ = true;
+        break;
+      }
       case FxOp::gather_rows:
         valid = op.inputs.size() == 2 && no_params && op.inputs[1] < static_cast<int64_t>(roles_.size());
         break;
@@ -150,7 +164,7 @@ BucketProgram::BucketProgram(std::vector<int64_t> roles, std::vector<FxNode> ope
         mark_weight(op.inputs[2]);
         if (op.inputs.size() == 4) mark_weight(op.inputs[3]);
         break;
-      case FxOp::rms_norm: case FxOp::embedding:
+      case FxOp::rms_norm: case FxOp::embedding: case FxOp::shard_embedding:
         mark_weight(op.inputs[1]);
         break;
       case FxOp::fused_add_rms_norm: case FxOp::rotary:
@@ -394,6 +408,105 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
         params.batchDims = 0;
         const auto guid = "gather_fwd_" + std::string(type.name);
         node({values[op.inputs[1]], masked}, values[id], params, guid.c_str());
+        continue;
+      }
+      if (op.op == FxOp::shard_embedding) {
+        const auto& se = std::get<FxShardEmbedding>(op.parameters);
+        const int32_t org_start = static_cast<int32_t>(se.org_start);
+        const int32_t org_end = static_cast<int32_t>(se.org_end);
+        const int32_t org_len = org_end - org_start;
+        const int32_t added_start = static_cast<int32_t>(se.added_start);
+        const int32_t added_end = static_cast<int32_t>(se.added_end);
+        const int32_t added_len = added_end - added_start;
+
+        auto input = tensor_nd(syn_type_int32, {1, bucket}, -1);
+        auto masked = tensor_nd(syn_type_int32, {bucket}, -1);
+        auto status = tensor_nd(syn_type_int32, {bucket}, -1);
+        node({values[op.inputs[0]]}, input, std::monostate{}, "reshape");
+        builder.node(NodeSpec{"gk_scheduler_tokens_i32_v1", {input, row_count},
+                              {masked, status}, int32_t{1}});
+
+        auto const_i32 = [&](int32_t value) {
+          auto out = tensor_nd(syn_type_int32, {bucket}, -1);
+          ns_ConstantKernel::ParamsV3 p{};
+          p.constant.i = value;
+          node({}, out, p, "constant_i32");
+          return out;
+        };
+        const auto zero_i32 = const_i32(0);
+
+        auto range_mask = [&](int32_t lo, int32_t hi) {
+          auto ge_u8 = tensor_nd(syn_type_uint8, {bucket}, -1);
+          auto lt_u8 = tensor_nd(syn_type_uint8, {bucket}, -1);
+          auto mask_u8 = tensor_nd(syn_type_uint8, {bucket}, -1);
+          node({masked, const_i32(lo)}, ge_u8, std::monostate{}, "greater_equal_fwd_i32");
+          node({masked, const_i32(hi)}, lt_u8, std::monostate{}, "less_fwd_i32");
+          node({ge_u8, lt_u8}, mask_u8, std::monostate{}, "and_fwd_u8");
+          return mask_u8;
+        };
+
+        synTensor valid_u8 = nullptr;
+        synTensor safe_idx = zero_i32;
+        if (org_len > 0) {
+          auto org_u8 = range_mask(org_start, org_end);
+          auto org_idx = org_start == 0 ? masked : tensor_nd(syn_type_int32, {bucket}, -1);
+          if (org_start != 0) {
+            node({masked, const_i32(org_start)}, org_idx, std::monostate{}, "sub_fwd_i32");
+          }
+          auto sel_idx = tensor_nd(syn_type_int32, {bucket}, -1);
+          node({org_u8, org_idx, zero_i32}, sel_idx, std::monostate{}, "where_fwd_i32");
+          safe_idx = sel_idx;
+          valid_u8 = org_u8;
+        }
+        if (added_len > 0) {
+          auto add_u8 = range_mask(added_start, added_end);
+          const int32_t add_shift = static_cast<int32_t>(se.added_offset);
+          auto add_idx = add_shift == 0 ? masked : tensor_nd(syn_type_int32, {bucket}, -1);
+          if (add_shift != 0) {
+            node({masked, const_i32(add_shift)}, add_idx, std::monostate{}, "sub_fwd_i32");
+          }
+          auto merged_idx = tensor_nd(syn_type_int32, {bucket}, -1);
+          node({add_u8, add_idx, safe_idx}, merged_idx, std::monostate{}, "where_fwd_i32");
+          safe_idx = merged_idx;
+          if (!valid_u8) {
+            valid_u8 = add_u8;
+          } else {
+            const auto one_i32 = const_i32(1);
+            auto org_flag = tensor_nd(syn_type_int32, {bucket}, -1);
+            auto any_flag = tensor_nd(syn_type_int32, {bucket}, -1);
+            auto any_u8 = tensor_nd(syn_type_uint8, {bucket}, -1);
+            node({valid_u8, one_i32, zero_i32}, org_flag, std::monostate{}, "where_fwd_i32");
+            node({add_u8, one_i32, org_flag}, any_flag, std::monostate{}, "where_fwd_i32");
+            node({any_flag, one_i32}, any_u8, std::monostate{}, "equal_fwd_i32");
+            valid_u8 = any_u8;
+          }
+        }
+
+        ns_ConstantKernel::ParamsV3 zparams{};
+        zparams.constant.f = 0.f;
+        const auto const_guid = "constant_" + std::string(type.name);
+        if (!valid_u8) {
+          node({}, values[id], zparams, const_guid.c_str());
+          continue;
+        }
+
+        auto gathered = tensor(type.syn, width, bucket, -1);
+        ns_GatherKernel::ParamsV2 gparams{};
+        gparams.axis = 1;
+        gparams.batchDims = 0;
+        const auto gather_guid = "gather_fwd_" + std::string(type.name);
+        node({values[op.inputs[1]], safe_idx}, gathered, gparams, gather_guid.c_str());
+
+        auto mask_1d_2d = tensor_nd(syn_type_uint8, {1, bucket}, -1);
+        auto mask_2d = tensor_nd(syn_type_uint8, {width, bucket}, -1);
+        node({valid_u8}, mask_1d_2d, std::monostate{}, "reshape");
+        node({mask_1d_2d}, mask_2d, std::monostate{}, "broadcast");
+
+        auto zero_embed = tensor(type.syn, width, bucket, -1);
+        node({}, zero_embed, zparams, const_guid.c_str());
+
+        const auto where_guid = "where_fwd_" + std::string(type.name);
+        node({mask_2d, gathered, zero_embed}, values[id], std::monostate{}, where_guid.c_str());
         continue;
       }
       if (op.op == FxOp::rotary) {
@@ -1099,7 +1212,7 @@ std::vector<at::Tensor> BucketProgram::run_internal(const std::vector<at::Tensor
     if (!trusted.empty() && trusted[i]) continue;
     const auto& input = inputs[i];
     const auto& spec = specs_[i];
-    TORCH_CHECK(input.device().type() == c10::kPrivateUse1 && input.device().index() == 0 &&
+    TORCH_CHECK(input.device().type() == c10::kPrivateUse1 && input.device().index() == ctx->device_index &&
                 input.scalar_type() == spec.dtype && input.dim() == static_cast<int64_t>(spec.sizes.size()),
                 "GaudiRT FX: input device, dtype or rank changed");
     for (int64_t dim = 0; dim < input.dim(); ++dim) {

@@ -59,8 +59,6 @@ def bind(execution, guard_manager, frame_locals, globals_, outer_result):
     static = [index for index in indices if
               "._parameters[" in sources[index] or "._buffers[" in sources[index] or
               getattr(args[index], "_gaudirt_static_binding", False)]
-    if not static:
-        return None
     dynamic = [index for index in indices if index not in static]
     extra = sorted({value for _, arguments, _, _ in execution.records for kind, value in arguments
                     if kind == "input" and value not in indices})
@@ -95,8 +93,10 @@ def bind(execution, guard_manager, frame_locals, globals_, outer_result):
     static_values = {index: weakref.ref(args[index]) for index in static}
     dynamic_positions = {index: pos for pos, index in enumerate(dynamic)}
     extra_positions = {index: pos for pos, index in enumerate(extra)}
-    if any(index not in static_values and index not in dynamic_positions
-           for pair in (execution.token_checks, execution.row_checks) for check in pair for index in check):
+    if (any(index not in static_values and index not in dynamic_positions
+            for check in execution.token_checks for index in check[:2]) or
+            any(index not in static_values and index not in dynamic_positions
+                for check in execution.row_checks for index in check)):
         return None
     execution.runner.bind_static([indices.index(index) for index in static], [args[index] for index in static])
 
@@ -111,9 +111,11 @@ def bind(execution, guard_manager, frame_locals, globals_, outer_result):
                 raise RuntimeError("GaudiRT FX: static tensor expired")
             return value
 
-        for index, weight in execution.token_checks:
+        for index, weight, is_sharded in execution.token_checks:
             vocabulary = getattr(tensor_at(index), "_gaudirt_validated_vocab", None)
-            if not isinstance(vocabulary, int) or vocabulary <= 0 or vocabulary > tensor_at(weight).shape[0]:
+            if not isinstance(vocabulary, int) or vocabulary <= 0 or (
+                not is_sharded and vocabulary > tensor_at(weight).shape[0]
+            ):
                 raise RuntimeError("GaudiRT FX: embedding token IDs must pass batch metadata validation")
         for index, dynamic_index in execution.row_checks:
             if getattr(tensor_at(index), "_gaudirt_validated_rows", None) != tensor_at(dynamic_index).shape[0]:

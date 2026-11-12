@@ -167,7 +167,7 @@ at::Tensor paged_attn_internal(const at::Tensor& query, const at::Tensor& key, c
   TORCH_CHECK(plan.stream == stream && std::isfinite(scale) && std::isfinite(scale_f) && scale_f > 0 &&
               head_dim == plan.head_dim, "GaudiRT attention: invalid scale, stream, or head dimension");
   for (const auto& input : {query, key, value})
-    TORCH_CHECK(input.device().type() == c10::kPrivateUse1 && input.device().index() == 0 &&
+    TORCH_CHECK(input.device().type() == c10::kPrivateUse1 && input.device().index() == ctx->device_index &&
                 input.scalar_type() == at::kBFloat16 && input.dim() == 2 && input.size(0) == plan.rows,
                 "GaudiRT attention: Q/K/V must be BF16 device matrices with matching rows");
   TORCH_CHECK(query.size(1) == plan.query_heads * head_dim && key.size(1) == plan.kv_heads * head_dim &&
@@ -175,7 +175,7 @@ at::Tensor paged_attn_internal(const at::Tensor& query, const at::Tensor& key, c
               locations.scalar_type() == at::kInt,
               "GaudiRT attention: Q/K/V or slot dimensions do not match metadata");
   for (const auto& pool : {key_pool, value_pool})
-    TORCH_CHECK(pool.device().type() == c10::kPrivateUse1 && pool.device().index() == 0 &&
+    TORCH_CHECK(pool.device().type() == c10::kPrivateUse1 && pool.device().index() == ctx->device_index &&
                 pool.scalar_type() == at::kBFloat16 && pool.dim() == 3 &&
                 pool.size(0) == plan.slots && pool.size(1) == plan.kv_heads && pool.size(2) == head_dim &&
                 pool.stride(0) == head_dim && pool.stride(1) == plan.slots * head_dim && pool.stride(2) == 1,
