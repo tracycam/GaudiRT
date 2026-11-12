@@ -26,16 +26,21 @@ def _program_backend(graph_module, example_inputs, compact_outputs=()):
     placeholders = tuple(node for node in nodes if node.op == "placeholder")
     if len(placeholders) != len(example_inputs):
         raise RuntimeError("GaudiRT FX: placeholder count mismatch")
-    tensor_indices, roles, ids = [], [], {}
+    placeholder_tensors = []
     for index, (node, value) in enumerate(zip(placeholders, example_inputs)):
         if not isinstance(value, torch.Tensor):
             continue
         dynamic = getattr(value, "_dynamo_dynamic_indices", set()) or set()
         if dynamic and dynamic != {0}:
             raise RuntimeError("GaudiRT FX: only the outer token dimension may be dynamic")
+        role = int(node.meta.get("gaudirt_dynamic", bool(dynamic)))
+        placeholder_tensors.append((index, node, role))
+    placeholder_tensors.sort(key=lambda item: not item[2])
+    tensor_indices, roles, ids = [], [], {}
+    for index, node, role in placeholder_tensors:
         ids[node] = len(tensor_indices)
         tensor_indices.append(index)
-        roles.append(int(node.meta.get("gaudirt_dynamic", bool(dynamic))))
+        roles.append(role)
     if not any(roles):
         raise RuntimeError("GaudiRT FX: mark each dynamic token input before capture")
 

@@ -97,17 +97,32 @@ def main():
             def __init__(self, runner):
                 self.runner = runner
 
+            def bind_static(self, slots, tensors):
+                return self.runner.bind_static(slots, tensors)
+
             def run(self, values):
                 calls.append("run")
                 return self.runner.run(values)
+
+            def run_bound(self, values):
+                calls.append("run")
+                return self.runner.run_bound(values)
 
             def run_traced(self, values, indices):
                 calls.append("trace")
                 return self.runner.run_traced(values, indices)
 
+            def run_bound_traced(self, values, indices):
+                calls.append("trace")
+                return self.runner.run_bound_traced(values, indices)
+
             def run_profiled(self, values, events):
                 calls.append("profile")
                 return self.runner.run_profiled(values, events)
+
+            def run_bound_profiled(self, values, events):
+                calls.append("profile")
+                return self.runner.run_bound_profiled(values, events)
 
         executor.runner = CountCalls(executor.runner)
         if tracing:

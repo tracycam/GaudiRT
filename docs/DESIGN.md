@@ -10,7 +10,15 @@
 
 1. **零旧桥隔离**：运行进程设置 `TORCH_DEVICE_BACKEND_AUTOLOAD=0`，C++ 源码与构建产物不引入任何 `gaudi-pytorch-bridge` 头文件或动态库，Python 侧禁止加载 `habana_frameworks` 或 `PT_HPU_LAZY_MODE`；启动与运行期对进程模块表与动态库映射执行硬核查。
 2. **明确契约与快速失败（Fail-Fast）**：所有形状越界、设备索引不匹配、未声明算子或非法通信组在入口处直接报错终止，不做静默回退（Fallback），不在解码热循环内部堆砌重复的防御性检查。
-3. **跨模型与跨引擎复用**：设备上下文（`Context`）、显存块缓存分配器（`BlockCachingAllocator`）、Recipe 编译缓存（`RecipeRegistry` / `RecipeCache`）、分段图执行器（`SegmentedRunner`）以及分布式后端（`ProcessGroupGaudiRT`）全部建立在标准 PyTorch 2 `PrivateUse1` / `torch.compile` / `c10d::Backend` 契约之上，不绑死单一模型结构或单一上层服务框架。
+3. **跨模型与跨引擎复用**：设备上下文（`Context`）、显存块缓存分配器（`BlockCachingAllocator`）、Recipe 编译缓存（`RecipeCache`）、分段图执行器（`SegmentedRunner`）以及分布式后端（`ProcessGroupGaudiRT`）全部建立在标准 PyTorch 2 `PrivateUse1` / `torch.compile` / `c10d::Backend` 契约之上，不绑死单一模型结构或单一上层服务框架。
+
+### 1.1 模块分层与职责边界
+
+`GaudiRT` 彻底清除早期单模手写图、裸 SCAL 探针与历史兼容壳，按单一职责收敛为四层：
+
+- **C++ 通用运行时底座（`include/gaudirt/{common,runtime}/`、`src/*.cpp`）**：`DeviceRuntime`（单设备与计算/H2D/D2H 流生命周期）、`BlockCachingAllocator` + `GraphPool`（流序块式显存分配与分段图复用池）、`PinnedHostPool`（锁页主机 DMA 池）、`EventPool` / `StreamEvent`（零稳态创建的可复用硬件事件）与 `RecipeCache`（带编译器/算子库/构图二进制 SHA256 指纹的多进程原子落盘缓存）。
+- **C++ 统一构图与分段桥接层（`src/bridge/`）**：全仓唯一 `synGraphCreate` 入口收敛至 RAII `SynapseGraphBuilder`（`graph_builder.{hpp,cpp}`），统一服务于 13 档静态桶编译子图与冷路径微型算子；`fx_op_lowering.{hpp,cpp}` 承载 FX 算子节点到 Synapse 节点的下沉（含 `128×128` Block-FP8 小桶/大桶片上 SRAM MME 路径与词表分片 `shard_embedding`），`bucket_program.{hpp,cpp}` 负责 13 档静态桶缓存与快速发射（图外 `bucket_linear` 直接复用同一 `BucketProgram`），`paged_attention*.{hpp,cpp}` / `paged_metadata.{hpp,cpp}` 承载 4D 片上归约分页注意力，`segmented_runner.{hpp,cpp}` 与 `communicator.{hpp,cpp}` / `process_group.{hpp,cpp}` 承载分段图调度与 HCCL 分布式后端。
+- **Python 编译前端（`python/gaudirt/`）**：`compiler.py`（`torch.compile` 入口、Dynamo 守卫与静态签名缓存）、`fx_passes.py`（`VocabParallelEmbedding` 折叠与集合通信算子函数式归一化）、`op_lowering.py`（扁平分发表驱动的 `FX -> BucketProgram` 下沉）、`partitioner.py`（基于边界秩的凸集 DAG 划分与 `ASAP Start + ALAP Wait` 拓扑调度）与 `segment_binding.py`（C++ 守卫托管下的静态张量直绑快路径）。
 
 ---
 
@@ -82,7 +90,7 @@ CommunicatorRegistry (进程内单例，按 group_name / pg_uid 索引)
 
 ### 5.1 集合通信前端归一化
 
-`compiler.py` 同时识别标准 PyTorch 函数式集合通信与 SGLang 通信算子族，统一归一化为无副作用的函数式图节点：
+`fx_passes.py` 同时识别标准 PyTorch 函数式集合通信与 SGLang 通信算子族，统一归一化为无副作用的函数式图节点：
 
 - `torch.ops._c10d_functional.{all_reduce, all_gather_into_tensor, reduce_scatter_tensor, all_to_all_single}` + `wait_tensor`
 - `torch.ops.sglang.{outplace_all_reduce, inplace_all_reduce, reg_all_gather_into_tensor, reg_reduce_scatter_tensor, reg_all_to_all_single}`
