@@ -295,7 +295,7 @@ void lower_block_fp8_linear(SynapseGraphBuilder& builder, synDeviceId device_id,
   auto local = [&](synDataType dtype, std::vector<uint64_t> dimensions, bool rmw = false) {
     return builder.tensor(dtype, dimensions, -1, -1, 0, false, {}, rmw);
   };
-  if (token_rows >= 512) {
+  if (token_rows >= 128) {
     // Hardware-budgeted single-pass 1K FP16 SRAM-bundled prefill lowering:
     // - Keep the single FP32 accumulator (c0) <= 256 MiB per (row_tile, col_tile)
     //   so wide projections (e.g. N=44032 at M=4096) split into 2048-row tiles

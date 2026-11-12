@@ -448,7 +448,7 @@ void test_small_buckets_keep_batch_gemm() {
   auto w = make_dev_tensor({2, 256, 128}, at::kFloat8_e4m3fn);
   auto s = make_dev_tensor({2, 2}, at::kFloat);
 
-  for (int64_t m : {1, 64, 128, 256}) {
+  for (int64_t m : {1, 16, 32, 64}) {
     g_state.clear_graph_records();
     auto x = make_dev_tensor({m, 256}, at::kBFloat16);
     auto out = prog.run({x, w, s});
@@ -463,14 +463,14 @@ void test_small_buckets_keep_batch_gemm() {
 
 void test_prefill_fp16_1k_unbiased_and_sram_row_tiling() {
   // K = 7168 (56 groups), N = 9216:
-  // - M in {512, 1024} -> row_tiles = 1, column_tiles = 1, g_cnt = 1 (6 nodes, 0 splits/concats)
+  // - M in {128, 256, 512, 1024} -> row_tiles = 1, column_tiles = 1, g_cnt = 1 (6 nodes, 0 splits/concats)
   // - M = 4096 -> row_tiles = 1 (tile_rows = 4096), column_tiles = 1, g_cnt = 2 (gc = 28),
   //   with col_offset K-slicing on activation and 3-input GEMM K-accumulation
   BucketProgram prog({1, 0, 0}, {FxNode{FxOp::block_fp8_linear, {0, 1, 2}, std::monostate{}}});
   auto w = make_dev_tensor({56, 9216, 128}, at::kFloat8_e4m3fn);
   auto s = make_dev_tensor({72, 56}, at::kFloat);
 
-  for (uint64_t m : {512ULL, 1024ULL}) {
+  for (uint64_t m : {128ULL, 256ULL, 512ULL, 1024ULL}) {
     g_state.clear_graph_records();
     auto x = make_dev_tensor({static_cast<int64_t>(m), 7168}, at::kBFloat16);
     auto out = prog.run({x, w, s});
@@ -609,17 +609,17 @@ void test_3d_activation_threshold_and_reshapes() {
   auto w = make_dev_tensor({2, 256, 128}, at::kFloat8_e4m3fn);
   auto s = make_dev_tensor({2, 2}, at::kFloat);
 
-  // [128, 2, 256] -> bucket=128, token_rows=256 -> stays on batch_gemm
+  // [32, 2, 256] -> bucket=32, token_rows=64 -> stays on batch_gemm
   g_state.clear_graph_records();
-  auto out256 = prog.run({make_dev_tensor({128, 2, 256}, at::kBFloat16), w, s});
-  assert(out256[0].sizes().equals({128, 2, 256}));
+  auto out64 = prog.run({make_dev_tensor({32, 2, 256}, at::kBFloat16), w, s});
+  assert(out64[0].sizes().equals({32, 2, 256}));
   assert(count_guid("batch_gemm") == 1);
   assert(count_guid("gk_fp8_quant_act_fp16_1k_v1") == 0);
 
-  // [256, 2, 256] -> bucket=256, token_rows=512 -> takes single-pass 1K FP16 with 2 reshapes
+  // [64, 2, 256] -> bucket=64, token_rows=128 -> takes single-pass 1K FP16 with 2 reshapes
   g_state.clear_graph_records();
-  auto out512 = prog.run({make_dev_tensor({256, 2, 256}, at::kBFloat16), w, s});
-  assert(out512[0].sizes().equals({256, 2, 256}));
+  auto out128 = prog.run({make_dev_tensor({64, 2, 256}, at::kBFloat16), w, s});
+  assert(out128[0].sizes().equals({64, 2, 256}));
   assert(count_guid("reshape") == 2);
   assert(count_guid("gk_fp8_act_row_scale_f32_v1") == 1);
   assert(count_guid("gk_fp8_weight_blk_scale_f32_v1") == 1);
