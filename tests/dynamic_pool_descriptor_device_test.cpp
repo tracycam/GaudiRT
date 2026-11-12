@@ -1,7 +1,7 @@
 // Verify one dynamic external pool descriptor against two physical pool sizes.
 // The optional invalid index bypasses runtime validation solely to test device bounds.
 #include "gaudirt/runtime/device_runtime.hpp"
-#include "gaudirt/runtime/hbm_arena.hpp"
+#include "test_device_slab.hpp"
 #include "gaudirt/runtime/recipe_registry.hpp"
 #include <perf_lib_layer_params.h>
 
@@ -33,7 +33,7 @@ int main(int argc, char** argv) {
     if (slots < 2 || slots > max_slots || (mode != "cold" && mode != "warm"))
       throw std::invalid_argument("invalid pool size or mode");
     DeviceRuntime runtime({});
-    HbmArena arena(runtime.device_id(), 64ULL * 1024 * 1024);
+    gaudirt::testing::TestDeviceSlab arena(runtime.device_id(), 64ULL * 1024 * 1024);
     RecipeCache cache(argv[2]);
     const auto canary_before = arena.allocate(width * 2);
     const auto pool = arena.allocate(width * slots * 2);

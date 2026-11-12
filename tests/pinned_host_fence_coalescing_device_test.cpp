@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Merged pinned blocks wait for the latest fence on each distinct stream.
 #include "gaudirt/runtime/device_runtime.hpp"
-#include "gaudirt/runtime/hbm_arena.hpp"
+#include "test_device_slab.hpp"
 #include "gaudirt/runtime/pinned_host_pool.hpp"
 
 #include <array>
@@ -20,7 +20,7 @@ int main() {
     if (!synchronizes) throw std::runtime_error("event counter interposer is required");
     constexpr uint64_t bytes = 256;
     DeviceRuntime runtime({});
-    HbmArena arena(runtime.device_id(), 1024 * 1024);
+    gaudirt::testing::TestDeviceSlab arena(runtime.device_id(), 1024 * 1024);
     PinnedHostPool pool(runtime.device_id(), 3 * bytes);
     std::array<uint8_t, 3 * bytes> input{};
     for (size_t i = 0; i < input.size(); ++i) input[i] = static_cast<uint8_t>((i * 37 + 19) & 255);

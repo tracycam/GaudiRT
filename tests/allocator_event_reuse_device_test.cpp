@@ -1,7 +1,7 @@
 // Re-record pooled allocator events across three streams without host waits.
 #include "gaudirt/runtime/block_caching_allocator.hpp"
 #include "gaudirt/runtime/device_runtime.hpp"
-#include "gaudirt/runtime/hbm_arena.hpp"
+#include "test_device_slab.hpp"
 
 #include <array>
 #include <cstdint>
@@ -26,7 +26,7 @@ int main() {
     if (!creates || !destroys) throw std::runtime_error("event counter interposer is required");
     constexpr uint64_t steps = 512, bytes = 256;
     DeviceRuntime runtime({});
-    HbmArena arena(runtime.device_id(), 4ULL * 1024 * 1024);
+    gaudirt::testing::TestDeviceSlab arena(runtime.device_id(), 4ULL * 1024 * 1024);
     BlockCachingAllocator pool(runtime.device_id(), bytes);
     void* memory = nullptr;
     check(synHostMalloc(runtime.device_id(), steps * bytes, 0, &memory), "host allocation");

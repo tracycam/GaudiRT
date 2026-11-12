@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Exercise BF16 midpoint rounding of a compensated reduction on Gaudi2.
 #include "gaudirt/runtime/device_runtime.hpp"
-#include "gaudirt/runtime/hbm_arena.hpp"
+#include "test_device_slab.hpp"
 #include "gaudirt/runtime/prepared_launch.hpp"
 #include "gaudirt/runtime/recipe_registry.hpp"
 
@@ -34,7 +34,7 @@ int main(int argc, char** argv) {
   const bool include_subnormal = argc == 2;
   constexpr unsigned columns = 1024, rows = 32, groups = 2;
   DeviceRuntime runtime(DeviceRuntime::Config{});
-  HbmArena arena(runtime.device_id(), 64ULL * 1024 * 1024);
+  gaudirt::testing::TestDeviceSlab arena(runtime.device_id(), 64ULL * 1024 * 1024);
   synGraphHandle graph = nullptr;
   synRecipeHandle recipe = nullptr;
   std::array<synSectionHandle, 5> sections{};

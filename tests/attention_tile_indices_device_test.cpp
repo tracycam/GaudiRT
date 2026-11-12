@@ -1,6 +1,6 @@
 // Check dynamic request maps and complete vector writes by the tile-index kernel.
 #include "gaudirt/runtime/device_runtime.hpp"
-#include "gaudirt/runtime/hbm_arena.hpp"
+#include "test_device_slab.hpp"
 #include "gaudirt/runtime/recipe_registry.hpp"
 
 #include <array>
@@ -39,7 +39,7 @@ int main(int argc, char** argv) {
       work[t * 4 + 3] = (t / 2) * slots;
     }
     DeviceRuntime runtime({});
-    HbmArena arena(runtime.device_id(), 32ULL * 1024 * 1024);
+    gaudirt::testing::TestDeviceSlab arena(runtime.device_id(), 32ULL * 1024 * 1024);
     RecipeCache cache(argv[1]);
     const std::array<uint64_t, 5> addresses{arena.allocate(map.size() * 4), arena.allocate(sizeof(row_requests)),
         arena.allocate(sizeof(work)), arena.allocate(4), arena.allocate(tasks * 64 * 4)};

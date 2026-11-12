@@ -2,7 +2,7 @@
 // Standalone block-FP8 graph: BF16 dynamic activation quantization, native
 // FP8 batch GEMM, and FP32 block-scale/bias reduction to BF16.
 #include "gaudirt/runtime/device_runtime.hpp"
-#include "gaudirt/runtime/hbm_arena.hpp"
+#include "test_device_slab.hpp"
 #include "gaudirt/runtime/recipe_registry.hpp"
 
 #include <perf_lib_layer_params.h>
@@ -209,7 +209,7 @@ int main(int argc, char** argv) {
         output.size() * sizeof(output[0]) +
         (use_hybrid ? 2560ULL * 1024 * 1024
                     : (tile_width ? 512ULL * 1024 * 1024 : 2 * partial_bytes + 256ULL * 1024 * 1024));
-    HbmArena arena(runtime.device_id(), arena_bytes);
+    gaudirt::testing::TestDeviceSlab arena(runtime.device_id(), arena_bytes);
     RecipeCache cache(argv[1]);
     const auto xa = arena.allocate(x.size() * sizeof(x[0]));
     const auto wa = arena.allocate(prepared.size());

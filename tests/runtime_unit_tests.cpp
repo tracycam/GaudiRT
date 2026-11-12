@@ -1,19 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "gaudirt/common/sha256.hpp"
+#include "gaudirt/runtime/block_caching_allocator.hpp"
 #include "gaudirt/runtime/device_runtime.hpp"
-#include "gaudirt/runtime/hbm_arena.hpp"
 #include "gaudirt/runtime/inflight_credit_manager.hpp"
-#include "gaudirt/runtime/weight_manifest.hpp"
+#include "gaudirt/runtime/pinned_host_pool.hpp"
+#include "gaudirt/runtime/prepared_launch.hpp"
 #include "gaudirt/runtime/recipe_registry.hpp"
-#include "gaudirt/runtime/tp_reduce.hpp"
 #include "gaudirt/scal/long_so.hpp"
 
+#include <array>
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
+#include <filesystem>
 #include <stdexcept>
 #include <string>
 #include <unistd.h>
@@ -167,131 +168,15 @@ void test_binding_table_value_semantics_and_dtype() {
   verify(assigned);
 }
 
-void test_weight_manifest() {
+void test_sha256_vectors() {
+  assert(gaudirt::common::sha256_bytes(nullptr, 0) ==
+         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+  const uint8_t abc[] = {'a', 'b', 'c'};
+  assert(gaudirt::common::sha256_bytes(abc, sizeof(abc)) ==
+         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
   const std::vector<uint8_t> million_a(1000000, 'a');
   assert(gaudirt::common::sha256_bytes(million_a.data(), million_a.size()) ==
          "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
-  const std::filesystem::path directory =
-      std::filesystem::temp_directory_path() /
-      ("gaudirt_weight_manifest_" + std::to_string(getpid()));
-  std::filesystem::create_directories(directory);
-  const std::string digest =
-      "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
-  {
-    std::ofstream raw(directory / "x.bin", std::ios::binary);
-    raw << "abc";
-  }
-  {
-    std::ofstream manifest(directory / "weights.manifest");
-    manifest << "GAUDIRT_WEIGHTS_V1\n"
-             << "T x uint8 3 1 3 x.bin " << digest << '\n'
-             << "T e4m3 fp8_e4m3 3 1 3 x.bin " << digest << '\n'
-             << "T e5m2 fp8_e5m2 3 1 3 x.bin " << digest << '\n';
-  }
-  const auto tensors = WeightManifest::read_manifest(directory);
-  assert(tensors.size() == 3);
-  assert(tensors[0].name == "x" && tensors[0].dtype == syn_type_uint8);
-  assert(tensors[0].elements == 3 && tensors[0].bytes == 3);
-  assert(tensors[1].dtype == syn_type_fp8_143);
-  assert(tensors[2].dtype == syn_type_fp8_152);
-  {
-    std::ofstream raw(directory / "x.bin", std::ios::binary);
-    raw << "abd";
-  }
-  bool rejected = false;
-  try {
-    WeightManifest::read_manifest(directory);
-  } catch (const std::runtime_error&) {
-    rejected = true;
-  }
-  assert(rejected);
-  {
-    std::ofstream manifest(directory / "weights.manifest");
-    manifest << "GAUDIRT_WEIGHTS_V1\n"
-             << "T x fp32 1 1 1 ../x.bin "
-             << std::string(64, '0') << '\n';
-  }
-  rejected = false;
-  try {
-    WeightManifest::read_manifest(directory);
-  } catch (const std::runtime_error&) {
-    rejected = true;
-  }
-  assert(rejected);
-
-  WeightTensor borrowed;
-  borrowed.name = "borrowed";
-  borrowed.dtype = syn_type_bf16;
-  borrowed.shape = {2, 4};
-  borrowed.elements = 8;
-  borrowed.bytes = 16;
-  borrowed.device_address = 0x1000;
-  WeightManifest external(std::vector<WeightTensor>{borrowed});
-  assert(external.get("borrowed").device_address == 0x1000);
-  auto rejects = [](WeightTensor tensor) {
-    try {
-      WeightManifest invalid(std::vector<WeightTensor>{tensor});
-    } catch (const std::invalid_argument&) {
-      return true;
-    }
-    return false;
-  };
-  auto invalid = borrowed;
-  invalid.device_address = 0;
-  assert(rejects(invalid));
-  invalid = borrowed;
-  invalid.bytes = 1;
-  assert(rejects(invalid));
-  rejected = false;
-  try {
-    WeightManifest duplicate(std::vector<WeightTensor>{borrowed, borrowed});
-  } catch (const std::invalid_argument&) {
-    rejected = true;
-  }
-  assert(rejected);
-  std::filesystem::remove_all(directory);
-}
-
-void test_borrowed_arena() {
-  gaudirt::runtime::HbmArena arena(0, 0x1000, 4096,
-                                   gaudirt::runtime::HbmArena::BorrowedSlab{});
-  assert(arena.base_addr() == 0x1000);
-  assert(arena.capacity_bytes() == 4096);
-  const uint64_t workspace = arena.ensure_workspace(128);
-  assert(workspace == 0x1000);
-  assert(arena.workspace_bytes() == 128);
-  assert(arena.allocate(128) == 0x1100);
-  assert(arena.ensure_workspace(128) == workspace);
-
-  gaudirt::runtime::HbmArena external(0, 0x1000, 4096,
-                                      gaudirt::runtime::HbmArena::BorrowedSlab{});
-  external.set_borrowed_workspace(0x8000, 512);
-  assert(external.ensure_workspace(128) == 0x8000);
-  assert(external.ensure_workspace(512) == 0x8000);
-  assert(external.allocate(128) == 0x1000);
-  bool rejected = false;
-  try {
-    external.ensure_workspace(513);
-  } catch (const std::runtime_error&) {
-    rejected = true;
-  }
-  assert(rejected);
-  assert(external.used_bytes() == 128);
-  rejected = false;
-  try {
-    external.set_borrowed_workspace(0x9000, 512);
-  } catch (const std::runtime_error&) {
-    rejected = true;
-  }
-  assert(rejected);
-  rejected = false;
-  try {
-    gaudirt::runtime::HbmArena invalid(0, 0x1001, 4096,
-                                       gaudirt::runtime::HbmArena::BorrowedSlab{});
-  } catch (const std::invalid_argument&) {
-    rejected = true;
-  }
-  assert(rejected);
 }
 
 synRecipeHandle compile_test_add_recipe(const std::string& recipe_name,
@@ -341,13 +226,11 @@ synRecipeHandle compile_test_add_recipe(const std::string& recipe_name,
 void test_foundation_on_hardware() {
   DeviceRuntime::Config cfg{};
   cfg.module_id = 0;
-  cfg.rank = 0;
-  cfg.world_size = 1;
   cfg.uclamp_min = 1024;
-  cfg.uclamp_max = 1024;
 
   DeviceRuntime rt(cfg);
-  HbmArena arena(rt.device_id(), 64ULL * 1024 * 1024);
+  BlockCachingAllocator allocator(rt.device_id(), 16ULL * 1024 * 1024);
+  PinnedHostPool pinned(rt.device_id(), 1024 * 1024);
   RecipeRegistry registry;
 
   constexpr TSize kElems = 1024;
@@ -367,16 +250,23 @@ void test_foundation_on_hardware() {
   assert(disk_entry.slots.size() == 3);
   for (const auto& slot : disk_entry.slots) assert(slot.byte_size == kBytes);
 
-  uint64_t addr_a = arena.allocate(kBytes);
-  uint64_t addr_b = arena.allocate(kBytes);
-  uint64_t addr_out = arena.allocate(kBytes);
-  std::vector<float> host_a(kElems, 2.5f);
-  std::vector<float> host_b(kElems, 1.5f);
-  std::vector<float> host_out(kElems, 0.0f);
-  arena.copy_h2d_sync(rt.h2d_stream(), host_a.data(), addr_a, kBytes);
-  arena.copy_h2d_sync(rt.h2d_stream(), host_b.data(), addr_b, kBytes);
-  arena.copy_d2h_sync(rt.d2h_stream(), addr_a, host_out.data(), kBytes);
-  for (const float value : host_out) assert(value == 2.5f);
+  uint64_t addr_a = allocator.allocate(kBytes, rt.compute_stream());
+  uint64_t addr_b = allocator.allocate(kBytes, rt.compute_stream());
+  uint64_t addr_out = allocator.allocate(kBytes, rt.compute_stream());
+  uint64_t addr_ws = disk_entry.workspace_size > 0
+                         ? allocator.allocate(disk_entry.workspace_size, rt.compute_stream())
+                         : 0;
+  auto* host_a = static_cast<float*>(pinned.allocate(kBytes));
+  auto* host_b = static_cast<float*>(pinned.allocate(kBytes));
+  auto* host_out = static_cast<float*>(pinned.allocate(kBytes));
+  std::fill_n(host_a, kElems, 2.5f);
+  std::fill_n(host_b, kElems, 1.5f);
+  std::fill_n(host_out, kElems, 0.0f);
+
+  pinned.copy_h2d(addr_a, host_a, kBytes, rt.h2d_stream(), false);
+  pinned.copy_h2d(addr_b, host_b, kBytes, rt.h2d_stream(), false);
+  pinned.copy_d2h(host_out, addr_a, kBytes, rt.d2h_stream(), false);
+  for (size_t i = 0; i < kElems; ++i) assert(host_out[i] == 2.5f);
 
   BindingTable bindings = registry.create_binding_table(id_disk);
   bindings.bind_name("in_a", addr_a);
@@ -389,92 +279,24 @@ void test_foundation_on_hardware() {
   bindings.bind_slot(bindings.find_slot("in_b"), addr_a);
   assert(bindings.address_at(bindings.find_slot("in_b")) == addr_a);
   assert(bindings.generation() == generation + 1);
+  bindings.bind_slot(bindings.find_slot("in_b"), addr_b);
 
-  const std::filesystem::path weight_dir =
-      std::filesystem::temp_directory_path() /
-      ("gaudirt_weight_upload_" + std::to_string(getpid()));
-  std::filesystem::create_directories(weight_dir);
-  {
-    std::ofstream raw(weight_dir / "x.bin", std::ios::binary);
-    raw << "abc";
-  }
-  {
-    std::ofstream manifest(weight_dir / "weights.manifest");
-    manifest << "GAUDIRT_WEIGHTS_V1\n"
-             << "T x uint8 3 1 3 x.bin "
-             << "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\n";
-  }
-  WeightManifest uploaded(weight_dir, rt, arena);
-  std::vector<uint8_t> roundtrip(3);
-  arena.copy_d2h_sync(rt.d2h_stream(), uploaded.get("x").device_address,
-                      roundtrip.data(), roundtrip.size());
-  assert(std::string(roundtrip.begin(), roundtrip.end()) == "abc");
-  std::filesystem::remove_all(weight_dir);
+  PreparedLaunch launch{disk_entry.handle, addr_ws, bindings.launch_infos(), 0};
+  launch.validate();
+  launch.execute(rt.compute_stream());
+  rt.synchronize_compute();
 
-  std::vector<float> gathered(8 * kElems);
-  for (size_t rank = 0; rank < 8; ++rank) {
-    std::fill_n(gathered.begin() + rank * kElems, kElems,
-                static_cast<float>(rank + 1));
-  }
-  const uint64_t gathered_addr = arena.allocate(gathered.size() * sizeof(float));
-  arena.copy_h2d_sync(rt.h2d_stream(), gathered.data(), gathered_addr,
-                      gathered.size() * sizeof(float));
-  const uint64_t reduced_addr = arena.allocate(kElems * sizeof(uint16_t));
-  TpReduce reduce(arena, kElems, syn_type_float);
-  reduce.execute(gathered_addr, reduced_addr, rt.compute_stream());
-  assert(synStreamSynchronize(rt.compute_stream()) == synSuccess);
-  std::vector<uint16_t> reduced(kElems);
-  arena.copy_d2h_sync(rt.d2h_stream(), reduced_addr, reduced.data(),
-                      reduced.size() * sizeof(uint16_t));
-  for (const uint16_t value : reduced) assert(value == 0x4210);
+  std::fill_n(host_out, kElems, 0.0f);
+  pinned.copy_d2h(host_out, addr_out, kBytes, rt.d2h_stream(), false);
+  for (size_t i = 0; i < kElems; ++i) assert(host_out[i] == 4.0f);
 
-  const uint64_t prepared_addr = arena.allocate(kElems * sizeof(uint16_t));
-  auto prepared = reduce.prepare(gathered_addr, prepared_addr);
-  prepared.execute(rt.compute_stream());
-  assert(synStreamSynchronize(rt.compute_stream()) == synSuccess);
-  std::vector<uint16_t> prepared_result(kElems);
-  arena.copy_d2h_sync(rt.d2h_stream(), prepared_addr, prepared_result.data(),
-                      prepared_result.size() * sizeof(uint16_t));
-  assert(prepared_result == reduced);
-  // The last row of each rank's multirow gather is separated by a rank stride.
-  constexpr size_t kRows = 512;
-  std::vector<float> strided(8 * kRows * kElems, -17.0f);
-  for (size_t rank = 0; rank < 8; ++rank)
-    std::fill_n(strided.begin() + (rank * kRows + kRows - 1) * kElems,
-                kElems, static_cast<float>(rank + 1));
-  const uint64_t strided_addr = arena.allocate(strided.size() * sizeof(float));
-  arena.copy_h2d_sync(rt.h2d_stream(), strided.data(), strided_addr,
-                      strided.size() * sizeof(float));
-  auto last_row = reduce.prepare_strided(strided_addr + (kRows - 1) * kBytes,
-                                         prepared_addr, kRows * kBytes);
-  last_row.execute(rt.compute_stream());
-  assert(synStreamSynchronize(rt.compute_stream()) == synSuccess);
-  arena.copy_d2h_sync(rt.d2h_stream(), prepared_addr, prepared_result.data(),
-                      prepared_result.size() * sizeof(uint16_t));
-  assert(prepared_result == reduced);
-  bool overlap_rejected = false;
-  try {
-    static_cast<void>(reduce.prepare(gathered_addr, gathered_addr));
-  } catch (const std::invalid_argument&) {
-    overlap_rejected = true;
-  }
-  assert(overlap_rejected);
-
-  const std::array<uint16_t, 8> rank_bf16 = {
-      0x3f80, 0x4000, 0x4040, 0x4080, 0x40a0, 0x40c0, 0x40e0, 0x4100};
-  std::vector<uint16_t> gathered_bf16(8 * kElems);
-  for (size_t rank = 0; rank < 8; ++rank)
-    std::fill_n(gathered_bf16.begin() + rank * kElems, kElems, rank_bf16[rank]);
-  const uint64_t gathered_bf16_addr = arena.allocate(gathered_bf16.size() * sizeof(uint16_t));
-  arena.copy_h2d_sync(rt.h2d_stream(), gathered_bf16.data(), gathered_bf16_addr,
-                      gathered_bf16.size() * sizeof(uint16_t));
-  TpReduce reduce_bf16(arena, kElems, syn_type_bf16);
-  auto prepared_bf16 = reduce_bf16.prepare(gathered_bf16_addr, prepared_addr);
-  prepared_bf16.execute(rt.compute_stream());
-  assert(synStreamSynchronize(rt.compute_stream()) == synSuccess);
-  arena.copy_d2h_sync(rt.d2h_stream(), prepared_addr, prepared_result.data(),
-                      prepared_result.size() * sizeof(uint16_t));
-  assert(prepared_result == reduced);
+  pinned.free(host_out);
+  pinned.free(host_b);
+  pinned.free(host_a);
+  if (addr_ws) allocator.free(addr_ws);
+  allocator.free(addr_out);
+  allocator.free(addr_b);
+  allocator.free(addr_a);
 }
 
 void test_invalid_module_fails() {
@@ -515,8 +337,7 @@ int main(int argc, char** argv) {
   test_credit_formula();
   test_recipe_cache_contract();
   test_binding_table_value_semantics_and_dtype();
-  test_weight_manifest();
-  test_borrowed_arena();
+  test_sha256_vectors();
   if (argc == 2 && std::strcmp(argv[1], "--host-only") == 0) {
     std::printf("[GaudiRT] Host-only runtime_unit_tests PASSED.\n");
     return 0;

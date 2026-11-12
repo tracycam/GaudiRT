@@ -1,6 +1,6 @@
 // Verify the single-pass causal softmax, including masked and padded rows.
 #include "gaudirt/runtime/device_runtime.hpp"
-#include "gaudirt/runtime/hbm_arena.hpp"
+#include "test_device_slab.hpp"
 #include "gaudirt/runtime/recipe_registry.hpp"
 
 #include <perf_lib_layer_params.h>
@@ -126,7 +126,7 @@ int main(int argc, char** argv) {
                                         static_cast<int32_t>(visible_keys), 0};
     std::vector<uint16_t> output(scores.size(), 0x7fc0);
     DeviceRuntime runtime({});
-    HbmArena arena(runtime.device_id(), 32ULL * 1024 * 1024);
+    gaudirt::testing::TestDeviceSlab arena(runtime.device_id(), 32ULL * 1024 * 1024);
     RecipeCache cache(argv[1]);
     const auto scores_addr = arena.allocate(scores.size() * 4);
     const auto positions_addr = arena.allocate(positions.size() * 4);

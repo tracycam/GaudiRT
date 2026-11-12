@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Head-major KV write + multi-tile fused MME/TPC KV-chunk attention + online-state finalization.
 #include "gaudirt/runtime/device_runtime.hpp"
-#include "gaudirt/runtime/hbm_arena.hpp"
+#include "test_device_slab.hpp"
 #include "gaudirt/runtime/recipe_registry.hpp"
 
 #include <perf_lib_layer_params.h>
@@ -230,7 +230,7 @@ int main(int argc, char** argv) {
         descriptor_bytes + q.size() * 4 + 768ULL * 1024 * 1024);
 
     DeviceRuntime runtime({});
-    HbmArena arena(runtime.device_id(), arena_bytes);
+    gaudirt::testing::TestDeviceSlab arena(runtime.device_id(), arena_bytes);
     RecipeCache cache(argv[1]);
     const auto q_addr = arena.allocate(q.size() * 2);
     const auto key_new_addr = arena.allocate(key_new.size() * 2);

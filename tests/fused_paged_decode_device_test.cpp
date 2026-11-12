@@ -1,6 +1,6 @@
 // Fused single-bucket paged attention, with CPU references and whole-pool checks.
 #include "gaudirt/runtime/device_runtime.hpp"
-#include "gaudirt/runtime/hbm_arena.hpp"
+#include "test_device_slab.hpp"
 #include "gaudirt/runtime/recipe_registry.hpp"
 
 #include <perf_lib_layer_params.h>
@@ -210,7 +210,7 @@ int main(int argc, char** argv) {
     }
 
     DeviceRuntime runtime({});
-    HbmArena arena(runtime.device_id(), 832ULL * 1024 * 1024);
+    gaudirt::testing::TestDeviceSlab arena(runtime.device_id(), 832ULL * 1024 * 1024);
     RecipeCache cache(argv[1]);
     const auto q_addr = arena.allocate(q.size() * 2);
     const auto key_new_addr = arena.allocate(key_new.size() * 2);

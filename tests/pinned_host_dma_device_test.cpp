@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // A synHostMalloc allocation is already mapped; copy directly into it.
 #include "gaudirt/runtime/device_runtime.hpp"
-#include "gaudirt/runtime/hbm_arena.hpp"
+#include "test_device_slab.hpp"
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
@@ -10,7 +10,7 @@ int main() {
   try {
     using namespace gaudirt::runtime;
     DeviceRuntime::Config cfg{}; cfg.module_id=0; DeviceRuntime runtime(cfg);
-    HbmArena arena(runtime.device_id(),1024*1024);
+    gaudirt::testing::TestDeviceSlab arena(runtime.device_id(),1024*1024);
     int32_t value=1729; const auto device=arena.allocate(sizeof(value));
     arena.copy_h2d_sync(runtime.h2d_stream(),&value,device,sizeof(value));
     void* pinned=nullptr;

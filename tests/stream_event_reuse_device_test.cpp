@@ -1,6 +1,6 @@
 // Stress repeated cross-stream record/wait on two persistent Synapse events.
 #include "gaudirt/runtime/device_runtime.hpp"
-#include "gaudirt/runtime/hbm_arena.hpp"
+#include "test_device_slab.hpp"
 #include "gaudirt/runtime/pinned_host_pool.hpp"
 
 #include <cstdint>
@@ -24,7 +24,7 @@ int main() {
     if (!event_count) throw std::runtime_error("event counter interposer is required");
     constexpr uint64_t steps = 512, bytes = 256;
     DeviceRuntime runtime({});
-    HbmArena arena(runtime.device_id(), 4ULL * 1024 * 1024);
+    gaudirt::testing::TestDeviceSlab arena(runtime.device_id(), 4ULL * 1024 * 1024);
     void* memory = nullptr;
     check(synHostMalloc(runtime.device_id(), steps * bytes, 0, &memory), "host allocation");
     auto* input = static_cast<uint8_t*>(memory);

@@ -20,42 +20,58 @@ add_link_options(-Wl,-rpath,${HABANA_LIB_DIR})
 
 add_library(gaudirt STATIC
     src/block_caching_allocator.cpp
-    src/bridge/rank_lifecycle.cpp
     src/device_runtime.cpp
-    src/hbm_arena.cpp
     src/pinned_host_pool.cpp
     src/recipe_registry.cpp
     src/sha256.cpp
-    src/weight_manifest.cpp
-    src/tp_reduce.cpp
 )
-target_link_libraries(gaudirt PUBLIC Synapse hcl pthread ${CMAKE_DL_LIBS})
+target_link_libraries(gaudirt PUBLIC Synapse pthread ${CMAKE_DL_LIBS})
 
 option(GAUDIRT_BUILD_TORCH "Build the generic PrivateUse1 extension" OFF)
 if(GAUDIRT_BUILD_TORCH)
     find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Module)
     find_package(Torch REQUIRED)
     find_library(TORCH_PYTHON_LIBRARY torch_python PATHS "${TORCH_INSTALL_PREFIX}/lib" REQUIRED NO_DEFAULT_PATH)
-    add_library(_gaudirt_C MODULE src/bridge/generic_private_use1.cpp
-        src/bridge/context.cpp src/bridge/context_allocator.cpp src/bridge/layout_copy.cpp
-        src/bridge/paged_metadata.cpp src/bridge/attention_plan.cpp src/bridge/paged_attention.cpp
+    add_library(_gaudirt_C MODULE
+        src/bridge/generic_private_use1.cpp
+        src/bridge/context.cpp
+        src/bridge/context_allocator.cpp
+        src/bridge/layout_copy.cpp
+        src/bridge/paged_metadata.cpp
+        src/bridge/attention_plan.cpp
+        src/bridge/paged_attention.cpp
         src/bridge/paged_attention_tiles.cpp
-        src/bridge/paged_kv_pool.cpp src/bridge/paged_slot_allocator.cpp src/bridge/eager_copy.cpp src/bridge/eager_ops.cpp
-        src/bridge/eager_index.cpp src/bridge/eager_scheduler.cpp src/bridge/argmax_vocab.cpp
-        src/bridge/bucket_program.cpp src/bridge/segmented_runner.cpp
-        src/bridge/communicator.cpp src/bridge/process_group.cpp
-        src/bridge/tensor_spec.cpp src/bridge/fx_node.cpp
-        src/bridge/fx_geometry.cpp src/bridge/graph_builder.cpp)
+        src/bridge/paged_kv_pool.cpp
+        src/bridge/paged_slot_allocator.cpp
+        src/bridge/eager_copy.cpp
+        src/bridge/eager_ops.cpp
+        src/bridge/eager_index.cpp
+        src/bridge/eager_scheduler.cpp
+        src/bridge/argmax_vocab.cpp
+        src/bridge/bucket_program.cpp
+        src/bridge/segmented_runner.cpp
+        src/bridge/communicator.cpp
+        src/bridge/process_group.cpp
+        src/bridge/tensor_spec.cpp
+        src/bridge/fx_node.cpp
+        src/bridge/fx_geometry.cpp
+        src/bridge/graph_builder.cpp
+    )
     target_compile_definitions(_gaudirt_C PRIVATE TORCH_EXTENSION_NAME=_gaudirt_C)
     target_compile_options(_gaudirt_C PRIVATE ${TORCH_CXX_FLAGS})
-    target_link_libraries(_gaudirt_C PRIVATE gaudirt ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIBRARY} Python3::Module)
+    target_link_libraries(_gaudirt_C PRIVATE gaudirt hcl ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIBRARY} Python3::Module)
     set_target_properties(_gaudirt_C PROPERTIES PREFIX "")
 
     add_executable(block_fp8_hybrid_lowering_unit_test
-        src/bridge/bucket_program.cpp src/bridge/fx_geometry.cpp src/bridge/fx_node.cpp
-        src/bridge/tensor_spec.cpp src/bridge/graph_builder.cpp
-        src/block_caching_allocator.cpp src/sha256.cpp
-        tests/block_fp8_hybrid_lowering_unit_test.cpp)
+        src/bridge/bucket_program.cpp
+        src/bridge/fx_geometry.cpp
+        src/bridge/fx_node.cpp
+        src/bridge/tensor_spec.cpp
+        src/bridge/graph_builder.cpp
+        src/block_caching_allocator.cpp
+        src/sha256.cpp
+        tests/block_fp8_hybrid_lowering_unit_test.cpp
+    )
     target_include_directories(block_fp8_hybrid_lowering_unit_test BEFORE PRIVATE tests/mock_synapse src/bridge)
     target_compile_options(block_fp8_hybrid_lowering_unit_test PRIVATE ${TORCH_CXX_FLAGS} -UNDEBUG)
     target_link_libraries(block_fp8_hybrid_lowering_unit_test PRIVATE ${TORCH_LIBRARIES})
@@ -74,7 +90,8 @@ if(GAUDIRT_BUILD_TORCH)
         src/device_runtime.cpp
         src/pinned_host_pool.cpp
         src/recipe_registry.cpp
-        src/sha256.cpp)
+        src/sha256.cpp
+    )
     target_include_directories(multitile_paged_attention_unit_test BEFORE PRIVATE tests/mock_synapse src/bridge)
     target_compile_options(multitile_paged_attention_unit_test PRIVATE ${TORCH_CXX_FLAGS} -UNDEBUG)
     target_link_libraries(multitile_paged_attention_unit_test PRIVATE ${TORCH_LIBRARIES} pthread)
@@ -88,6 +105,9 @@ add_executable(block_allocator_fences_unit_test
     src/block_caching_allocator.cpp tests/block_allocator_fences_unit_test.cpp)
 target_include_directories(block_allocator_fences_unit_test BEFORE PRIVATE tests/mock_synapse)
 target_compile_options(block_allocator_fences_unit_test PRIVATE -UNDEBUG)
+
+add_executable(host_policy_inherit_test tests/host_policy_inherit_test.cpp)
+target_include_directories(host_policy_inherit_test PRIVATE include)
 
 add_executable(recipe_cache_fingerprint_test tests/recipe_cache_fingerprint_test.cpp)
 target_link_libraries(recipe_cache_fingerprint_test PRIVATE gaudirt)
@@ -103,224 +123,33 @@ target_link_libraries(fixed_tile_paged_attention_device_test PRIVATE gaudirt)
 
 add_executable(fused_paged_decode_device_test tests/fused_paged_decode_device_test.cpp)
 target_link_libraries(fused_paged_decode_device_test PRIVATE gaudirt)
+
 add_executable(attention_tile_indices_device_test tests/attention_tile_indices_device_test.cpp)
 target_link_libraries(attention_tile_indices_device_test PRIVATE gaudirt)
+
 add_executable(direct_softmax_device_test tests/direct_softmax_device_test.cpp)
 target_link_libraries(direct_softmax_device_test PRIVATE gaudirt)
+
 add_executable(block_fp8_device_test tests/block_fp8_device_test.cpp)
 target_link_libraries(block_fp8_device_test PRIVATE gaudirt)
 
+add_executable(compensated_qkv_reduce_device_test tests/compensated_qkv_reduce_device_test.cpp)
+target_link_libraries(compensated_qkv_reduce_device_test PRIVATE gaudirt)
+
 add_executable(stream_event_reuse_device_test tests/stream_event_reuse_device_test.cpp)
 target_link_libraries(stream_event_reuse_device_test PRIVATE gaudirt)
+
 add_executable(allocator_event_reuse_device_test tests/allocator_event_reuse_device_test.cpp)
 target_link_libraries(allocator_event_reuse_device_test PRIVATE gaudirt)
-add_library(gaudirt_synapse_call_counter SHARED tests/synapse_node_count_interposer.cpp)
-target_link_libraries(gaudirt_synapse_call_counter PRIVATE ${CMAKE_DL_LIBS})
-
-add_library(mimo_layer_vertical STATIC
-    models/mimo/mimo_attention.cpp
-    models/mimo/mimo_full_attention.cpp
-    models/mimo/mimo_dense_mlp.cpp
-    models/mimo/mimo_moe.cpp
-    models/mimo/model_argmax.cpp
-    models/mimo/model_embedding.cpp
-    models/mimo/model_head.cpp
-)
-target_include_directories(mimo_layer_vertical PUBLIC models/mimo)
-target_link_libraries(mimo_layer_vertical PUBLIC gaudirt)
-
-add_executable(model_embedding_prefill_device_test tests/model_embedding_prefill_device_test.cpp)
-target_link_libraries(model_embedding_prefill_device_test PRIVATE mimo_layer_vertical)
-
-add_executable(model_embedding_batch_device_test tests/model_embedding_batch_device_test.cpp)
-target_link_libraries(model_embedding_batch_device_test PRIVATE mimo_layer_vertical)
-
-add_executable(model_embedding_prefill_large_device_test tests/model_embedding_prefill_large_device_test.cpp)
-target_link_libraries(model_embedding_prefill_large_device_test PRIVATE mimo_layer_vertical)
-
-add_executable(mimo_moe_prefill_real_weight_test tests/mimo_moe_prefill_real_weight_test.cpp)
-target_link_libraries(mimo_moe_prefill_real_weight_test PRIVATE mimo_layer_vertical)
-
-add_executable(mimo_grouped_moe_compile_test tests/mimo_grouped_moe_compile_test.cpp)
-target_link_libraries(mimo_grouped_moe_compile_test PRIVATE mimo_layer_vertical)
-
-add_executable(mimo_grouped_moe_math_test tests/mimo_grouped_moe_math_test.cpp)
-target_link_libraries(mimo_grouped_moe_math_test PRIVATE mimo_layer_vertical)
-
-add_executable(mimo_grouped_moe_real_weight_test tests/mimo_grouped_moe_real_weight_test.cpp)
-target_link_libraries(mimo_grouped_moe_real_weight_test PRIVATE mimo_layer_vertical)
 
 add_executable(pinned_host_dma_device_test tests/pinned_host_dma_device_test.cpp)
 target_link_libraries(pinned_host_dma_device_test PRIVATE gaudirt)
+
 add_executable(pinned_host_fence_coalescing_device_test tests/pinned_host_fence_coalescing_device_test.cpp)
 target_link_libraries(pinned_host_fence_coalescing_device_test PRIVATE gaudirt ${CMAKE_DL_LIBS})
 
 add_executable(block_allocator_device_test tests/block_allocator_device_test.cpp)
 target_link_libraries(block_allocator_device_test PRIVATE gaudirt)
 
-add_executable(model_head_batch_device_test tests/model_head_batch_device_test.cpp)
-target_link_libraries(model_head_batch_device_test PRIVATE mimo_layer_vertical)
-
-add_executable(model_head_dual_device_test tests/model_head_dual_device_test.cpp)
-target_link_libraries(model_head_dual_device_test PRIVATE mimo_layer_vertical)
-
-add_executable(mimo_embedding_device_test tests/mimo_embedding_device_test.cpp)
-target_link_libraries(mimo_embedding_device_test PRIVATE mimo_layer_vertical)
-
-add_executable(mimo_argmax_device_test tests/mimo_argmax_device_test.cpp)
-target_link_libraries(mimo_argmax_device_test PRIVATE mimo_layer_vertical)
-
-add_executable(mimo_fused_reduce_device_test tests/mimo_fused_reduce_device_test.cpp)
-target_link_libraries(mimo_fused_reduce_device_test PRIVATE mimo_layer_vertical)
-
-add_executable(mimo_fused_reduce_large_device_test tests/mimo_fused_reduce_large_device_test.cpp)
-target_link_libraries(mimo_fused_reduce_large_device_test PRIVATE mimo_layer_vertical)
-
-add_executable(mimo_fused_reduce_m1024_device_test tests/mimo_fused_reduce_large_device_test.cpp)
-target_compile_definitions(mimo_fused_reduce_m1024_device_test PRIVATE GAUDIRT_TEST_ROWS=1024)
-target_link_libraries(mimo_fused_reduce_m1024_device_test PRIVATE mimo_layer_vertical)
-
-add_executable(mimo_batch_argmax_device_test tests/mimo_batch_argmax_device_test.cpp)
-target_link_libraries(mimo_batch_argmax_device_test PRIVATE mimo_layer_vertical)
-
-add_executable(mimo_dense_batch_device_test tests/mimo_dense_batch_device_test.cpp)
-target_link_libraries(mimo_dense_batch_device_test PRIVATE mimo_layer_vertical)
-
-add_executable(mimo_moe_batch_device_test tests/mimo_moe_batch_device_test.cpp)
-target_link_libraries(mimo_moe_batch_device_test PRIVATE mimo_layer_vertical)
-
-add_executable(mimo_swa_batch_model_device_test tests/mimo_swa_batch_model_device_test.cpp)
-target_link_libraries(mimo_swa_batch_model_device_test PRIVATE mimo_layer_vertical)
-
-add_executable(mimo_full_batch_model_device_test tests/mimo_full_batch_model_device_test.cpp)
-target_link_libraries(mimo_full_batch_model_device_test PRIVATE mimo_layer_vertical)
-
-add_executable(mimo_full_batch_group_device_test tests/mimo_full_batch_group_device_test.cpp)
-target_link_libraries(mimo_full_batch_group_device_test PRIVATE gaudirt)
-
-add_executable(mimo_vocab_head_device_test tests/mimo_vocab_head_device_test.cpp)
-target_link_libraries(mimo_vocab_head_device_test PRIVATE mimo_layer_vertical)
-
-add_executable(mimo_vocab_allgather_device_test tests/mimo_vocab_allgather_device_test.cpp)
-target_link_libraries(mimo_vocab_allgather_device_test PRIVATE gaudirt)
-
-add_executable(mimo_moe_output_device_test tests/mimo_moe_output_device_test.cpp)
-target_link_libraries(mimo_moe_output_device_test PRIVATE mimo_layer_vertical)
-
-add_executable(mimo_moe_gate_fp32_device_test tests/mimo_moe_gate_fp32_device_test.cpp)
-target_link_libraries(mimo_moe_gate_fp32_device_test PRIVATE gaudirt)
-
-add_executable(mimo_full_attention_output_device_test tests/mimo_full_attention_output_device_test.cpp)
-target_link_libraries(mimo_full_attention_output_device_test PRIVATE mimo_layer_vertical)
-
-add_executable(mimo_dense_prefill_real_weight_test tests/mimo_dense_prefill_real_weight_test.cpp)
-target_link_libraries(mimo_dense_prefill_real_weight_test PRIVATE mimo_layer_vertical)
-
-add_executable(mimo_dense_prefill_large_real_weight_test tests/mimo_dense_prefill_large_real_weight_test.cpp)
-target_link_libraries(mimo_dense_prefill_large_real_weight_test PRIVATE mimo_layer_vertical)
-
-add_executable(mimo_prefill_residual_reuse_device_test tests/mimo_prefill_residual_reuse_device_test.cpp)
-target_link_libraries(mimo_prefill_residual_reuse_device_test PRIVATE mimo_layer_vertical)
-
-add_executable(mimo_full_prefill_real_weight_test tests/mimo_full_prefill_real_weight_test.cpp)
-target_link_libraries(mimo_full_prefill_real_weight_test PRIVATE mimo_layer_vertical)
-
-add_executable(mimo_full_prefill_large_real_weight_test tests/mimo_full_prefill_large_real_weight_test.cpp)
-target_link_libraries(mimo_full_prefill_large_real_weight_test PRIVATE mimo_layer_vertical)
-
-add_executable(mimo_full_prefill_large_empty_kv_test tests/mimo_full_prefill_large_empty_kv_test.cpp)
-target_link_libraries(mimo_full_prefill_large_empty_kv_test PRIVATE mimo_layer_vertical)
-
-add_executable(mimo_full_prefill_page_prune_device_test tests/mimo_full_prefill_page_prune_device_test.cpp)
-target_link_libraries(mimo_full_prefill_page_prune_device_test PRIVATE mimo_layer_vertical)
-
-add_executable(mimo_full_prefill_softmax_device_test tests/mimo_full_prefill_softmax_device_test.cpp)
-target_link_libraries(mimo_full_prefill_softmax_device_test PRIVATE gaudirt)
-
-add_executable(compensated_qkv_reduce_device_test tests/compensated_qkv_reduce_device_test.cpp)
-target_link_libraries(compensated_qkv_reduce_device_test PRIVATE gaudirt)
-
-add_executable(mimo_full_mme_softmax_device_test tests/mimo_full_mme_softmax_device_test.cpp)
-target_link_libraries(mimo_full_mme_softmax_device_test PRIVATE gaudirt)
-
-add_executable(mimo_layer_b_prefill_tp8_test tests/mimo_layer_b_prefill_tp8_test.cpp)
-target_link_libraries(mimo_layer_b_prefill_tp8_test PRIVATE mimo_layer_b_vertical)
-
-add_executable(mimo_layer_b_prefill_large_tp8_test tests/mimo_layer_b_prefill_large_tp8_test.cpp)
-target_link_libraries(mimo_layer_b_prefill_large_tp8_test PRIVATE mimo_layer_b_vertical)
-
-add_executable(mimo_layer0_prefill_tp8_test tests/mimo_layer0_prefill_tp8_test.cpp)
-target_link_libraries(mimo_layer0_prefill_tp8_test PRIVATE mimo_layer0_vertical)
-
-add_executable(mimo_layer0_batch_tp8_test tests/mimo_layer0_batch_tp8_test.cpp)
-target_link_libraries(mimo_layer0_batch_tp8_test PRIVATE mimo_layer0_vertical)
-
-add_executable(mimo_layer_b_batch_tp8_test tests/mimo_moe_layer_batch_tp8_test.cpp)
-target_link_libraries(mimo_layer_b_batch_tp8_test PRIVATE mimo_layer_b_vertical)
-
-add_executable(mimo_layer_c_batch_tp8_test tests/mimo_moe_layer_batch_tp8_test.cpp)
-target_compile_definitions(mimo_layer_c_batch_tp8_test PRIVATE TEST_SWA)
-target_link_libraries(mimo_layer_c_batch_tp8_test PRIVATE mimo_layer_c_vertical)
-
-add_executable(mimo_swa_prefill_tp8_test tests/mimo_swa_prefill_tp8_test.cpp)
-target_link_libraries(mimo_swa_prefill_tp8_test PRIVATE mimo_layer_c_vertical)
-
-add_executable(mimo_swa_prefill_real_weight_test tests/mimo_swa_prefill_real_weight_test.cpp)
-target_link_libraries(mimo_swa_prefill_real_weight_test PRIVATE mimo_layer_vertical)
-
-add_executable(mimo_swa_prefill_large_real_weight_test tests/mimo_swa_prefill_large_real_weight_test.cpp)
-target_link_libraries(mimo_swa_prefill_large_real_weight_test PRIVATE mimo_layer_vertical)
-
-add_executable(mimo_swa_prefill_device_test tests/mimo_swa_prefill_device_test.cpp)
-target_link_libraries(mimo_swa_prefill_device_test PRIVATE gaudirt)
-
-add_executable(mimo_swa_softmax_device_test tests/mimo_swa_softmax_device_test.cpp)
-target_link_libraries(mimo_swa_softmax_device_test PRIVATE gaudirt)
-
-add_executable(mimo_swa_output_device_test tests/mimo_swa_output_device_test.cpp)
-target_link_libraries(mimo_swa_output_device_test PRIVATE mimo_layer_vertical)
-
-add_executable(prefill_metadata_test tests/prefill_metadata_test.cpp)
-target_include_directories(prefill_metadata_test PRIVATE models/mimo)
-
-add_executable(prefill_chunks_test tests/prefill_chunks_test.cpp)
-target_include_directories(prefill_chunks_test PRIVATE models/mimo)
-
-add_executable(prefill_bindings_test tests/prefill_bindings_test.cpp)
-target_include_directories(prefill_bindings_test PRIVATE models/mimo)
-
-add_executable(mimo_step_metadata_test tests/mimo_step_metadata_test.cpp)
-target_include_directories(mimo_step_metadata_test PRIVATE models/mimo)
-
-add_executable(mimo_batch_step_metadata_test tests/mimo_batch_step_metadata_test.cpp)
-target_include_directories(mimo_batch_step_metadata_test PRIVATE models/mimo)
-
-add_executable(host_policy_inherit_test tests/host_policy_inherit_test.cpp)
-target_include_directories(host_policy_inherit_test PRIVATE include)
-
-add_executable(mimo_layer1 models/mimo/layer1_main.cpp)
-target_link_libraries(mimo_layer1 PRIVATE mimo_layer_vertical)
-
-add_executable(mimo_dense models/mimo/dense_main.cpp)
-target_link_libraries(mimo_dense PRIVATE mimo_layer_vertical)
-
-add_executable(mimo_full_attention models/mimo/full_attention_main.cpp)
-target_link_libraries(mimo_full_attention PRIVATE mimo_layer_vertical)
-
-add_library(mimo_layer0_vertical STATIC models/mimo/layer0.cpp)
-target_include_directories(mimo_layer0_vertical PUBLIC models/mimo)
-target_link_libraries(mimo_layer0_vertical PUBLIC mimo_layer_vertical)
-
-add_executable(mimo_layer0 models/mimo/layer0_main.cpp)
-target_link_libraries(mimo_layer0 PRIVATE mimo_layer0_vertical)
-
-add_library(mimo_layer_b_vertical STATIC models/mimo/layer_b.cpp)
-target_include_directories(mimo_layer_b_vertical PUBLIC models/mimo)
-target_link_libraries(mimo_layer_b_vertical PUBLIC mimo_layer_vertical)
-
-add_executable(mimo_layer_b models/mimo/layer_b_main.cpp)
-target_link_libraries(mimo_layer_b PRIVATE mimo_layer_b_vertical)
-
-add_library(mimo_layer_c_vertical STATIC models/mimo/layer_c.cpp)
-target_include_directories(mimo_layer_c_vertical PUBLIC models/mimo)
-target_link_libraries(mimo_layer_c_vertical PUBLIC mimo_layer_vertical)
+add_library(gaudirt_synapse_call_counter SHARED tests/synapse_node_count_interposer.cpp)
+target_link_libraries(gaudirt_synapse_call_counter PRIVATE ${CMAKE_DL_LIBS})

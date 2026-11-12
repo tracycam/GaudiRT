@@ -3,7 +3,7 @@
 // other persistent section in this graph. This is a device-layout experiment,
 // not a paged-attention implementation or a general allocator guarantee.
 #include "gaudirt/runtime/device_runtime.hpp"
-#include "gaudirt/runtime/hbm_arena.hpp"
+#include "test_device_slab.hpp"
 #include "gaudirt/runtime/recipe_registry.hpp"
 #include <perf_lib_layer_params.h>
 
@@ -49,7 +49,7 @@ int main(int argc, char** argv) {
       value[i] = static_cast<uint16_t>(0x4000 + (i * 7) % 127);
     }
     DeviceRuntime runtime({});
-    HbmArena arena(runtime.device_id(), 832ULL * 1024 * 1024);
+    gaudirt::testing::TestDeviceSlab arena(runtime.device_id(), 832ULL * 1024 * 1024);
     RecipeCache cache(argv[2]);
     std::array<uint64_t, 9> addresses{};
     addresses[0] = arena.allocate(source_count * 2);
