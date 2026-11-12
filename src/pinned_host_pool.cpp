@@ -28,21 +28,63 @@ StreamEvent::StreamEvent(synDeviceId device) {
   check(synEventCreate(&event_, device, 0), "event creation failed");
 }
 StreamEvent::~StreamEvent() { if (event_) synEventDestroy(event_); }
+void StreamEvent::record(synStreamHandle stream) {
+  if (!stream) throw std::invalid_argument("StreamEvent: null stream");
+  std::lock_guard lock(mutex_);
+  if (needs_wait_) {
+    check(synStreamWaitEvent(stream, event_, 0), "event reuse wait failed");
+    needs_wait_ = false;
+  }
+  check(synEventRecord(event_, stream), "event record failed");
+  needs_wait_ = true;
+  recorded_ = true;
+}
+void StreamEvent::wait(synStreamHandle consumer) {
+  if (!consumer) throw std::invalid_argument("StreamEvent: null stream");
+  std::lock_guard lock(mutex_);
+  check(synStreamWaitEvent(consumer, event_, 0), "stream wait failed");
+  needs_wait_ = false;
+}
+bool StreamEvent::query() const {
+  std::lock_guard lock(mutex_);
+  if (!recorded_) return true;
+  const synStatus st = synEventQuery(event_);
+  if (st == synSuccess) {
+    needs_wait_ = false;
+    return true;
+  }
+  if (st == synBusy) return false;
+  check(st, "event query failed");
+  return false;
+}
 void StreamEvent::record_and_wait(synStreamHandle producer, synStreamHandle consumer) {
   if (!producer || !consumer) throw std::invalid_argument("StreamEvent: null stream");
   std::lock_guard lock(mutex_);
+  if (needs_wait_) {
+    check(synStreamWaitEvent(producer, event_, 0), "event reuse wait failed");
+    needs_wait_ = false;
+  }
   check(synEventRecord(event_, producer), "event record failed");
   check(synStreamWaitEvent(consumer, event_, 0), "stream wait failed");
+  needs_wait_ = false;
+  recorded_ = true;
 }
 void StreamEvent::record_and_synchronize(synStreamHandle stream) {
   if (!stream) throw std::invalid_argument("StreamEvent: null stream");
   std::lock_guard lock(mutex_);
+  if (needs_wait_) {
+    check(synStreamWaitEvent(stream, event_, 0), "event reuse wait failed");
+    needs_wait_ = false;
+  }
   check(synEventRecord(event_, stream), "event record failed");
   check(synEventSynchronize(event_), "event wait failed");
+  needs_wait_ = false;
+  recorded_ = true;
 }
 void StreamEvent::synchronize() const {
   std::lock_guard lock(mutex_);
   check(synEventSynchronize(event_), "event wait failed");
+  needs_wait_ = false;
 }
 
 PinnedHostPool::PinnedHostPool(synDeviceId device, uint64_t bytes)

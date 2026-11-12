@@ -3,12 +3,14 @@
 #include "gaudirt/common/sha256.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
 #include <mutex>
 #include <stdexcept>
+#include <unistd.h>
 #include <utility>
 
 namespace gaudirt::runtime {
@@ -176,10 +178,13 @@ void RecipeCache::save(synRecipeHandle recipe, const std::string& key) {
   }
   std::filesystem::create_directories(directory_);
   const auto path = file_for(key);
+  static std::atomic<uint64_t> temp_seq{0};
   auto temporary = path;
-  temporary += ".tmp";
+  temporary += ".tmp." + std::to_string(static_cast<long>(::getpid())) + "." +
+               std::to_string(temp_seq.fetch_add(1, std::memory_order_relaxed));
   std::filesystem::remove(temporary);
   if (synRecipeSerialize(recipe, temporary.c_str()) != synSuccess) {
+    std::filesystem::remove(temporary);
     throw std::runtime_error("RecipeCache: serialization failed for " +
                              path.filename().string());
   }

@@ -14,7 +14,7 @@ DeviceRuntime::DeviceRuntime(const Config& cfg)
       host_policy_(common::lock_host_policy(cfg.pin_cpu, cfg.uclamp_min)),
       owns_device_(cfg.borrowed_device_id == SYN_INVALID_DEVICE_ID) {
   setenv("GC_KERNEL_PATH", "/usr/lib/habanalabs/libtpc_kernels.so", 0);
-  if (cfg_.world_size > 1) {
+  if (owns_device_) {
     const std::string mod_str = std::to_string(cfg_.module_id);
     setenv("ID", mod_str.c_str(), 1);
     setenv("HLS_MODULE_ID", mod_str.c_str(), 1);

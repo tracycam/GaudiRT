@@ -19,11 +19,16 @@ class StreamEvent {
   ~StreamEvent();
   StreamEvent(const StreamEvent&) = delete;
   StreamEvent& operator=(const StreamEvent&) = delete;
+  void record(synStreamHandle stream);
+  void wait(synStreamHandle consumer);
+  bool query() const;
   void record_and_wait(synStreamHandle producer, synStreamHandle consumer);
   void record_and_synchronize(synStreamHandle stream);
   void synchronize() const;
  private:
   synEventHandle event_ = nullptr;
+  mutable bool needs_wait_ = false;
+  mutable bool recorded_ = false;
   mutable std::mutex mutex_;
 };
 
