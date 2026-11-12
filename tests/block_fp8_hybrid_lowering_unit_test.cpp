@@ -383,6 +383,9 @@ Layout::Layout(const at::Tensor& t) : tensor(t), run(1) {}
 uint64_t Layout::offset(uint64_t index) const { return index; }
 void dma_copy(uint64_t, const Layout*, uint64_t, const Layout*, uint64_t, uint64_t, uint64_t,
               synStreamHandle, synDmaDir) {}
+bool try_pack_strided_2d(Context&, uint64_t, uint64_t, const at::Tensor&, synStreamHandle) {
+  return false;
+}
 
 namespace {
 at::Tensor mock_empty(at::IntArrayRef size, std::optional<at::ScalarType> dtype,

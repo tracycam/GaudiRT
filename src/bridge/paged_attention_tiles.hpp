@@ -6,7 +6,13 @@
 namespace gaudirt::generic {
 
 struct TiledAttentionInputs {
-  uint64_t query, pool, output;
+  uint64_t query = 0;
+  uint64_t pool = 0;
+  uint64_t output = 0;
+  uint64_t direct_key = 0;
+  uint64_t direct_value = 0;
+  uint64_t tail_key = 0;
+  uint64_t tail_value = 0;
 };
 
 void launch_layer_kv_store(Context& ctx, const AttentionPlan& plan, uint64_t key, uint64_t value,

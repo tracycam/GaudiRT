@@ -717,8 +717,10 @@ std::vector<at::Tensor> BucketProgram::run_internal(const std::vector<at::Tensor
     uint64_t binding = address;
     if (!direct) {
       const auto temp = temporaries.allocate(bytes);
-      const Layout layout(input);
-      dma_copy(temp, nullptr, address, &layout, 0, input.numel(), item, stream, DRAM_TO_DRAM);
+      if (!try_pack_strided_2d(*ctx, temp, bytes, input, stream)) {
+        const Layout layout(input);
+        dma_copy(temp, nullptr, address, &layout, 0, input.numel(), item, stream, DRAM_TO_DRAM);
+      }
       binding = temp;
     }
     regions.emplace_back(binding, bytes);

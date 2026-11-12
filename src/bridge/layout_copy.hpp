@@ -8,6 +8,8 @@
 
 namespace gaudirt::generic {
 
+struct Context;
+
 struct Layout {
   explicit Layout(const at::Tensor& tensor);
   uint64_t offset(uint64_t index) const;
@@ -18,5 +20,7 @@ struct Layout {
 void host_copy(uint8_t* packed, const at::Tensor& tensor, uint64_t start, uint64_t elements, bool pack);
 void dma_copy(uint64_t dst, const Layout* dst_layout, uint64_t src, const Layout* src_layout,
               uint64_t start, uint64_t elements, uint64_t item, synStreamHandle stream, synDmaDir direction);
+bool try_pack_strided_2d(Context& ctx, uint64_t dst, uint64_t dst_capacity_bytes,
+                         const at::Tensor& src, synStreamHandle stream);
 
 }  // namespace gaudirt::generic

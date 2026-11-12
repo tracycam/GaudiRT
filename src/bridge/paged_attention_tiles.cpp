@@ -48,7 +48,7 @@ ColdRecipe& store_recipe(Context& ctx, const AttentionPlan& plan, uint32_t rows)
 }
 
 ColdRecipe& chunk_recipe(Context& ctx, const AttentionPlan& plan, const AttentionBlock& block, float scale,
-                         uint32_t chunk_tiles, bool first_chunk, bool finalize_last) {
+                         uint32_t chunk_tiles, bool first_chunk, bool finalize_last, bool direct_kv) {
   TORCH_CHECK(chunk_tiles >= 1 && chunk_tiles <= kMaxFusedAttentionTiles &&
               !(first_chunk && finalize_last && chunk_tiles < 2),
               "GaudiRT attention: invalid fused tile chunk");
@@ -56,32 +56,51 @@ ColdRecipe& chunk_recipe(Context& ctx, const AttentionPlan& plan, const Attentio
   const uint64_t d = plan.head_dim, heads = plan.query_heads, kv_heads = plan.kv_heads;
   const uint64_t group = heads / kv_heads, stats_rows = (rows + 63) / 64 * 64;
   std::ostringstream signature;
-  signature << "chunk_v3:" << rows << ':' << kv << ':' << d << ':' << heads << ':' << kv_heads << ':'
+  signature << (direct_kv ? "chunk_direct_v4:" : "chunk_paged_v4:")
+            << rows << ':' << kv << ':' << d << ':' << heads << ':' << kv_heads << ':'
             << std::bit_cast<uint32_t>(scale) << ':' << chunk_tiles << ':'
             << (first_chunk ? 1 : 0) << ':' << (finalize_last ? 1 : 0);
   GraphKey graph_key(signature.str(), rows);
   if (auto found = ctx.cold_recipes.find(graph_key.key); found != ctx.cold_recipes.end()) return *found->second;
 
-  const size_t slot_count = 3 + 3 * static_cast<size_t>(chunk_tiles) +
+  const size_t slot_count = (direct_kv ? 2 : 3) + 3 * static_cast<size_t>(chunk_tiles) +
                             (first_chunk ? 0 : 3) + (finalize_last ? 1 : 3);
   auto recipe = std::make_unique<ColdRecipe>(slot_count);
   SynapseGraphBuilder graph(graph_key.prefix, *recipe);
+  synTransposeParams perm3d{};
+  perm3d.tensorDim = 3;
+  perm3d.permutation[0] = TPD_Channel;
+  perm3d.permutation[1] = TPD_Height;
+  perm3d.permutation[2] = TPD_Width;
+
   int slot = 0;
-  auto query = graph.tensor(syn_type_bf16, {d, rows, group, kv_heads}, slot++);
-  synTensorPermutation q_perm{};
-  q_perm.dims = 4;
-  q_perm.permutation[0] = 0; q_perm.permutation[1] = 2;
-  q_perm.permutation[2] = 3; q_perm.permutation[3] = 1;
-  if (rows > 1) graph.permutation(query, q_perm);
-  auto pool = graph.tensor(syn_type_bf16, {d, 2 * kPagedKvDescriptorSlots * kv_heads}, slot++);
+  synTensor query = nullptr;
+  if (rows > 1) {
+    auto query_in = graph.tensor(syn_type_bf16, {d, heads, rows}, slot++);
+    auto query_t = graph.tensor(syn_type_bf16, {d, rows, heads}, -1);
+    query = graph.tensor(syn_type_bf16, {d, rows, group, kv_heads}, -1);
+    graph.node({"transpose", {query_in}, {query_t}, perm3d});
+    graph.node({"reshape", {query_t}, {query}, {}});
+  } else {
+    query = graph.tensor(syn_type_bf16, {d, rows, group, kv_heads}, slot++);
+  }
+  synTensor pool = nullptr;
+  if (!direct_kv) {
+    pool = graph.tensor(syn_type_bf16, {d, 2 * kPagedKvDescriptorSlots * kv_heads}, slot++);
+  }
   auto positions = graph.tensor(syn_type_int32, {rows}, slot++);
 
-  std::vector<synTensor> key_indices(chunk_tiles), value_indices(chunk_tiles), headers(chunk_tiles);
+  std::vector<synTensor> key_sources(chunk_tiles), value_sources(chunk_tiles), headers(chunk_tiles);
   const uint64_t value_indices_offset = kv * kv_heads * sizeof(int32_t);
   for (uint32_t t = 0; t < chunk_tiles; ++t) {
-    const int key_slot = slot++;
-    key_indices[t] = graph.tensor(syn_type_int32, {kv * kv_heads}, key_slot);
-    value_indices[t] = graph.tensor(syn_type_int32, {kv * kv_heads}, slot++, key_slot, value_indices_offset);
+    if (direct_kv) {
+      key_sources[t] = graph.tensor(syn_type_bf16, {d, kv_heads, kv}, slot++);
+      value_sources[t] = graph.tensor(syn_type_bf16, {d, kv_heads, kv}, slot++);
+    } else {
+      const int key_slot = slot++;
+      key_sources[t] = graph.tensor(syn_type_int32, {kv * kv_heads}, key_slot);
+      value_sources[t] = graph.tensor(syn_type_int32, {kv * kv_heads}, slot++, key_slot, value_indices_offset);
+    }
     headers[t] = graph.tensor(syn_type_int32, {3}, slot++);
   }
 
@@ -94,8 +113,8 @@ ColdRecipe& chunk_recipe(Context& ctx, const AttentionPlan& plan, const Attentio
 
   synTensor final_out = nullptr, out_m = nullptr, out_l = nullptr, out_o = nullptr;
   if (finalize_last) {
-    final_out = graph.tensor(syn_type_bf16, {d, rows, group, kv_heads}, slot++);
-    if (rows > 1) graph.permutation(final_out, q_perm);
+    final_out = rows > 1 ? graph.tensor(syn_type_bf16, {d, heads, rows}, slot++)
+                         : graph.tensor(syn_type_bf16, {d, rows, group, kv_heads}, slot++);
   } else {
     out_m = graph.tensor(syn_type_float, {stats_rows, group, kv_heads}, slot++);
     out_l = graph.tensor(syn_type_float, {stats_rows, group, kv_heads}, slot++);
@@ -108,10 +127,17 @@ ColdRecipe& chunk_recipe(Context& ctx, const AttentionPlan& plan, const Attentio
   for (uint32_t t = 0; t < chunk_tiles; ++t) {
     std::array<synTensor, 2> kv_tiles{};
     for (unsigned i = 0; i < 2; ++i) {
-      auto gathered = graph.tensor(syn_type_bf16, {d, kv * kv_heads}, -1);
+      auto src_tensor = i ? value_sources[t] : key_sources[t];
       kv_tiles[i] = graph.tensor(syn_type_bf16, {d, kv, 1, kv_heads}, -1);
-      graph.node({"gather_fwd_bf16", {pool, i ? value_indices[t] : key_indices[t]}, {gathered}, gather});
-      graph.node({"reshape", {gathered}, {kv_tiles[i]}, {}});
+      if (direct_kv) {
+        auto transposed = graph.tensor(syn_type_bf16, {d, kv, kv_heads}, -1);
+        graph.node({"transpose", {src_tensor}, {transposed}, perm3d});
+        graph.node({"reshape", {transposed}, {kv_tiles[i]}, {}});
+      } else {
+        auto gathered = graph.tensor(syn_type_bf16, {d, kv * kv_heads}, -1);
+        graph.node({"gather_fwd_bf16", {pool, src_tensor}, {gathered}, gather});
+        graph.node({"reshape", {gathered}, {kv_tiles[i]}, {}});
+      }
     }
     auto score4 = graph.tensor(syn_type_float, {kv, rows, group, kv_heads}, -1);
     auto probability4 = graph.tensor(syn_type_bf16, {kv, rows, group, kv_heads}, -1);
@@ -138,7 +164,15 @@ ColdRecipe& chunk_recipe(Context& ctx, const AttentionPlan& plan, const Attentio
     cur_o = next_o;
   }
   if (finalize_last) {
-    graph.node({"gk_attn_online_finalize_bf16_v1", {cur_l, cur_o}, {final_out}, {}});
+    if (rows > 1) {
+      auto final_o4 = graph.tensor(syn_type_bf16, {d, rows, group, kv_heads}, -1);
+      auto final_o3 = graph.tensor(syn_type_bf16, {d, rows, heads}, -1);
+      graph.node({"gk_attn_online_finalize_bf16_v1", {cur_l, cur_o}, {final_o4}, {}});
+      graph.node({"reshape", {final_o4}, {final_o3}, {}});
+      graph.node({"transpose", {final_o3}, {final_out}, perm3d});
+    } else {
+      graph.node({"gk_attn_online_finalize_bf16_v1", {cur_l, cur_o}, {final_out}, {}});
+    }
   }
   graph.compile(ctx.cache, graph_key.key);
   auto [it, inserted] = ctx.cold_recipes.emplace(graph_key.key, std::move(recipe));
@@ -147,12 +181,12 @@ ColdRecipe& chunk_recipe(Context& ctx, const AttentionPlan& plan, const Attentio
 }
 
 ColdRecipe& cached_chunk_recipe(Context& ctx, const AttentionPlan& plan, const AttentionBlock& block, float scale,
-                                uint32_t chunk_tiles, bool first_chunk, bool finalize_last) {
+                                uint32_t chunk_tiles, bool first_chunk, bool finalize_last, bool direct_kv) {
   struct TiledRecipeCache {
     uint64_t generation = 0;
     uint32_t rows = 0, kv = 0, scale = 0;
     int64_t heads = 0, kv_heads = 0, head_dim = 0;
-    std::array<ColdRecipe*, kMaxFusedAttentionTiles * 4> entries{};
+    std::array<ColdRecipe*, kMaxFusedAttentionTiles * 8> entries{};
   };
   thread_local TiledRecipeCache cache;
   const auto scale_bits = std::bit_cast<uint32_t>(scale);
@@ -168,11 +202,11 @@ ColdRecipe& cached_chunk_recipe(Context& ctx, const AttentionPlan& plan, const A
     cache.head_dim = plan.head_dim;
     cache.entries.fill(nullptr);
   }
-  const size_t idx = (static_cast<size_t>(chunk_tiles - 1) * 4) +
-                     (first_chunk ? 2 : 0) + (finalize_last ? 1 : 0);
+  const size_t idx = (static_cast<size_t>(chunk_tiles - 1) * 8) +
+                     (direct_kv ? 4 : 0) + (first_chunk ? 2 : 0) + (finalize_last ? 1 : 0);
   if (auto* found = cache.entries[idx]) return *found;
   std::lock_guard lock(ctx.cold_mutex);
-  auto& recipe = chunk_recipe(ctx, plan, block, scale, chunk_tiles, first_chunk, finalize_last);
+  auto& recipe = chunk_recipe(ctx, plan, block, scale, chunk_tiles, first_chunk, finalize_last, direct_kv);
   cache.entries[idx] = &recipe;
   return recipe;
 }
@@ -208,8 +242,11 @@ void launch_tiled_attention(Context& ctx, const AttentionPlan& plan, const Atten
                             const TiledAttentionInputs& input, float scale) {
   const size_t total_tiles = block.tiles.size();
   TORCH_CHECK(total_tiles > 1, "GaudiRT attention: multi-tile launch requires at least two KV tiles");
+  const bool direct_kv = input.direct_key != 0;
+  TORCH_CHECK(!direct_kv || input.direct_value != 0, "GaudiRT attention: missing direct value binding");
   const auto stream = ctx.stream();
   const uint64_t rows = block.query_bucket, heads = plan.query_heads, d = plan.head_dim;
+  const uint64_t kv_row_bytes = static_cast<uint64_t>(plan.kv_heads) * d * sizeof(uint16_t);
   const uint64_t stats = align((rows + 63) / 64 * 64 * heads * sizeof(float));
   const uint64_t output_bytes = align(rows * heads * d * sizeof(float));
   const uint64_t stride = 2 * stats + output_bytes;
@@ -224,20 +261,20 @@ void launch_tiled_attention(Context& ctx, const AttentionPlan& plan, const Atten
   ColdRecipe* last_recipe = nullptr;
   if (num_chunks == 1) {
     first_recipe = &cached_chunk_recipe(ctx, plan, block, scale,
-                                        static_cast<uint32_t>(total_tiles), true, true);
+                                        static_cast<uint32_t>(total_tiles), true, true, direct_kv);
     workspace_size = first_recipe->workspace;
   } else {
     first_recipe = &cached_chunk_recipe(ctx, plan, block, scale,
-                                        static_cast<uint32_t>(kMaxFusedAttentionTiles), true, false);
+                                        static_cast<uint32_t>(kMaxFusedAttentionTiles), true, false, direct_kv);
     workspace_size = first_recipe->workspace;
     if (num_chunks > 2) {
       middle_recipe = &cached_chunk_recipe(ctx, plan, block, scale,
-                                           static_cast<uint32_t>(kMaxFusedAttentionTiles), false, false);
+                                           static_cast<uint32_t>(kMaxFusedAttentionTiles), false, false, direct_kv);
       workspace_size = std::max(workspace_size, middle_recipe->workspace);
     }
     const uint32_t tail_tiles = static_cast<uint32_t>(
         total_tiles - (num_chunks - 1) * kMaxFusedAttentionTiles);
-    last_recipe = &cached_chunk_recipe(ctx, plan, block, scale, tail_tiles, false, true);
+    last_recipe = &cached_chunk_recipe(ctx, plan, block, scale, tail_tiles, false, true, direct_kv);
     workspace_size = std::max(workspace_size, last_recipe->workspace);
   }
 
@@ -261,13 +298,22 @@ void launch_tiled_attention(Context& ctx, const AttentionPlan& plan, const Atten
     std::copy(recipe->tensors.begin(), recipe->tensors.end(), bindings.begin());
     size_t b = 0;
     bindings[b++].pTensorAddress = input.query;
-    bindings[b++].pTensorAddress = input.pool;
+    if (!direct_kv) bindings[b++].pTensorAddress = input.pool;
     bindings[b++].pTensorAddress = plan.address + block.positions_offset;
     for (uint32_t t = 0; t < chunk_tiles; ++t) {
-      const auto& tile = block.tiles[tile_offset + t];
-      bindings[b++].pTensorAddress = plan.address + tile.indices_offset;
-      bindings[b++].pTensorAddress = plan.address + tile.indices_offset + value_indices_offset;
-      bindings[b++].pTensorAddress = plan.address + tile.header_offset;
+      const size_t global_t = tile_offset + t;
+      const auto& tile = block.tiles[global_t];
+      if (direct_kv) {
+        const bool use_tail = (global_t + 1 == total_tiles) && (input.tail_key != 0);
+        const uint64_t off = static_cast<uint64_t>(tile.first_key) * kv_row_bytes;
+        bindings[b++].pTensorAddress = use_tail ? input.tail_key : (input.direct_key + off);
+        bindings[b++].pTensorAddress = use_tail ? input.tail_value : (input.direct_value + off);
+        bindings[b++].pTensorAddress = plan.address + tile.header_offset;
+      } else {
+        bindings[b++].pTensorAddress = plan.address + tile.indices_offset;
+        bindings[b++].pTensorAddress = plan.address + tile.indices_offset + value_indices_offset;
+        bindings[b++].pTensorAddress = plan.address + tile.header_offset;
+      }
     }
     if (!first_chunk) {
       const uint64_t in_state = scratch + ((chunk_idx - 1) % 2) * stride;

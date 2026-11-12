@@ -190,18 +190,22 @@ at::Tensor PagedMetadata::attention_plan(int64_t query_heads, int64_t kv_heads, 
       block.valid_rows = count;
       block.query_bucket = q_bucket;
       block.kv_bucket = kv_bucket;
+      block.kv_source_row = sequence.prefix == 0 ? sequence.row : -1;
+      const bool emit_tile_indices = block.kv_source_row < 0 || visible <= static_cast<int32_t>(kv_bucket);
       for (int32_t first = 0; first < visible; first += kv_bucket) {
         const int32_t valid = std::min<int32_t>(kv_bucket, visible - first);
         AttentionTile tile{};
         tile.indices_offset = static_cast<uint64_t>(tasks.size()) * 64 * sizeof(int32_t);
         tile.first_key = first;
         tile.valid_keys = valid;
-        for (int32_t kind = 0; kind < 2; ++kind) {
-          for (int32_t head = 0; head < kv_heads; ++head) {
-            for (int32_t key = 0; key < static_cast<int32_t>(kv_bucket); key += 64) {
-              const auto lanes = std::clamp(valid - key, 0, 64);
-              tasks.push_back({block.first_row, first + key, lanes,
-                               static_cast<int32_t>((kind * kv_heads + head) * slots_)});
+        if (emit_tile_indices) {
+          for (int32_t kind = 0; kind < 2; ++kind) {
+            for (int32_t head = 0; head < kv_heads; ++head) {
+              for (int32_t key = 0; key < static_cast<int32_t>(kv_bucket); key += 64) {
+                const auto lanes = std::clamp(valid - key, 0, 64);
+                tasks.push_back({block.first_row, first + key, lanes,
+                                 static_cast<int32_t>((kind * kv_heads + head) * slots_)});
+              }
             }
           }
         }

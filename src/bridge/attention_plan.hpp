@@ -46,12 +46,13 @@ struct AttentionTile {
 inline constexpr size_t kMaxFusedAttentionTiles = 8;
 
 struct AttentionBlock {
-  int32_t first_row;
-  int32_t valid_rows;
-  uint32_t query_bucket;
-  uint32_t kv_bucket;
-  uint64_t positions_offset;
-  uint64_t store_header_offset;
+  int32_t first_row = 0;
+  int32_t valid_rows = 0;
+  uint32_t query_bucket = 0;
+  uint32_t kv_bucket = 0;
+  int32_t kv_source_row = -1;
+  uint64_t positions_offset = 0;
+  uint64_t store_header_offset = 0;
   std::vector<AttentionTile> tiles;
 };
 

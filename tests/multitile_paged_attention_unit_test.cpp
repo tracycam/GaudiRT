@@ -208,6 +208,7 @@ struct MockState {
   uint64_t event_destroys = 0;
   uint64_t node_creates = 0;
   uint64_t node_with_id_creates = 0;
+  uint64_t multi_dma_calls = 0;
   bool execute_math = false;
   std::vector<LaunchRecord> launches;
   std::vector<const MockRecipe*> compiled_recipes;
@@ -217,6 +218,7 @@ struct MockState {
     event_destroys = 0;
     node_creates = 0;
     node_with_id_creates = 0;
+    multi_dma_calls = 0;
     launches.clear();
   }
 };
@@ -241,8 +243,11 @@ void verify_recipe_structure(const MockRecipe& recipe) {
   std::vector<const MockNode*> finalizes;
   std::vector<const MockNode*> constants;
   std::vector<const MockNode*> reshapes;
+  std::vector<const MockNode*> transposes;
+  std::vector<const MockNode*> gathers;
   std::set<uint64_t> header_sections;
   std::set<uint64_t> key_index_sections;
+  std::set<uint64_t> direct_kv_sections;
 
   for (const auto& n : recipe.nodes) {
     if (n.guid == "gk_attn_online_init_f32_v1") inits.push_back(&n);
@@ -252,7 +257,9 @@ void verify_recipe_structure(const MockRecipe& recipe) {
     else if (n.guid == "gk_attn_online_finalize_bf16_v1") finalizes.push_back(&n);
     else if (n.guid == "constant_f32") constants.push_back(&n);
     else if (n.guid == "reshape") reshapes.push_back(&n);
+    else if (n.guid == "transpose") transposes.push_back(&n);
     else if (n.guid == "gather_fwd_bf16") {
+      gathers.push_back(&n);
       assert(n.inputs.size() == 2);
       const auto& idx_t = recipe.tensor_snapshots.at(n.inputs[1]);
       assert(idx_t.section && idx_t.section->persistent);
@@ -262,11 +269,31 @@ void verify_recipe_structure(const MockRecipe& recipe) {
 
   const size_t chunk_tiles = softmaxes.size();
   const bool first_chunk = !inits.empty();
+  const bool finalize_last = !finalizes.empty();
+  const bool direct_kv = gathers.empty();
+  const uint64_t rows = recipe.tensor_snapshots.at(softmaxes[0]->inputs[0]).sizes[1];
+  const size_t io_transforms = (rows > 1 ? 1U : 0U) + (finalize_last && rows > 1 ? 1U : 0U);
   assert(chunk_tiles >= 1 && chunk_tiles <= gaudirt::generic::kMaxFusedAttentionTiles);
   assert(packs.empty() && "packed 3D tile stats eliminate redundant gk_attn_pack_stats_f32_v1 nodes");
   assert(constants.empty() && "gk_attn_online_init_f32_v1 eliminates redundant constant_f32 zero nodes");
-  assert(reshapes.size() == 2 * chunk_tiles && "only 2 gather reshapes per KV tile; zero score/prob/output reshapes");
-  assert(key_index_sections.size() == chunk_tiles && "each tile must use a distinct persistent index section");
+  assert(reshapes.size() == 2 * chunk_tiles + io_transforms &&
+         "only 2 KV reshapes per tile plus query/output 3D<->4D reshapes; zero score/prob reshapes");
+  assert(transposes.size() == (direct_kv ? 2 * chunk_tiles : 0) + io_transforms &&
+         "explicit 3D transpose nodes avoid per-tile query re-transposition");
+  if (direct_kv) {
+    for (const auto* tn : transposes) {
+      assert(tn->inputs.size() == 1 && tn->outputs.size() == 1);
+      const auto& in_snap = recipe.tensor_snapshots.at(tn->inputs[0]);
+      if (in_snap.section && in_snap.section->persistent) {
+        direct_kv_sections.insert(in_snap.section->id);
+      }
+    }
+    assert(direct_kv_sections.size() == 2 * chunk_tiles + (rows > 1 ? 1U : 0U) &&
+           "each direct KV tile + query must bind its own persistent input section");
+  } else {
+    assert(gathers.size() == 2 * chunk_tiles);
+    assert(key_index_sections.size() == chunk_tiles && "each tile must use a distinct persistent index section");
+  }
   if (first_chunk) {
     assert(inits.size() == 1 && merges.size() + 1 == chunk_tiles);
   } else {
@@ -320,7 +347,14 @@ void verify_recipe_structure(const MockRecipe& recipe) {
     assert(fin->inputs[0] == last_state_node->outputs[1] && "finalize sums must come from last tile state new_l");
     assert(fin->inputs[1] == last_state_node->outputs[2] && "finalize acc must come from last tile state new_o");
     const auto& out_spec = recipe.tensor_snapshots.at(fin->outputs[0]);
-    assert(out_spec.section && out_spec.section->persistent && out_spec.dtype == syn_type_bf16);
+    assert(out_spec.dtype == syn_type_bf16);
+    if (rows == 1) {
+      assert(out_spec.section && out_spec.section->persistent);
+    } else {
+      assert(out_spec.section == nullptr);
+      const auto& out_t_spec = recipe.tensor_snapshots.at(transposes.back()->outputs[0]);
+      assert(out_t_spec.section && out_t_spec.section->persistent && out_t_spec.dtype == syn_type_bf16);
+    }
     for (int s = 0; s < 3; ++s) {
       assert(recipe.tensor_snapshots.at(last_state_node->outputs[s]).section == nullptr &&
              "finalized chunk must not write running (m, l, o) to persistent HBM");
@@ -448,6 +482,47 @@ void execute_recipe_on_cpu(const MockRecipe& recipe, const synLaunchTensorInfo* 
     } else if (node.guid == "reshape") {
       const auto& in_b = load_tensor(node.inputs[0]);
       buffers[node.outputs[0]] = in_b;
+    } else if (node.guid == "transpose") {
+      synTransposeParams p{};
+      std::memcpy(&p, node.params.data(), sizeof(p));
+      const auto& in_spec = recipe.tensor_snapshots.at(node.inputs[0]);
+      const auto& out_spec = recipe.tensor_snapshots.at(node.outputs[0]);
+      assert(p.tensorDim == 3 && in_spec.dims == 3 && out_spec.dims == 3 &&
+             p.permutation[0] == TPD_Channel && p.permutation[1] == TPD_Height &&
+             p.permutation[2] == TPD_Width);
+      const auto& in_b = load_tensor(node.inputs[0]);
+      auto& out_b = alloc_tensor(node.outputs[0]);
+      const uint64_t d0 = in_spec.sizes[0], d1 = in_spec.sizes[1], d2 = in_spec.sizes[2];
+      const size_t elem_sz = dtype_bytes(in_spec.dtype);
+      for (uint64_t i2 = 0; i2 < d2; ++i2)
+        for (uint64_t i1 = 0; i1 < d1; ++i1) {
+          const uint64_t src_off = (i2 * d1 + i1) * d0 * elem_sz;
+          const uint64_t dst_off = (i1 * d2 + i2) * d0 * elem_sz;
+          std::memcpy(out_b.data() + dst_off, in_b.data() + src_off, d0 * elem_sz);
+        }
+    } else if (node.guid == "split") {
+      synSplitParams p{};
+      std::memcpy(&p, node.params.data(), sizeof(p));
+      assert(p.axis == 0);
+      const auto& in_spec = recipe.tensor_snapshots.at(node.inputs[0]);
+      assert(in_spec.dims == 2);
+      const auto& in_b = load_tensor(node.inputs[0]);
+      const uint64_t total_cols = in_spec.sizes[0], rows = in_spec.sizes[1];
+      const size_t elem_sz = dtype_bytes(in_spec.dtype);
+      uint64_t col_cursor = 0;
+      for (MockTensor* out_h : node.outputs) {
+        const auto& out_spec = recipe.tensor_snapshots.at(out_h);
+        assert(out_spec.dims == 2 && out_spec.sizes[1] == rows);
+        const uint64_t part_cols = out_spec.sizes[0];
+        auto& out_b = alloc_tensor(out_h);
+        for (uint64_t r = 0; r < rows; ++r) {
+          std::memcpy(out_b.data() + r * part_cols * elem_sz,
+                      in_b.data() + (r * total_cols + col_cursor) * elem_sz,
+                      part_cols * elem_sz);
+        }
+        col_cursor += part_cols;
+      }
+      assert(col_cursor == total_cols);
     } else if (node.guid == "batch_gemm") {
       synGEMMParams p{};
       std::memcpy(&p, node.params.data(), sizeof(p));
@@ -801,6 +876,7 @@ synStatus synMemCopyAsync(synStreamHandle, uint64_t src, uint64_t size, uint64_t
 }
 synStatus synMemCopyAsyncMultiple(synStreamHandle s, const uint64_t* src, const uint64_t* size,
                                   const uint64_t* dst, synDmaDir dir, uint64_t n) {
+  ++mock().multi_dma_calls;
   for (uint64_t i = 0; i < n; ++i) synMemCopyAsync(s, src[i], size[i], dst[i], dir);
   return synSuccess;
 }
@@ -1650,6 +1726,98 @@ int main() {
         }
       }
     }
+
+    // 7a. Partial-tail direct_kv (prefix=0, rows=600 -> tail valid_keys=88 < 512) with NaN-poisoned
+    // caller bucket padding in rows [600, 1024): must neither propagate NaNs nor mutate caller storage!
+    {
+      constexpr int32_t kRows = 600;
+      constexpr int32_t kBucket = 1024;
+      const int32_t q_width = kTestQHeads * kTestD;
+      const int32_t kv_width = kTestKvHeads * kTestD;
+      std::vector<int32_t> slot_table(kRows);
+      for (int32_t i = 0; i < kRows; ++i) slot_table[i] = 1 + i;
+      std::vector<uint16_t> k_pool_init(static_cast<size_t>(kTestSlots) * kv_width, 0);
+      std::vector<uint16_t> v_pool_init(static_cast<size_t>(kTestSlots) * kv_width, 0);
+
+      std::vector<uint16_t> q_host(static_cast<size_t>(kRows) * q_width);
+      std::vector<uint16_t> k_padded(static_cast<size_t>(kBucket) * kv_width, uint16_t{0x7fc0U});
+      std::vector<uint16_t> v_padded(static_cast<size_t>(kBucket) * kv_width, uint16_t{0x7fc0U});
+      for (auto& x : q_host) x = f32_to_bf16(dist(rng));
+      for (int32_t i = 0; i < kRows * kv_width; ++i) {
+        k_padded[i] = f32_to_bf16(dist(rng));
+        v_padded[i] = f32_to_bf16(dist(rng));
+      }
+      std::vector<uint16_t> k_valid(k_padded.begin(), k_padded.begin() + kRows * kv_width);
+      std::vector<uint16_t> v_valid(v_padded.begin(), v_padded.begin() + kRows * kv_width);
+
+      auto sched = build_schedule(0, kRows, kTestSlots, 16384, kTestQHeads, kTestKvHeads, kTestD, &slot_table);
+      auto q_dev = make_device_tensor({kRows, q_width}, at::kBFloat16, q_host.data());
+      auto k_full = make_device_tensor({kBucket, kv_width}, at::kBFloat16, k_padded.data());
+      auto v_full = make_device_tensor({kBucket, kv_width}, at::kBFloat16, v_padded.data());
+      auto k_dev = k_full.narrow(0, 0, kRows);
+      auto v_dev = v_full.narrow(0, 0, kRows);
+
+      auto out_dev = paged_attn_validated(q_dev, k_dev, v_dev, mk_pool, mv_pool,
+                                          sched.locations, sched.requests, sched.positions,
+                                          sched.plan_tensor, sched.header, kTestD, test_scale);
+      std::vector<uint16_t> actual(static_cast<size_t>(kRows) * q_width, 0);
+      mock().arena.read(actual.data(), address_of(out_dev, ctx), actual.size() * 2);
+      const auto expected = cpu_reference_paged_attention(
+          q_host, k_valid, v_valid, k_pool_init, v_pool_init, slot_table,
+          0, kRows, kTestQHeads, kTestKvHeads, kTestD, 256, 512, test_scale);
+      assert(actual == expected && "NaN-padded partial tail direct_kv must match CPU reference bit-for-bit");
+
+      // Caller's backing storage beyond row 600 must remain untouched!
+      std::vector<uint16_t> k_tail_check(kv_width, 0);
+      mock().arena.read(k_tail_check.data(), address_of(k_full, ctx) + static_cast<uint64_t>(kRows) * kv_width * 2,
+                        kv_width * 2);
+      for (uint16_t w : k_tail_check) assert(w == uint16_t{0x7fc0U});
+    }
+
+    // 7b. Strided 2D packed_kv slices (exact-row 137 -> 2-launch split, and pow2 1024 -> 1-launch split):
+    // zero synMemCopyAsyncMultiple descriptor storms and 0-ULP CPU reference match!
+    for (int32_t s_rows : {137, 1024}) {
+      const int32_t q_width = kTestQHeads * kTestD;
+      const int32_t kv_width = kTestKvHeads * kTestD;
+      std::vector<int32_t> slot_table(s_rows);
+      for (int32_t i = 0; i < s_rows; ++i) slot_table[i] = 1 + i;
+      std::vector<uint16_t> k_pool_init(static_cast<size_t>(kTestSlots) * kv_width, 0);
+      std::vector<uint16_t> v_pool_init(static_cast<size_t>(kTestSlots) * kv_width, 0);
+      std::vector<uint16_t> q_host(static_cast<size_t>(s_rows) * q_width);
+      std::vector<uint16_t> k_host(static_cast<size_t>(s_rows) * kv_width);
+      std::vector<uint16_t> v_host(static_cast<size_t>(s_rows) * kv_width);
+      std::vector<uint16_t> kv_interleaved(static_cast<size_t>(s_rows) * 2 * kv_width);
+      for (auto& x : q_host) x = f32_to_bf16(dist(rng));
+      for (int32_t r = 0; r < s_rows; ++r) {
+        for (int32_t c = 0; c < kv_width; ++c) {
+          const uint16_t kv_k = f32_to_bf16(dist(rng));
+          const uint16_t kv_v = f32_to_bf16(dist(rng));
+          k_host[r * kv_width + c] = kv_k;
+          v_host[r * kv_width + c] = kv_v;
+          kv_interleaved[r * (2 * kv_width) + c] = kv_k;
+          kv_interleaved[r * (2 * kv_width) + kv_width + c] = kv_v;
+        }
+      }
+      auto sched = build_schedule(0, s_rows, kTestSlots, 16384, kTestQHeads, kTestKvHeads, kTestD, &slot_table);
+      auto q_dev = make_device_tensor({s_rows, q_width}, at::kBFloat16, q_host.data());
+      auto packed_kv = make_device_tensor({s_rows, 2 * kv_width}, at::kBFloat16, kv_interleaved.data());
+      auto k_slice = packed_kv.narrow(1, 0, kv_width);
+      auto v_slice = packed_kv.narrow(1, kv_width, kv_width);
+      assert(!k_slice.is_contiguous() && !v_slice.is_contiguous());
+
+      mock().reset_counters();
+      auto out_dev = paged_attn_validated(q_dev, k_slice, v_slice, mk_pool, mv_pool,
+                                          sched.locations, sched.requests, sched.positions,
+                                          sched.plan_tensor, sched.header, kTestD, test_scale);
+      assert(mock().multi_dma_calls == 0 && "256B-aligned 2D strided KV slices must bypass synMemCopyAsyncMultiple");
+      std::vector<uint16_t> actual(static_cast<size_t>(s_rows) * q_width, 0);
+      mock().arena.read(actual.data(), address_of(out_dev, ctx), actual.size() * 2);
+      const auto expected = cpu_reference_paged_attention(
+          q_host, k_host, v_host, k_pool_init, v_pool_init, slot_table,
+          0, s_rows, kTestQHeads, kTestKvHeads, kTestD, 256, 512, test_scale);
+      assert(actual == expected && "strided 2D packed_kv output must match CPU reference bit-for-bit");
+    }
+
     mock().execute_math = false;
   }
 

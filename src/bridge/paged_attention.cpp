@@ -217,8 +217,10 @@ at::Tensor paged_attn_internal(const at::Tensor& query, const at::Tensor& key, c
       auto staged = std::make_unique<TemporaryDevice>(*ctx, bytes);
       result = staged->address;
       const auto slice = input.narrow(0, first_row, valid_rows);
-      const Layout layout(slice);
-      dma_copy(result, nullptr, source, &layout, 0, slice.numel(), item, stream, DRAM_TO_DRAM);
+      if (!try_pack_strided_2d(*ctx, result, bytes, slice, stream)) {
+        const Layout layout(slice);
+        dma_copy(result, nullptr, source, &layout, 0, slice.numel(), item, stream, DRAM_TO_DRAM);
+      }
       temporary.push_back(std::move(staged));
     }
     regions.emplace_back(result, bytes);
@@ -228,19 +230,27 @@ at::Tensor paged_attn_internal(const at::Tensor& query, const at::Tensor& key, c
   // their target slots unique, and causal masking hides future rows.
   const bool separate_store = plan.blocks.size() != 1 || plan.blocks.front().tiles.size() != 1;
   std::vector<std::unique_ptr<TemporaryDevice>> layer_temporary;
+  uint64_t layer_k = 0, layer_v = 0;
+  const uint64_t kv_row_bytes = static_cast<uint64_t>(plan.kv_heads) * head_dim * sizeof(uint16_t);
+  const uint64_t layer_kv_bytes = static_cast<uint64_t>(output_bucket) * kv_row_bytes;
   if (separate_store) {
     std::vector<std::pair<uint64_t, uint64_t>> regions{{pool_address, descriptor_bytes},
                                                        {plan.address, plan.bytes}};
-    const auto k = input_address(key, 0, plan.rows, output_bucket, regions, layer_temporary);
-    const auto v = input_address(value, 0, plan.rows, output_bucket, regions, layer_temporary);
+    layer_k = input_address(key, 0, plan.rows, output_bucket, regions, layer_temporary);
+    layer_v = input_address(value, 0, plan.rows, output_bucket, regions, layer_temporary);
     const auto loc = input_address(locations, 0, plan.rows, output_bucket, regions, layer_temporary);
-    launch_layer_kv_store(*ctx, plan, k, v, loc, pool_address);
+    launch_layer_kv_store(*ctx, plan, layer_k, layer_v, loc, pool_address);
   }
   for (const auto& block : plan.blocks) {
     const auto& tile = block.tiles.front();
+    const bool direct_kv = separate_store && block.tiles.size() > 1 && block.kv_source_row >= 0;
     std::vector<std::unique_ptr<TemporaryDevice>> temporary;
     std::vector<std::pair<uint64_t, uint64_t>> regions{{pool_address, descriptor_bytes},
                                                        {plan.address, plan.bytes}};
+    if (direct_kv) {
+      regions.emplace_back(layer_k, layer_kv_bytes);
+      regions.emplace_back(layer_v, layer_kv_bytes);
+    }
     const auto block_input = [&](const at::Tensor& input) {
       return input_address(input, block.first_row, block.valid_rows, block.query_bucket, regions, temporary);
     };
@@ -261,9 +271,33 @@ at::Tensor paged_attn_internal(const at::Tensor& query, const at::Tensor& key, c
       temporary.push_back(std::move(staged));
     }
     if (block.tiles.size() > 1) {
-      launch_tiled_attention(*ctx, plan, block,
-                             {q_address, pool_address, out_binding},
-                             scale_f);
+      TiledAttentionInputs tiled_input{q_address, pool_address, out_binding};
+      if (direct_kv) {
+        const uint64_t seq_offset = static_cast<uint64_t>(block.kv_source_row) * kv_row_bytes;
+        tiled_input.direct_key = layer_k + seq_offset;
+        tiled_input.direct_value = layer_v + seq_offset;
+        const auto& last_tile = block.tiles.back();
+        if (last_tile.valid_keys < static_cast<int32_t>(block.kv_bucket)) {
+          const uint64_t tile_bytes = static_cast<uint64_t>(block.kv_bucket) * kv_row_bytes;
+          const uint64_t valid_bytes = static_cast<uint64_t>(last_tile.valid_keys) * kv_row_bytes;
+          const uint64_t pad_bytes = tile_bytes - valid_bytes;
+          const uint64_t tail_src_off = static_cast<uint64_t>(last_tile.first_key) * kv_row_bytes;
+          auto tail_kv = std::make_unique<TemporaryDevice>(*ctx, 2 * tile_bytes);
+          tiled_input.tail_key = tail_kv->address;
+          tiled_input.tail_value = tail_kv->address + tile_bytes;
+          TORCH_CHECK(synMemCopyAsync(stream, tiled_input.direct_key + tail_src_off, valid_bytes,
+                                      tiled_input.tail_key, DRAM_TO_DRAM) == synSuccess &&
+                      synMemCopyAsync(stream, tiled_input.direct_value + tail_src_off, valid_bytes,
+                                      tiled_input.tail_value, DRAM_TO_DRAM) == synSuccess &&
+                      synMemsetD32Async(tiled_input.tail_key + valid_bytes, 0,
+                                        pad_bytes / sizeof(uint32_t), stream) == synSuccess &&
+                      synMemsetD32Async(tiled_input.tail_value + valid_bytes, 0,
+                                        pad_bytes / sizeof(uint32_t), stream) == synSuccess,
+                      "GaudiRT attention: partial KV tile staging failed");
+          temporary.push_back(std::move(tail_kv));
+        }
+      }
+      launch_tiled_attention(*ctx, plan, block, tiled_input, scale_f);
     } else {
       auto* recipe = &cached_fused_recipe(*ctx, plan, block, scale_f, !separate_store);
       auto bindings = recipe->tensors;
