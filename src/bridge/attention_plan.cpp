@@ -165,7 +165,9 @@ at::Tensor PagedMetadata::attention_plan(int64_t query_heads, int64_t kv_heads, 
       const int32_t end = sequence.prefix + done + remaining;
       int32_t count = std::min<int32_t>(remaining, 256);
       uint32_t q_bucket = std::bit_ceil(static_cast<uint32_t>(count));
-      const uint32_t direct_kv = std::max<uint32_t>(128, std::bit_ceil(static_cast<uint32_t>(end)));
+      const uint32_t direct_kv = (remaining == 1 && end > 512 && end <= 8192)
+          ? static_cast<uint32_t>((end + 511) & ~511)
+          : std::max<uint32_t>(128, std::bit_ceil(static_cast<uint32_t>(end)));
       // Account for BF16 K/V, FP32 scores and exponentials, and BF16 probabilities.
       // Leave SRAM headroom for graph scheduling instead of tying the choice to a model geometry.
       const uint64_t fused_bytes = uint64_t{direct_kv} *

@@ -1517,11 +1517,14 @@ int main() {
   auto pool = allocate_paged_kv(1, 65536, kKvHeads, kHeadDim);
   auto [k_pool, v_pool] = make_kv_views(pool);
 
-  // 1. Decode schedules: (q=1, kv=128) and (q=1, kv=4096)
-  for (int64_t ctx_len : {128L, 4096L}) {
+  // 1. Decode schedules: (q=1, kv=128), (q=1, kv=1025->1536), (q=1, kv=4096), and (q=1, kv=4097->4608)
+  for (std::pair<int64_t, uint32_t> dec_case :
+       std::initializer_list<std::pair<int64_t, uint32_t>>{{128, 128}, {1025, 1536}, {4096, 4096}, {4097, 4608}}) {
+    const int64_t ctx_len = dec_case.first;
     auto sched = build_schedule(ctx_len - 1, 1, 65536, 32768, kQHeads, kKvHeads, kHeadDim);
     const auto& plan = attention_plan_data(sched.plan_tensor, ctx);
     assert(plan.blocks.size() == 1 && plan.blocks[0].tiles.size() == 1);
+    assert(plan.blocks[0].kv_bucket == dec_case.second);
     assert(plan.scratch_bytes == 0);
     auto q = make_device_tensor({1, kQHeads * kHeadDim}, at::kBFloat16);
     auto k = make_device_tensor({1, kKvHeads * kHeadDim}, at::kBFloat16);
