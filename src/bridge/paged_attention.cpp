@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <memory>
@@ -24,18 +25,25 @@
 namespace gaudirt::generic {
 using namespace runtime;
 namespace {
+struct DirectSoftmaxParameters {
+  float scale;
+  float softcap;
+  int32_t sliding_window;
+};
+
 enum FusedSlot {
   kQuery, kKey, kValue, kLocations, kStoreHeader, kOldPool, kPool,
   kKeyIndices, kValueIndices, kPositions, kTileHeader, kResult, kFusedSlots
 };
 
 ColdRecipe& fused_recipe(Context& ctx, const AttentionPlan& plan, const AttentionBlock& block, float scale,
-                         bool write_kv) {
+                         float softcap, int32_t sliding_window, bool write_kv) {
   std::ostringstream signature;
-  signature << (write_kv ? "paged_fused_v2:" : "paged_fused_read_v2:")
+  signature << (write_kv ? "paged_fused_v3:" : "paged_fused_read_v3:")
             << block.query_bucket << ':' << block.kv_bucket << ':'
             << plan.query_heads << ':' << plan.kv_heads << ':' << plan.head_dim << ':'
-            << std::bit_cast<uint32_t>(scale);
+            << std::bit_cast<uint32_t>(scale) << ':' << std::bit_cast<uint32_t>(softcap) << ':'
+            << sliding_window;
   const auto structure = signature.str();
   const auto digest = common::sha256_bytes(reinterpret_cast<const uint8_t*>(structure.data()), structure.size());
   const auto prefix = "g" + digest.substr(0, 12) + "_b" + std::to_string(block.query_bucket);
@@ -63,7 +71,7 @@ ColdRecipe& fused_recipe(Context& ctx, const AttentionPlan& plan, const Attentio
     const auto old_pool_slot = slot++;
     const auto pool_input = graph.tensor(syn_type_bf16, {d, 2 * kPagedKvDescriptorSlots * kv_heads}, old_pool_slot);
     pool = graph.tensor(syn_type_bf16, {d, 2 * kPagedKvDescriptorSlots * kv_heads}, slot++, old_pool_slot);
-    graph.node({"gk_kv_store_head_major_bf16_v1", {key_input, value_input, locations, store_header, pool_input},
+    graph.node({kv_store_guid(d), {key_input, value_input, locations, store_header, pool_input},
                 {pool}, {}});
   } else {
     pool = graph.tensor(syn_type_bf16, {d, 2 * kPagedKvDescriptorSlots * kv_heads}, slot++);
@@ -92,14 +100,16 @@ ColdRecipe& fused_recipe(Context& ctx, const AttentionPlan& plan, const Attentio
   const auto probability4 = graph.tensor(syn_type_bf16, {kv, rows, group, kv_heads}, -1);
   graph.node({"batch_gemm", {query, tiles[0]}, {score4}, synGEMMParams{false, true}});
   if (kv <= 512) {
-    graph.node({"gk_attn_direct_softmax_bf16_v1", {score4, positions, header}, {probability4}, scale});
+    graph.node({"gk_attn_direct_softmax_bf16_v1", {score4, positions, header}, {probability4},
+                pack_node_params(DirectSoftmaxParameters{scale, softcap, sliding_window})});
   } else {
     const auto score3 = graph.tensor(syn_type_float, {kv, rows, heads}, -1);
     const auto probability3 = graph.tensor(syn_type_bf16, {kv, rows, heads}, -1);
     const auto exponent = graph.tensor(syn_type_float, {kv, rows, heads}, -1);
     const auto sum = graph.tensor(syn_type_float, {64, heads}, -1);
     graph.node({"reshape", {score4}, {score3}, {}});
-    graph.node({"gk_attn_decode_exp_f32_v1", {score3, positions, header}, {exponent, sum}, scale});
+    graph.node({"gk_attn_decode_exp_f32_v1", {score3, positions, header}, {exponent, sum},
+                pack_node_params(DirectSoftmaxParameters{scale, softcap, sliding_window})});
     graph.node({"gk_attn_decode_normalize_bf16_v1", {exponent, sum}, {probability3}, {}});
     graph.node({"reshape", {probability3}, {probability4}, {}});
   }
@@ -117,24 +127,27 @@ ColdRecipe& fused_recipe(Context& ctx, const AttentionPlan& plan, const Attentio
 }
 
 ColdRecipe& cached_fused_recipe(Context& ctx, const AttentionPlan& plan, const AttentionBlock& block, float scale,
-                                bool write_kv) {
+                                float softcap, int32_t sliding_window, bool write_kv) {
   struct Cache {
     uint64_t generation = 0;
-    uint32_t rows = 0, kv = 0, scale = 0;
+    uint32_t rows = 0, kv = 0, scale = 0, softcap = 0;
+    int32_t sliding_window = -1;
     int64_t heads = 0, kv_heads = 0, head_dim = 0;
     bool write_kv = false;
     ColdRecipe* recipe = nullptr;
   };
   thread_local Cache cache;
   const auto scale_bits = std::bit_cast<uint32_t>(scale);
+  const auto softcap_bits = std::bit_cast<uint32_t>(softcap);
   if (cache.recipe && cache.generation == ctx.generation && cache.rows == block.query_bucket &&
-      cache.kv == block.kv_bucket && cache.scale == scale_bits && cache.heads == plan.query_heads &&
+      cache.kv == block.kv_bucket && cache.scale == scale_bits && cache.softcap == softcap_bits &&
+      cache.sliding_window == sliding_window && cache.heads == plan.query_heads &&
       cache.kv_heads == plan.kv_heads && cache.head_dim == plan.head_dim && cache.write_kv == write_kv)
     return *cache.recipe;
   std::lock_guard lock(ctx.cold_mutex);
-  auto& recipe = fused_recipe(ctx, plan, block, scale, write_kv);
-  cache = {ctx.generation, block.query_bucket, block.kv_bucket, scale_bits,
-           plan.query_heads, plan.kv_heads, plan.head_dim, write_kv, &recipe};
+  auto& recipe = fused_recipe(ctx, plan, block, scale, softcap, sliding_window, write_kv);
+  cache = {ctx.generation, block.query_bucket, block.kv_bucket, scale_bits, softcap_bits,
+           sliding_window, plan.query_heads, plan.kv_heads, plan.head_dim, write_kv, &recipe};
   return recipe;
 }
 
@@ -151,21 +164,28 @@ void record_if_needed(Context& ctx, const at::Tensor& tensor, synStreamHandle st
 at::Tensor paged_attn_validated(const at::Tensor& query, const at::Tensor& key, const at::Tensor& value,
     const at::Tensor& key_pool, const at::Tensor& value_pool, const at::Tensor& locations,
     const at::Tensor& requests, const at::Tensor& positions, const at::Tensor& plan_tensor, const at::Tensor& header,
-    int64_t head_dim, double scale) {
+    int64_t head_dim, double scale, double softcap, int64_t sliding_window) {
   return paged_attn_internal(query, key, value, key_pool, value_pool, locations, requests, positions,
-                             plan_tensor, header, head_dim, scale, false, false, false);
+                             plan_tensor, header, head_dim, scale, false, false, false, softcap, sliding_window);
 }
 
 at::Tensor paged_attn_internal(const at::Tensor& query, const at::Tensor& key, const at::Tensor& value,
     const at::Tensor& key_pool, const at::Tensor& value_pool, const at::Tensor& locations,
     const at::Tensor&, const at::Tensor&, const at::Tensor& plan_tensor, const at::Tensor&,
-    int64_t head_dim, double scale, bool query_trusted, bool key_trusted, bool value_trusted) {
+    int64_t head_dim, double scale, bool query_trusted, bool key_trusted, bool value_trusted,
+    double softcap, int64_t sliding_window) {
   auto ctx = current();
   const auto stream = ctx->stream();
   const auto& plan = attention_plan_data(plan_tensor, *ctx);
   const float scale_f = static_cast<float>(scale);
+  const float softcap_f = static_cast<float>(softcap);
   TORCH_CHECK(plan.stream == stream && std::isfinite(scale) && std::isfinite(scale_f) && scale_f > 0 &&
+              std::isfinite(softcap) && std::isfinite(softcap_f) && softcap_f >= 0.0f &&
+              (sliding_window == -1 || (sliding_window > 0 && sliding_window <= INT32_MAX)) &&
               head_dim == plan.head_dim, "GaudiRT attention: invalid scale, stream, or head dimension");
+  const int32_t swa = sliding_window > 0 ? static_cast<int32_t>(sliding_window) : -1;
+  TORCH_CHECK(plan.sliding_window <= 0 || plan.sliding_window == sliding_window,
+              "GaudiRT attention: plan sliding_window mismatch");
   for (const auto& input : {query, key, value})
     TORCH_CHECK(input.device().type() == c10::kPrivateUse1 && input.device().index() == ctx->device_index &&
                 input.scalar_type() == at::kBFloat16 && input.dim() == 2 && input.size(0) == plan.rows,
@@ -297,9 +317,11 @@ at::Tensor paged_attn_internal(const at::Tensor& query, const at::Tensor& key, c
           temporary.push_back(std::move(tail_kv));
         }
       }
-      launch_tiled_attention(*ctx, plan, block, tiled_input, scale_f);
+      launch_tiled_attention(*ctx, plan, block, tiled_input, scale_f, softcap_f, swa);
     } else {
-      auto* recipe = &cached_fused_recipe(*ctx, plan, block, scale_f, !separate_store);
+      TORCH_CHECK(!(block.kv_bucket > 512 && swa > 0 && plan.sliding_window != sliding_window),
+                  "GaudiRT attention: decode >512 with sliding_window requires matching SWA attention_plan");
+      auto* recipe = &cached_fused_recipe(*ctx, plan, block, scale_f, softcap_f, swa, !separate_store);
       auto bindings = recipe->tensors;
       const uint64_t value_indices_offset = static_cast<uint64_t>(block.kv_bucket) * plan.kv_heads * sizeof(int32_t);
       std::vector<uint64_t> addresses{q_address};

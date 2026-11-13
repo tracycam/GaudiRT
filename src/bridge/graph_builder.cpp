@@ -95,7 +95,10 @@ void SynapseGraphBuilder::node(const NodeSpec& node) {
     using Parameters = std::decay_t<decltype(params)>;
     const void* data = nullptr;
     size_t size = 0;
-    if constexpr (!std::is_same_v<Parameters, std::monostate>) {
+    if constexpr (std::is_same_v<Parameters, std::vector<uint8_t>>) {
+      data = params.empty() ? nullptr : params.data();
+      size = params.size();
+    } else if constexpr (!std::is_same_v<Parameters, std::monostate>) {
       data = &params;
       size = sizeof(params);
     }

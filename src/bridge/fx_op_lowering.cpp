@@ -2,6 +2,7 @@
 #include "fx_op_lowering.hpp"
 
 #include "bridge_internal.hpp"
+#include "bucket_program.hpp"
 
 #include <c10/util/Exception.h>
 #include <perf_lib_layer_params.h>
@@ -18,6 +19,10 @@
 namespace gaudirt::generic {
 namespace {
 
+static_assert(sizeof(EwiseUnaryParameters) == 12, "ABI mismatch for EwiseUnaryParameters");
+static_assert(sizeof(GeluAndMulParameters) == 4, "ABI mismatch for GeluAndMulParameters");
+static_assert(sizeof(RmsNormParameters) == 8, "ABI mismatch for RmsNormParameters");
+
 synTensor make_tensor_2d(SynapseGraphBuilder& builder, synDataType type, uint64_t fcd,
                          uint64_t rows, int slot = -1) {
   return builder.tensor(type, {fcd, rows}, slot);
@@ -28,7 +33,555 @@ void add_single_out_node(SynapseGraphBuilder& builder, std::vector<synTensor> in
   builder.node(NodeSpec{std::move(guid), std::move(inputs), {output}, std::move(params)});
 }
 
+synDataType syn_dtype_for(at::ScalarType dtype) {
+  if (dtype == at::kFloat8_e4m3fn) return syn_type_fp8_143;
+  return cast_type(dtype).syn;
+}
+
+uint64_t syn_axis_from_pt(size_t rank, int64_t pt_dim) {
+  const int64_t resolved = pt_dim < 0 ? pt_dim + static_cast<int64_t>(rank) : pt_dim;
+  TORCH_CHECK(resolved >= 0 && resolved < static_cast<int64_t>(rank), "GaudiRT: axis out of bounds");
+  return static_cast<uint64_t>(rank - 1 - static_cast<size_t>(resolved));
+}
+
 }  // namespace
+
+std::vector<uint64_t> flatten_2d_syn_dims(const std::vector<uint64_t>& syn_dims) {
+  TORCH_CHECK(!syn_dims.empty(), "GaudiRT: empty tensor dimensions");
+  if (syn_dims.size() == 1) return {syn_dims[0], 1};
+  if (syn_dims.size() == 2) return syn_dims;
+  uint64_t rows = 1;
+  for (size_t i = 1; i < syn_dims.size(); ++i) rows *= syn_dims[i];
+  return {syn_dims[0], rows};
+}
+
+synTensor emit_constant(SynapseGraphBuilder& builder, at::ScalarType dtype,
+                        const std::vector<uint64_t>& syn_dims,
+                        float float_value, int64_t int_value, bool is_integral,
+                        synTensor target_out) {
+  auto out = target_out ? target_out : builder.tensor(syn_dtype_for(dtype), syn_dims, -1);
+  if (dtype == at::kFloat) {
+    ns_ConstantKernel::ParamsV3 p{};
+    p.constant.f = is_integral ? static_cast<float>(int_value) : float_value;
+    add_single_out_node(builder, {}, out, p, "constant_f32");
+    return out;
+  }
+  if (dtype == at::kBFloat16) {
+    auto f32 = builder.tensor(syn_type_float, syn_dims, -1);
+    ns_ConstantKernel::ParamsV3 p{};
+    p.constant.f = is_integral ? static_cast<float>(int_value) : float_value;
+    add_single_out_node(builder, {}, f32, p, "constant_f32");
+    return emit_cast(builder, f32, syn_dims, at::kFloat, at::kBFloat16, out);
+  }
+  if (dtype == at::kInt) {
+    ns_ConstantKernel::ParamsV3 p{};
+    p.constant.i = is_integral ? static_cast<int32_t>(int_value) : static_cast<int32_t>(float_value);
+    add_single_out_node(builder, {}, out, p, "constant_i32");
+    return out;
+  }
+  if (dtype == at::kLong) {
+    auto i32 = builder.tensor(syn_type_int32, syn_dims, -1);
+    ns_ConstantKernel::ParamsV3 p{};
+    p.constant.i = is_integral ? static_cast<int32_t>(int_value) : static_cast<int32_t>(float_value);
+    add_single_out_node(builder, {}, i32, p, "constant_i32");
+    ns_CastKernel::ParamsV3 cast{};
+    cast.round_mode = CAST_ROUND_HALF_NE;
+    add_single_out_node(builder, {i32}, out, cast, "cast_i32_to_i64");
+    return out;
+  }
+  TORCH_CHECK(dtype == at::kBool, "GaudiRT: unsupported constant dtype");
+  const bool flag = is_integral ? (int_value != 0) : (float_value != 0.f);
+  auto lhs = builder.tensor(syn_type_int32, syn_dims, -1);
+  auto rhs = builder.tensor(syn_type_int32, syn_dims, -1);
+  ns_ConstantKernel::ParamsV3 pl{}, pr{};
+  pl.constant.i = flag ? 1 : 0;
+  pr.constant.i = 1;
+  add_single_out_node(builder, {}, lhs, pl, "constant_i32");
+  add_single_out_node(builder, {}, rhs, pr, "constant_i32");
+  add_single_out_node(builder, {lhs, rhs}, out, std::monostate{}, "equal_fwd_i32");
+  return out;
+}
+
+synTensor emit_cast(SynapseGraphBuilder& builder, synTensor input,
+                    const std::vector<uint64_t>& syn_dims,
+                    at::ScalarType from, at::ScalarType to,
+                    synTensor target_out) {
+  if (from == to) {
+    if (!target_out) return input;
+    auto zero = emit_constant(builder, from, syn_dims, 0.f, 0, from == at::kInt || from == at::kLong, nullptr);
+    if (from == at::kBool) {
+      add_single_out_node(builder, {input, zero}, target_out, std::monostate{}, "or_fwd_u8");
+    } else {
+      add_single_out_node(builder, {input, zero}, target_out, std::monostate{},
+                          "add_fwd_" + std::string(cast_type(from).name));
+    }
+    return target_out;
+  }
+  auto out = target_out ? target_out : builder.tensor(syn_dtype_for(to), syn_dims, -1);
+  ns_CastKernel::ParamsV3 cast{};
+  cast.round_mode = CAST_ROUND_HALF_NE;
+
+  if (to == at::kBool) {
+    auto zero = emit_constant(builder, from, syn_dims, 0.f, 0, from == at::kInt || from == at::kLong, nullptr);
+    auto eq_u8 = builder.tensor(syn_type_uint8, syn_dims, -1);
+    add_single_out_node(builder, {input, zero}, eq_u8, std::monostate{},
+                        "equal_fwd_" + std::string(cast_type(from).name));
+    add_single_out_node(builder, {eq_u8}, out, std::monostate{}, "not_fwd_u8");
+    return out;
+  }
+  if (from == at::kBool) {
+    if (to == at::kFloat) {
+      add_single_out_node(builder, {input}, out, cast, "cast_u8_to_f32");
+      return out;
+    }
+    if (to == at::kInt) {
+      auto one = emit_constant(builder, at::kInt, syn_dims, 0.f, 1, true);
+      auto zero = emit_constant(builder, at::kInt, syn_dims, 0.f, 0, true);
+      add_single_out_node(builder, {input, one, zero}, out, std::monostate{}, "where_fwd_i32");
+      return out;
+    }
+    auto f32 = builder.tensor(syn_type_float, syn_dims, -1);
+    add_single_out_node(builder, {input}, f32, cast, "cast_u8_to_f32");
+    return emit_cast(builder, f32, syn_dims, at::kFloat, to, out);
+  }
+  if (from == at::kBFloat16 && to == at::kFloat) {
+    add_single_out_node(builder, {input}, out, cast, "cast_bf16_to_f32");
+    return out;
+  }
+  if (from == at::kFloat && to == at::kBFloat16) {
+    if (syn_dims.size() == 2 && syn_dims[1] <= kMaxBucketRows) {
+      add_single_out_node(builder, {input}, out, std::monostate{}, "gk_cast_f32_to_bf16_v1");
+    } else {
+      add_single_out_node(builder, {input}, out, cast, "cast_f32_to_bf16");
+    }
+    return out;
+  }
+  if ((from == at::kInt && to == at::kLong) || (from == at::kLong && to == at::kInt) ||
+      (from == at::kInt && to == at::kFloat) || (from == at::kFloat && to == at::kInt)) {
+    add_single_out_node(builder, {input}, out, cast,
+                        "cast_" + std::string(cast_type(from).name) + "_to_" + cast_type(to).name);
+    return out;
+  }
+  if (from == at::kBFloat16) {
+    auto f32 = emit_cast(builder, input, syn_dims, at::kBFloat16, at::kFloat);
+    return emit_cast(builder, f32, syn_dims, at::kFloat, to, out);
+  }
+  if (to == at::kBFloat16) {
+    auto f32 = emit_cast(builder, input, syn_dims, from, at::kFloat);
+    return emit_cast(builder, f32, syn_dims, at::kFloat, at::kBFloat16, out);
+  }
+  // Int64 <-> Float32 via Int32
+  auto i32 = emit_cast(builder, input, syn_dims, from, at::kInt);
+  return emit_cast(builder, i32, syn_dims, at::kInt, to, out);
+}
+
+synTensor emit_broadcast_to(SynapseGraphBuilder& builder, synTensor input, synDataType dtype,
+                            const std::vector<uint64_t>& src_syn_dims,
+                            const std::vector<uint64_t>& dst_syn_dims) {
+  if (src_syn_dims == dst_syn_dims) return input;
+  auto current = input;
+  auto cur_dims = src_syn_dims;
+  if (cur_dims.size() < dst_syn_dims.size()) {
+    while (cur_dims.size() < dst_syn_dims.size()) cur_dims.push_back(1);
+    auto reshaped = builder.tensor(dtype, cur_dims, -1);
+    add_single_out_node(builder, {current}, reshaped, std::monostate{}, "reshape");
+    current = reshaped;
+  }
+  TORCH_CHECK(cur_dims.size() == dst_syn_dims.size(), "GaudiRT: invalid broadcast rank");
+  if (cur_dims == dst_syn_dims) return current;
+  auto out = builder.tensor(dtype, dst_syn_dims, -1);
+  add_single_out_node(builder, {current}, out, std::monostate{}, "broadcast");
+  return out;
+}
+
+void emit_ewise_unary(SynapseGraphBuilder& builder, synTensor input, synTensor output,
+                      at::ScalarType dtype, const std::vector<uint64_t>& syn_dims,
+                      int32_t op_code, float alpha, float beta) {
+  if (dtype == at::kInt) {
+    if (op_code == static_cast<int32_t>(FxUnaryOp::neg)) {
+      auto minus_one = emit_constant(builder, at::kInt, syn_dims, 0.f, -1, true);
+      add_single_out_node(builder, {input, minus_one}, output, std::monostate{}, "mult_fwd_i32");
+      return;
+    }
+    TORCH_CHECK(op_code == static_cast<int32_t>(FxUnaryOp::abs),
+                "GaudiRT: int32 ewise_unary supports only neg and abs");
+    auto zero = emit_constant(builder, at::kInt, syn_dims, 0.f, 0, true);
+    auto minus_one = emit_constant(builder, at::kInt, syn_dims, 0.f, -1, true);
+    auto is_neg = builder.tensor(syn_type_uint8, syn_dims, -1);
+    auto negated = builder.tensor(syn_type_int32, syn_dims, -1);
+    add_single_out_node(builder, {input, zero}, is_neg, std::monostate{}, "less_fwd_i32");
+    add_single_out_node(builder, {input, minus_one}, negated, std::monostate{}, "mult_fwd_i32");
+    add_single_out_node(builder, {is_neg, negated, input}, output, std::monostate{}, "where_fwd_i32");
+    return;
+  }
+  TORCH_CHECK(dtype == at::kBFloat16 || dtype == at::kFloat,
+              "GaudiRT: ewise_unary requires BF16 or FP32 tensor");
+  const auto syn = syn_dtype_for(dtype);
+  const auto guid = dtype == at::kBFloat16 ? "gk_ewise_unary_bf16_v1" : "gk_ewise_unary_f32_v1";
+  const auto packed = pack_node_params(EwiseUnaryParameters{op_code, alpha, beta});
+  if (syn_dims.size() == 2) {
+    add_single_out_node(builder, {input}, output, packed, guid);
+    return;
+  }
+  const auto flat_dims = flatten_2d_syn_dims(syn_dims);
+  auto flat_in = builder.tensor(syn, flat_dims, -1);
+  auto flat_out = builder.tensor(syn, flat_dims, -1);
+  add_single_out_node(builder, {input}, flat_in, std::monostate{}, "reshape");
+  add_single_out_node(builder, {flat_in}, flat_out, packed, guid);
+  add_single_out_node(builder, {flat_out}, output, std::monostate{}, "reshape");
+}
+
+void emit_isnan(SynapseGraphBuilder& builder, synTensor input, synTensor output,
+                at::ScalarType dtype) {
+  TORCH_CHECK(dtype == at::kBFloat16 || dtype == at::kFloat, "GaudiRT: isnan requires BF16 or FP32");
+  add_single_out_node(builder, {input}, output, std::monostate{},
+                      "isnan_fwd_" + std::string(cast_type(dtype).name));
+}
+
+void emit_logical_not(SynapseGraphBuilder& builder, synTensor input, synTensor output) {
+  add_single_out_node(builder, {input}, output, std::monostate{}, "not_fwd_u8");
+}
+
+void emit_binary_pointwise(SynapseGraphBuilder& builder, FxOp op, synTensor left, synTensor right,
+                           synTensor output, at::ScalarType in_dtype,
+                           const std::vector<uint64_t>& left_dims,
+                           const std::vector<uint64_t>& right_dims,
+                           const std::vector<uint64_t>& out_dims) {
+  const auto type = cast_type(in_dtype);
+  auto lhs = emit_broadcast_to(builder, left, type.syn, left_dims, out_dims);
+  auto rhs = emit_broadcast_to(builder, right, type.syn, right_dims, out_dims);
+
+  if (op == FxOp::add) {
+    const auto guid = (in_dtype == at::kBFloat16 && out_dims.size() == 2 && out_dims[1] <= kMaxBucketRows)
+                          ? std::string("gk_add_bf16_v1")
+                          : "add_fwd_" + std::string(type.name);
+    add_single_out_node(builder, {lhs, rhs}, output, std::monostate{}, guid);
+    return;
+  }
+  if (op == FxOp::sub) {
+    if (in_dtype == at::kLong) {
+      auto minus_one = emit_constant(builder, at::kLong, out_dims, 0.f, -1, true);
+      auto neg_rhs = builder.tensor(syn_type_int64, out_dims, -1);
+      add_single_out_node(builder, {rhs, minus_one}, neg_rhs, std::monostate{}, "mult_fwd_i64");
+      add_single_out_node(builder, {lhs, neg_rhs}, output, std::monostate{}, "add_fwd_i64");
+      return;
+    }
+    add_single_out_node(builder, {lhs, rhs}, output, std::monostate{}, "sub_fwd_" + std::string(type.name));
+    return;
+  }
+  if (op == FxOp::mul) {
+    add_single_out_node(builder, {lhs, rhs}, output, std::monostate{}, "mult_fwd_" + std::string(type.name));
+    return;
+  }
+  if (op == FxOp::div) {
+    if (in_dtype == at::kBFloat16) {
+      auto nl = emit_cast(builder, lhs, out_dims, at::kBFloat16, at::kFloat);
+      auto nr = emit_cast(builder, rhs, out_dims, at::kBFloat16, at::kFloat);
+      auto q = builder.tensor(syn_type_float, out_dims, -1);
+      add_single_out_node(builder, {nl, nr}, q, std::monostate{}, "div_fwd_f32");
+      emit_cast(builder, q, out_dims, at::kFloat, at::kBFloat16, output);
+      return;
+    }
+    add_single_out_node(builder, {lhs, rhs}, output, std::monostate{}, "div_fwd_f32");
+    return;
+  }
+  if (op == FxOp::minimum || op == FxOp::maximum) {
+    const std::string base = op == FxOp::minimum ? "min_fwd_" : "max_fwd_";
+    add_single_out_node(builder, {lhs, rhs}, output, std::monostate{}, base + type.name);
+    return;
+  }
+  if (op == FxOp::logical_and || (op == FxOp::bitwise_and && in_dtype == at::kBool)) {
+    add_single_out_node(builder, {lhs, rhs}, output, std::monostate{}, "and_fwd_u8");
+    return;
+  }
+  if (op == FxOp::logical_or || (op == FxOp::bitwise_or && in_dtype == at::kBool)) {
+    add_single_out_node(builder, {lhs, rhs}, output, std::monostate{}, "or_fwd_u8");
+    return;
+  }
+  if (op == FxOp::bitwise_and) {
+    add_single_out_node(builder, {lhs, rhs}, output, std::monostate{}, "bitwise_and_fwd_i32");
+    return;
+  }
+  if (op == FxOp::bitwise_or) {
+    add_single_out_node(builder, {lhs, rhs}, output, std::monostate{}, "bitwise_or_fwd_i32");
+    return;
+  }
+  // Comparisons: eq, ne, lt, le, gt, ge
+  if (op == FxOp::ne) {
+    auto eq_u8 = builder.tensor(syn_type_uint8, out_dims, -1);
+    add_single_out_node(builder, {lhs, rhs}, eq_u8, std::monostate{}, "equal_fwd_" + std::string(type.name));
+    add_single_out_node(builder, {eq_u8}, output, std::monostate{}, "not_fwd_u8");
+    return;
+  }
+  if (in_dtype == at::kLong) {
+    if (op == FxOp::gt) {
+      add_single_out_node(builder, {rhs, lhs}, output, std::monostate{}, "less_fwd_i64");
+      return;
+    }
+    if (op == FxOp::le) {
+      add_single_out_node(builder, {rhs, lhs}, output, std::monostate{}, "greater_equal_fwd_i64");
+      return;
+    }
+  }
+  const char* prefix = op == FxOp::eq   ? "equal_fwd_"
+                       : op == FxOp::lt ? "less_fwd_"
+                       : op == FxOp::le ? "less_equal_fwd_"
+                       : op == FxOp::gt ? "greater_fwd_"
+                                        : "greater_equal_fwd_";
+  add_single_out_node(builder, {lhs, rhs}, output, std::monostate{}, std::string(prefix) + type.name);
+}
+
+void emit_where(SynapseGraphBuilder& builder, synTensor cond, synTensor x, synTensor y,
+                synTensor output, at::ScalarType dtype,
+                const std::vector<uint64_t>& cond_dims,
+                const std::vector<uint64_t>& x_dims,
+                const std::vector<uint64_t>& y_dims,
+                const std::vector<uint64_t>& out_dims) {
+  auto c_b = emit_broadcast_to(builder, cond, syn_type_uint8, cond_dims, out_dims);
+  if (dtype == at::kBool) {
+    auto x_b = emit_broadcast_to(builder, x, syn_type_uint8, x_dims, out_dims);
+    auto y_b = emit_broadcast_to(builder, y, syn_type_uint8, y_dims, out_dims);
+    auto not_c = builder.tensor(syn_type_uint8, out_dims, -1);
+    auto lhs = builder.tensor(syn_type_uint8, out_dims, -1);
+    auto rhs = builder.tensor(syn_type_uint8, out_dims, -1);
+    add_single_out_node(builder, {c_b}, not_c, std::monostate{}, "not_fwd_u8");
+    add_single_out_node(builder, {c_b, x_b}, lhs, std::monostate{}, "and_fwd_u8");
+    add_single_out_node(builder, {not_c, y_b}, rhs, std::monostate{}, "and_fwd_u8");
+    add_single_out_node(builder, {lhs, rhs}, output, std::monostate{}, "or_fwd_u8");
+    return;
+  }
+  const auto syn = syn_dtype_for(dtype);
+  auto x_b = emit_broadcast_to(builder, x, syn, x_dims, out_dims);
+  auto y_b = emit_broadcast_to(builder, y, syn, y_dims, out_dims);
+  if (dtype == at::kLong) {
+    std::vector<uint64_t> lanes_dims{2};
+    lanes_dims.insert(lanes_dims.end(), out_dims.begin(), out_dims.end());
+    std::vector<uint64_t> c_lanes_dims{1};
+    c_lanes_dims.insert(c_lanes_dims.end(), out_dims.begin(), out_dims.end());
+    auto xl = builder.tensor(syn_type_int32, lanes_dims, -1);
+    auto yl = builder.tensor(syn_type_int32, lanes_dims, -1);
+    auto c1 = builder.tensor(syn_type_uint8, c_lanes_dims, -1);
+    auto cl = builder.tensor(syn_type_uint8, lanes_dims, -1);
+    auto ol = builder.tensor(syn_type_int32, lanes_dims, -1);
+    add_single_out_node(builder, {x_b}, xl, std::monostate{}, "reshape");
+    add_single_out_node(builder, {y_b}, yl, std::monostate{}, "reshape");
+    add_single_out_node(builder, {c_b}, c1, std::monostate{}, "reshape");
+    add_single_out_node(builder, {c1}, cl, std::monostate{}, "broadcast");
+    add_single_out_node(builder, {cl, xl, yl}, ol, std::monostate{}, "where_fwd_i32");
+    add_single_out_node(builder, {ol}, output, std::monostate{}, "reshape");
+    return;
+  }
+  add_single_out_node(builder, {c_b, x_b, y_b}, output, std::monostate{},
+                      "where_fwd_" + std::string(cast_type(dtype).name));
+}
+
+void emit_rms_norm(SynapseGraphBuilder& builder, synTensor input, synTensor residual,
+                   synTensor weight, synTensor out_norm, synTensor out_residual,
+                   const std::vector<uint64_t>& syn_dims, float epsilon, float weight_offset) {
+  const auto params = pack_node_params(RmsNormParameters{epsilon, weight_offset});
+  const bool fused = (residual != nullptr);
+  const std::string guid = fused ? "gk_fused_add_rms_norm_bf16_v1" : "gk_rms_norm_bf16_v1";
+  if (syn_dims.size() == 2) {
+    if (fused) {
+      builder.node(NodeSpec{guid, {input, residual, weight}, {out_residual, out_norm}, params});
+    } else {
+      add_single_out_node(builder, {input, weight}, out_norm, params, guid);
+    }
+    return;
+  }
+  const auto flat_dims = flatten_2d_syn_dims(syn_dims);
+  auto flat_in = builder.tensor(syn_type_bf16, flat_dims, -1);
+  add_single_out_node(builder, {input}, flat_in, std::monostate{}, "reshape");
+  auto flat_out = builder.tensor(syn_type_bf16, flat_dims, -1);
+  if (fused) {
+    auto flat_res = builder.tensor(syn_type_bf16, flat_dims, -1);
+    auto flat_out_res = builder.tensor(syn_type_bf16, flat_dims, -1);
+    add_single_out_node(builder, {residual}, flat_res, std::monostate{}, "reshape");
+    builder.node(NodeSpec{guid, {flat_in, flat_res, weight}, {flat_out_res, flat_out}, params});
+    add_single_out_node(builder, {flat_out_res}, out_residual, std::monostate{}, "reshape");
+  } else {
+    add_single_out_node(builder, {flat_in, weight}, flat_out, params, guid);
+  }
+  add_single_out_node(builder, {flat_out}, out_norm, std::monostate{}, "reshape");
+}
+
+void emit_gated_mul(SynapseGraphBuilder& builder, bool is_gelu, int32_t approximate,
+                    synTensor input, synTensor output,
+                    const std::vector<uint64_t>& in_syn_dims,
+                    const std::vector<uint64_t>& out_syn_dims) {
+  const std::string guid = is_gelu ? "gk_gelu_and_mul_bf16_v1" : "gk_silu_and_mul_bf16_v1";
+  NodeParameters params = is_gelu ? NodeParameters{pack_node_params(GeluAndMulParameters{approximate})}
+                                  : NodeParameters{std::monostate{}};
+  if (in_syn_dims.size() == 2) {
+    add_single_out_node(builder, {input}, output, std::move(params), guid);
+    return;
+  }
+  const auto flat_in_dims = flatten_2d_syn_dims(in_syn_dims);
+  const auto flat_out_dims = flatten_2d_syn_dims(out_syn_dims);
+  auto flat_in = builder.tensor(syn_type_bf16, flat_in_dims, -1);
+  auto flat_out = builder.tensor(syn_type_bf16, flat_out_dims, -1);
+  add_single_out_node(builder, {input}, flat_in, std::monostate{}, "reshape");
+  add_single_out_node(builder, {flat_in}, flat_out, std::move(params), guid);
+  add_single_out_node(builder, {flat_out}, output, std::monostate{}, "reshape");
+}
+
+void emit_rotary_pos(SynapseGraphBuilder& builder, synTensor q, synTensor k, synTensor cache,
+                     synTensor positions, synTensor q_out, synTensor k_out,
+                     const std::vector<uint64_t>& q_syn_dims,
+                     const std::vector<uint64_t>& k_syn_dims,
+                     at::ScalarType pos_dtype, uint64_t rows,
+                     int32_t head_dim, int32_t rotary_dim, bool is_neox) {
+  auto pos_i32 = positions;
+  if (pos_dtype == at::kLong) {
+    pos_i32 = emit_cast(builder, positions, {rows}, at::kLong, at::kInt);
+  }
+  auto q_2d = q;
+  auto k_2d = k;
+  auto q_out_2d = q_out;
+  auto k_out_2d = k_out;
+  const bool need_q_reshape = (q_syn_dims.size() != 2);
+  const bool need_k_reshape = (k_syn_dims.size() != 2);
+  if (need_q_reshape) {
+    TORCH_CHECK(q_syn_dims.size() == 3, "GaudiRT: rotary_pos expects rank 2 or 3 query");
+    const std::vector<uint64_t> q_flat{q_syn_dims[0] * q_syn_dims[1], q_syn_dims[2]};
+    q_2d = builder.tensor(syn_type_bf16, q_flat, -1);
+    q_out_2d = builder.tensor(syn_type_bf16, q_flat, -1);
+    add_single_out_node(builder, {q}, q_2d, std::monostate{}, "reshape");
+  }
+  if (need_k_reshape) {
+    TORCH_CHECK(k_syn_dims.size() == 3, "GaudiRT: rotary_pos expects rank 2 or 3 key");
+    const std::vector<uint64_t> k_flat{k_syn_dims[0] * k_syn_dims[1], k_syn_dims[2]};
+    k_2d = builder.tensor(syn_type_bf16, k_flat, -1);
+    k_out_2d = builder.tensor(syn_type_bf16, k_flat, -1);
+    add_single_out_node(builder, {k}, k_2d, std::monostate{}, "reshape");
+  }
+  const RotaryParameters params{head_dim, rotary_dim, is_neox ? 1 : 0};
+  builder.node(NodeSpec{"gk_rotary_pos_bf16_v1", {q_2d, k_2d, pos_i32, cache},
+                        {q_out_2d, k_out_2d}, params});
+  if (need_q_reshape) add_single_out_node(builder, {q_out_2d}, q_out, std::monostate{}, "reshape");
+  if (need_k_reshape) add_single_out_node(builder, {k_out_2d}, k_out, std::monostate{}, "reshape");
+}
+
+void emit_reduction(SynapseGraphBuilder& builder, FxOp op, synTensor input, synTensor output,
+                    at::ScalarType dtype, const std::vector<uint64_t>& in_syn_dims,
+                    const std::vector<uint64_t>& out_syn_dims, int64_t pt_dim, bool keepdim) {
+  const uint64_t syn_axis = syn_axis_from_pt(in_syn_dims.size(), pt_dim);
+  std::vector<uint64_t> reduced_dims = in_syn_dims;
+  reduced_dims[syn_axis] = 1;
+  auto src_f32 = dtype == at::kFloat ? input : emit_cast(builder, input, in_syn_dims, dtype, at::kFloat);
+  const bool direct_out = (dtype == at::kFloat && keepdim);
+  auto red_f32 = direct_out ? output : builder.tensor(syn_type_float, reduced_dims, -1);
+  const char* guid = op == FxOp::sum_dim  ? "reduce_sum_f32"
+                     : op == FxOp::mean_dim ? "reduce_mean_f32"
+                                            : "reduce_max_f32";
+  add_single_out_node(builder, {src_f32}, red_f32,
+                      ns_Reduction::Params{static_cast<unsigned int>(syn_axis)}, guid);
+  if (direct_out) return;
+  auto shaped = red_f32;
+  if (!keepdim) {
+    if (dtype == at::kFloat) {
+      add_single_out_node(builder, {red_f32}, output, std::monostate{}, "reshape");
+      return;
+    }
+    shaped = builder.tensor(syn_type_float, out_syn_dims, -1);
+    add_single_out_node(builder, {red_f32}, shaped, std::monostate{}, "reshape");
+  }
+  emit_cast(builder, shaped, out_syn_dims, at::kFloat, dtype, output);
+}
+
+void emit_softmax(SynapseGraphBuilder& builder, bool is_log, synTensor input, synTensor output,
+                  at::ScalarType dtype, const std::vector<uint64_t>& syn_dims, int64_t pt_dim) {
+  const uint64_t syn_axis = syn_axis_from_pt(syn_dims.size(), pt_dim);
+  std::vector<uint64_t> red_dims = syn_dims;
+  red_dims[syn_axis] = 1;
+  const ns_Reduction::Params red_params{static_cast<unsigned int>(syn_axis)};
+
+  auto x_f32 = dtype == at::kFloat ? input : emit_cast(builder, input, syn_dims, dtype, at::kFloat);
+  auto max_val = builder.tensor(syn_type_float, red_dims, -1);
+  add_single_out_node(builder, {x_f32}, max_val, red_params, "reduce_max_f32");
+  auto max_b = emit_broadcast_to(builder, max_val, syn_type_float, red_dims, syn_dims);
+  auto shifted = builder.tensor(syn_type_float, syn_dims, -1);
+  add_single_out_node(builder, {x_f32, max_b}, shifted, std::monostate{}, "sub_fwd_f32");
+
+  // P-TPC-01: all exp nodes MUST route through gk_ewise_unary_*_v1 (op_code=0).
+  auto exps = builder.tensor(syn_type_float, syn_dims, -1);
+  emit_ewise_unary(builder, shifted, exps, at::kFloat, syn_dims,
+                   static_cast<int32_t>(FxUnaryOp::exp));
+  auto denom = builder.tensor(syn_type_float, red_dims, -1);
+  add_single_out_node(builder, {exps}, denom, red_params, "reduce_sum_f32");
+
+  auto result_f32 = dtype == at::kFloat ? output : builder.tensor(syn_type_float, syn_dims, -1);
+  if (is_log) {
+    auto log_denom = builder.tensor(syn_type_float, red_dims, -1);
+    add_single_out_node(builder, {denom}, log_denom, std::monostate{}, "log_fwd_f32");
+    auto log_denom_b = emit_broadcast_to(builder, log_denom, syn_type_float, red_dims, syn_dims);
+    add_single_out_node(builder, {shifted, log_denom_b}, result_f32, std::monostate{}, "sub_fwd_f32");
+  } else {
+    auto denom_b = emit_broadcast_to(builder, denom, syn_type_float, red_dims, syn_dims);
+    add_single_out_node(builder, {exps, denom_b}, result_f32, std::monostate{}, "div_fwd_f32");
+  }
+  if (dtype != at::kFloat) {
+    emit_cast(builder, result_f32, syn_dims, at::kFloat, dtype, output);
+  }
+}
+
+void emit_layer_norm(SynapseGraphBuilder& builder, synTensor input, synTensor weight,
+                     synTensor bias, synTensor output, synTensor mean_out, synTensor rstd_out,
+                     at::ScalarType dtype, const std::vector<uint64_t>& syn_dims, float eps) {
+  std::vector<uint64_t> red_dims = syn_dims;
+  red_dims[0] = 1;
+  const ns_Reduction::Params last_axis{0};
+  auto x_f32 = dtype == at::kFloat ? input : emit_cast(builder, input, syn_dims, dtype, at::kFloat);
+
+  auto mean_f32 = (mean_out && dtype == at::kFloat) ? mean_out
+                                                   : builder.tensor(syn_type_float, red_dims, -1);
+  add_single_out_node(builder, {x_f32}, mean_f32, last_axis, "reduce_mean_f32");
+  if (mean_out && dtype != at::kFloat) {
+    emit_cast(builder, mean_f32, red_dims, at::kFloat, dtype, mean_out);
+  }
+  auto mean_b = emit_broadcast_to(builder, mean_f32, syn_type_float, red_dims, syn_dims);
+  auto diff = builder.tensor(syn_type_float, syn_dims, -1);
+  add_single_out_node(builder, {x_f32, mean_b}, diff, std::monostate{}, "sub_fwd_f32");
+
+  auto sq = builder.tensor(syn_type_float, syn_dims, -1);
+  add_single_out_node(builder, {diff, diff}, sq, std::monostate{}, "mult_fwd_f32");
+  auto var = builder.tensor(syn_type_float, red_dims, -1);
+  add_single_out_node(builder, {sq}, var, last_axis, "reduce_mean_f32");
+  auto eps_c = emit_constant(builder, at::kFloat, red_dims, eps, 0, false);
+  auto var_eps = builder.tensor(syn_type_float, red_dims, -1);
+  add_single_out_node(builder, {var, eps_c}, var_eps, std::monostate{}, "add_fwd_f32");
+
+  auto rstd_f32 = (rstd_out && dtype == at::kFloat) ? rstd_out
+                                                   : builder.tensor(syn_type_float, red_dims, -1);
+  emit_ewise_unary(builder, var_eps, rstd_f32, at::kFloat, red_dims,
+                   static_cast<int32_t>(FxUnaryOp::rsqrt));
+  if (rstd_out && dtype != at::kFloat) {
+    emit_cast(builder, rstd_f32, red_dims, at::kFloat, dtype, rstd_out);
+  }
+  auto rstd_b = emit_broadcast_to(builder, rstd_f32, syn_type_float, red_dims, syn_dims);
+  auto normed = builder.tensor(syn_type_float, syn_dims, -1);
+  add_single_out_node(builder, {diff, rstd_b}, normed, std::monostate{}, "mult_fwd_f32");
+
+  const std::vector<uint64_t> param_dims{syn_dims[0]};
+  auto cur = normed;
+  if (weight) {
+    auto w_f32 = dtype == at::kFloat ? weight : emit_cast(builder, weight, param_dims, dtype, at::kFloat);
+    auto w_b = emit_broadcast_to(builder, w_f32, syn_type_float, param_dims, syn_dims);
+    auto scaled = (!bias && dtype == at::kFloat) ? output : builder.tensor(syn_type_float, syn_dims, -1);
+    add_single_out_node(builder, {cur, w_b}, scaled, std::monostate{}, "mult_fwd_f32");
+    cur = scaled;
+  }
+  if (bias) {
+    auto b_f32 = dtype == at::kFloat ? bias : emit_cast(builder, bias, param_dims, dtype, at::kFloat);
+    auto b_b = emit_broadcast_to(builder, b_f32, syn_type_float, param_dims, syn_dims);
+    auto shifted = dtype == at::kFloat ? output : builder.tensor(syn_type_float, syn_dims, -1);
+    add_single_out_node(builder, {cur, b_b}, shifted, std::monostate{}, "add_fwd_f32");
+    cur = shifted;
+  }
+  if (cur != output) {
+    emit_cast(builder, cur, syn_dims, at::kFloat, dtype, output);
+  }
+}
 
 void lower_shard_embedding(SynapseGraphBuilder& builder, const FxNode& op, const TensorSpec& spec,
                            uint32_t bucket, synTensor row_count,
@@ -43,10 +596,11 @@ void lower_shard_embedding(SynapseGraphBuilder& builder, const FxNode& op, const
   const int32_t added_end = static_cast<int32_t>(se.added_end);
   const int32_t added_len = added_end - added_start;
 
+  auto tok_in = values[op.inputs[0]];
   auto input = builder.tensor(syn_type_int32, {1, bucket}, -1);
   auto masked = builder.tensor(syn_type_int32, {bucket}, -1);
   auto status = builder.tensor(syn_type_int32, {bucket}, -1);
-  add_single_out_node(builder, {values[op.inputs[0]]}, input, std::monostate{}, "reshape");
+  add_single_out_node(builder, {tok_in}, input, std::monostate{}, "reshape");
   builder.node(NodeSpec{"gk_scheduler_tokens_i32_v1", {input, row_count},
                         {masked, status}, int32_t{1}});
 
@@ -113,11 +667,8 @@ void lower_shard_embedding(SynapseGraphBuilder& builder, const FxNode& op, const
     }
   }
 
-  ns_ConstantKernel::ParamsV3 zparams{};
-  zparams.constant.f = 0.f;
-  const auto const_guid = "constant_" + std::string(type.name);
   if (!valid_u8) {
-    add_single_out_node(builder, {}, output, zparams, const_guid);
+    emit_constant(builder, spec.dtype, {width, bucket}, 0.f, 0, false, output);
     return;
   }
 
@@ -133,8 +684,7 @@ void lower_shard_embedding(SynapseGraphBuilder& builder, const FxNode& op, const
   add_single_out_node(builder, {valid_u8}, mask_1d_2d, std::monostate{}, "reshape");
   add_single_out_node(builder, {mask_1d_2d}, mask_2d, std::monostate{}, "broadcast");
 
-  auto zero_embed = make_tensor_2d(builder, type.syn, width, bucket);
-  add_single_out_node(builder, {}, zero_embed, zparams, const_guid);
+  auto zero_embed = emit_constant(builder, spec.dtype, {width, bucket}, 0.f, 0, false);
   add_single_out_node(builder, {mask_2d, gathered, zero_embed}, output, std::monostate{},
                       "where_fwd_" + std::string(type.name));
 }
@@ -148,7 +698,8 @@ void lower_feature_slice(SynapseGraphBuilder& builder, size_t op_index,
   const auto& op = operations[op_index];
   const auto id = roles.size() + op_index;
   const auto type = cast_type(specs[id].dtype);
-  const auto total = specs[op.inputs[0]].sizes[1];
+  const auto src_syn_dims = specs[op.inputs[0]].synapse_sizes(bucket);
+  const int64_t total = specs[op.inputs[0]].sizes.back();
   const auto& feature = std::get<FxSlice>(op.parameters);
   struct FeaturePart {
     int64_t start;
@@ -171,114 +722,113 @@ void lower_feature_slice(SynapseGraphBuilder& builder, size_t op_index,
   std::sort(selected.begin(), selected.end(), [](const FeaturePart& a, const FeaturePart& b) {
     return a.start < b.start;
   });
+  auto slice_tensor = [&](int64_t width, int slot) {
+    auto dims = src_syn_dims;
+    dims[0] = static_cast<uint64_t>(width);
+    return builder.tensor(type.syn, dims, slot);
+  };
   std::vector<synTensor> parts;
   int64_t offset = 0;
   for (const auto& part : selected) {
     if (part.start > offset) {
-      parts.push_back(make_tensor_2d(builder, type.syn, part.start - offset, bucket));
+      parts.push_back(slice_tensor(part.start - offset, -1));
     }
     if (!values[part.id]) {
       const auto out_it = std::find(outputs.begin(), outputs.end(), static_cast<int64_t>(part.id));
       const int slot = out_it == outputs.end()
                            ? -1
                            : static_cast<int>(roles.size() + std::distance(outputs.begin(), out_it));
-      values[part.id] = make_tensor_2d(builder, type.syn, part.width, bucket, slot);
+      values[part.id] = slice_tensor(part.width, slot);
     }
     parts.push_back(values[part.id]);
     offset = part.start + part.width;
   }
   if (offset < total) {
-    parts.push_back(make_tensor_2d(builder, type.syn, total - offset, bucket));
+    parts.push_back(slice_tensor(total - offset, -1));
   }
   synSplitParams params{0};
   builder.node(NodeSpec{"split", {values[op.inputs[0]]}, std::move(parts), params});
 }
 
+void lower_slice_dim(SynapseGraphBuilder& builder, const FxNode& op, const TensorSpec& in_spec,
+                     const TensorSpec& /*out_spec*/, uint32_t bucket,
+                     synTensor input, synTensor output) {
+  const auto& p = std::get<FxSliceDim>(op.parameters);
+  const auto syn = syn_dtype_for(in_spec.dtype);
+  const auto in_dims = in_spec.synapse_sizes(bucket);
+  const int64_t pt_dim = p.dim < 0 ? p.dim + static_cast<int64_t>(in_spec.sizes.size()) : p.dim;
+  const unsigned int syn_axis = static_cast<unsigned int>(syn_axis_from_pt(in_dims.size(), pt_dim));
+  const int64_t total = in_spec.sizes[pt_dim];
+  if (p.start == 0 && p.length == total) {
+    add_single_out_node(builder, {input}, output, std::monostate{}, "reshape");
+    return;
+  }
+  std::vector<synTensor> parts;
+  auto make_part = [&](uint64_t dim_len) {
+    auto d = in_dims;
+    d[syn_axis] = dim_len;
+    return builder.tensor(syn, d, -1);
+  };
+  if (p.start > 0) parts.push_back(make_part(static_cast<uint64_t>(p.start)));
+  parts.push_back(output);
+  const int64_t tail = total - (p.start + p.length);
+  if (tail > 0) parts.push_back(make_part(static_cast<uint64_t>(tail)));
+  synSplitParams params{syn_axis};
+  builder.node(NodeSpec{"split", {input}, std::move(parts), params});
+}
+
 void lower_scalar_arith(SynapseGraphBuilder& builder, const FxNode& op, const TensorSpec& spec,
                         uint32_t bucket, const std::vector<synTensor>& values, synTensor output) {
-  const auto type = cast_type(spec.dtype);
-  const uint64_t width = spec.sizes.back();
-  const uint64_t rows =
-      spec.sizes.size() == 3 ? spec.sizes[1] : (spec.dynamic() ? bucket : spec.sizes[0]);
+  const auto syn_dims = spec.synapse_sizes(bucket);
   const auto& scalar_params = std::get<FxScalar>(op.parameters);
   const bool bf16 = spec.dtype == at::kBFloat16;
   const bool wide = bf16 && (op.op == FxOp::scalar_mul || op.op == FxOp::scalar_div);
-  const auto arithmetic_type = wide ? syn_type_float : type.syn;
-  const auto arithmetic_name = wide ? std::string("f32") : std::string(type.name);
+  const auto arith_dtype = wide ? at::kFloat : spec.dtype;
   auto input = values[op.inputs[0]];
-  ns_CastKernel::ParamsV3 cast{};
-  cast.round_mode = CAST_ROUND_HALF_NE;
-  if (wide) {
-    input = make_tensor_2d(builder, syn_type_float, width, rows);
-    add_single_out_node(builder, {values[op.inputs[0]]}, input, cast, "cast_bf16_to_f32");
-  }
-  auto scalar = make_tensor_2d(builder, arithmetic_type, width, rows);
-  ns_ConstantKernel::ParamsV3 cparams{};
-  cparams.constant.f = scalar_params.value;
-  add_single_out_node(builder, {}, scalar, cparams, "constant_" + arithmetic_name);
+  if (wide) input = emit_cast(builder, input, syn_dims, at::kBFloat16, at::kFloat);
+  const bool is_int = (arith_dtype == at::kInt || arith_dtype == at::kLong);
+  auto scalar = emit_constant(builder, arith_dtype, syn_dims, scalar_params.value,
+                              static_cast<int64_t>(scalar_params.value), is_int);
   const bool reversed = scalar_params.reversed;
   const auto left = reversed ? scalar : input;
   const auto right = reversed ? input : scalar;
-  auto result = wide ? make_tensor_2d(builder, syn_type_float, width, rows) : output;
-  const auto guid = op.op == FxOp::scalar_add && bf16
-                        ? std::string("gk_add_bf16_v1")
-                        : std::string(op.op == FxOp::scalar_add   ? "add_fwd_"
-                                      : op.op == FxOp::scalar_sub ? "sub_fwd_"
-                                      : op.op == FxOp::scalar_mul ? "mult_fwd_"
-                                                                  : "div_fwd_") +
-                              arithmetic_name;
-  add_single_out_node(builder, {left, right}, result, std::monostate{}, guid);
-  if (wide) {
-    add_single_out_node(builder, {result}, output, std::monostate{}, "gk_cast_f32_to_bf16_v1");
-  }
+  auto result = wide ? builder.tensor(syn_type_float, syn_dims, -1) : output;
+  const FxOp binary_op = op.op == FxOp::scalar_add   ? FxOp::add
+                         : op.op == FxOp::scalar_sub ? FxOp::sub
+                         : op.op == FxOp::scalar_mul ? FxOp::mul
+                                                     : FxOp::div;
+  emit_binary_pointwise(builder, binary_op, left, right, result, arith_dtype, syn_dims, syn_dims, syn_dims);
+  if (wide) emit_cast(builder, result, syn_dims, at::kFloat, at::kBFloat16, output);
+}
+
+void lower_scalar_cmp(SynapseGraphBuilder& builder, const FxNode& op, const TensorSpec& in_spec,
+                      const TensorSpec& out_spec, uint32_t bucket,
+                      const std::vector<synTensor>& values, synTensor output) {
+  const auto syn_dims = in_spec.synapse_sizes(bucket);
+  const auto& scalar_params = std::get<FxScalar>(op.parameters);
+  const bool is_int = (in_spec.dtype == at::kInt || in_spec.dtype == at::kLong || in_spec.dtype == at::kBool);
+  auto scalar = emit_constant(builder, in_spec.dtype, syn_dims, scalar_params.value,
+                              static_cast<int64_t>(scalar_params.value), is_int);
+  const auto left = scalar_params.reversed ? scalar : values[op.inputs[0]];
+  const auto right = scalar_params.reversed ? values[op.inputs[0]] : scalar;
+  const FxOp cmp_op = op.op == FxOp::scalar_eq   ? FxOp::eq
+                      : op.op == FxOp::scalar_ne ? FxOp::ne
+                      : op.op == FxOp::scalar_lt ? FxOp::lt
+                      : op.op == FxOp::scalar_le ? FxOp::le
+                      : op.op == FxOp::scalar_gt ? FxOp::gt
+                                                 : FxOp::ge;
+  emit_binary_pointwise(builder, cmp_op, left, right, output, in_spec.dtype,
+                        syn_dims, syn_dims, out_spec.synapse_sizes(bucket));
 }
 
 void lower_binary_arith(SynapseGraphBuilder& builder, const FxNode& op, const TensorSpec& spec,
                         const std::vector<TensorSpec>& specs, uint32_t bucket,
                         const std::vector<synTensor>& values, synTensor output) {
-  const auto type = cast_type(spec.dtype);
-  const uint64_t width = spec.sizes.back();
-  const uint64_t rows =
-      spec.sizes.size() == 3 ? spec.sizes[1] : (spec.dynamic() ? bucket : spec.sizes[0]);
-  auto expand = [&](int64_t input_id) {
-    const auto& input = specs[input_id];
-    if (input.dynamic()) return values[input_id];
-    auto source = values[input_id];
-    if (input.sizes.size() == 1) {
-      auto reshaped = make_tensor_2d(builder, type.syn, width, 1);
-      add_single_out_node(builder, {source}, reshaped, std::monostate{}, "reshape");
-      source = reshaped;
-    }
-    auto expanded = make_tensor_2d(builder, type.syn, width, bucket);
-    ns_BroadcastNonFcd::Params params{1};
-    add_single_out_node(builder, {source}, expanded, params,
-                        "broadcast_non_fcd_" + std::string(type.name));
-    return expanded;
-  };
-  auto left = expand(op.inputs[0]);
-  auto right = expand(op.inputs[1]);
-  if (op.op == FxOp::add) {
-    const auto guid = spec.dtype == at::kBFloat16 ? std::string("gk_add_bf16_v1")
-                                                  : "add_fwd_" + std::string(type.name);
-    add_single_out_node(builder, {left, right}, output, std::monostate{}, guid);
-    return;
-  }
-  if (op.op == FxOp::div && spec.dtype == at::kBFloat16) {
-    auto numerator = make_tensor_2d(builder, syn_type_float, width, rows);
-    auto denominator = make_tensor_2d(builder, syn_type_float, width, rows);
-    auto quotient = make_tensor_2d(builder, syn_type_float, width, rows);
-    ns_CastKernel::ParamsV3 params{};
-    params.round_mode = CAST_ROUND_HALF_NE;
-    add_single_out_node(builder, {left}, numerator, params, "cast_bf16_to_f32");
-    add_single_out_node(builder, {right}, denominator, params, "cast_bf16_to_f32");
-    add_single_out_node(builder, {numerator, denominator}, quotient, std::monostate{}, "div_fwd_f32");
-    add_single_out_node(builder, {quotient}, output, std::monostate{}, "gk_cast_f32_to_bf16_v1");
-    return;
-  }
-  const auto operation =
-      op.op == FxOp::sub ? "sub_fwd_" : (op.op == FxOp::mul ? "mult_fwd_" : "div_fwd_");
-  add_single_out_node(builder, {left, right}, output, std::monostate{},
-                      std::string(operation) + type.name);
+  const auto& left_spec = specs[op.inputs[0]];
+  const auto& right_spec = specs[op.inputs[1]];
+  emit_binary_pointwise(builder, op.op, values[op.inputs[0]], values[op.inputs[1]], output,
+                        left_spec.dtype, left_spec.synapse_sizes(bucket),
+                        right_spec.synapse_sizes(bucket), spec.synapse_sizes(bucket));
 }
 
 void lower_block_fp8_linear(SynapseGraphBuilder& builder, synDeviceId device_id, const FxNode& op,
@@ -290,8 +840,8 @@ void lower_block_fp8_linear(SynapseGraphBuilder& builder, synDeviceId device_id,
   const uint64_t columns = weight_spec.sizes[1];
   const uint64_t input_width = groups * 128;
   const uint64_t token_rows = bucket * (input_spec.sizes.size() == 3 ? input_spec.sizes[1] : 1);
-  TORCH_CHECK(token_rows > 0 && token_rows <= 4096,
-              "GaudiRT FP8: flattened token rows outside 1..4096");
+  TORCH_CHECK(token_rows > 0 && token_rows <= kMaxBucketRows,
+              "GaudiRT FP8: flattened token rows outside 1..8192");
   auto local = [&](synDataType dtype, std::vector<uint64_t> dimensions, bool rmw = false) {
     return builder.tensor(dtype, dimensions, -1, -1, 0, false, {}, rmw);
   };
@@ -557,8 +1107,8 @@ void lower_fp8_linear(SynapseGraphBuilder& builder, synDeviceId device_id, const
   const uint64_t columns = weight_spec.sizes[0];
   const uint64_t input_width = weight_spec.sizes[1];
   const uint64_t token_rows = bucket * (input_spec.sizes.size() == 3 ? input_spec.sizes[1] : 1);
-  TORCH_CHECK(token_rows > 0 && token_rows <= 4096,
-              "GaudiRT FP8: flattened token rows outside 1..4096");
+  TORCH_CHECK(token_rows > 0 && token_rows <= kMaxBucketRows,
+              "GaudiRT FP8: flattened token rows outside 1..8192");
   uint64_t rmw_limit = 0;
   synDeviceAttribute attribute = DEVICE_ATTRIBUTE_MAX_RMW_SIZE;
   TORCH_CHECK(synDeviceGetAttribute(&rmw_limit, &attribute, 1, device_id) == synSuccess,

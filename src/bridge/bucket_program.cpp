@@ -52,7 +52,14 @@ BucketProgram::BucketProgram(std::vector<int64_t> roles, std::vector<FxNode> ope
         valid = (op.inputs.size() == 3 || op.inputs.size() == 4) && no_params;
         break;
       case FxOp::add: case FxOp::sub: case FxOp::mul: case FxOp::div: case FxOp::bmm:
+      case FxOp::minimum: case FxOp::maximum: case FxOp::eq: case FxOp::ne:
+      case FxOp::lt: case FxOp::le: case FxOp::gt: case FxOp::ge:
+      case FxOp::logical_and: case FxOp::logical_or:
+      case FxOp::bitwise_and: case FxOp::bitwise_or:
         valid = op.inputs.size() == 2 && no_params;
+        break;
+      case FxOp::where:
+        valid = op.inputs.size() == 3 && no_params;
         break;
       case FxOp::embedding:
         valid = op.inputs.size() == 2 && no_params && op.inputs[0] < static_cast<int64_t>(roles_.size()) &&
@@ -76,21 +83,34 @@ BucketProgram::BucketProgram(std::vector<int64_t> roles, std::vector<FxNode> ope
       case FxOp::gather_rows:
         valid = op.inputs.size() == 2 && no_params && op.inputs[1] < static_cast<int64_t>(roles_.size());
         break;
-      case FxOp::rms_norm: case FxOp::fused_add_rms_norm: {
+      case FxOp::rms_norm: case FxOp::gemma_rms_norm:
+      case FxOp::fused_add_rms_norm: case FxOp::fused_add_gemma_rms_norm: {
         const auto* params = std::get_if<FxEpsilon>(&op.parameters);
-        valid = op.inputs.size() == (op.op == FxOp::rms_norm ? 2 : 3) && params &&
+        const bool is_fused = (op.op == FxOp::fused_add_rms_norm || op.op == FxOp::fused_add_gemma_rms_norm);
+        valid = op.inputs.size() == (is_fused ? 3u : 2u) && params &&
                 std::isfinite(params->value) && params->value > 0;
         break;
       }
-      case FxOp::silu_and_mul: case FxOp::copy:
+      case FxOp::silu_and_mul: case FxOp::copy: case FxOp::isnan: case FxOp::logical_not:
         valid = op.inputs.size() == 1 && no_params;
         break;
+      case FxOp::gelu_and_mul:
+        valid = op.inputs.size() == 1 && std::holds_alternative<FxGeluMul>(op.parameters);
+        break;
+      case FxOp::ewise_unary: {
+        const auto* params = std::get_if<FxUnary>(&op.parameters);
+        valid = op.inputs.size() == 1 && params && params->op_code >= 0 && params->op_code <= 11;
+        break;
+      }
       case FxOp::fused_residual: case FxOp::rotary_key: {
         valid = op.inputs.size() == 1 && no_params && op.inputs[0] >= static_cast<int64_t>(roles_.size());
         if (valid) {
           auto& producers = op.op == FxOp::fused_residual ? residual_producers : rotary_producers;
-          const auto expected = op.op == FxOp::fused_residual ? FxOp::fused_add_rms_norm : FxOp::rotary;
-          valid = operations_[op.inputs[0] - roles_.size()].op == expected &&
+          const auto producer_op = operations_[op.inputs[0] - roles_.size()].op;
+          const bool ok_producer = op.op == FxOp::fused_residual
+              ? (producer_op == FxOp::fused_add_rms_norm || producer_op == FxOp::fused_add_gemma_rms_norm)
+              : (producer_op == FxOp::rotary || producer_op == FxOp::rotary_pos);
+          valid = ok_producer &&
                   std::find(producers.begin(), producers.end(), op.inputs[0]) == producers.end();
           if (valid) producers.push_back(op.inputs[0]);
         }
@@ -101,27 +121,45 @@ BucketProgram::BucketProgram(std::vector<int64_t> roles, std::vector<FxNode> ope
         valid = op.inputs.size() == 1 && params && params->start >= 0 && params->width > 0 && params->total > 0;
         break;
       }
+      case FxOp::slice_dim: {
+        const auto* params = std::get_if<FxSliceDim>(&op.parameters);
+        valid = op.inputs.size() == 1 && params && params->start >= 0 && params->length > 0;
+        break;
+      }
       case FxOp::rotary: {
         const auto* params = std::get_if<FxRotary>(&op.parameters);
         valid = op.inputs.size() == 5 && params && params->context > 0 &&
                 params->head_dim > 0 && params->rotary_dim > 0;
         break;
       }
+      case FxOp::rotary_pos: {
+        const auto* params = std::get_if<FxRotary>(&op.parameters);
+        valid = op.inputs.size() == 4 && params && params->head_dim > 0 && params->rotary_dim > 0;
+        break;
+      }
       case FxOp::cast:
-        valid = op.inputs.size() == 1 && std::holds_alternative<FxCast>(op.parameters);
+        valid = op.inputs.size() == 1 &&
+                (std::holds_alternative<FxCast>(op.parameters) ||
+                 std::holds_alternative<FxCastDtype>(op.parameters));
         break;
       case FxOp::concat:
-        valid = op.inputs.size() >= 2 && no_params;
+        valid = op.inputs.size() >= 2 &&
+                (no_params || std::holds_alternative<FxAxis>(op.parameters));
         break;
       case FxOp::reshape: {
         const auto* params = std::get_if<FxShape>(&op.parameters);
-        valid = op.inputs.size() == 1 && params && params->dimensions.size() <= 4 &&
+        valid = op.inputs.size() == 1 && params && params->dimensions.size() <= 5 &&
                 std::all_of(params->dimensions.begin(), params->dimensions.end(), [](int64_t d) { return d > 0; });
+        break;
+      }
+      case FxOp::expand: {
+        const auto* params = std::get_if<FxShape>(&op.parameters);
+        valid = op.inputs.size() == 1 && params && !params->dimensions.empty() && params->dimensions.size() <= 5;
         break;
       }
       case FxOp::transpose: {
         const auto* params = std::get_if<FxTranspose>(&op.parameters);
-        valid = op.inputs.size() == 1 && params && params->dim0 > 0 && params->dim1 > 0 &&
+        valid = op.inputs.size() == 1 && params && params->dim0 >= 0 && params->dim1 >= 0 &&
                 params->dim0 != params->dim1;
         break;
       }
@@ -130,6 +168,28 @@ BucketProgram::BucketProgram(std::vector<int64_t> roles, std::vector<FxNode> ope
         valid = op.inputs.size() == 1 && params && std::isfinite(params->value);
         break;
       }
+      case FxOp::scalar_eq: case FxOp::scalar_ne: case FxOp::scalar_lt:
+      case FxOp::scalar_le: case FxOp::scalar_gt: case FxOp::scalar_ge: {
+        const auto* params = std::get_if<FxScalar>(&op.parameters);
+        valid = op.inputs.size() == 1 && params && !std::isnan(params->value);
+        break;
+      }
+      case FxOp::sum_dim: case FxOp::mean_dim: case FxOp::amax_dim:
+        valid = op.inputs.size() == 1 && std::holds_alternative<FxReduce>(op.parameters);
+        break;
+      case FxOp::softmax: case FxOp::log_softmax:
+        valid = op.inputs.size() == 1 && std::holds_alternative<FxAxis>(op.parameters);
+        break;
+      case FxOp::layer_norm: {
+        const auto* params = std::get_if<FxLayerNorm>(&op.parameters);
+        valid = params && op.inputs.size() ==
+                (1 + static_cast<size_t>(params->has_weight) + static_cast<size_t>(params->has_bias)) &&
+                std::isfinite(params->epsilon) && params->epsilon > 0;
+        break;
+      }
+      case FxOp::full_like:
+        valid = op.inputs.size() == 1 && std::holds_alternative<FxConstant>(op.parameters);
+        break;
     }
     TORCH_CHECK(valid, "GaudiRT FX: invalid normalized node");
   }
@@ -165,11 +225,15 @@ BucketProgram::BucketProgram(std::vector<int64_t> roles, std::vector<FxNode> ope
         mark_weight(op.inputs[2]);
         if (op.inputs.size() == 4) mark_weight(op.inputs[3]);
         break;
-      case FxOp::rms_norm: case FxOp::embedding: case FxOp::shard_embedding:
+      case FxOp::rms_norm: case FxOp::gemma_rms_norm: case FxOp::embedding: case FxOp::shard_embedding:
         mark_weight(op.inputs[1]);
         break;
-      case FxOp::fused_add_rms_norm: case FxOp::rotary:
+      case FxOp::fused_add_rms_norm: case FxOp::fused_add_gemma_rms_norm:
+      case FxOp::rotary: case FxOp::rotary_pos:
         mark_weight(op.inputs[2]);
+        break;
+      case FxOp::layer_norm:
+        for (size_t idx = 1; idx < op.inputs.size(); ++idx) mark_weight(op.inputs[idx]);
         break;
       default: break;
     }
@@ -345,8 +409,6 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
       const auto& spec = specs_[id];
       const auto type = cast_type(spec.dtype);
       const uint64_t width = spec.sizes.back();
-      const uint64_t rows = spec.sizes.size() == 3 ? spec.sizes[1] :
-                            (spec.dynamic() ? bucket : spec.sizes[0]);
       const auto output = std::find(outputs_.begin(), outputs_.end(), static_cast<int64_t>(id));
       const int slot = output == outputs_.end() ? -1 :
           static_cast<int>(roles_.size() + std::distance(outputs_.begin(), output));
@@ -366,6 +428,24 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
         node({values[op.inputs[0]]}, values[id], std::monostate{}, "reshape");
         continue;
       }
+      if (op.op == FxOp::expand) {
+        const auto src_dims = specs_[op.inputs[0]].synapse_sizes(bucket);
+        const auto dst_dims = spec.synapse_sizes(bucket);
+        if (src_dims == dst_dims) {
+          emit_cast(builder, values[op.inputs[0]], dst_dims, spec.dtype, spec.dtype, values[id]);
+        } else {
+          auto cur = values[op.inputs[0]];
+          auto cur_dims = src_dims;
+          if (cur_dims.size() < dst_dims.size()) {
+            while (cur_dims.size() < dst_dims.size()) cur_dims.push_back(1);
+            auto padded = tensor_nd(type.syn, cur_dims, -1);
+            node({cur}, cur_dims == dst_dims ? values[id] : padded, std::monostate{}, "reshape");
+            cur = padded;
+          }
+          if (cur_dims != dst_dims) node({cur}, values[id], std::monostate{}, "broadcast");
+        }
+        continue;
+      }
       if (op.op == FxOp::bmm) {
         synGEMMParams params{false, false};
         node({values[op.inputs[0]], values[op.inputs[1]]}, values[id], params, "batch_gemm");
@@ -376,32 +456,40 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
         params.axis = 1;
         params.batchDims = 0;
         const auto guid = "gather_fwd_" + std::string(type.name);
-        node({values[op.inputs[0]], values[op.inputs[1]]}, values[id], params, guid.c_str());
+        auto idx = values[op.inputs[1]];
+        if (specs_[op.inputs[1]].dtype == at::kLong) {
+          idx = emit_cast(builder, idx, specs_[op.inputs[1]].synapse_sizes(bucket), at::kLong, at::kInt);
+        }
+        node({values[op.inputs[0]], idx}, values[id], params, guid.c_str());
         continue;
       }
       if (op.op == FxOp::cast) {
-        ns_CastKernel::ParamsV3 params{};
-        params.round_mode = CAST_ROUND_HALF_NE;
-        if (spec.dtype == at::kFloat)
-          node({values[op.inputs[0]]}, values[id], params, "cast_bf16_to_f32");
-        else
-          node({values[op.inputs[0]]}, values[id], std::monostate{}, "gk_cast_f32_to_bf16_v1");
+        emit_cast(builder, values[op.inputs[0]], spec.synapse_sizes(bucket),
+                  specs_[op.inputs[0]].dtype, spec.dtype, values[id]);
         continue;
       }
       if (op.op == FxOp::concat) {
         std::vector<synTensor> inputs;
         for (auto input : op.inputs) inputs.push_back(values[input]);
-        synConcatenateParams params{0};
+        const int64_t pt_dim = std::holds_alternative<FxAxis>(op.parameters)
+                                   ? std::get<FxAxis>(op.parameters).dim
+                                   : static_cast<int64_t>(spec.sizes.size()) - 1;
+        const int64_t resolved = pt_dim < 0 ? pt_dim + static_cast<int64_t>(spec.sizes.size()) : pt_dim;
+        synConcatenateParams params{static_cast<unsigned int>(spec.sizes.size() - 1 - resolved)};
         node(inputs, values[id], params, "concat");
         continue;
       }
       if (op.op == FxOp::embedding) {
         // Token values were validated at the FX boundary. Mask only the
         // unused bucket rows before gather; the external input stays bound.
+        auto tok_src = values[op.inputs[0]];
+        if (specs_[op.inputs[0]].dtype == at::kLong) {
+          tok_src = emit_cast(builder, tok_src, {bucket}, at::kLong, at::kInt);
+        }
         auto input = tensor_nd(syn_type_int32, {1, bucket}, -1);
         auto masked = tensor_nd(syn_type_int32, {bucket}, -1);
         auto status = tensor_nd(syn_type_int32, {bucket}, -1);
-        node({values[op.inputs[0]]}, input, std::monostate{}, "reshape");
+        node({tok_src}, input, std::monostate{}, "reshape");
         builder.node(NodeSpec{"gk_scheduler_tokens_i32_v1", {input, row_count},
                               {masked, status}, int32_t{1}});
         ns_GatherKernel::ParamsV2 params{};
@@ -434,7 +522,26 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
                               {values[id], key}, params});
         continue;
       }
-      if (op.op == FxOp::fused_add_rms_norm) {
+      if (op.op == FxOp::rotary_pos) {
+        const auto& rotary = std::get<FxRotary>(op.parameters);
+        size_t key_id = specs_.size();
+        for (size_t j = i + 1; j < operations_.size(); ++j)
+          if (operations_[j].op == FxOp::rotary_key && operations_[j].inputs[0] == static_cast<int64_t>(id))
+            key_id = roles_.size() + j;
+        const auto key_output = std::find(outputs_.begin(), outputs_.end(), static_cast<int64_t>(key_id));
+        const int key_slot = key_output == outputs_.end() ? -1 :
+            static_cast<int>(roles_.size() + std::distance(outputs_.begin(), key_output));
+        const auto k_syn_dims = specs_[op.inputs[1]].synapse_sizes(bucket);
+        auto key = tensor_nd(type.syn, k_syn_dims, key_slot);
+        if (key_id < values.size()) values[key_id] = key;
+        emit_rotary_pos(builder, values[op.inputs[0]], values[op.inputs[1]], values[op.inputs[2]],
+                        values[op.inputs[3]], values[id], key, spec.synapse_sizes(bucket), k_syn_dims,
+                        specs_[op.inputs[3]].dtype, bucket,
+                        static_cast<int32_t>(rotary.head_dim),
+                        static_cast<int32_t>(rotary.rotary_dim), rotary.neox);
+        continue;
+      }
+      if (op.op == FxOp::fused_add_rms_norm || op.op == FxOp::fused_add_gemma_rms_norm) {
         size_t residual_id = specs_.size();
         for (size_t j = i + 1; j < operations_.size(); ++j)
           if (operations_[j].op == FxOp::fused_residual && operations_[j].inputs[0] == static_cast<int64_t>(id))
@@ -442,16 +549,21 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
         const auto residual_output = std::find(outputs_.begin(), outputs_.end(), static_cast<int64_t>(residual_id));
         const int residual_slot = residual_output == outputs_.end() ? -1 :
             static_cast<int>(roles_.size() + std::distance(outputs_.begin(), residual_output));
-        auto residual = tensor(type.syn, width, bucket, residual_slot);
+        const auto syn_dims = spec.synapse_sizes(bucket);
+        auto residual = tensor_nd(type.syn, syn_dims, residual_slot);
         if (residual_id < values.size()) values[residual_id] = residual;
         const float epsilon = std::get<FxEpsilon>(op.parameters).value;
-        builder.node(NodeSpec{"gk_fused_add_rms_norm_bf16_v1",
-                              {values[op.inputs[0]], values[op.inputs[1]], values[op.inputs[2]]},
-                              {residual, values[id]}, epsilon});
+        const float weight_offset = op.op == FxOp::fused_add_gemma_rms_norm ? 1.0f : 0.0f;
+        emit_rms_norm(builder, values[op.inputs[0]], values[op.inputs[1]], values[op.inputs[2]],
+                      values[id], residual, syn_dims, epsilon, weight_offset);
         continue;
       }
       if (op.op == FxOp::feature_slice) {
         lower_feature_slice(builder, i, roles_, operations_, outputs_, specs_, bucket, values);
+        continue;
+      }
+      if (op.op == FxOp::slice_dim) {
+        lower_slice_dim(builder, op, specs_[op.inputs[0]], spec, bucket, values[op.inputs[0]], values[id]);
         continue;
       }
       if (op.op == FxOp::scalar_add || op.op == FxOp::scalar_sub ||
@@ -459,18 +571,81 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
         lower_scalar_arith(builder, op, spec, bucket, values, values[id]);
         continue;
       }
-      if (op.op == FxOp::add || op.op == FxOp::sub || op.op == FxOp::mul || op.op == FxOp::div) {
+      if (op.op == FxOp::scalar_eq || op.op == FxOp::scalar_ne || op.op == FxOp::scalar_lt ||
+          op.op == FxOp::scalar_le || op.op == FxOp::scalar_gt || op.op == FxOp::scalar_ge) {
+        lower_scalar_cmp(builder, op, specs_[op.inputs[0]], spec, bucket, values, values[id]);
+        continue;
+      }
+      if (op.op == FxOp::ewise_unary) {
+        const auto& u = std::get<FxUnary>(op.parameters);
+        emit_ewise_unary(builder, values[op.inputs[0]], values[id], spec.dtype,
+                         spec.synapse_sizes(bucket), u.op_code, u.alpha, u.beta);
+        continue;
+      }
+      if (op.op == FxOp::isnan) {
+        emit_isnan(builder, values[op.inputs[0]], values[id], specs_[op.inputs[0]].dtype);
+        continue;
+      }
+      if (op.op == FxOp::logical_not) {
+        emit_logical_not(builder, values[op.inputs[0]], values[id]);
+        continue;
+      }
+      if (op.op == FxOp::full_like) {
+        const auto& c = std::get<FxConstant>(op.parameters);
+        emit_constant(builder, spec.dtype, spec.synapse_sizes(bucket),
+                      c.float_value, c.int_value, c.is_integral, values[id]);
+        continue;
+      }
+      if (op.op == FxOp::add || op.op == FxOp::sub || op.op == FxOp::mul || op.op == FxOp::div ||
+          op.op == FxOp::minimum || op.op == FxOp::maximum ||
+          op.op == FxOp::eq || op.op == FxOp::ne || op.op == FxOp::lt ||
+          op.op == FxOp::le || op.op == FxOp::gt || op.op == FxOp::ge ||
+          op.op == FxOp::logical_and || op.op == FxOp::logical_or ||
+          op.op == FxOp::bitwise_and || op.op == FxOp::bitwise_or) {
         lower_binary_arith(builder, op, spec, specs_, bucket, values, values[id]);
         continue;
       }
-      if (op.op == FxOp::rms_norm) {
-        const float epsilon = std::get<FxEpsilon>(op.parameters).value;
-        node({values[op.inputs[0]], values[op.inputs[1]]}, values[id], epsilon,
-             "gk_rms_norm_bf16_v1");
+      if (op.op == FxOp::where) {
+        emit_where(builder, values[op.inputs[0]], values[op.inputs[1]], values[op.inputs[2]],
+                   values[id], spec.dtype, specs_[op.inputs[0]].synapse_sizes(bucket),
+                   specs_[op.inputs[1]].synapse_sizes(bucket),
+                   specs_[op.inputs[2]].synapse_sizes(bucket), spec.synapse_sizes(bucket));
         continue;
       }
-      if (op.op == FxOp::silu_and_mul) {
-        node({values[op.inputs[0]]}, values[id], std::monostate{}, "gk_silu_and_mul_bf16_v1");
+      if (op.op == FxOp::rms_norm || op.op == FxOp::gemma_rms_norm) {
+        const float epsilon = std::get<FxEpsilon>(op.parameters).value;
+        const float weight_offset = op.op == FxOp::gemma_rms_norm ? 1.0f : 0.0f;
+        emit_rms_norm(builder, values[op.inputs[0]], nullptr, values[op.inputs[1]],
+                      values[id], nullptr, spec.synapse_sizes(bucket), epsilon, weight_offset);
+        continue;
+      }
+      if (op.op == FxOp::silu_and_mul || op.op == FxOp::gelu_and_mul) {
+        const bool is_gelu = op.op == FxOp::gelu_and_mul;
+        const int32_t approx = is_gelu ? std::get<FxGeluMul>(op.parameters).approximate : 0;
+        emit_gated_mul(builder, is_gelu, approx, values[op.inputs[0]], values[id],
+                       specs_[op.inputs[0]].synapse_sizes(bucket), spec.synapse_sizes(bucket));
+        continue;
+      }
+      if (op.op == FxOp::sum_dim || op.op == FxOp::mean_dim || op.op == FxOp::amax_dim) {
+        const auto& r = std::get<FxReduce>(op.parameters);
+        emit_reduction(builder, op.op, values[op.inputs[0]], values[id], spec.dtype,
+                       specs_[op.inputs[0]].synapse_sizes(bucket), spec.synapse_sizes(bucket),
+                       r.dim, r.keepdim);
+        continue;
+      }
+      if (op.op == FxOp::softmax || op.op == FxOp::log_softmax) {
+        const auto& ax = std::get<FxAxis>(op.parameters);
+        emit_softmax(builder, op.op == FxOp::log_softmax, values[op.inputs[0]], values[id],
+                     spec.dtype, spec.synapse_sizes(bucket), ax.dim);
+        continue;
+      }
+      if (op.op == FxOp::layer_norm) {
+        const auto& ln = std::get<FxLayerNorm>(op.parameters);
+        size_t next_in = 1;
+        synTensor weight = ln.has_weight ? values[op.inputs[next_in++]] : nullptr;
+        synTensor bias = ln.has_bias ? values[op.inputs[next_in++]] : nullptr;
+        emit_layer_norm(builder, values[op.inputs[0]], weight, bias, values[id], nullptr, nullptr,
+                        spec.dtype, spec.synapse_sizes(bucket), ln.epsilon);
         continue;
       }
       if (op.op == FxOp::block_fp8_linear) {
@@ -483,12 +658,24 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
       }
       TORCH_CHECK(op.op == FxOp::linear, "GaudiRT FX: unsupported graph operation");
       synGEMMParams gemm{false, std::get<FxLinear>(op.parameters).transpose_weight};
+      const auto syn_dims = spec.synapse_sizes(bucket);
+      const auto flat_dims = flatten_2d_syn_dims(syn_dims);
+      const uint64_t flat_rows = flat_dims[1];
+      auto act = values[op.inputs[0]];
+      if (specs_[op.inputs[0]].sizes.size() != 2) {
+        const auto in_flat = flatten_2d_syn_dims(specs_[op.inputs[0]].synapse_sizes(bucket));
+        auto reshaped = tensor_nd(type.syn, in_flat, -1);
+        node({act}, reshaped, std::monostate{}, "reshape");
+        act = reshaped;
+      }
+      auto gemm_out = (op.inputs.size() == 2 && syn_dims.size() == 2)
+                          ? values[id]
+                          : tensor(op.inputs.size() == 2 ? type.syn : syn_type_float, width, flat_rows, -1);
+      node({act, values[op.inputs[1]]}, gemm_out, gemm, "gemm");
       if (op.inputs.size() == 2) {
-        node({values[op.inputs[0]], values[op.inputs[1]]}, values[id], gemm, "gemm");
+        if (syn_dims.size() != 2) node({gemm_out}, values[id], std::monostate{}, "reshape");
         continue;
       }
-      auto product = tensor(syn_type_float, width, rows, -1);
-      node({values[op.inputs[0]], values[op.inputs[1]]}, product, gemm, "gemm");
       const bool bf16 = spec.dtype == at::kBFloat16;
       auto bias = values[op.inputs[2]];
       ns_CastKernel::ParamsV3 cast{};
@@ -498,9 +685,15 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
         node({bias}, wide_bias, cast, "cast_bf16_to_f32");
         bias = wide_bias;
       }
-      auto sum = bf16 ? tensor(syn_type_float, width, rows, -1) : values[id];
-      node({product, bias}, sum, std::monostate{}, "add_fwd_f32");
-      if (bf16) node({sum}, values[id], cast, "cast_f32_to_bf16");
+      auto bias_b = emit_broadcast_to(builder, bias, syn_type_float, {width}, flat_dims);
+      auto sum = (bf16 || syn_dims.size() != 2) ? tensor(syn_type_float, width, flat_rows, -1) : values[id];
+      node({gemm_out, bias_b}, sum, std::monostate{}, "add_fwd_f32");
+      auto final_2d = sum;
+      if (bf16) {
+        final_2d = syn_dims.size() == 2 ? values[id] : tensor(syn_type_bf16, width, flat_rows, -1);
+        emit_cast(builder, sum, flat_dims, at::kFloat, at::kBFloat16, final_2d);
+      }
+      if (syn_dims.size() != 2) node({final_2d}, values[id], std::monostate{}, "reshape");
     }
     builder.compile(ctx.cache, key);
   }
@@ -602,7 +795,7 @@ std::vector<at::Tensor> BucketProgram::run_internal(const std::vector<at::Tensor
       TORCH_CHECK(inputs[i].size(0) == m, "GaudiRT FX: inconsistent token dimensions");
     }
   }
-  TORCH_CHECK(m > 0 && m <= 4096, "GaudiRT FX: token count outside 1..4096");
+  TORCH_CHECK(m > 0 && m <= kMaxBucketRows, "GaudiRT FX: token count outside 1..8192");
   std::call_once(geometry_once_, [&] { initialize_geometry(inputs); });
   auto ctx = current();
   auto stream = ctx->stream();

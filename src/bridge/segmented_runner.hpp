@@ -60,7 +60,8 @@ class SegmentedRunner {
   explicit SegmentedRunner(size_t input_count);
   std::vector<size_t> add_program(std::shared_ptr<BucketProgram> program, std::vector<size_t> inputs,
                                   std::vector<SegmentRoute> outputs);
-  size_t add_attention(std::vector<size_t> inputs, int64_t head_dim, double scale);
+  size_t add_attention(std::vector<size_t> inputs, int64_t head_dim, double scale,
+                       double softcap = 0.0, int64_t sliding_window = -1);
   uint32_t add_collective_start(uint32_t comm_id, CollectiveKind collective_kind,
                                 size_t input_slot, bool dynamic_output);
   size_t add_collective_wait(uint32_t coll_id);
@@ -106,6 +107,8 @@ class SegmentedRunner {
     std::vector<size_t> outputs;
     int64_t head_dim = 0;
     double scale = 0;
+    double softcap = 0.0;
+    int64_t sliding_window = -1;
     uint32_t coll_id = 0;
     uint32_t comm_id = 0;
     CollectiveKind collective_kind = CollectiveKind::AllReduce;

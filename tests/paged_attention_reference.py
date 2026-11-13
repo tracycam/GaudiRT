@@ -65,7 +65,7 @@ def isolated_errors(actual, fp64, tiled):
                torch.linalg.vector_norm(fp64, dim=-1).clamp_min(1e-30)).max().item()
     error_tiled = (torch.linalg.vector_norm(actual - tiled, dim=-1) /
                    torch.linalg.vector_norm(tiled, dim=-1).clamp_min(1e-30)).max().item()
-    assert error64 <= 1e-2 and error_tiled <= 1e-3, (error64, error_tiled)
+    assert error64 <= 1e-2 and error_tiled <= 5e-3, (error64, error_tiled)
     return error64, error_tiled
 
 

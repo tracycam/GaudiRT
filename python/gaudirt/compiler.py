@@ -13,6 +13,8 @@ from .fx_passes import _fx_collective, _normalize_fx_graph
 from .op_lowering import _program_backend
 from .partitioner import _SegmentExecution, _partition_backend
 
+MAX_BUCKET_ROWS = int(getattr(_C, "_max_bucket_rows", 8192))
+
 
 def _restore_staged_outputs(value, replacements):
     if isinstance(value, torch.Tensor):
@@ -31,7 +33,7 @@ def _restore_staged_outputs(value, replacements):
 
 
 def gaudirt_backend(graph_module, example_inputs):
-    _normalize_fx_graph(graph_module)
+    _normalize_fx_graph(graph_module, example_inputs)
     nodes = tuple(graph_module.graph.nodes)
     if any(node.op == "call_function" and node.target in (
         torch.ops.gaudirt._paged_attn_validated,
@@ -123,7 +125,7 @@ def compile(module, dynamic_arg_indices=(0,), prepare_capture=None):
             if id(original) not in staged_inputs:
                 if (isinstance(original, torch.Tensor) and original.ndim == 1 and original.stride(0) == 1 and
                         original.device.type == "gaudirt" and original.device.index == _C.current_device() and
-                        0 < original.shape[0] <= 4096):
+                        0 < original.shape[0] <= MAX_BUCKET_ROWS):
                     staged = None
                 else:
                     staged = _C._prepare_strided_input(original)
@@ -205,7 +207,7 @@ def compile(module, dynamic_arg_indices=(0,), prepare_capture=None):
         for index in dynamic_arg_indices:
             if prepared_args[index].ndim > 1:
                 torch._dynamo.mark_static(prepared_args[index], list(range(1, prepared_args[index].ndim)))
-            torch._dynamo.mark_dynamic(prepared_args[index], 0, min=1, max=4096)
+            torch._dynamo.mark_dynamic(prepared_args[index], 0)
         key = (tuple(static_tokens[index] if static_tokens[index] is not None else
                      signature(value, index in dynamic_arg_indices or index in declared_dynamic)
                      for index, value in enumerate(prepared_args)), signature(kwargs))

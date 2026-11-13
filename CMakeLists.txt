@@ -48,6 +48,7 @@ if(GAUDIRT_BUILD_TORCH)
         src/bridge/eager_index.cpp
         src/bridge/eager_scheduler.cpp
         src/bridge/argmax_vocab.cpp
+        src/bridge/sampler_vocab.cpp
         src/bridge/bucket_program.cpp
         src/bridge/fx_op_lowering.cpp
         src/bridge/segmented_runner.cpp

@@ -111,8 +111,24 @@ def _fake_fused_add_rms_norm(input, residual, weight, epsilon):
             torch.empty_like(residual, memory_format=torch.contiguous_format))
 
 
+@torch.library.register_fake("gaudirt::gemma_rms_norm")
+def _fake_gemma_rms_norm(input, weight, epsilon):
+    return torch.empty_like(input, memory_format=torch.contiguous_format)
+
+
+@torch.library.register_fake("gaudirt::fused_add_gemma_rms_norm")
+def _fake_fused_add_gemma_rms_norm(input, residual, weight, epsilon):
+    return (torch.empty_like(input, memory_format=torch.contiguous_format),
+            torch.empty_like(residual, memory_format=torch.contiguous_format))
+
+
 @torch.library.register_fake("gaudirt::silu_and_mul")
 def _fake_silu_and_mul(input):
+    return input.new_empty((*input.shape[:-1], input.shape[-1] // 2))
+
+
+@torch.library.register_fake("gaudirt::gelu_and_mul")
+def _fake_gelu_and_mul(input, approximate="none"):
     return input.new_empty((*input.shape[:-1], input.shape[-1] // 2))
 
 
@@ -127,13 +143,15 @@ def _fake_fp8_linear(input, weight, scales, bias=None):
 
 
 @torch.library.register_fake("gaudirt::paged_attn")
-def _fake_paged_attn(query, key, value, key_pool, value_pool, metadata, head_dim, scale):
+def _fake_paged_attn(query, key, value, key_pool, value_pool, metadata, head_dim, scale,
+                     softcap=0.0, sliding_window=-1):
     return torch.empty_like(query, memory_format=torch.contiguous_format)
 
 
 @torch.library.register_fake("gaudirt::_paged_attn_validated")
 def _fake_paged_attn_validated(query, key, value, key_pool, value_pool, locations,
-                               requests, positions, mapping, header, head_dim, scale):
+                               requests, positions, mapping, header, head_dim, scale,
+                               softcap=0.0, sliding_window=-1):
     return torch.empty_like(query, memory_format=torch.contiguous_format)
 
 
@@ -143,11 +161,31 @@ def _fake_rotary_embedding(query, key, cache, metadata, head_dim, rotary_dim, is
             torch.empty_like(key, memory_format=torch.contiguous_format))
 
 
+@torch.library.register_fake("gaudirt::rotary_embedding_positions")
+def _fake_rotary_embedding_positions(query, key, cache, positions, head_dim, rotary_dim, is_neox):
+    return (torch.empty_like(query, memory_format=torch.contiguous_format),
+            torch.empty_like(key, memory_format=torch.contiguous_format))
+
+
 @torch.library.register_fake("gaudirt::_rotary_embedding_validated")
 def _fake_rotary_embedding_validated(query, key, cache, positions, header, context,
                                      head_dim, rotary_dim, is_neox):
     return (torch.empty_like(query, memory_format=torch.contiguous_format),
             torch.empty_like(key, memory_format=torch.contiguous_format))
+
+
+@torch.library.register_fake("gaudirt::softcap_")
+def _fake_softcap_inplace(logits, cap):
+    return logits
+
+
+@torch.library.register_fake("gaudirt::sample_from_logits")
+def _fake_sample_from_logits(logits, temperatures, top_ps, top_ks, min_ps,
+                             seeds=None, positions=None, nan_to_neg_inf=True):
+    return logits.new_empty((logits.shape[0],), dtype=torch.int32)
+
+
+MAX_BUCKET_ROWS = int(_C._max_bucket_rows)
 
 
 torch.utils.rename_privateuse1_backend("gaudirt")

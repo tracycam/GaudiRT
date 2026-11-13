@@ -15,8 +15,8 @@ namespace gaudirt::generic {
 at::Tensor allocate_paged_kv(int64_t layers, int64_t slots, int64_t heads, int64_t head_dim) {
   TORCH_CHECK(layers > 0 && layers <= 4096 && slots > 0 &&
               static_cast<uint64_t>(slots) <= kPagedKvDescriptorSlots &&
-              heads > 0 && heads <= 256 && (head_dim == 64 || head_dim == 128) &&
-              (heads * head_dim) % 128 == 0,
+              heads > 0 && heads <= 256 &&
+              (head_dim == 64 || head_dim == 128 || head_dim == 256),
               "GaudiRT: unsupported head-major KV pool geometry");
   const uint64_t width = static_cast<uint64_t>(heads) * head_dim;
   const uint64_t layer_bytes = 2 * static_cast<uint64_t>(slots) * width * sizeof(uint16_t);

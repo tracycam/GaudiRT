@@ -104,7 +104,7 @@ def run():
         assert counts[:2] == [0, 13], counts
     elif os.environ.get("GAUDIRT_TEST_CACHE") == "warm":
         assert counts[:2] == [13, 0], counts
-    for invalid_m in (0, 4097):
+    for invalid_m in (0, 8193):
         invalid = torch.empty((invalid_m, 64), dtype=torch.bfloat16, device="gaudirt:0")
         try:
             gaudirt._C.bucket_linear(invalid, weight1)

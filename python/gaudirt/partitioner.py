@@ -266,27 +266,33 @@ def _segment_executor(split, example_inputs, paged):
                                          for item in segment_nodes):
                 raise RuntimeError("GaudiRT FX: invalid paged-attention partition")
             attention = stateful[0]
-            if len(attention.args) != 12 or attention.kwargs:
+            if len(attention.args) not in (12, 13, 14) or attention.kwargs:
                 raise RuntimeError("GaudiRT FX: unsupported paged-attention arguments")
             try:
                 tensor_arguments = tuple(segment_inputs.index(item) for item in attention.args[:10])
             except ValueError as error:
                 raise RuntimeError("GaudiRT FX: attention tensors must be segment inputs") from error
-            head_dim, scale = attention.args[10:]
-            if not isinstance(head_dim, int) or not isinstance(scale, (int, float)):
+            head_dim, scale = attention.args[10:12]
+            softcap = attention.args[12] if len(attention.args) >= 13 else 0.0
+            sliding_window = attention.args[13] if len(attention.args) >= 14 else -1
+            if (not isinstance(head_dim, int) or isinstance(head_dim, bool) or
+                    not isinstance(scale, (int, float)) or isinstance(scale, bool) or
+                    not isinstance(softcap, (int, float)) or isinstance(softcap, bool) or
+                    not isinstance(sliding_window, int) or isinstance(sliding_window, bool)):
                 raise RuntimeError("GaudiRT FX: attention geometry must be static")
             slots = [tensor_slot(node.args[index]) for index in tensor_arguments]
-            values[node] = runner.add_attention(slots, head_dim, float(scale))
+            values[node] = runner.add_attention(slots, head_dim, float(scale), float(softcap), int(sliding_window))
             records.append((segment, host_arguments(node.args, tensor_arguments), tensor_arguments, True))
             emit_getitem_children(node)
             available.add(node)
             return
 
         if not any(item.meta.get("gaudirt_dynamic") for item in segment_inputs):
+            max_bucket_rows = int(getattr(_C, "_max_bucket_rows", 8192))
             for idx_in, item in enumerate(segment_inputs):
                 ex = item.meta.get("example_value")
                 if (node.args[idx_in] not in positions and isinstance(ex, torch.Tensor) and
-                        ex.ndim >= 1 and isinstance(ex.shape[0], int) and 0 < ex.shape[0] <= 4096):
+                        ex.ndim >= 1 and isinstance(ex.shape[0], int) and 0 < ex.shape[0] <= max_bucket_rows):
                     item.meta["gaudirt_dynamic"] = True
                     break
 
@@ -374,13 +380,50 @@ def _partition_backend(graph_module, example_inputs):
 
     graph = graph_module.graph
     transpose_targets = (torch.transpose, torch.ops.aten.transpose.int)
-    split_targets = (torch.split, torch.ops.aten.split_with_sizes.default)
+    split_targets = (torch.split, torch.ops.aten.split.Tensor, torch.ops.aten.split_with_sizes.default)
     rotary_targets = (torch.ops.gaudirt._rotary_embedding_validated,
-                      torch.ops.gaudirt._rotary_embedding_validated.default)
+                      torch.ops.gaudirt._rotary_embedding_validated.default,
+                      torch.ops.gaudirt.rotary_embedding_positions,
+                      torch.ops.gaudirt.rotary_embedding_positions.default)
     fused_norm_targets = (torch.ops.gaudirt.fused_add_rms_norm,
-                          torch.ops.gaudirt.fused_add_rms_norm.default)
+                          torch.ops.gaudirt.fused_add_rms_norm.default,
+                          torch.ops.gaudirt.fused_add_gemma_rms_norm,
+                          torch.ops.gaudirt.fused_add_gemma_rms_norm.default,
+                          torch.ops.aten.native_layer_norm.default)
     paged = (torch.ops.gaudirt._paged_attn_validated, torch.ops.gaudirt._paged_attn_validated.default)
     boundary_targets = (*paged, _fx_collective)
+
+    def is_boundary(n):
+        return n.op == "call_function" and n.target in boundary_targets
+
+    nodes = tuple(graph.nodes)
+    placeholders = [node for node in nodes if node.op == "placeholder"]
+    if len(placeholders) != len(example_inputs):
+        raise RuntimeError("GaudiRT FX: placeholder count mismatch")
+    extents = set()
+    for node, value in zip(placeholders, example_inputs):
+        if not isinstance(value, torch.Tensor):
+            continue
+        dynamic = getattr(value, "_dynamo_dynamic_indices", set()) or set()
+        if dynamic and dynamic != {0}:
+            raise RuntimeError("GaudiRT FX: only the outer token dimension may be dynamic")
+        node.meta["gaudirt_dynamic"] = bool(dynamic)
+        example = node.meta.get("example_value")
+        if dynamic:
+            if not isinstance(example, torch.Tensor) or example.ndim == 0:
+                raise RuntimeError("GaudiRT FX: missing dynamic input shape")
+            extents.add(str(example.shape[0]))
+    if not extents:
+        raise RuntimeError("GaudiRT FX: mark each dynamic token input before capture")
+
+    for node in nodes:
+        if node.op == "placeholder":
+            continue
+        example = node.meta.get("example_value")
+        if isinstance(example, torch.Tensor) and example.ndim:
+            if node.op == "call_function" and node.target is _fx_collective and not isinstance(example.shape[0], int):
+                extents.add(str(example.shape[0]))
+            node.meta["gaudirt_dynamic"] = str(example.shape[0]) in extents
 
     def is_consumer_helper(n):
         if n.op == "call_method" and n.target in ("t", "long") and len(n.args) == 1 and not n.kwargs:
@@ -394,6 +437,12 @@ def _partition_backend(graph_module, example_inputs):
                 ex = n.args[0].meta.get("example_value")
                 if isinstance(ex, torch.Tensor) and ex.ndim == 2 and (n.args[1] % 2) != (n.args[2] % 2):
                     return True
+        if (not n.meta.get("gaudirt_dynamic", False) and
+                ((n.op == "call_method" and n.target in ("to", "float", "bfloat16", "half")) or
+                 (n.op == "call_function" and n.target in (
+                     torch.ops.aten._to_copy.default, torch.ops.aten.to.dtype))) and
+                n.users and all(u.op != "output" and not is_boundary(u) for u in n.users)):
+            return True
         return False
 
     def is_tuple_producer(n):
@@ -402,8 +451,8 @@ def _partition_backend(graph_module, example_inputs):
             return True
         return n.op == "call_function" and (n.target in rotary_targets or n.target in fused_norm_targets)
 
-    # Clone shared consumer helpers (.t(), .T, 2D transpose, .long()) per user so each
-    # stays local to its consuming BucketProgram without cross-partition edges.
+    # Clone shared consumer helpers (.t(), .T, 2D transpose, .long(), static weight casts) per
+    # user so each stays local to its consuming BucketProgram without cross-partition edges.
     for n in list(graph.nodes):
         if is_consumer_helper(n) and len(n.users) > 1:
             users = list(n.users)
@@ -414,33 +463,6 @@ def _partition_backend(graph_module, example_inputs):
                 user.replace_input_with(n, clone)
 
     nodes = tuple(graph.nodes)
-    placeholders = [node for node in nodes if node.op == "placeholder"]
-    if len(placeholders) != len(example_inputs):
-        raise RuntimeError("GaudiRT FX: placeholder count mismatch")
-    extents = set()
-    for node, value in zip(placeholders, example_inputs):
-        if not isinstance(value, torch.Tensor):
-            continue
-        dynamic = getattr(value, "_dynamo_dynamic_indices", set()) or set()
-        if dynamic and dynamic != {0}:
-            raise RuntimeError("GaudiRT FX: only the outer token dimension may be dynamic")
-        example = node.meta.get("example_value")
-        if dynamic:
-            if not isinstance(example, torch.Tensor) or example.ndim == 0:
-                raise RuntimeError("GaudiRT FX: missing dynamic input shape")
-            extents.add(str(example.shape[0]))
-    if not extents:
-        raise RuntimeError("GaudiRT FX: mark each dynamic token input before capture")
-
-    for node in nodes:
-        example = node.meta.get("example_value")
-        if isinstance(example, torch.Tensor) and example.ndim:
-            if node.op == "call_function" and node.target is _fx_collective and not isinstance(example.shape[0], int):
-                extents.add(str(example.shape[0]))
-            node.meta["gaudirt_dynamic"] = str(example.shape[0]) in extents
-
-    def is_boundary(n):
-        return n.op == "call_function" and n.target in boundary_targets
 
     anc = {}
     for n in nodes:

@@ -452,7 +452,9 @@ void execute_recipe_on_cpu(const MockRecipe& recipe, const synLaunchTensorInfo* 
           out[t * 64 + l] = base + slot;
         }
       }
-    } else if (node.guid == "gk_kv_store_head_major_bf16_v1") {
+    } else if (node.guid == "gk_kv_store_head_major_bf16_v1" ||
+               node.guid == "gk_kv_store_head_major64_bf16_v1" ||
+               node.guid == "gk_kv_store_head_major256_bf16_v1") {
       const auto& k_b = load_tensor(node.inputs[0]);
       const auto& v_b = load_tensor(node.inputs[1]);
       const auto& loc_b = load_tensor(node.inputs[2]);

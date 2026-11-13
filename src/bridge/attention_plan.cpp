@@ -32,15 +32,17 @@ void release_attention_plan(void* pointer) {
   if (auto ctx = plan->owner.lock()) ctx->attention_staging().release(plan->staging_slot, plan->stream);
 }
 
-ColdRecipe& indices_recipe(Context& ctx, uint32_t rows, uint32_t tasks) {
-  const std::string structure = "attention_indices_v1:" + std::to_string(rows) + ":" + std::to_string(tasks);
+ColdRecipe& indices_recipe(Context& ctx, uint32_t rows, uint32_t tasks, uint64_t map_elements) {
+  const uint64_t map_cap = std::max<uint64_t>(256 * kPagedKvDescriptorSlots, std::bit_ceil(map_elements));
+  std::string structure = "attention_indices_v1:" + std::to_string(rows) + ":" + std::to_string(tasks);
+  if (map_cap > 256 * kPagedKvDescriptorSlots) structure += ":" + std::to_string(map_cap);
   const auto digest = common::sha256_bytes(reinterpret_cast<const uint8_t*>(structure.data()), structure.size());
   const auto key = "attention_indices_" + digest;
   if (auto found = ctx.cold_recipes.find(key); found != ctx.cold_recipes.end()) return *found->second;
   auto recipe = std::make_unique<ColdRecipe>(5);
   const auto prefix = "g" + digest.substr(0, 12) + "_b" + std::to_string(rows);
   SynapseGraphBuilder graph(prefix, *recipe);
-  auto map = graph.tensor(syn_type_int32, {256 * kPagedKvDescriptorSlots}, 0, -1, 0, true);
+  auto map = graph.tensor(syn_type_int32, {map_cap}, 0, -1, 0, true);
   auto requests = graph.tensor(syn_type_int32, {rows}, 1);
   auto work = graph.tensor(syn_type_int32, {4, tasks}, 2);
   auto context = graph.tensor(syn_type_int32, {1}, 3);
@@ -136,17 +138,35 @@ const AttentionPlan& attention_plan_data(const at::Tensor& tensor, const Context
 }
 
 at::Tensor PagedMetadata::attention_plan(int64_t query_heads, int64_t kv_heads, int64_t head_dim) {
+  return attention_plan_for(query_heads, kv_heads, head_dim, -1);
+}
+
+at::Tensor PagedMetadata::attention_plan_for(int64_t query_heads, int64_t kv_heads, int64_t head_dim,
+                                             int64_t sliding_window) {
+  TORCH_CHECK(sliding_window == -1 || (sliding_window > 0 && sliding_window <= INT32_MAX),
+              "GaudiRT attention: invalid sliding window size");
+  const int64_t normalized_window = sliding_window > 0 ? sliding_window : -1;
   auto ctx = current();
-  if (attention_plan_.defined()) {
+  if (normalized_window <= 0 && attention_plan_.defined()) {
     const auto& plan = attention_plan_data(attention_plan_, *ctx);
     TORCH_CHECK(plan.query_heads == query_heads && plan.kv_heads == kv_heads && plan.head_dim == head_dim,
                 "GaudiRT attention: metadata already bound to different head geometry");
     return attention_plan_;
   }
+  if (normalized_window > 0) {
+    for (const auto& [win, cached_tensor] : swa_attention_plans_) {
+      if (win == normalized_window) {
+        const auto& plan = attention_plan_data(cached_tensor, *ctx);
+        TORCH_CHECK(plan.query_heads == query_heads && plan.kv_heads == kv_heads && plan.head_dim == head_dim,
+                    "GaudiRT attention: metadata already bound to different head geometry");
+        return cached_tensor;
+      }
+    }
+  }
   TORCH_CHECK(query_heads > 0 && query_heads <= 256 && kv_heads > 0 && kv_heads <= 256 &&
-              query_heads % kv_heads == 0 && (head_dim == 64 || head_dim == 128) &&
-              (kv_heads * head_dim) % 128 == 0 && slots_ > 0 &&
-              static_cast<uint64_t>(slots_) <= kPagedKvDescriptorSlots && request_count_ <= 256 &&
+              query_heads % kv_heads == 0 && (head_dim == 64 || head_dim == 128 || head_dim == 256) &&
+              slots_ > 0 && static_cast<uint64_t>(slots_) <= kPagedKvDescriptorSlots &&
+              request_count_ > 0 && mapping_.numel() <= INT32_MAX &&
               context_ <= static_cast<int64_t>(kPagedKvDescriptorSlots),
               "GaudiRT attention: unsupported head or request-map geometry");
 
@@ -157,14 +177,21 @@ at::Tensor PagedMetadata::attention_plan(int64_t query_heads, int64_t kv_heads, 
   plan->query_heads = query_heads;
   plan->kv_heads = kv_heads;
   plan->head_dim = head_dim;
+  plan->sliding_window = normalized_window;
   std::vector<std::array<int32_t, 4>> tasks;
   for (const auto& sequence : sequences_) {
     for (int32_t done = 0; done < sequence.length;) {
       const int32_t remaining = sequence.length - done;
-      const int32_t end = sequence.prefix + done + remaining;
+      const int32_t full_visible = sequence.prefix + done + remaining;
+      const bool is_decode_step = (remaining == 1);
+      const bool swa_active = (normalized_window > 0);
+      const int32_t effective_len = (is_decode_step && swa_active)
+          ? std::min<int32_t>(full_visible, static_cast<int32_t>(normalized_window))
+          : full_visible;
+      const int32_t end = is_decode_step ? effective_len : full_visible;
       int32_t count = std::min<int32_t>(remaining, 256);
       uint32_t q_bucket = std::bit_ceil(static_cast<uint32_t>(count));
-      const uint32_t direct_kv = (remaining == 1 && end > 512 && end <= 8192)
+      const uint32_t direct_kv = (is_decode_step && end > 512 && end <= 8192)
           ? static_cast<uint32_t>((end + 511) & ~511)
           : std::max<uint32_t>(128, std::bit_ceil(static_cast<uint32_t>(end)));
       // Account for BF16 K/V, FP32 scores and exponentials, and BF16 probabilities.
@@ -173,7 +200,7 @@ at::Tensor PagedMetadata::attention_plan(int64_t query_heads, int64_t kv_heads, 
           (4 * static_cast<uint64_t>(kv_heads) * static_cast<uint64_t>(head_dim) +
            10 * static_cast<uint64_t>(query_heads));
       constexpr uint64_t kFusedDecodeBudget = 40ULL * 1024 * 1024;
-      const bool single_decode = remaining == 1 &&
+      const bool single_decode = is_decode_step &&
           (end <= 4096 || (end <= 8192 && fused_bytes <= kFusedDecodeBudget));
       const bool short_prefill = end <= 512 &&
           uint64_t{q_bucket} * direct_kv * static_cast<uint64_t>(query_heads) <= 4 * 1024 * 1024;
@@ -184,27 +211,42 @@ at::Tensor PagedMetadata::attention_plan(int64_t query_heads, int64_t kv_heads, 
         count = std::min<int32_t>(remaining, static_cast<int32_t>(max_rows));
         q_bucket = std::bit_ceil(static_cast<uint32_t>(count));
       }
-      const int32_t visible = sequence.prefix + done + count;
+      const int32_t visible = is_decode_step ? effective_len : (sequence.prefix + done + count);
+      const int32_t kv_start_pos = (is_decode_step && swa_active) ? (full_visible - effective_len) : 0;
+      const int32_t min_pos = sequence.prefix + done;
+      const int32_t window_start = (!is_decode_step && swa_active)
+          ? std::max<int32_t>(0, min_pos - static_cast<int32_t>(normalized_window) + 1)
+          : 0;
       const uint32_t kv_bucket = (single_decode || short_prefill) ? direct_kv : kTileKvBucket;
       AttentionBlock block{};
       block.first_row = sequence.row + done;
       block.valid_rows = count;
       block.query_bucket = q_bucket;
       block.kv_bucket = kv_bucket;
-      block.kv_source_row = sequence.prefix == 0 ? sequence.row : -1;
-      const bool emit_tile_indices = block.kv_source_row < 0 || visible <= static_cast<int32_t>(kv_bucket);
+      block.kv_source_row = (sequence.prefix == 0 && kv_start_pos == 0 && window_start == 0)
+          ? sequence.row : -1;
+      struct CandidateTile { int32_t first; int32_t valid; };
+      std::vector<CandidateTile> kept_tiles;
       for (int32_t first = 0; first < visible; first += kv_bucket) {
         const int32_t valid = std::min<int32_t>(kv_bucket, visible - first);
+        const int32_t tile_end = first + valid - 1;
+        if (!is_decode_step && swa_active && tile_end < window_start) continue;
+        kept_tiles.push_back({first, valid});
+      }
+      TORCH_CHECK(!kept_tiles.empty(), "GaudiRT attention: no visible KV tiles in sliding window");
+      if (kept_tiles.size() <= 1 || kept_tiles.front().first != 0) block.kv_source_row = -1;
+      const bool emit_tile_indices = (block.kv_source_row < 0);
+      for (const auto& candidate : kept_tiles) {
         AttentionTile tile{};
-        tile.indices_offset = static_cast<uint64_t>(tasks.size()) * 64 * sizeof(int32_t);
-        tile.first_key = first;
-        tile.valid_keys = valid;
+        tile.indices_offset = emit_tile_indices ? static_cast<uint64_t>(tasks.size()) * 64 * sizeof(int32_t) : 0;
+        tile.first_key = candidate.first;
+        tile.valid_keys = candidate.valid;
         if (emit_tile_indices) {
           for (int32_t kind = 0; kind < 2; ++kind) {
             for (int32_t head = 0; head < kv_heads; ++head) {
               for (int32_t key = 0; key < static_cast<int32_t>(kv_bucket); key += 64) {
-                const auto lanes = std::clamp(valid - key, 0, 64);
-                tasks.push_back({block.first_row, first + key, lanes,
+                const auto lanes = std::clamp(candidate.valid - key, 0, 64);
+                tasks.push_back({block.first_row, kv_start_pos + candidate.first + key, lanes,
                                  static_cast<int32_t>((kind * kv_heads + head) * slots_)});
               }
             }
@@ -216,9 +258,8 @@ at::Tensor PagedMetadata::attention_plan(int64_t query_heads, int64_t kv_heads, 
       done += count;
     }
   }
-  TORCH_CHECK(!tasks.empty() && tasks.size() <= (uint64_t{1} << 21),
-              "GaudiRT attention: too many tile-index tasks");
-  const auto task_bucket = std::bit_ceil(static_cast<uint32_t>(tasks.size()));
+  TORCH_CHECK(tasks.size() <= (uint64_t{1} << 21), "GaudiRT attention: too many tile-index tasks");
+  const auto task_bucket = tasks.empty() ? uint32_t{0} : std::bit_ceil(static_cast<uint32_t>(tasks.size()));
   const uint64_t index_bytes = static_cast<uint64_t>(task_bucket) * 64 * sizeof(int32_t);
   std::vector<int32_t> host(static_cast<size_t>(task_bucket) * 4, 0);
   for (size_t i = 0; i < tasks.size(); ++i)
@@ -239,8 +280,14 @@ at::Tensor PagedMetadata::attention_plan(int64_t query_heads, int64_t kv_heads, 
       ++sequence_index;
     const auto& sequence = sequences_[sequence_index];
     std::vector<int32_t> positions(block.query_bucket, 0);
-    for (int32_t i = 0; i < block.valid_rows; ++i)
-      positions[i] = sequence.prefix + block.first_row - sequence.row + i;
+    const bool remapped_decode = (normalized_window > 0 && block.valid_rows == 1 && !block.tiles.empty());
+    if (remapped_decode) {
+      const auto& last_tile = block.tiles.back();
+      positions[0] = last_tile.first_key + last_tile.valid_keys - 1;
+    } else {
+      for (int32_t i = 0; i < block.valid_rows; ++i)
+        positions[i] = sequence.prefix + block.first_row - sequence.row + i;
+    }
     block.positions_offset = append_aligned(positions);
     for (auto& tile : block.tiles)
       tile.header_offset = append_aligned({block.valid_rows, tile.valid_keys, tile.first_key});
@@ -285,13 +332,13 @@ at::Tensor PagedMetadata::attention_plan(int64_t query_heads, int64_t kv_heads, 
              sizeof(int32_t), compute, DRAM_TO_DRAM);
     finish_pending_metadata();
   }
-  const auto map_address = address_of(mapping_, *ctx);
-  const auto request_address = address_of(requests_, *ctx);
-  ctx->allocator.record_stream(map_address, compute);
-  ctx->allocator.record_stream(request_address, compute);
-  {
+  if (!tasks.empty()) {
+    const auto map_address = address_of(mapping_, *ctx);
+    const auto request_address = address_of(requests_, *ctx);
+    ctx->allocator.record_stream(map_address, compute);
+    ctx->allocator.record_stream(request_address, compute);
     std::lock_guard lock(ctx->cold_mutex);
-    auto& recipe = indices_recipe(*ctx, bucket_, task_bucket);
+    auto& recipe = indices_recipe(*ctx, bucket_, task_bucket, static_cast<uint64_t>(mapping_.numel()));
     std::unique_ptr<TemporaryDevice> workspace;
     if (recipe.workspace) workspace = std::make_unique<TemporaryDevice>(*ctx, recipe.workspace);
     auto bindings = recipe.tensors;
@@ -302,7 +349,11 @@ at::Tensor PagedMetadata::attention_plan(int64_t query_heads, int64_t kv_heads, 
     TORCH_CHECK(synLaunch(compute, bindings.data(), bindings.size(), workspace ? workspace->address : 0,
                           recipe.recipe, 0) == synSuccess, "GaudiRT attention: tile-index launch failed");
   }
-  attention_plan_ = tensor;
+  if (normalized_window <= 0) {
+    attention_plan_ = tensor;
+  } else {
+    swa_attention_plans_.emplace_back(normalized_window, tensor);
+  }
   return tensor;
 }
 

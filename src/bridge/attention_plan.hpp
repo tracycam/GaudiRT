@@ -68,6 +68,7 @@ struct AttentionPlan {
   synStreamHandle stream;
   size_t staging_slot = 0;
   int64_t rows, slots, query_heads, kv_heads, head_dim;
+  int64_t sliding_window = -1;
   std::vector<AttentionBlock> blocks;
 };
 

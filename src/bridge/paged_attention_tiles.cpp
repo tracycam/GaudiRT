@@ -16,6 +16,13 @@
 namespace gaudirt::generic {
 using namespace runtime;
 namespace {
+struct TileSoftmaxParameters {
+  float scale;
+  int32_t block_rows;
+  float softcap;
+  int32_t sliding_window;
+};
+
 uint64_t align(uint64_t bytes) { return (bytes + 255) & ~uint64_t{255}; }
 
 struct GraphKey {
@@ -40,7 +47,7 @@ ColdRecipe& store_recipe(Context& ctx, const AttentionPlan& plan, uint32_t rows)
   auto header = graph.tensor(syn_type_int32, {3}, 3);
   auto old_pool = graph.tensor(syn_type_bf16, {d, 2 * kPagedKvDescriptorSlots * kv_heads}, 4);
   auto pool = graph.tensor(syn_type_bf16, {d, 2 * kPagedKvDescriptorSlots * kv_heads}, 5, 4);
-  graph.node({"gk_kv_store_head_major_bf16_v1", {key, value, locations, header, old_pool}, {pool}, {}});
+  graph.node({kv_store_guid(d), {key, value, locations, header, old_pool}, {pool}, {}});
   graph.compile(ctx.cache, graph_key.key);
   auto [it, inserted] = ctx.cold_recipes.emplace(graph_key.key, std::move(recipe));
   TORCH_CHECK(inserted, "GaudiRT attention: duplicate KV store recipe");
@@ -48,7 +55,8 @@ ColdRecipe& store_recipe(Context& ctx, const AttentionPlan& plan, uint32_t rows)
 }
 
 ColdRecipe& chunk_recipe(Context& ctx, const AttentionPlan& plan, const AttentionBlock& block, float scale,
-                         uint32_t chunk_tiles, bool first_chunk, bool finalize_last, bool direct_kv) {
+                         float softcap, int32_t sliding_window, uint32_t chunk_tiles, bool first_chunk,
+                         bool finalize_last, bool direct_kv) {
   TORCH_CHECK(chunk_tiles >= 1 && chunk_tiles <= kMaxFusedAttentionTiles &&
               (!first_chunk || chunk_tiles >= 2),
               "GaudiRT attention: invalid fused tile chunk");
@@ -56,9 +64,10 @@ ColdRecipe& chunk_recipe(Context& ctx, const AttentionPlan& plan, const Attentio
   const uint64_t d = plan.head_dim, heads = plan.query_heads, kv_heads = plan.kv_heads;
   const uint64_t group = heads / kv_heads, stats_rows = (rows + 63) / 64 * 64;
   std::ostringstream signature;
-  signature << (direct_kv ? "chunk_direct_v6:" : "chunk_paged_v6:")
+  signature << (direct_kv ? "chunk_direct_v7:" : "chunk_paged_v7:")
             << rows << ':' << kv << ':' << d << ':' << heads << ':' << kv_heads << ':'
-            << std::bit_cast<uint32_t>(scale) << ':' << chunk_tiles << ':'
+            << std::bit_cast<uint32_t>(scale) << ':' << std::bit_cast<uint32_t>(softcap) << ':'
+            << sliding_window << ':' << chunk_tiles << ':'
             << (first_chunk ? 1 : 0) << ':' << (finalize_last ? 1 : 0);
   GraphKey graph_key(signature.str(), rows);
   if (auto found = ctx.cold_recipes.find(graph_key.key); found != ctx.cold_recipes.end()) return *found->second;
@@ -145,10 +154,12 @@ ColdRecipe& chunk_recipe(Context& ctx, const AttentionPlan& plan, const Attentio
     auto next_m = write_persistent_state ? out_m : graph.tensor(syn_type_float, {stats_rows, group, kv_heads}, -1);
     auto next_l = write_persistent_state ? out_l : graph.tensor(syn_type_float, {stats_rows, group, kv_heads}, -1);
     auto next_o = write_persistent_state ? out_o : graph.tensor(syn_type_float, {d, rows, group, kv_heads}, -1);
+    const auto softmax_params = pack_node_params(
+        TileSoftmaxParameters{scale, static_cast<int32_t>(rows), softcap, sliding_window});
     if (first_chunk && t == 0) {
       graph.node({"batch_gemm", {query, kv_tiles[0]}, {score4}, synGEMMParams{false, true}});
       graph.node({"gk_attn_tile_softmax_bf16_v1", {score4, positions, headers[t]},
-                  {probability4, next_m, next_l}, scale});
+                  {probability4, next_m, next_l}, softmax_params});
       graph.node({"batch_gemm", {probability4, kv_tiles[1]}, {next_o}, synGEMMParams{false, false}});
     } else {
       auto tile_m = graph.tensor(syn_type_float, {stats_rows, group, kv_heads}, -1);
@@ -157,7 +168,7 @@ ColdRecipe& chunk_recipe(Context& ctx, const AttentionPlan& plan, const Attentio
       const int32_t prev_unscaled = (first_chunk && t == 1) ? 1 : 0;
       graph.node({"batch_gemm", {query, kv_tiles[0]}, {score4}, synGEMMParams{false, true}});
       graph.node({"gk_attn_tile_softmax_bf16_v1", {score4, positions, headers[t]},
-                  {probability4, tile_m, tile_l}, scale});
+                  {probability4, tile_m, tile_l}, softmax_params});
       graph.node({"batch_gemm", {probability4, kv_tiles[1]}, {tile_o4}, synGEMMParams{false, false}});
       graph.node({"gk_attn_online_merge_f32_v1", {cur_m, cur_l, cur_o, tile_m, tile_l, tile_o4},
                   {next_m, next_l, next_o}, prev_unscaled});
@@ -184,22 +195,28 @@ ColdRecipe& chunk_recipe(Context& ctx, const AttentionPlan& plan, const Attentio
 }
 
 ColdRecipe& cached_chunk_recipe(Context& ctx, const AttentionPlan& plan, const AttentionBlock& block, float scale,
-                                uint32_t chunk_tiles, bool first_chunk, bool finalize_last, bool direct_kv) {
+                                float softcap, int32_t sliding_window, uint32_t chunk_tiles, bool first_chunk,
+                                bool finalize_last, bool direct_kv) {
   struct TiledRecipeCache {
     uint64_t generation = 0;
-    uint32_t rows = 0, kv = 0, scale = 0;
+    uint32_t rows = 0, kv = 0, scale = 0, softcap = 0;
+    int32_t sliding_window = -1;
     int64_t heads = 0, kv_heads = 0, head_dim = 0;
     std::array<ColdRecipe*, kMaxFusedAttentionTiles * 8> entries{};
   };
   thread_local TiledRecipeCache cache;
   const auto scale_bits = std::bit_cast<uint32_t>(scale);
+  const auto softcap_bits = std::bit_cast<uint32_t>(softcap);
   if (cache.generation != ctx.generation || cache.rows != block.query_bucket || cache.kv != block.kv_bucket ||
-      cache.scale != scale_bits || cache.heads != plan.query_heads || cache.kv_heads != plan.kv_heads ||
-      cache.head_dim != plan.head_dim) {
+      cache.scale != scale_bits || cache.softcap != softcap_bits ||
+      cache.sliding_window != sliding_window || cache.heads != plan.query_heads ||
+      cache.kv_heads != plan.kv_heads || cache.head_dim != plan.head_dim) {
     cache.generation = ctx.generation;
     cache.rows = block.query_bucket;
     cache.kv = block.kv_bucket;
     cache.scale = scale_bits;
+    cache.softcap = softcap_bits;
+    cache.sliding_window = sliding_window;
     cache.heads = plan.query_heads;
     cache.kv_heads = plan.kv_heads;
     cache.head_dim = plan.head_dim;
@@ -209,7 +226,8 @@ ColdRecipe& cached_chunk_recipe(Context& ctx, const AttentionPlan& plan, const A
                      (direct_kv ? 4 : 0) + (first_chunk ? 2 : 0) + (finalize_last ? 1 : 0);
   if (auto* found = cache.entries[idx]) return *found;
   std::lock_guard lock(ctx.cold_mutex);
-  auto& recipe = chunk_recipe(ctx, plan, block, scale, chunk_tiles, first_chunk, finalize_last, direct_kv);
+  auto& recipe = chunk_recipe(ctx, plan, block, scale, softcap, sliding_window, chunk_tiles,
+                              first_chunk, finalize_last, direct_kv);
   cache.entries[idx] = &recipe;
   return recipe;
 }
@@ -242,7 +260,8 @@ void launch_layer_kv_store(Context& ctx, const AttentionPlan& plan, uint64_t key
 }
 
 void launch_tiled_attention(Context& ctx, const AttentionPlan& plan, const AttentionBlock& block,
-                            const TiledAttentionInputs& input, float scale) {
+                            const TiledAttentionInputs& input, float scale,
+                            float softcap, int32_t sliding_window) {
   const size_t total_tiles = block.tiles.size();
   TORCH_CHECK(total_tiles > 1, "GaudiRT attention: multi-tile launch requires at least two KV tiles");
   const bool direct_kv = input.direct_key != 0;
@@ -263,21 +282,22 @@ void launch_tiled_attention(Context& ctx, const AttentionPlan& plan, const Atten
   ColdRecipe* middle_recipe = nullptr;
   ColdRecipe* last_recipe = nullptr;
   if (num_chunks == 1) {
-    first_recipe = &cached_chunk_recipe(ctx, plan, block, scale,
+    first_recipe = &cached_chunk_recipe(ctx, plan, block, scale, softcap, sliding_window,
                                         static_cast<uint32_t>(total_tiles), true, true, direct_kv);
     workspace_size = first_recipe->workspace;
   } else {
-    first_recipe = &cached_chunk_recipe(ctx, plan, block, scale,
+    first_recipe = &cached_chunk_recipe(ctx, plan, block, scale, softcap, sliding_window,
                                         static_cast<uint32_t>(kMaxFusedAttentionTiles), true, false, direct_kv);
     workspace_size = first_recipe->workspace;
     if (num_chunks > 2) {
-      middle_recipe = &cached_chunk_recipe(ctx, plan, block, scale,
+      middle_recipe = &cached_chunk_recipe(ctx, plan, block, scale, softcap, sliding_window,
                                            static_cast<uint32_t>(kMaxFusedAttentionTiles), false, false, direct_kv);
       workspace_size = std::max(workspace_size, middle_recipe->workspace);
     }
     const uint32_t tail_tiles = static_cast<uint32_t>(
         total_tiles - (num_chunks - 1) * kMaxFusedAttentionTiles);
-    last_recipe = &cached_chunk_recipe(ctx, plan, block, scale, tail_tiles, false, true, direct_kv);
+    last_recipe = &cached_chunk_recipe(ctx, plan, block, scale, softcap, sliding_window,
+                                       tail_tiles, false, true, direct_kv);
     workspace_size = std::max(workspace_size, last_recipe->workspace);
   }
 

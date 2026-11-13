@@ -17,6 +17,8 @@
 
 namespace gaudirt::generic {
 
+inline constexpr int64_t kMaxBucketRows = 8192;
+
 struct Context;
 struct ColdRecipe;
 
@@ -50,7 +52,7 @@ class BucketProgram {
     explicit CachedContext(uint64_t id) : generation(id) {}
     uint64_t generation;
     CachedContext* next = nullptr;
-    std::array<std::atomic<ColdRecipe*>, 13> recipes{};
+    std::array<std::atomic<ColdRecipe*>, 14> recipes{};
   };
 
   struct StaticInput {

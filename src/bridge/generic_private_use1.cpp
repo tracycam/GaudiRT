@@ -17,11 +17,13 @@
 #include "layout_copy.hpp"
 #include "eager_copy.hpp"
 #include "eager_index.hpp"
+#include "eager_ops.hpp"
 #include "eager_scheduler.hpp"
 #include "paged_metadata.hpp"
 #include "paged_attention.hpp"
 #include "paged_kv_pool.hpp"
 #include "paged_slot_allocator.hpp"
+#include "sampler_vocab.hpp"
 #include "temporaries.hpp"
 
 #include <perf_lib_layer_params.h>
@@ -52,7 +54,7 @@ using namespace runtime;
 std::optional<at::Tensor> prepare_strided_input(const at::Tensor& input) {
   const auto active = current_device_index();
   TORCH_CHECK(input.device().type() == c10::kPrivateUse1 && input.device().index() == active &&
-              input.dim() >= 1 && input.dim() <= 5 && input.size(0) > 0 && input.size(0) <= 4096,
+              input.dim() >= 1 && input.dim() <= 5 && input.size(0) > 0 && input.size(0) <= kMaxBucketRows,
               "GaudiRT FX: invalid dynamic input");
   if (input.is_contiguous()) {
     std::vector<int64_t> strides(input.dim());
@@ -225,7 +227,7 @@ at::Tensor bucket_linear(const at::Tensor& input, const at::Tensor& weight,
               (input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kFloat),
               "GaudiRT: bucket GEMM supports matching BF16 or FP32 tensors");
   const auto m = input.size(0), k = input.size(1), n = weight.size(0);
-  TORCH_CHECK(m > 0 && m <= 4096 && k > 0 && n > 0, "GaudiRT: invalid bucket GEMM shape");
+  TORCH_CHECK(m > 0 && m <= kMaxBucketRows && k > 0 && n > 0, "GaudiRT: invalid bucket GEMM shape");
   if (bias) {
     TORCH_CHECK(bias->device() == input.device() && bias->scalar_type() == input.scalar_type() &&
                 bias->dim() == 1 && bias->size(0) == n,
@@ -241,25 +243,6 @@ at::Tensor bucket_linear(const at::Tensor& input, const at::Tensor& weight,
       std::move(roles),
       {FxNode::linear(0, 1, bias ? std::optional<int64_t>(2) : std::nullopt, true)});
   return program.run(inputs)[0];
-}
-
-at::Tensor bucket_rms_norm(const at::Tensor& input, const at::Tensor& weight, double epsilon) {
-  const float eps = static_cast<float>(epsilon);
-  TORCH_CHECK(std::isfinite(epsilon) && std::isfinite(eps) && eps > 0,
-              "GaudiRT: RMSNorm epsilon must be a positive finite FP32 value");
-  BucketProgram program({1, 0}, {FxNode::norm(0, 1, eps)});
-  return program.run({input, weight})[0];
-}
-
-std::tuple<at::Tensor, at::Tensor> bucket_fused_add_rms_norm(
-    const at::Tensor& input, const at::Tensor& residual, const at::Tensor& weight, double epsilon) {
-  const float eps = static_cast<float>(epsilon);
-  TORCH_CHECK(std::isfinite(epsilon) && std::isfinite(eps) && eps > 0,
-              "GaudiRT: fused RMSNorm epsilon must be a positive finite FP32 value");
-  BucketProgram program({1, 1, 0}, {FxNode::fused_norm(0, 1, 2, eps), FxNode::unary(FxOp::fused_residual, 3)},
-                        {3, 4});
-  auto result = program.run({input, residual, weight});
-  return {result[0], result[1]};
 }
 
 at::Tensor bucket_silu_and_mul(const at::Tensor& input) {
@@ -293,14 +276,20 @@ at::Tensor bucket_fp8(const at::Tensor& input, const at::Tensor& weight,
 
 at::Tensor paged_attn(const at::Tensor& query, const at::Tensor& key, const at::Tensor& value,
                       const at::Tensor& key_pool, const at::Tensor& value_pool,
-                      c10::intrusive_ptr<PagedMetadata> metadata, int64_t head_dim, double scale) {
+                      c10::intrusive_ptr<PagedMetadata> metadata, int64_t head_dim, double scale,
+                      double softcap = 0.0, int64_t sliding_window = -1) {
   TORCH_CHECK(metadata, "GaudiRT paged attention: metadata is required");
-  TORCH_CHECK(query.dim() == 2 && key_pool.dim() == 3 && (head_dim == 64 || head_dim == 128),
+  TORCH_CHECK(query.dim() == 2 && key_pool.dim() == 3 &&
+              (head_dim == 64 || head_dim == 128 || head_dim == 256),
               "GaudiRT paged attention: invalid tensor ranks or head dimension");
+  const auto q_heads = query.size(1) / head_dim;
+  const auto kv_heads = key_pool.size(1);
+  auto plan = sliding_window > 0
+      ? metadata->attention_plan_for(q_heads, kv_heads, head_dim, sliding_window)
+      : metadata->attention_plan(q_heads, kv_heads, head_dim);
   return paged_attn_validated(query, key, value, key_pool, value_pool,
                               metadata->row_locations(), metadata->row_requests(), metadata->rotary_positions(),
-                              metadata->attention_plan(query.size(1) / head_dim, key_pool.size(1), head_dim),
-                              metadata->rotary_header(), head_dim, scale);
+                              plan, metadata->rotary_header(), head_dim, scale, softcap, sliding_window);
 }
 
 ColdRecipe& rotary_recipe(Context& ctx, uint32_t bucket, uint64_t q_width,
@@ -346,7 +335,7 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_validated(const at::Tensor& 
   for (const auto& tensor : {query, key, cache})
     TORCH_CHECK(tensor.device().type() == c10::kPrivateUse1 && tensor.device().index() == ctx->device_index &&
                 tensor.scalar_type() == at::kBFloat16, "GaudiRT rotary: expected gaudirt BF16 tensors");
-  TORCH_CHECK(query.dim() == 2 && key.dim() == 2 && query.size(0) > 0 && query.size(0) <= 4096 &&
+  TORCH_CHECK(query.dim() == 2 && key.dim() == 2 && query.size(0) > 0 && query.size(0) <= kMaxBucketRows &&
               key.size(0) == query.size(0) && query.size(1) > 0 && key.size(1) > 0 &&
               query.size(1) <= INT32_MAX && key.size(1) <= INT32_MAX &&
               query.size(1) % head_dim == 0 && key.size(1) % head_dim == 0,
@@ -456,39 +445,55 @@ TORCH_LIBRARY(gaudirt, m) {
       .def("row_requests", &gaudirt::generic::PagedMetadata::row_requests)
       .def("request_mapping", &gaudirt::generic::PagedMetadata::request_mapping)
       .def("attention_plan", &gaudirt::generic::PagedMetadata::attention_plan)
+      .def("attention_plan_for", &gaudirt::generic::PagedMetadata::attention_plan_for)
       .def("last_token_indices", &gaudirt::generic::PagedMetadata::last_token_indices)
       .def("token_ids", &gaudirt::generic::PagedMetadata::token_ids)
       .def("vocabulary", &gaudirt::generic::PagedMetadata::vocabulary);
   m.def("rms_norm(Tensor input, Tensor weight, float epsilon) -> Tensor");
   m.def("fused_add_rms_norm(Tensor input, Tensor residual, Tensor weight, float epsilon) -> (Tensor, Tensor)");
+  m.def("gemma_rms_norm(Tensor input, Tensor weight, float epsilon) -> Tensor");
+  m.def("fused_add_gemma_rms_norm(Tensor input, Tensor residual, Tensor weight, float epsilon) -> (Tensor, Tensor)");
   m.def("silu_and_mul(Tensor input) -> Tensor");
+  m.def("gelu_and_mul(Tensor input, str approximate=\"none\") -> Tensor");
   m.def("block_fp8_linear(Tensor input, Tensor weight, Tensor scales, Tensor? bias=None) -> Tensor");
   m.def("fp8_linear(Tensor input, Tensor weight, Tensor scales, Tensor? bias=None) -> Tensor");
   m.def("paged_attn(Tensor query, Tensor key, Tensor value, Tensor(a!) key_pool, Tensor(b!) value_pool, "
-        "__torch__.torch.classes.gaudirt.PagedMetadata metadata, int head_dim, float scale) -> Tensor");
+        "__torch__.torch.classes.gaudirt.PagedMetadata metadata, int head_dim, float scale, "
+        "float softcap=0.0, int sliding_window=-1) -> Tensor");
   m.def("_paged_attn_validated(Tensor query, Tensor key, Tensor value, Tensor(a!) key_pool, Tensor(b!) value_pool, "
         "Tensor locations, Tensor requests, Tensor positions, Tensor mapping, Tensor header, "
-        "int head_dim, float scale) -> Tensor");
+        "int head_dim, float scale, float softcap=0.0, int sliding_window=-1) -> Tensor");
   m.def("rotary_embedding(Tensor query, Tensor key, Tensor cache, "
         "__torch__.torch.classes.gaudirt.PagedMetadata metadata, int head_dim, int rotary_dim, bool is_neox) "
         "-> (Tensor, Tensor)");
+  m.def("rotary_embedding_positions(Tensor query, Tensor key, Tensor cache, Tensor positions, "
+        "int head_dim, int rotary_dim, bool is_neox) -> (Tensor, Tensor)");
   m.def("_rotary_embedding_validated(Tensor query, Tensor key, Tensor cache, Tensor positions, "
         "Tensor header, int context, int head_dim, int rotary_dim, bool is_neox) -> (Tensor, Tensor)");
+  m.def("softcap_(Tensor(a!) logits, float cap) -> Tensor(a!)");
+  m.def("sample_from_logits(Tensor logits, Tensor temperatures, Tensor top_ps, Tensor top_ks, Tensor min_ps, "
+        "Tensor? seeds=None, Tensor? positions=None, bool nan_to_neg_inf=True) -> Tensor");
   m.def("_index_select_validated(Tensor input, int axis, Tensor indices) -> Tensor");
   m.def("_index_put_validated_(Tensor(a!) input, Tensor indices, Tensor values) -> Tensor(a!)");
   m.def("_advance_decode_lengths(Tensor seq_lens, Tensor orig_seq_lens) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(gaudirt, PrivateUse1, m) {
-  m.impl("rms_norm", TORCH_FN(gaudirt::generic::bucket_rms_norm));
-  m.impl("fused_add_rms_norm", TORCH_FN(gaudirt::generic::bucket_fused_add_rms_norm));
+  m.impl("rms_norm", TORCH_FN(gaudirt::generic::rms_norm));
+  m.impl("fused_add_rms_norm", TORCH_FN(gaudirt::generic::fused_add_rms_norm));
+  m.impl("gemma_rms_norm", TORCH_FN(gaudirt::generic::gemma_rms_norm));
+  m.impl("fused_add_gemma_rms_norm", TORCH_FN(gaudirt::generic::fused_add_gemma_rms_norm));
   m.impl("silu_and_mul", TORCH_FN(gaudirt::generic::bucket_silu_and_mul));
+  m.impl("gelu_and_mul", TORCH_FN(gaudirt::generic::gelu_and_mul));
   m.impl("block_fp8_linear", TORCH_FN(gaudirt::generic::bucket_block_fp8));
   m.impl("fp8_linear", TORCH_FN(gaudirt::generic::bucket_fp8));
   m.impl("paged_attn", TORCH_FN(gaudirt::generic::paged_attn));
   m.impl("_paged_attn_validated", TORCH_FN(gaudirt::generic::paged_attn_validated));
   m.impl("rotary_embedding", TORCH_FN(gaudirt::generic::rotary_embedding));
+  m.impl("rotary_embedding_positions", TORCH_FN(gaudirt::generic::rotary_embedding_positions));
   m.impl("_rotary_embedding_validated", TORCH_FN(gaudirt::generic::rotary_embedding_validated));
+  m.impl("softcap_", TORCH_FN(gaudirt::generic::softcap_));
+  m.impl("sample_from_logits", TORCH_FN(gaudirt::generic::sample_from_logits));
   m.impl("_index_select_validated", TORCH_FN(gaudirt::generic::index_select_validated));
   m.impl("_index_put_validated_", TORCH_FN(gaudirt::generic::index_put_validated));
   m.impl("_advance_decode_lengths", TORCH_FN(gaudirt::generic::advance_decode_lengths));
@@ -530,6 +535,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("_reshape_view", &gaudirt::generic::reshape_view);
   m.def("_transpose_feature_view", &gaudirt::generic::transpose_feature_view);
   m.attr("_rotary_static_rows") = gaudirt::generic::kRotaryStaticRows;
+  m.attr("_max_bucket_rows") = gaudirt::generic::kMaxBucketRows;
   m.def("_paged_attn_kv_tile", [](int64_t) { return static_cast<int>(gaudirt::generic::kTileKvBucket); });
   m.def("bucket_linear", &gaudirt::generic::bucket_linear,
         pybind11::arg("input"), pybind11::arg("weight"), pybind11::arg("bias") = pybind11::none());
@@ -561,17 +567,47 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .value("transpose", FxOp::transpose).value("copy", FxOp::copy)
       .value("scalar_add", FxOp::scalar_add).value("scalar_sub", FxOp::scalar_sub)
       .value("scalar_mul", FxOp::scalar_mul).value("scalar_div", FxOp::scalar_div)
-      .value("block_fp8_linear", FxOp::block_fp8_linear).value("fp8_linear", FxOp::fp8_linear);
+      .value("block_fp8_linear", FxOp::block_fp8_linear).value("fp8_linear", FxOp::fp8_linear)
+      .value("ewise_unary", FxOp::ewise_unary).value("gelu_and_mul", FxOp::gelu_and_mul)
+      .value("gemma_rms_norm", FxOp::gemma_rms_norm)
+      .value("fused_add_gemma_rms_norm", FxOp::fused_add_gemma_rms_norm)
+      .value("rotary_pos", FxOp::rotary_pos)
+      .value("minimum", FxOp::minimum).value("maximum", FxOp::maximum).value("where", FxOp::where)
+      .value("eq", FxOp::eq).value("ne", FxOp::ne).value("lt", FxOp::lt)
+      .value("le", FxOp::le).value("gt", FxOp::gt).value("ge", FxOp::ge)
+      .value("scalar_eq", FxOp::scalar_eq).value("scalar_ne", FxOp::scalar_ne)
+      .value("scalar_lt", FxOp::scalar_lt).value("scalar_le", FxOp::scalar_le)
+      .value("scalar_gt", FxOp::scalar_gt).value("scalar_ge", FxOp::scalar_ge)
+      .value("isnan", FxOp::isnan).value("logical_and", FxOp::logical_and)
+      .value("logical_or", FxOp::logical_or).value("logical_not", FxOp::logical_not)
+      .value("bitwise_and", FxOp::bitwise_and).value("bitwise_or", FxOp::bitwise_or)
+      .value("expand", FxOp::expand).value("slice_dim", FxOp::slice_dim)
+      .value("sum_dim", FxOp::sum_dim).value("mean_dim", FxOp::mean_dim).value("amax_dim", FxOp::amax_dim)
+      .value("softmax", FxOp::softmax).value("log_softmax", FxOp::log_softmax)
+      .value("layer_norm", FxOp::layer_norm).value("full_like", FxOp::full_like);
   pybind11::class_<FxNode>(m, "FxNode")
       .def_readonly("op", &FxNode::op)
       .def_static("unary", &FxNode::unary).def_static("binary", &FxNode::binary)
+      .def_static("ternary", &FxNode::ternary)
       .def_static("linear", &FxNode::linear).def_static("slice", &FxNode::slice)
+      .def_static("slice_dim", &FxNode::slice_dim)
       .def_static("block_fp8", &FxNode::block_fp8)
       .def_static("fp8", &FxNode::fp8)
-      .def_static("norm", &FxNode::norm).def_static("fused_norm", &FxNode::fused_norm)
-      .def_static("rotary", &FxNode::rotary).def_static("cast", &FxNode::cast)
-      .def_static("concat", &FxNode::concat).def_static("reshape", &FxNode::reshape)
+      .def_static("norm", &FxNode::norm).def_static("gemma_norm", &FxNode::gemma_norm)
+      .def_static("fused_norm", &FxNode::fused_norm)
+      .def_static("fused_gemma_norm", &FxNode::fused_gemma_norm)
+      .def_static("rotary", &FxNode::rotary).def_static("rotary_pos", &FxNode::rotary_pos)
+      .def_static("cast", &FxNode::cast).def_static("cast_dtype", &FxNode::cast_dtype)
+      .def_static("concat", &FxNode::concat).def_static("concat_dim", &FxNode::concat_dim)
+      .def_static("reshape", &FxNode::reshape).def_static("expand", &FxNode::expand)
       .def_static("transpose", &FxNode::transpose).def_static("scalar", &FxNode::scalar)
+      .def_static("ewise_unary", &FxNode::ewise_unary, pybind11::arg("input"),
+                  pybind11::arg("op_code"), pybind11::arg("alpha") = 0.f, pybind11::arg("beta") = 0.f)
+      .def_static("gelu_and_mul", &FxNode::gelu_and_mul)
+      .def_static("reduce", &FxNode::reduce)
+      .def_static("softmax", &FxNode::softmax)
+      .def_static("layer_norm", &FxNode::layer_norm)
+      .def_static("full_like", &FxNode::full_like)
       .def_static("shard_embedding", &FxNode::shard_embedding);
   pybind11::class_<gaudirt::generic::BucketProgram, std::shared_ptr<gaudirt::generic::BucketProgram>>(m, "BucketProgram")
       .def(pybind11::init<std::vector<int64_t>, std::vector<FxNode>, std::vector<int64_t>>())
@@ -591,7 +627,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   pybind11::class_<SegmentedRunner>(m, "SegmentedRunner")
       .def(pybind11::init<size_t>())
       .def("add_program", &SegmentedRunner::add_program)
-      .def("add_attention", &SegmentedRunner::add_attention)
+      .def("add_attention", &SegmentedRunner::add_attention,
+           pybind11::arg("inputs"), pybind11::arg("head_dim"), pybind11::arg("scale"),
+           pybind11::arg("softcap") = 0.0, pybind11::arg("sliding_window") = -1)
       .def("add_collective_start", &SegmentedRunner::add_collective_start)
       .def("add_collective_wait", &SegmentedRunner::add_collective_wait)
       .def("schedule_summary", &SegmentedRunner::schedule_summary)

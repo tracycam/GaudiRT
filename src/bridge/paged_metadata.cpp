@@ -89,7 +89,7 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& requ
               locations.size(0) == requests.size(0) && locations.size(0) == positions.size(0),
               "GaudiRT: invalid paged metadata ranks or row counts");
   const int64_t m = locations.size(0), request_count = mapping.size(0), context = mapping.size(1);
-  TORCH_CHECK(m > 0 && m <= 4096 && slots > 0 && slots <= INT32_MAX &&
+  TORCH_CHECK(m > 0 && m <= kMaxRows && slots > 0 && slots <= INT32_MAX &&
               request_count > 0 && request_count <= INT32_MAX && context > 0 && context <= INT32_MAX &&
               mapping.numel() <= INT32_MAX, "GaudiRT: paged metadata dimensions outside supported range");
   const auto read = [](const at::Tensor& tensor, int64_t index) -> int64_t {
@@ -186,11 +186,12 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
     TORCH_CHECK(tensor.device().type() == c10::kPrivateUse1 && tensor.device().index() == expected_dev &&
                 tensor.dim() == 1 && (tensor.scalar_type() == at::kInt || tensor.scalar_type() == at::kLong),
                 "GaudiRT device metadata: expected gaudirt int32 or int64 vectors");
+  const bool positions_on_cpu = fuse_scheduler_plan && positions.device().is_cpu();
+  const bool positions_on_device =
+      positions.device().type() == c10::kPrivateUse1 && positions.device().index() == expected_dev;
   TORCH_CHECK(positions.dim() == 1 &&
-              ((fuse_scheduler_plan && positions.device().is_cpu() && positions.scalar_type() == at::kLong &&
-                positions.is_contiguous()) ||
-               (!fuse_scheduler_plan && positions.device().type() == c10::kPrivateUse1 &&
-                positions.device().index() == expected_dev &&
+              ((positions_on_cpu && positions.scalar_type() == at::kLong && positions.is_contiguous()) ||
+               (positions_on_device &&
                 (positions.scalar_type() == at::kInt || positions.scalar_type() == at::kLong))),
               "GaudiRT device metadata: invalid position input");
   TORCH_CHECK(mapping.device().type() == c10::kPrivateUse1 && mapping.device().index() == expected_dev &&
@@ -199,13 +200,12 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
   const int64_t m = locations.numel(), batch = batch_requests.numel();
   const int64_t request_count = mapping.size(0), context = mapping.size(1);
   const bool has_tokens = token_ids.defined();
-  TORCH_CHECK(!scheduler_owned || has_tokens, "GaudiRT: scheduler metadata requires token IDs");
   TORCH_CHECK((has_tokens && token_ids.device().type() == c10::kPrivateUse1 && token_ids.device().index() == expected_dev &&
                token_ids.dim() == 1 && token_ids.numel() == m &&
                (token_ids.scalar_type() == at::kInt || token_ids.scalar_type() == at::kLong) &&
                vocabulary > 0 && vocabulary <= INT32_MAX) || (!has_tokens && vocabulary == 0),
               "GaudiRT device metadata: invalid token ID inputs or vocabulary");
-  TORCH_CHECK(m > 0 && m <= 4096 && positions.numel() == m && batch > 0 && batch <= m &&
+  TORCH_CHECK(m > 0 && m <= kMaxRows && positions.numel() == m && batch > 0 && batch <= m &&
               static_cast<int64_t>(prefixes.size()) == batch && static_cast<int64_t>(lengths.size()) == batch &&
               slots > 0 && slots <= INT32_MAX && request_count > 0 && request_count <= INT32_MAX &&
               context > 0 && context <= INT32_MAX && mapping.numel() <= INT32_MAX,
@@ -229,7 +229,7 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
     last_token_indices[index] = static_cast<int32_t>(cursor - 1);
   }
   TORCH_CHECK(cursor == m, "GaudiRT device metadata: sequence lengths do not cover token rows");
-  if (fuse_scheduler_plan) {
+  if (positions_on_cpu) {
     const auto* host_positions = positions.data_ptr<int64_t>();
     for (int64_t row = 0; row < m; ++row)
       TORCH_CHECK(host_positions[row] == info[1 + bucket + row],
@@ -252,7 +252,7 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
   const auto header_offset = reserve(1);
   const auto info_offset = reserve(info.size());
   const auto last_offset = reserve(batch);
-  const auto model_positions_offset = fuse_scheduler_plan ? reserve(2 * bucket) : 0;
+  const auto model_positions_offset = positions_on_cpu ? reserve(2 * bucket) : 0;
   const auto staged_words = cursor_words;
   const auto locations_offset = reserve(bucket);
   const auto requests_offset = reserve(bucket);
@@ -265,8 +265,10 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
   header_ = view(header_offset, 1);
   auto device_info = view(info_offset, info.size());
   last_token_indices_ = view(last_offset, batch);
-  if (fuse_scheduler_plan)
+  if (positions_on_cpu)
     model_positions_ = view(model_positions_offset, 2 * bucket).view(at::kLong).narrow(0, 0, m);
+  else if (fuse_scheduler_plan)
+    model_positions_ = positions;
   locations_ = view(locations_offset, bucket);
   requests_ = view(requests_offset, bucket);
   positions_ = view(positions_offset, bucket);
@@ -289,8 +291,9 @@ PagedMetadata::PagedMetadata(const at::Tensor& locations, const at::Tensor& batc
     std::memcpy(pending_host_.data() + info_offset, info.data(), info.size() * sizeof(int32_t));
     std::memcpy(pending_host_.data() + last_offset, last_token_indices.data(),
                 last_token_indices.size() * sizeof(int32_t));
-    std::memcpy(pending_host_.data() + model_positions_offset, positions.data_ptr<int64_t>(),
-                m * sizeof(int64_t));
+    if (positions_on_cpu)
+      std::memcpy(pending_host_.data() + model_positions_offset, positions.data_ptr<int64_t>(),
+                  m * sizeof(int64_t));
     pending_locations_ = locations;
     pending_requests_ = batch_requests;
     pending_tokens_ = token_ids;

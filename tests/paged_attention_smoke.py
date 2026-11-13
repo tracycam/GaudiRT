@@ -69,7 +69,11 @@ def run_layer(query_cpu, key_cpu, value_cpu, key_base, value_base, prepared,
     query = query_cpu.to("gaudirt:0")
     key, key_storage = source_tensor(key_cpu, sliced)
     value, value_storage = source_tensor(value_cpu, sliced)
-    key_pool, value_pool = key_base.to("gaudirt:0"), value_base.to("gaudirt:0")
+    combined = gaudirt._C._allocate_paged_kv(1, SLOTS, KV_HEADS, DIM)
+    key_pool = combined[0, 0].transpose(0, 1)
+    value_pool = combined[0, 1].transpose(0, 1)
+    key_pool.copy_(key_base)
+    value_pool.copy_(value_base)
     output = torch.ops.gaudirt.paged_attn.default(query, key, value, key_pool, value_pool,
                                                    prepared, DIM, SCALE)
     assert output.shape == query_cpu.shape and output.is_contiguous()
@@ -98,7 +102,7 @@ def run_layer(query_cpu, key_cpu, value_cpu, key_base, value_base, prepared,
 
 
 def main():
-    gaudirt.initialize(hbm_bytes=256 * 1024 * 1024, pinned_bytes=4 * 1024 * 1024)
+    gaudirt.initialize(hbm_bytes=2048 * 1024 * 1024, pinned_bytes=16 * 1024 * 1024)
     payload, errors, floors, absolutes, tiled_errors = bytearray(), [], [], [], []
     for rows in ROWS:
         prepared, locations, requests, positions, mapping = metadata(rows)
@@ -123,7 +127,7 @@ def main():
                 torch.ops.gaudirt.paged_attn.default(first[4], first[5], first[6], first[7], first[7],
                                                       prepared, DIM, SCALE)
             except RuntimeError as error:
-                assert "disjoint" in str(error)
+                assert "disjoint" in str(error) or "combined storage" in str(error), error
             else:
                 raise AssertionError("overlapping KV pools were accepted")
             assert torch.equal(first[7].cpu().view(torch.int16), before_pool.view(torch.int16))

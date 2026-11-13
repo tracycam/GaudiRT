@@ -54,7 +54,7 @@ at::Tensor allocate_collective_output(
   }
 
   const int64_t out_m = out_sizes[0];
-  if (dynamic_output && out_m > 0 && out_m <= 4096) {
+  if (dynamic_output && out_m > 0 && out_m <= kMaxBucketRows) {
     int64_t width = 1;
     for (size_t d = 1; d < out_sizes.size(); ++d) width *= out_sizes[d];
     const uint32_t bucket = std::bit_ceil(static_cast<uint32_t>(out_m));
@@ -268,7 +268,8 @@ std::vector<size_t> SegmentedRunner::add_program(std::shared_ptr<BucketProgram> 
   return result;
 }
 
-size_t SegmentedRunner::add_attention(std::vector<size_t> inputs, int64_t head_dim, double scale) {
+size_t SegmentedRunner::add_attention(std::vector<size_t> inputs, int64_t head_dim, double scale,
+                                      double softcap, int64_t sliding_window) {
   TORCH_CHECK(uses_.empty() && inputs.size() == 10, "GaudiRT segments: invalid attention plan");
   for (auto input : inputs) TORCH_CHECK(input < slots_, "GaudiRT segments: unknown attention input");
   Instruction step;
@@ -277,6 +278,8 @@ size_t SegmentedRunner::add_attention(std::vector<size_t> inputs, int64_t head_d
   for (auto input : step.inputs) step.trusted.push_back(trusted_slots_[input]);
   step.head_dim = head_dim;
   step.scale = scale;
+  step.softcap = softcap;
+  step.sliding_window = sliding_window;
   step.outputs.push_back(slots_++);
   trusted_slots_.push_back(true);
   auto result = step.outputs[0];
@@ -470,7 +473,8 @@ SegmentedRunner::TracedResult SegmentedRunner::execute(const std::vector<at::Ten
       values[step.outputs[0]] = paged_attn_internal(arguments[0], arguments[1], arguments[2], arguments[3],
                                                     arguments[4], arguments[5], arguments[6], arguments[7],
                                                     arguments[8], arguments[9], step.head_dim, step.scale,
-                                                    step.trusted[0], step.trusted[1], step.trusted[2]);
+                                                    step.trusted[0], step.trusted[1], step.trusted[2],
+                                                    step.softcap, step.sliding_window);
     } else if (step.kind == StepKind::CollectiveStart) {
       auto& grp = communicator_registry(*ctx).group(step.comm_id);
       uint32_t bucket_elems = 0;

@@ -8,8 +8,10 @@
 #include <synapse_common_types.hpp>
 
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <string>
+#include <type_traits>
 #include <variant>
 #include <vector>
 
@@ -36,7 +38,16 @@ using NodeParameters = std::variant<std::monostate, synTransposeParams, synGEMMP
                                     synAxisParams, RotaryParameters, ArgmaxParameters,
                                     Fp8QuantActParameters, float, int32_t,
                                     ns_ConstantKernel::ParamsV3, ns_BroadcastNonFcd::Params,
-                                    ns_RangeKernel::Params, ns_Reduction::Params>;
+                                    ns_RangeKernel::Params, ns_Reduction::Params,
+                                    std::vector<uint8_t>>;
+
+template <typename T>
+inline std::vector<uint8_t> pack_node_params(const T& value) {
+  static_assert(std::is_trivially_copyable_v<T>, "POD node parameters must be trivially copyable");
+  std::vector<uint8_t> bytes(sizeof(T));
+  std::memcpy(bytes.data(), &value, sizeof(T));
+  return bytes;
+}
 
 struct NodeSpec {
   std::string guid;

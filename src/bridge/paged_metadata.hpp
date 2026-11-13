@@ -2,6 +2,7 @@
 #pragma once
 
 #include <ATen/core/Tensor.h>
+#include <c10/util/Optional.h>
 #include <torch/custom_class.h>
 
 #include <cstdint>
@@ -15,6 +16,7 @@ inline constexpr uint32_t kTileKvBucket = 512;
 
 class PagedMetadata : public torch::CustomClassHolder {
  public:
+  static constexpr int64_t kMaxRows = 8192;
   PagedMetadata(const at::Tensor& locations, const at::Tensor& requests,
                 const at::Tensor& positions, const at::Tensor& mapping, int64_t slots);
   PagedMetadata(const at::Tensor& locations, const at::Tensor& batch_requests,
@@ -44,19 +46,19 @@ class PagedMetadata : public torch::CustomClassHolder {
       const at::Tensor& locations, const at::Tensor& batch_requests,
       const at::Tensor& positions, const at::Tensor& mapping,
       std::vector<int64_t> prefixes, std::vector<int64_t> lengths, int64_t slots,
-      const at::Tensor& token_ids, int64_t vocabulary) {
+      const c10::optional<at::Tensor>& token_ids = c10::nullopt, int64_t vocabulary = 0) {
     return c10::make_intrusive<PagedMetadata>(locations, batch_requests, positions, mapping,
                                              std::move(prefixes), std::move(lengths), slots,
-                                             token_ids, vocabulary, true);
+                                             token_ids.value_or(at::Tensor{}), vocabulary, true);
   }
   static c10::intrusive_ptr<PagedMetadata> from_scheduler_fused(
       const at::Tensor& locations, const at::Tensor& batch_requests,
       const at::Tensor& positions, const at::Tensor& mapping,
       std::vector<int64_t> prefixes, std::vector<int64_t> lengths, int64_t slots,
-      const at::Tensor& token_ids, int64_t vocabulary,
+      const c10::optional<at::Tensor>& token_ids, int64_t vocabulary,
       int64_t query_heads, int64_t kv_heads, int64_t head_dim) {
     auto metadata = c10::make_intrusive<PagedMetadata>(locations, batch_requests, positions, mapping,
-        std::move(prefixes), std::move(lengths), slots, token_ids, vocabulary, true, true);
+        std::move(prefixes), std::move(lengths), slots, token_ids.value_or(at::Tensor{}), vocabulary, true, true);
     metadata->attention_plan(query_heads, kv_heads, head_dim);
     return metadata;
   }
@@ -73,6 +75,7 @@ class PagedMetadata : public torch::CustomClassHolder {
   at::Tensor row_requests() const { return requests_.narrow(0, 0, rows_); }
   at::Tensor request_mapping() const { return mapping_; }
   at::Tensor attention_plan(int64_t query_heads, int64_t kv_heads, int64_t head_dim);
+  at::Tensor attention_plan_for(int64_t query_heads, int64_t kv_heads, int64_t head_dim, int64_t sliding_window);
   at::Tensor last_token_indices() const {
     TORCH_CHECK(last_token_indices_.defined(), "GaudiRT: last-token indices require batched metadata");
     return last_token_indices_;
@@ -94,6 +97,7 @@ class PagedMetadata : public torch::CustomClassHolder {
   struct Sequence { int32_t row, length, prefix; };
   std::vector<Sequence> sequences_;
   at::Tensor attention_plan_;
+  std::vector<std::pair<int64_t, at::Tensor>> swa_attention_plans_;
   std::vector<int32_t> pending_host_;
   at::Tensor pending_locations_, pending_requests_, pending_tokens_, pending_info_, pending_status_,
       pending_token_status_, model_positions_;
