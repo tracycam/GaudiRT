@@ -387,8 +387,6 @@ def _partition_backend(graph_module, example_inputs):
                       torch.ops.gaudirt.rotary_embedding_positions.default)
     fused_norm_targets = (torch.ops.gaudirt.fused_add_rms_norm,
                           torch.ops.gaudirt.fused_add_rms_norm.default,
-                          torch.ops.gaudirt.fused_add_gemma_rms_norm,
-                          torch.ops.gaudirt.fused_add_gemma_rms_norm.default,
                           torch.ops.aten.native_layer_norm.default)
     paged = (torch.ops.gaudirt._paged_attn_validated, torch.ops.gaudirt._paged_attn_validated.default)
     boundary_targets = (*paged, _fx_collective)

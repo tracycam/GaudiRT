@@ -15,7 +15,7 @@ enum class FxOp {
   fused_residual, rotary, rotary_key, embedding, gather_rows, cast, sub, mul,
   div, concat, bmm, reshape, transpose, copy, scalar_add, scalar_sub,
   scalar_mul, scalar_div, block_fp8_linear, fp8_linear, shard_embedding,
-  ewise_unary, gelu_and_mul, gemma_rms_norm, fused_add_gemma_rms_norm,
+  ewise_unary, gelu_and_mul,
   rotary_pos, minimum, maximum, where, eq, ne, lt, le, gt, ge,
   scalar_eq, scalar_ne, scalar_lt, scalar_le, scalar_gt, scalar_ge,
   isnan, logical_and, logical_or, logical_not, bitwise_and, bitwise_or,
@@ -40,7 +40,7 @@ enum class FxUnaryOp : int32_t {
 
 struct FxLinear { bool transpose_weight; };
 struct FxSlice { int64_t start, width, total; };
-struct FxEpsilon { float value; };
+struct FxRmsNorm { float epsilon; float weight_offset = 0.0f; };
 struct FxRotary { int64_t context, head_dim, rotary_dim; bool neox; };
 struct FxCast { bool to_float; };
 struct FxCastDtype { int32_t scalar_type; };
@@ -55,7 +55,7 @@ struct FxReduce { int64_t dim; bool keepdim; };
 struct FxLayerNorm { bool has_weight; bool has_bias; float epsilon; };
 struct FxSliceDim { int64_t dim, start, length; };
 struct FxConstant { float float_value; int64_t int_value; int32_t scalar_type; bool is_integral; };
-using FxParameters = std::variant<std::monostate, FxLinear, FxSlice, FxEpsilon,
+using FxParameters = std::variant<std::monostate, FxLinear, FxSlice, FxRmsNorm,
                                   FxRotary, FxCast, FxCastDtype, FxShape, FxTranspose, FxScalar,
                                   FxShardEmbedding, FxUnary, FxGeluMul, FxAxis, FxReduce,
                                   FxLayerNorm, FxSliceDim, FxConstant>;
@@ -89,17 +89,12 @@ struct FxNode {
   static FxNode slice_dim(int64_t input, int64_t dim, int64_t start, int64_t length) {
     return {FxOp::slice_dim, {input}, FxSliceDim{dim, start, length}};
   }
-  static FxNode norm(int64_t input, int64_t weight, float epsilon) {
-    return {FxOp::rms_norm, {input, weight}, FxEpsilon{epsilon}};
+  static FxNode norm(int64_t input, int64_t weight, float epsilon, float weight_offset = 0.0f) {
+    return {FxOp::rms_norm, {input, weight}, FxRmsNorm{epsilon, weight_offset}};
   }
-  static FxNode gemma_norm(int64_t input, int64_t weight, float epsilon) {
-    return {FxOp::gemma_rms_norm, {input, weight}, FxEpsilon{epsilon}};
-  }
-  static FxNode fused_norm(int64_t input, int64_t residual, int64_t weight, float epsilon) {
-    return {FxOp::fused_add_rms_norm, {input, residual, weight}, FxEpsilon{epsilon}};
-  }
-  static FxNode fused_gemma_norm(int64_t input, int64_t residual, int64_t weight, float epsilon) {
-    return {FxOp::fused_add_gemma_rms_norm, {input, residual, weight}, FxEpsilon{epsilon}};
+  static FxNode fused_norm(int64_t input, int64_t residual, int64_t weight, float epsilon,
+                           float weight_offset = 0.0f) {
+    return {FxOp::fused_add_rms_norm, {input, residual, weight}, FxRmsNorm{epsilon, weight_offset}};
   }
   static FxNode rotary(int64_t q, int64_t k, int64_t cache, int64_t positions, int64_t header,
                        int64_t context, int64_t head_dim, int64_t rotary_dim, bool neox) {

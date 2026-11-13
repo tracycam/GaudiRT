@@ -50,7 +50,7 @@ def main():
     rejected((locations, requests, positions, mismatch), "does not match")
     empty = torch.empty(0, dtype=torch.int64)
     rejected((empty, empty, empty, mapping), "dimensions outside supported range")
-    too_many = torch.zeros(4097, dtype=torch.int64)
+    too_many = torch.zeros(gaudirt.MAX_BUCKET_ROWS + 1, dtype=torch.int64)
     rejected((too_many, too_many, too_many, mapping), "dimensions outside supported range")
     gc.collect()
     gaudirt.empty_cache()

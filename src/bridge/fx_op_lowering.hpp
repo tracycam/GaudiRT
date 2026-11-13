@@ -37,7 +37,8 @@ synTensor emit_cast(SynapseGraphBuilder& builder, synTensor input,
 
 synTensor emit_broadcast_to(SynapseGraphBuilder& builder, synTensor input, synDataType dtype,
                             const std::vector<uint64_t>& src_syn_dims,
-                            const std::vector<uint64_t>& dst_syn_dims);
+                            const std::vector<uint64_t>& dst_syn_dims,
+                            synTensor target_out = nullptr);
 
 synTensor emit_constant(SynapseGraphBuilder& builder, at::ScalarType dtype,
                         const std::vector<uint64_t>& syn_dims,

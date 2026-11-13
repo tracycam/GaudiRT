@@ -449,10 +449,8 @@ TORCH_LIBRARY(gaudirt, m) {
       .def("last_token_indices", &gaudirt::generic::PagedMetadata::last_token_indices)
       .def("token_ids", &gaudirt::generic::PagedMetadata::token_ids)
       .def("vocabulary", &gaudirt::generic::PagedMetadata::vocabulary);
-  m.def("rms_norm(Tensor input, Tensor weight, float epsilon) -> Tensor");
-  m.def("fused_add_rms_norm(Tensor input, Tensor residual, Tensor weight, float epsilon) -> (Tensor, Tensor)");
-  m.def("gemma_rms_norm(Tensor input, Tensor weight, float epsilon) -> Tensor");
-  m.def("fused_add_gemma_rms_norm(Tensor input, Tensor residual, Tensor weight, float epsilon) -> (Tensor, Tensor)");
+  m.def("rms_norm(Tensor input, Tensor weight, float epsilon, float weight_offset=0.0) -> Tensor");
+  m.def("fused_add_rms_norm(Tensor input, Tensor residual, Tensor weight, float epsilon, float weight_offset=0.0) -> (Tensor, Tensor)");
   m.def("silu_and_mul(Tensor input) -> Tensor");
   m.def("gelu_and_mul(Tensor input, str approximate=\"none\") -> Tensor");
   m.def("block_fp8_linear(Tensor input, Tensor weight, Tensor scales, Tensor? bias=None) -> Tensor");
@@ -481,8 +479,6 @@ TORCH_LIBRARY(gaudirt, m) {
 TORCH_LIBRARY_IMPL(gaudirt, PrivateUse1, m) {
   m.impl("rms_norm", TORCH_FN(gaudirt::generic::rms_norm));
   m.impl("fused_add_rms_norm", TORCH_FN(gaudirt::generic::fused_add_rms_norm));
-  m.impl("gemma_rms_norm", TORCH_FN(gaudirt::generic::gemma_rms_norm));
-  m.impl("fused_add_gemma_rms_norm", TORCH_FN(gaudirt::generic::fused_add_gemma_rms_norm));
   m.impl("silu_and_mul", TORCH_FN(gaudirt::generic::bucket_silu_and_mul));
   m.impl("gelu_and_mul", TORCH_FN(gaudirt::generic::gelu_and_mul));
   m.impl("block_fp8_linear", TORCH_FN(gaudirt::generic::bucket_block_fp8));
@@ -569,8 +565,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .value("scalar_mul", FxOp::scalar_mul).value("scalar_div", FxOp::scalar_div)
       .value("block_fp8_linear", FxOp::block_fp8_linear).value("fp8_linear", FxOp::fp8_linear)
       .value("ewise_unary", FxOp::ewise_unary).value("gelu_and_mul", FxOp::gelu_and_mul)
-      .value("gemma_rms_norm", FxOp::gemma_rms_norm)
-      .value("fused_add_gemma_rms_norm", FxOp::fused_add_gemma_rms_norm)
       .value("rotary_pos", FxOp::rotary_pos)
       .value("minimum", FxOp::minimum).value("maximum", FxOp::maximum).value("where", FxOp::where)
       .value("eq", FxOp::eq).value("ne", FxOp::ne).value("lt", FxOp::lt)
@@ -593,9 +587,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_static("slice_dim", &FxNode::slice_dim)
       .def_static("block_fp8", &FxNode::block_fp8)
       .def_static("fp8", &FxNode::fp8)
-      .def_static("norm", &FxNode::norm).def_static("gemma_norm", &FxNode::gemma_norm)
-      .def_static("fused_norm", &FxNode::fused_norm)
-      .def_static("fused_gemma_norm", &FxNode::fused_gemma_norm)
+      .def_static("norm", &FxNode::norm, pybind11::arg("input"), pybind11::arg("weight"),
+                  pybind11::arg("epsilon"), pybind11::arg("weight_offset") = 0.f)
+      .def_static("fused_norm", &FxNode::fused_norm, pybind11::arg("input"), pybind11::arg("residual"),
+                  pybind11::arg("weight"), pybind11::arg("epsilon"),
+                  pybind11::arg("weight_offset") = 0.f)
       .def_static("rotary", &FxNode::rotary).def_static("rotary_pos", &FxNode::rotary_pos)
       .def_static("cast", &FxNode::cast).def_static("cast_dtype", &FxNode::cast_dtype)
       .def_static("concat", &FxNode::concat).def_static("concat_dim", &FxNode::concat_dim)

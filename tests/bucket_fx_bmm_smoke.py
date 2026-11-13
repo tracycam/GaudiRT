@@ -95,7 +95,7 @@ def main():
     elif os.environ.get("GAUDIRT_TEST_CACHE") == "warm":
         assert stats[:2] == [12, 0], stats
     assert captures == 4, captures
-    for rows in (0, 4097):
+    for rows in (0, gaudirt.MAX_BUCKET_ROWS + 1):
         x = torch.empty((rows, 3, 7), dtype=torch.float32, device="gaudirt:0")
         y = torch.empty((rows, 7, 5), dtype=torch.float32, device="gaudirt:0")
         try:

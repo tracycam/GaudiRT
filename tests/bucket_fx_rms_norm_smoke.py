@@ -153,15 +153,21 @@ def main():
             raise AssertionError("invalid RMSNorm epsilon accepted")
     check_norm(probe_x, gammas[0], gamma_cpu[0])
     check_norm(midpoint_x, gammas[0], gamma_cpu[0])
-    for invalid_m in (0, 4097):
+    for invalid_m in (0, gaudirt.MAX_BUCKET_ROWS + 1):
         invalid = torch.empty((invalid_m, 64), dtype=torch.bfloat16, device="gaudirt:0")
         try:
-            torch.ops.gaudirt.rms_norm.default(invalid, gammas[0], EPSILON)
+            compiled(invalid, gammas[0], weights[0], biases[0], invalid)
         except RuntimeError as error:
-            assert "token count" in str(error)
+            assert "invalid dynamic input" in str(error), str(error)
         else:
-            raise AssertionError("invalid token count accepted")
-    del x, r1, r2, first, second, probe_x, probe_r, midpoint_x, other, variant, invalid
+            raise AssertionError("invalid FX dynamic token count accepted")
+    empty_out = torch.ops.gaudirt.rms_norm.default(
+        torch.empty((0, 64), dtype=torch.bfloat16, device="gaudirt:0"), gammas[0], EPSILON
+    )
+    assert empty_out.shape == (0, 64) and empty_out.device.type == "gaudirt"
+    cold_x = torch.randn(gaudirt.MAX_BUCKET_ROWS + 1, 64, dtype=torch.bfloat16).to("gaudirt:0")
+    check_norm(cold_x, gammas[0], gamma_cpu[0])
+    del x, r1, r2, first, second, probe_x, probe_r, midpoint_x, other, variant, invalid, empty_out, cold_x
     del weights, gammas, biases
     gaudirt.empty_cache()
     gaudirt.shutdown()

@@ -83,12 +83,13 @@ BucketProgram::BucketProgram(std::vector<int64_t> roles, std::vector<FxNode> ope
       case FxOp::gather_rows:
         valid = op.inputs.size() == 2 && no_params && op.inputs[1] < static_cast<int64_t>(roles_.size());
         break;
-      case FxOp::rms_norm: case FxOp::gemma_rms_norm:
-      case FxOp::fused_add_rms_norm: case FxOp::fused_add_gemma_rms_norm: {
-        const auto* params = std::get_if<FxEpsilon>(&op.parameters);
-        const bool is_fused = (op.op == FxOp::fused_add_rms_norm || op.op == FxOp::fused_add_gemma_rms_norm);
+      case FxOp::rms_norm:
+      case FxOp::fused_add_rms_norm: {
+        const auto* params = std::get_if<FxRmsNorm>(&op.parameters);
+        const bool is_fused = (op.op == FxOp::fused_add_rms_norm);
         valid = op.inputs.size() == (is_fused ? 3u : 2u) && params &&
-                std::isfinite(params->value) && params->value > 0;
+                std::isfinite(params->epsilon) && params->epsilon > 0 &&
+                std::isfinite(params->weight_offset);
         break;
       }
       case FxOp::silu_and_mul: case FxOp::copy: case FxOp::isnan: case FxOp::logical_not:
@@ -108,7 +109,7 @@ BucketProgram::BucketProgram(std::vector<int64_t> roles, std::vector<FxNode> ope
           auto& producers = op.op == FxOp::fused_residual ? residual_producers : rotary_producers;
           const auto producer_op = operations_[op.inputs[0] - roles_.size()].op;
           const bool ok_producer = op.op == FxOp::fused_residual
-              ? (producer_op == FxOp::fused_add_rms_norm || producer_op == FxOp::fused_add_gemma_rms_norm)
+              ? (producer_op == FxOp::fused_add_rms_norm)
               : (producer_op == FxOp::rotary || producer_op == FxOp::rotary_pos);
           valid = ok_producer &&
                   std::find(producers.begin(), producers.end(), op.inputs[0]) == producers.end();
@@ -225,10 +226,10 @@ BucketProgram::BucketProgram(std::vector<int64_t> roles, std::vector<FxNode> ope
         mark_weight(op.inputs[2]);
         if (op.inputs.size() == 4) mark_weight(op.inputs[3]);
         break;
-      case FxOp::rms_norm: case FxOp::gemma_rms_norm: case FxOp::embedding: case FxOp::shard_embedding:
+      case FxOp::rms_norm: case FxOp::embedding: case FxOp::shard_embedding:
         mark_weight(op.inputs[1]);
         break;
-      case FxOp::fused_add_rms_norm: case FxOp::fused_add_gemma_rms_norm:
+      case FxOp::fused_add_rms_norm:
       case FxOp::rotary: case FxOp::rotary_pos:
         mark_weight(op.inputs[2]);
         break;
@@ -434,15 +435,7 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
         if (src_dims == dst_dims) {
           emit_cast(builder, values[op.inputs[0]], dst_dims, spec.dtype, spec.dtype, values[id]);
         } else {
-          auto cur = values[op.inputs[0]];
-          auto cur_dims = src_dims;
-          if (cur_dims.size() < dst_dims.size()) {
-            while (cur_dims.size() < dst_dims.size()) cur_dims.push_back(1);
-            auto padded = tensor_nd(type.syn, cur_dims, -1);
-            node({cur}, cur_dims == dst_dims ? values[id] : padded, std::monostate{}, "reshape");
-            cur = padded;
-          }
-          if (cur_dims != dst_dims) node({cur}, values[id], std::monostate{}, "broadcast");
+          emit_broadcast_to(builder, values[op.inputs[0]], type.syn, src_dims, dst_dims, values[id]);
         }
         continue;
       }
@@ -541,7 +534,7 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
                         static_cast<int32_t>(rotary.rotary_dim), rotary.neox);
         continue;
       }
-      if (op.op == FxOp::fused_add_rms_norm || op.op == FxOp::fused_add_gemma_rms_norm) {
+      if (op.op == FxOp::fused_add_rms_norm) {
         size_t residual_id = specs_.size();
         for (size_t j = i + 1; j < operations_.size(); ++j)
           if (operations_[j].op == FxOp::fused_residual && operations_[j].inputs[0] == static_cast<int64_t>(id))
@@ -552,10 +545,9 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
         const auto syn_dims = spec.synapse_sizes(bucket);
         auto residual = tensor_nd(type.syn, syn_dims, residual_slot);
         if (residual_id < values.size()) values[residual_id] = residual;
-        const float epsilon = std::get<FxEpsilon>(op.parameters).value;
-        const float weight_offset = op.op == FxOp::fused_add_gemma_rms_norm ? 1.0f : 0.0f;
+        const auto& rms = std::get<FxRmsNorm>(op.parameters);
         emit_rms_norm(builder, values[op.inputs[0]], values[op.inputs[1]], values[op.inputs[2]],
-                      values[id], residual, syn_dims, epsilon, weight_offset);
+                      values[id], residual, syn_dims, rms.epsilon, rms.weight_offset);
         continue;
       }
       if (op.op == FxOp::feature_slice) {
@@ -612,11 +604,10 @@ ColdRecipe& BucketProgram::recipe(Context& ctx, uint32_t bucket) {
                    specs_[op.inputs[2]].synapse_sizes(bucket), spec.synapse_sizes(bucket));
         continue;
       }
-      if (op.op == FxOp::rms_norm || op.op == FxOp::gemma_rms_norm) {
-        const float epsilon = std::get<FxEpsilon>(op.parameters).value;
-        const float weight_offset = op.op == FxOp::gemma_rms_norm ? 1.0f : 0.0f;
+      if (op.op == FxOp::rms_norm) {
+        const auto& rms = std::get<FxRmsNorm>(op.parameters);
         emit_rms_norm(builder, values[op.inputs[0]], nullptr, values[op.inputs[1]],
-                      values[id], nullptr, spec.synapse_sizes(bucket), epsilon, weight_offset);
+                      values[id], nullptr, spec.synapse_sizes(bucket), rms.epsilon, rms.weight_offset);
         continue;
       }
       if (op.op == FxOp::silu_and_mul || op.op == FxOp::gelu_and_mul) {

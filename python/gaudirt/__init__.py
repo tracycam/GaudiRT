@@ -101,23 +101,12 @@ StreamContext = stream
 
 
 @torch.library.register_fake("gaudirt::rms_norm")
-def _fake_rms_norm(input, weight, epsilon):
+def _fake_rms_norm(input, weight, epsilon, weight_offset=0.0):
     return torch.empty_like(input, memory_format=torch.contiguous_format)
 
 
 @torch.library.register_fake("gaudirt::fused_add_rms_norm")
-def _fake_fused_add_rms_norm(input, residual, weight, epsilon):
-    return (torch.empty_like(input, memory_format=torch.contiguous_format),
-            torch.empty_like(residual, memory_format=torch.contiguous_format))
-
-
-@torch.library.register_fake("gaudirt::gemma_rms_norm")
-def _fake_gemma_rms_norm(input, weight, epsilon):
-    return torch.empty_like(input, memory_format=torch.contiguous_format)
-
-
-@torch.library.register_fake("gaudirt::fused_add_gemma_rms_norm")
-def _fake_fused_add_gemma_rms_norm(input, residual, weight, epsilon):
+def _fake_fused_add_rms_norm(input, residual, weight, epsilon, weight_offset=0.0):
     return (torch.empty_like(input, memory_format=torch.contiguous_format),
             torch.empty_like(residual, memory_format=torch.contiguous_format))
 
@@ -345,5 +334,7 @@ def _exit_audit():
         print(error, file=sys.stderr, flush=True)
         os._exit(1)
 
+
+from .fx_collectives import register_collective_op, register_comm_group_resolver  # noqa: E402
 
 atexit.register(_exit_audit)

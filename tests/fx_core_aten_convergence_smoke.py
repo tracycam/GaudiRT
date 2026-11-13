@@ -34,12 +34,12 @@ def main():
     exp_qk = ref_rms(x3, w_d, 1e-6, 0.0)
     assert (out_qk.float() - exp_qk.float()).abs().max().item() <= 3e-2
 
-    out_gemma = torch.ops.gaudirt.gemma_rms_norm.default(x3.to(dev), w_d.to(dev), 1e-6).cpu()
+    out_gemma = torch.ops.gaudirt.rms_norm.default(x3.to(dev), w_d.to(dev), 1e-6, 1.0).cpu()
     exp_gemma = ref_rms(x3, w_d, 1e-6, 1.0)
     assert (out_gemma.float() - exp_gemma.float()).abs().max().item() <= 3e-2
 
-    out_fg, out_fres = torch.ops.gaudirt.fused_add_gemma_rms_norm.default(
-        x3.to(dev), res3.to(dev), w_d.to(dev), 1e-6
+    out_fg, out_fres = torch.ops.gaudirt.fused_add_rms_norm.default(
+        x3.to(dev), res3.to(dev), w_d.to(dev), 1e-6, 1.0
     )
     sum_ref = (x3.float() + res3.float()).to(torch.bfloat16)
     exp_fg = ref_rms(sum_ref, w_d, 1e-6, 1.0)
@@ -79,7 +79,7 @@ def main():
     def core_model(hidden, q_in, k_in, pos_in, mask):
         inv_rms_norm = torch.tensor(math.sqrt(0.5), dtype=torch.bfloat16)
         h = hidden * inv_rms_norm
-        h = torch.ops.gaudirt.gemma_rms_norm.default(h, norm_w, 1e-6)
+        h = torch.ops.gaudirt.rms_norm.default(h, norm_w, 1e-6, 1.0)
         h = torch.nn.functional.layer_norm(h, (128,), ln_w, ln_b, 1e-5)
         h3 = h.view(-1, 2, 64)
         h3 = torch.ops.gaudirt.rms_norm.default(h3, norm_w[:64], 1e-6)

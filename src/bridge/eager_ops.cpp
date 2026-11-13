@@ -42,42 +42,192 @@
 namespace gaudirt::generic {
 using namespace runtime;
 
-ColdRecipe& cat_recipe(Context& ctx, const std::vector<at::Tensor>& inputs,
-                       const at::Tensor& output, int64_t axis) {
-  std::string signature = std::to_string(static_cast<int>(output.scalar_type())) + ":" +
-                          std::to_string(axis);
-  for (const auto& tensor : inputs) {
-    signature += ";";
-    for (auto size : tensor.sizes()) signature += std::to_string(size) + ",";
+namespace {
+
+std::vector<uint64_t> to_syn_dims(const at::Tensor& tensor) {
+  if (tensor.dim() == 0) return {1};
+  std::vector<uint64_t> dims(tensor.dim());
+  for (int64_t d = 0; d < tensor.dim(); ++d) {
+    dims[d] = static_cast<uint64_t>(tensor.size(tensor.dim() - 1 - d));
   }
-  const auto digest = common::sha256_bytes(reinterpret_cast<const uint8_t*>(signature.data()),
-                                            signature.size());
-  const std::string key = "cold_cat_" + digest;
-  auto found = ctx.cold_recipes.find(key);
-  if (found != ctx.cold_recipes.end()) return *found->second;
-  auto recipe = std::make_unique<ColdRecipe>(inputs.size() + 1);
-  {
-    SynapseGraphBuilder builder(key, *recipe);
-    std::vector<synTensor> cat_inputs;
-    cat_inputs.reserve(inputs.size());
-    synTensor out_tensor = nullptr;
-    for (size_t i = 0; i <= inputs.size(); ++i) {
-      const auto& tensor = i < inputs.size() ? inputs[i] : output;
-      std::vector<uint64_t> dims(tensor.dim());
-      for (int64_t dim = 0; dim < tensor.dim(); ++dim)
-        dims[dim] = static_cast<uint64_t>(tensor.size(tensor.dim() - dim - 1));
-      auto handle = builder.tensor(cast_type(tensor.scalar_type()).syn, dims, static_cast<int>(i));
-      if (i < inputs.size()) cat_inputs.push_back(handle);
-      else out_tensor = handle;
-    }
-    synConcatenateParams params{static_cast<unsigned>(output.dim() - axis - 1)};
-    builder.node(NodeSpec{"concat", std::move(cat_inputs), {out_tensor}, params});
-    builder.compile(ctx.cache, key);
-  }
-  auto [it, inserted] = ctx.cold_recipes.emplace(key, std::move(recipe));
-  TORCH_CHECK(inserted, "GaudiRT: duplicate cold cat recipe");
-  return *it->second;
+  return dims;
 }
+
+std::string format_dims_key(const std::vector<uint64_t>& dims) {
+  std::string out;
+  for (size_t i = 0; i < dims.size(); ++i) {
+    if (i) out += "x";
+    out += std::to_string(dims[i]);
+  }
+  return out;
+}
+
+template <typename BuildFn>
+void launch_cold_recipe(const std::string& prefix, const std::string& raw_signature,
+                        std::vector<at::Tensor> inputs,
+                        const std::vector<at::Tensor>& outputs, BuildFn&& build_fn) {
+  auto ctx = current();
+  auto stream = ctx->stream();
+  std::vector<std::pair<uint64_t, uint64_t>> regions;
+  regions.reserve(inputs.size() + outputs.size());
+  for (const auto& out : outputs) {
+    TORCH_CHECK(out.device().type() == c10::kPrivateUse1 &&
+                out.device().index() == ctx->device_index && out.is_contiguous(),
+                "GaudiRT: cold recipe outputs must be contiguous on the active device");
+    const auto addr = address_of(out, *ctx);
+    TORCH_CHECK(addr % BlockCachingAllocator::kAlignment == 0,
+                "GaudiRT: cold recipe outputs must be aligned");
+    regions.emplace_back(addr, out.nbytes());
+  }
+  for (auto& input : inputs) {
+    TORCH_CHECK(input.device().type() == c10::kPrivateUse1 &&
+                input.device().index() == ctx->device_index,
+                "GaudiRT: cold recipe inputs must reside on the active device");
+    auto addr = address_of(input, *ctx);
+    const bool overlaps = std::any_of(regions.begin(), regions.end(), [&](const auto& region) {
+      return addr < region.first + region.second && region.first < addr + input.nbytes();
+    });
+    if (!input.is_contiguous() || addr % BlockCachingAllocator::kAlignment != 0 || overlaps) {
+      auto staged = at::empty(input.sizes(), input.options());
+      copy(staged, input, true);
+      input = std::move(staged);
+      addr = address_of(input, *ctx);
+    }
+    regions.emplace_back(addr, input.nbytes());
+  }
+
+  const auto digest = common::sha256_bytes(
+      reinterpret_cast<const uint8_t*>(raw_signature.data()), raw_signature.size());
+  const std::string key = prefix + "_" + digest;
+
+  std::lock_guard lock(ctx->cold_mutex);
+  ColdRecipe* recipe_ptr = nullptr;
+  auto found = ctx->cold_recipes.find(key);
+  if (found != ctx->cold_recipes.end()) {
+    recipe_ptr = found->second.get();
+  } else {
+    auto recipe = std::make_unique<ColdRecipe>(inputs.size() + outputs.size());
+    {
+      SynapseGraphBuilder builder("c" + digest.substr(0, 12), *recipe);
+      std::vector<synTensor> syn_inputs;
+      std::vector<synTensor> syn_outputs;
+      syn_inputs.reserve(inputs.size());
+      syn_outputs.reserve(outputs.size());
+      int ext_idx = 0;
+      for (const auto& t : inputs) {
+        syn_inputs.push_back(
+            builder.tensor(cast_type(t.scalar_type()).syn, to_syn_dims(t), ext_idx++));
+      }
+      for (const auto& t : outputs) {
+        syn_outputs.push_back(
+            builder.tensor(cast_type(t.scalar_type()).syn, to_syn_dims(t), ext_idx++));
+      }
+      build_fn(builder, syn_inputs, syn_outputs);
+      builder.compile(ctx->cache, key);
+    }
+    auto [it, inserted] = ctx->cold_recipes.emplace(key, std::move(recipe));
+    TORCH_CHECK(inserted, "GaudiRT: duplicate cold recipe");
+    recipe_ptr = it->second.get();
+  }
+
+  auto bindings = recipe_ptr->tensors;
+  size_t idx = 0;
+  for (const auto& t : inputs) {
+    bindings[idx].pTensorAddress = address_of(t, *ctx);
+    ctx->allocator.record_stream(bindings[idx].pTensorAddress, stream);
+    ++idx;
+  }
+  for (const auto& t : outputs) {
+    bindings[idx].pTensorAddress = address_of(t, *ctx);
+    ctx->allocator.record_stream(bindings[idx].pTensorAddress, stream);
+    ++idx;
+  }
+  std::unique_ptr<TemporaryDevice> workspace;
+  if (recipe_ptr->workspace) {
+    workspace = std::make_unique<TemporaryDevice>(*ctx, recipe_ptr->workspace);
+  }
+  TORCH_CHECK(synLaunch(stream, bindings.data(), bindings.size(),
+                        workspace ? workspace->address : 0, recipe_ptr->recipe, 0) == synSuccess,
+              "GaudiRT: cold recipe launch failed");
+}
+
+at::Tensor align_device_operand(const at::Tensor& tensor, const at::Tensor& peer,
+                                at::ScalarType dtype) {
+  if (tensor.device().is_cpu() && tensor.dim() == 0) {
+    auto scalar = at::empty({}, peer.options().dtype(dtype));
+    fill(scalar, tensor.item());
+    return scalar;
+  }
+  TORCH_CHECK(tensor.device() == peer.device() && tensor.device().type() == c10::kPrivateUse1,
+              "GaudiRT: binary operation requires same-device PrivateUse1 tensors");
+  return tensor.scalar_type() == dtype ? tensor : tensor.to(dtype);
+}
+
+at::Tensor scalar_to_device(const at::Tensor& peer, const at::Scalar& scalar,
+                            at::ScalarType dtype) {
+  auto out = at::empty({}, peer.options().dtype(dtype));
+  if (dtype == at::kInt && scalar.isIntegral(false)) {
+    const auto bits = static_cast<uint32_t>(scalar.toLong());
+    fill(out, at::Scalar(std::bit_cast<int32_t>(bits)));
+  } else {
+    fill(out, scalar);
+  }
+  return out;
+}
+
+at::Tensor binary_ewise_op(const at::Tensor& a, const at::Tensor& b, FxOp op,
+                           bool true_div = false) {
+  const auto& dev_peer = a.device().type() == c10::kPrivateUse1 ? a : b;
+  TORCH_CHECK(dev_peer.device().type() == c10::kPrivateUse1,
+              "GaudiRT: binary operation requires at least one PrivateUse1 tensor");
+  at::ScalarType dtype = at::result_type(a, b);
+  if (true_div && c10::isIntegralType(dtype, true)) dtype = at::kFloat;
+  if (op == FxOp::logical_and || op == FxOp::logical_or) dtype = at::kBool;
+  if (dtype == at::kBool && (op == FxOp::minimum || op == FxOp::maximum)) {
+    op = (op == FxOp::minimum) ? FxOp::logical_and : FxOp::logical_or;
+  }
+
+  auto left = align_device_operand(a, dev_peer, dtype);
+  auto right = align_device_operand(b, dev_peer, dtype);
+  TORCH_CHECK(left.dim() <= 5 && right.dim() <= 5,
+              "GaudiRT: binary operation requires tensor rank <= 5");
+  const auto inferred = at::infer_size(left.sizes(), right.sizes());
+  const std::vector<int64_t> shape(inferred.begin(), inferred.end());
+  const bool is_cmp = (op == FxOp::eq || op == FxOp::ne || op == FxOp::lt ||
+                       op == FxOp::le || op == FxOp::gt || op == FxOp::ge);
+  const auto out_dtype = is_cmp ? at::kBool : dtype;
+  auto out = at::empty(shape, dev_peer.options().dtype(out_dtype));
+  if (!out.numel()) return out;
+
+  if (dtype == at::kLong && (op == FxOp::minimum || op == FxOp::maximum)) {
+    return gaudirt::generic::where(
+        compare(left, right, op == FxOp::minimum ? "less" : "greater"), left, right);
+  }
+  if (op == FxOp::bitwise_and || op == FxOp::bitwise_or) {
+    TORCH_CHECK(dtype == at::kInt || dtype == at::kBool,
+                "GaudiRT: bitwise op supports Int32 or Bool tensors");
+    if (dtype == at::kBool) {
+      op = (op == FxOp::bitwise_and) ? FxOp::logical_and : FxOp::logical_or;
+    }
+  }
+
+  const auto l_syn = to_syn_dims(left);
+  const auto r_syn = to_syn_dims(right);
+  const auto o_syn = to_syn_dims(out);
+  std::ostringstream sig;
+  sig << "bin_v1:" << static_cast<int>(op) << ":" << cast_type(dtype).name << ":"
+      << format_dims_key(l_syn) << ":" << format_dims_key(r_syn) << ":"
+      << format_dims_key(o_syn);
+  launch_cold_recipe(
+      "cold_bin", sig.str(), {left, right}, {out},
+      [&](SynapseGraphBuilder& builder, const std::vector<synTensor>& in,
+          const std::vector<synTensor>& out_t) {
+        emit_binary_pointwise(builder, op, in[0], in[1], out_t[0], dtype, l_syn, r_syn, o_syn);
+      });
+  return out;
+}
+
+}  // namespace
 
 at::Tensor cat(const at::ITensorListRef& tensors, int64_t axis) {
   TORCH_CHECK(!tensors.empty(), "GaudiRT: cat requires at least one tensor");
@@ -127,36 +277,17 @@ at::Tensor cat(const at::ITensorListRef& tensors, int64_t axis) {
     }
     return result;
   }
-  auto ctx = current();
-  std::vector<std::pair<uint64_t, uint64_t>> regions;
-  for (auto& tensor : active) {
-    auto address = address_of(tensor, *ctx);
-    const bool overlaps = std::any_of(regions.begin(), regions.end(), [&](const auto& region) {
-      return address < region.first + region.second && region.first < address + tensor.nbytes();
-    });
-    if (!tensor.is_contiguous() || address % BlockCachingAllocator::kAlignment || overlaps) {
-      auto staged = at::empty(tensor.sizes(), tensor.options());
-      copy(staged, tensor, true);
-      tensor = std::move(staged);
-      address = address_of(tensor, *ctx);
-    }
-    regions.emplace_back(address, tensor.nbytes());
-  }
-  std::lock_guard lock(ctx->cold_mutex);
-  auto& recipe = cat_recipe(*ctx, active, result, axis);
-  auto stream = ctx->stream();
-  auto bindings = recipe.tensors;
-  for (size_t i = 0; i < active.size(); ++i) {
-    bindings[i].pTensorAddress = address_of(active[i], *ctx);
-    ctx->allocator.record_stream(bindings[i].pTensorAddress, stream);
-  }
-  bindings.back().pTensorAddress = address_of(result, *ctx);
-  ctx->allocator.record_stream(bindings.back().pTensorAddress, stream);
-  std::unique_ptr<TemporaryDevice> workspace;
-  if (recipe.workspace) workspace = std::make_unique<TemporaryDevice>(*ctx, recipe.workspace);
-  TORCH_CHECK(synLaunch(stream, bindings.data(), bindings.size(),
-                        workspace ? workspace->address : 0, recipe.recipe, 0) == synSuccess,
-              "GaudiRT: cat launch failed");
+  std::ostringstream sig;
+  sig << "cat_v1:" << cast_type(dtype).name << ":" << axis;
+  for (const auto& t : active) sig << ";" << format_dims_key(to_syn_dims(t));
+  launch_cold_recipe(
+      "cold_cat", sig.str(), std::move(active), {result},
+      [&](SynapseGraphBuilder& builder, const std::vector<synTensor>& in,
+          const std::vector<synTensor>& out_t) {
+        synConcatenateParams params{static_cast<unsigned>(result.dim() - axis - 1)};
+        builder.node(NodeSpec{"concat", std::vector<synTensor>(in.begin(), in.end()),
+                              {out_t[0]}, params});
+      });
   return result;
 }
 
@@ -246,9 +377,6 @@ ColdRecipe& range64_recipe(Context& ctx, uint32_t count, at::ScalarType dtype) {
   return *it->second;
 }
 
-at::Tensor pointwise(std::vector<at::Tensor> inputs, const std::vector<int64_t>& shape,
-                     at::ScalarType output_type, const std::string& op,
-                     const std::vector<synDataType>& types);
 at::Tensor& arange_out(const at::Scalar& start_value, const at::Scalar& end_value,
                        const at::Scalar& step_value, at::Tensor& out);
 
@@ -295,9 +423,7 @@ at::Tensor& arange_dyadic_out(const at::Scalar& start_value, const at::Scalar& e
   auto values = integral.to(at::kFloat);
   auto scale = at::empty({}, out.options().dtype(at::kFloat));
   fill(scale, at::Scalar(std::ldexp(1.0, -scale_shift)));
-  const std::vector<int64_t> result_shape{count};
-  auto result = pointwise({values, scale}, result_shape, at::kFloat, "mult_fwd_f32",
-                          {syn_type_float, syn_type_float, syn_type_float});
+  auto result = binary_ewise_op(values, scale, FxOp::mul);
   return copy(out, result, true);
 }
 
@@ -410,108 +536,64 @@ at::Tensor& arange_end_out(const at::Scalar& end, at::Tensor& out) {
   return arange_out(at::Scalar(0), end, at::Scalar(1), out);
 }
 
-ColdRecipe& pointwise_recipe(Context& ctx, const std::string& op,
-                             const std::vector<synDataType>& types, uint32_t count) {
-  std::string key = "cold_pointwise_" + op + "_" + std::to_string(count);
-  for (auto type : types) key += "_" + std::to_string(static_cast<int>(type));
-  auto found = ctx.cold_recipes.find(key);
-  if (found != ctx.cold_recipes.end()) return *found->second;
-  auto recipe = std::make_unique<ColdRecipe>(types.size());
-  {
-    SynapseGraphBuilder builder(key, *recipe);
-    std::vector<synTensor> inputs;
-    inputs.reserve(types.size() - 1);
-    synTensor out = nullptr;
-    for (size_t i = 0; i < types.size(); ++i) {
-      auto handle = builder.tensor(types[i], {count}, static_cast<int>(i));
-      if (i + 1 < types.size()) inputs.push_back(handle);
-      else out = handle;
-    }
-    if (op.rfind("not_equal_fwd_", 0) == 0) {
-      auto eq_u8 = builder.tensor(syn_type_uint8, {count}, -1);
-      builder.node(NodeSpec{"equal_fwd_" + op.substr(std::strlen("not_equal_fwd_")),
-                            std::move(inputs), {eq_u8}, {}});
-      builder.node(NodeSpec{"not_fwd_u8", {eq_u8}, {out}, {}});
-    } else {
-      builder.node(NodeSpec{op, std::move(inputs), {out}, {}});
-    }
-    builder.compile(ctx.cache, key);
-  }
-  auto [it, inserted] = ctx.cold_recipes.emplace(key, std::move(recipe));
-  TORCH_CHECK(inserted, "GaudiRT: duplicate cold pointwise recipe");
-  return *it->second;
-}
-
 at::Tensor pointwise(std::vector<at::Tensor> inputs, const std::vector<int64_t>& shape,
                      at::ScalarType output_type, const std::string& op,
                      const std::vector<synDataType>& types) {
   auto result = at::empty(shape, inputs[0].options().dtype(output_type));
   if (!result.numel()) return result;
-  TORCH_CHECK(static_cast<uint64_t>(result.numel()) <= UINT32_MAX,
-              "GaudiRT: pointwise tensor is too large");
-  auto ctx = current();
-  std::vector<std::pair<uint64_t, uint64_t>> regions;
+  const auto count = static_cast<uint64_t>(result.numel());
+  TORCH_CHECK(count <= UINT32_MAX, "GaudiRT: pointwise tensor is too large");
+  TORCH_CHECK(types.size() == inputs.size() + 1, "GaudiRT: pointwise type count mismatch");
+  std::vector<at::Tensor> flat_inputs;
+  flat_inputs.reserve(inputs.size());
   for (auto& input : inputs) {
     auto expanded = input.expand(shape);
-    auto address = address_of(expanded, *ctx);
-    const bool overlaps = std::any_of(regions.begin(), regions.end(), [&](const auto& region) {
-      return address < region.first + region.second && region.first < address + expanded.nbytes();
-    });
-    if (!expanded.is_contiguous() || address % BlockCachingAllocator::kAlignment || overlaps) {
+    if (!expanded.is_contiguous()) {
       auto staged = at::empty(shape, input.options());
       copy(staged, expanded, true);
-      input = std::move(staged);
-    } else {
-      input = std::move(expanded);
+      expanded = std::move(staged);
     }
-    regions.emplace_back(address_of(input, *ctx), input.nbytes());
+    flat_inputs.push_back(expanded.view({static_cast<int64_t>(count)}));
   }
-  std::lock_guard lock(ctx->cold_mutex);
-  auto& recipe = pointwise_recipe(*ctx, op, types, result.numel());
-  auto stream = ctx->stream();
-  auto bindings = recipe.tensors;
-  for (size_t i = 0; i < inputs.size(); ++i) {
-    bindings[i].pTensorAddress = address_of(inputs[i], *ctx);
-    ctx->allocator.record_stream(bindings[i].pTensorAddress, stream);
-  }
-  bindings.back().pTensorAddress = address_of(result, *ctx);
-  ctx->allocator.record_stream(bindings.back().pTensorAddress, stream);
-  std::unique_ptr<TemporaryDevice> workspace;
-  if (recipe.workspace) workspace = std::make_unique<TemporaryDevice>(*ctx, recipe.workspace);
-  TORCH_CHECK(synLaunch(stream, bindings.data(), bindings.size(),
-                        workspace ? workspace->address : 0, recipe.recipe, 0) == synSuccess,
-              "GaudiRT: pointwise launch failed");
+  std::ostringstream sig;
+  sig << "pw_v1:" << op << ":" << count;
+  for (auto type : types) sig << ":" << static_cast<int>(type);
+  launch_cold_recipe(
+      "cold_pw", sig.str(), std::move(flat_inputs), {result.view({static_cast<int64_t>(count)})},
+      [&](SynapseGraphBuilder& builder, const std::vector<synTensor>& in,
+          const std::vector<synTensor>& out_t) {
+        if (op.rfind("not_equal_fwd_", 0) == 0) {
+          auto eq_u8 = builder.tensor(syn_type_uint8, {count}, -1);
+          builder.node(NodeSpec{"equal_fwd_" + op.substr(std::strlen("not_equal_fwd_")),
+                                std::vector<synTensor>(in.begin(), in.end()), {eq_u8}, {}});
+          builder.node(NodeSpec{"not_fwd_u8", {eq_u8}, {out_t[0]}, {}});
+        } else {
+          builder.node(NodeSpec{op, std::vector<synTensor>(in.begin(), in.end()), {out_t[0]}, {}});
+        }
+      });
   return result;
 }
 
 at::Tensor compare(const at::Tensor& a, const at::Tensor& b, const char* op) {
   TORCH_CHECK(a.device() == b.device() && a.device().type() == c10::kPrivateUse1,
               "GaudiRT: comparison requires same-device tensors");
-  const auto dtype = at::result_type(a, b);
-  auto left = a.scalar_type() == dtype ? a : a.to(dtype);
-  auto right = b.scalar_type() == dtype ? b : b.to(dtype);
-  if (dtype == at::kLong && std::strcmp(op, "greater") == 0)
-    return compare(right, left, "less");
-  if (dtype == at::kLong && std::strcmp(op, "less_equal") == 0)
-    return compare(right, left, "greater_equal");
-  const auto type = cast_type(dtype);
-  const auto inferred = at::infer_size(left.sizes(), right.sizes());
-  const std::vector<int64_t> shape(inferred.begin(), inferred.end());
-  return pointwise({left, right}, shape, at::kBool, std::string(op) + "_fwd_" + type.name,
-                   {type.syn, type.syn, syn_type_uint8});
+  const FxOp fx_op = [&]() {
+    if (std::strcmp(op, "equal") == 0) return FxOp::eq;
+    if (std::strcmp(op, "not_equal") == 0) return FxOp::ne;
+    if (std::strcmp(op, "less") == 0) return FxOp::lt;
+    if (std::strcmp(op, "less_equal") == 0) return FxOp::le;
+    if (std::strcmp(op, "greater") == 0) return FxOp::gt;
+    if (std::strcmp(op, "greater_equal") == 0) return FxOp::ge;
+    TORCH_CHECK(false, "GaudiRT: unknown compare op ", op);
+    return FxOp::eq;
+  }();
+  return binary_ewise_op(a, b, fx_op);
 }
 
 at::Tensor compare_scalar(const at::Tensor& a, const at::Scalar& scalar, const char* op) {
   const auto dtype = at::result_type(a, scalar);
   auto input = a.scalar_type() == dtype ? a : a.to(dtype);
-  auto rhs = at::empty({}, input.options());
-  if (dtype == at::kInt && scalar.isIntegral(false)) {
-    const auto bits = static_cast<uint32_t>(scalar.toLong());
-    fill(rhs, at::Scalar(std::bit_cast<int32_t>(bits)));
-  } else {
-    fill(rhs, scalar);
-  }
-  return compare(input, rhs, op);
+  return compare(input, scalar_to_device(input, scalar, dtype), op);
 }
 
 #define GAUDIRT_COMPARE(name, guid) \
@@ -531,9 +613,7 @@ at::Tensor subtract(const at::Tensor& a, const at::Tensor& b, const at::Scalar& 
   if (a.device().type() == c10::kPrivateUse1 && b.device().is_cpu() && b.dim() == 0)
     return subtract_scalar(a, b.item(), alpha);
   if (b.device().type() == c10::kPrivateUse1 && a.device().is_cpu() && a.dim() == 0) {
-    auto scalar = at::empty({}, b.options().dtype(at::result_type(a, b)));
-    fill(scalar, a.item());
-    return gaudirt::generic::subtract(scalar, b, alpha);
+    return gaudirt::generic::subtract(scalar_to_device(b, a.item(), at::result_type(a, b)), b, alpha);
   }
   TORCH_CHECK(a.device() == b.device() && a.device().type() == c10::kPrivateUse1,
               "GaudiRT: subtraction requires same-device tensors");
@@ -541,28 +621,13 @@ at::Tensor subtract(const at::Tensor& a, const at::Tensor& b, const at::Scalar& 
   const auto dtype = at::result_type(a, b);
   TORCH_CHECK(dtype == at::kInt || dtype == at::kLong || dtype == at::kFloat || dtype == at::kBFloat16,
               "GaudiRT: subtraction dtype is not supported");
-  auto left = a.scalar_type() == dtype ? a : a.to(dtype);
-  auto right = b.scalar_type() == dtype ? b : b.to(dtype);
-  const auto inferred = at::infer_size(left.sizes(), right.sizes());
-  const std::vector<int64_t> shape(inferred.begin(), inferred.end());
-  const auto type = cast_type(dtype);
-  if (dtype == at::kLong) {
-    auto minus_one = at::empty({}, left.options());
-    fill(minus_one, at::Scalar(int64_t{-1}));
-    auto negated = pointwise({right, minus_one}, shape, dtype, "mult_fwd_i64",
-                             {type.syn, type.syn, type.syn});
-    return pointwise({left, negated}, shape, dtype, "add_fwd_i64", {type.syn, type.syn, type.syn});
-  }
-  return pointwise({left, right}, shape, dtype, std::string("sub_fwd_") + type.name,
-                   {type.syn, type.syn, type.syn});
+  return binary_ewise_op(a, b, FxOp::sub);
 }
 
 at::Tensor subtract_scalar(const at::Tensor& a, const at::Scalar& b, const at::Scalar& alpha) {
   const auto dtype = at::result_type(a, b);
   auto left = a.scalar_type() == dtype ? a : a.to(dtype);
-  auto right = at::empty({}, left.options());
-  fill(right, b);
-  return gaudirt::generic::subtract(left, right, alpha);
+  return gaudirt::generic::subtract(left, scalar_to_device(left, b, dtype), alpha);
 }
 
 at::Tensor& subtract_out(const at::Tensor& a, const at::Tensor& b, const at::Scalar& alpha, at::Tensor& out) {
@@ -593,21 +658,13 @@ at::Tensor add(const at::Tensor& a, const at::Tensor& b, const at::Scalar& alpha
   const auto dtype = at::result_type(a, b);
   TORCH_CHECK(dtype == at::kInt || dtype == at::kLong || dtype == at::kFloat || dtype == at::kBFloat16,
               "GaudiRT: addition dtype is not supported");
-  auto left = a.scalar_type() == dtype ? a : a.to(dtype);
-  auto right = b.scalar_type() == dtype ? b : b.to(dtype);
-  const auto inferred = at::infer_size(left.sizes(), right.sizes());
-  const std::vector<int64_t> shape(inferred.begin(), inferred.end());
-  const auto type = cast_type(dtype);
-  return pointwise({left, right}, shape, dtype, std::string("add_fwd_") + type.name,
-                   {type.syn, type.syn, type.syn});
+  return binary_ewise_op(a, b, FxOp::add);
 }
 
 at::Tensor add_scalar(const at::Tensor& a, const at::Scalar& b, const at::Scalar& alpha) {
   const auto dtype = at::result_type(a, b);
   auto left = a.scalar_type() == dtype ? a : a.to(dtype);
-  auto right = at::empty({}, left.options());
-  fill(right, b);
-  return gaudirt::generic::add(left, right, alpha);
+  return gaudirt::generic::add(left, scalar_to_device(left, b, dtype), alpha);
 }
 
 at::Tensor& add_out(const at::Tensor& a, const at::Tensor& b, const at::Scalar& alpha, at::Tensor& out) {
@@ -629,178 +686,41 @@ at::Tensor where(const at::Tensor& condition, const at::Tensor& a, const at::Ten
   TORCH_CHECK(condition.scalar_type() == at::kBool && condition.device() == a.device() &&
               a.device() == b.device() && a.device().type() == c10::kPrivateUse1,
               "GaudiRT: where requires a boolean condition and same-device values");
+  TORCH_CHECK(condition.dim() <= 5 && a.dim() <= 5 && b.dim() <= 5,
+              "GaudiRT: where requires tensors of rank <= 5");
   const auto dtype = at::result_type(a, b);
-  if (a.scalar_type() != dtype || b.scalar_type() != dtype) {
-    auto left = a.scalar_type() == dtype ? a : a.to(dtype);
-    auto right = b.scalar_type() == dtype ? b : b.to(dtype);
-    return gaudirt::generic::where(condition, left, right);
-  }
-  cast_type(a.scalar_type());
-  const auto first = at::infer_size(a.sizes(), b.sizes());
+  auto left = a.scalar_type() == dtype ? a : a.to(dtype);
+  auto right = b.scalar_type() == dtype ? b : b.to(dtype);
+  cast_type(dtype);
+  const auto first = at::infer_size(left.sizes(), right.sizes());
   const auto inferred = at::infer_size(first, condition.sizes());
   const std::vector<int64_t> shape(inferred.begin(), inferred.end());
-  if (a.scalar_type() == at::kBool)
-    return gaudirt::generic::where(condition, a.to(at::kInt), b.to(at::kInt)).to(at::kBool);
-  if (a.scalar_type() == at::kLong) {
-    auto left = at::empty(shape, a.options());
-    auto right = at::empty(shape, b.options());
-    if (!left.numel()) return left;
-    copy(left, a.expand(shape), true);
-    copy(right, b.expand(shape), true);
-    std::vector<int64_t> lanes = shape;
-    lanes.push_back(2);
-    auto left_lanes = left.view({-1}).view(at::kInt).view(lanes);
-    auto right_lanes = right.view({-1}).view(at::kInt).view(lanes);
-    auto mask_lanes = condition.expand(shape).unsqueeze(-1).expand(lanes);
-    auto selected = pointwise({mask_lanes, left_lanes, right_lanes}, lanes, at::kInt,
-                              "where_fwd_i32", {syn_type_uint8, syn_type_int32,
-                                                syn_type_int32, syn_type_int32});
-    return selected.view({-1}).view(at::kLong).view(shape);
-  }
-  const auto type = cast_type(a.scalar_type());
-  return pointwise({condition, a, b}, shape, a.scalar_type(),
-                   std::string("where_fwd_") + type.name,
-                   {syn_type_uint8, type.syn, type.syn, type.syn});
-}
-
-namespace {
-
-std::vector<uint64_t> to_syn_dims(const at::Tensor& tensor) {
-  if (tensor.dim() == 0) return {1};
-  std::vector<uint64_t> dims(tensor.dim());
-  for (int64_t d = 0; d < tensor.dim(); ++d) {
-    dims[d] = static_cast<uint64_t>(tensor.size(tensor.dim() - 1 - d));
-  }
-  return dims;
-}
-
-std::string format_dims_key(const std::vector<uint64_t>& dims) {
-  std::string out;
-  for (size_t i = 0; i < dims.size(); ++i) {
-    if (i) out += "x";
-    out += std::to_string(dims[i]);
-  }
+  auto out = at::empty(shape, left.options());
+  if (!out.numel()) return out;
+  const auto c_syn = to_syn_dims(condition);
+  const auto l_syn = to_syn_dims(left);
+  const auto r_syn = to_syn_dims(right);
+  const auto o_syn = to_syn_dims(out);
+  std::ostringstream sig;
+  sig << "where_v1:" << cast_type(dtype).name << ":" << format_dims_key(c_syn) << ":"
+      << format_dims_key(l_syn) << ":" << format_dims_key(r_syn) << ":"
+      << format_dims_key(o_syn);
+  launch_cold_recipe(
+      "cold_where", sig.str(), {condition, left, right}, {out},
+      [&](SynapseGraphBuilder& builder, const std::vector<synTensor>& in,
+          const std::vector<synTensor>& out_t) {
+        emit_where(builder, in[0], in[1], in[2], out_t[0], dtype, c_syn, l_syn, r_syn, o_syn);
+      });
   return out;
 }
 
-template <typename BuildFn>
-void launch_cold_recipe(const std::string& prefix, const std::string& raw_signature,
-                        std::vector<at::Tensor> inputs,
-                        const std::vector<at::Tensor>& outputs, BuildFn&& build_fn) {
-  auto ctx = current();
-  auto stream = ctx->stream();
-  std::vector<std::pair<uint64_t, uint64_t>> regions;
-  regions.reserve(inputs.size() + outputs.size());
-  for (const auto& out : outputs) {
-    TORCH_CHECK(out.device().type() == c10::kPrivateUse1 &&
-                out.device().index() == ctx->device_index && out.is_contiguous(),
-                "GaudiRT: cold recipe outputs must be contiguous on the active device");
-    const auto addr = address_of(out, *ctx);
-    TORCH_CHECK(addr % BlockCachingAllocator::kAlignment == 0,
-                "GaudiRT: cold recipe outputs must be aligned");
-    regions.emplace_back(addr, out.nbytes());
-  }
-  for (auto& input : inputs) {
-    TORCH_CHECK(input.device().type() == c10::kPrivateUse1 &&
-                input.device().index() == ctx->device_index,
-                "GaudiRT: cold recipe inputs must reside on the active device");
-    auto addr = address_of(input, *ctx);
-    const bool overlaps = std::any_of(regions.begin(), regions.end(), [&](const auto& region) {
-      return addr < region.first + region.second && region.first < addr + input.nbytes();
-    });
-    if (!input.is_contiguous() || addr % BlockCachingAllocator::kAlignment != 0 || overlaps) {
-      auto staged = at::empty(input.sizes(), input.options());
-      copy(staged, input, true);
-      input = std::move(staged);
-      addr = address_of(input, *ctx);
-    }
-    regions.emplace_back(addr, input.nbytes());
-  }
-
-  const auto digest = common::sha256_bytes(
-      reinterpret_cast<const uint8_t*>(raw_signature.data()), raw_signature.size());
-  const std::string key = prefix + "_" + digest;
-
-  std::lock_guard lock(ctx->cold_mutex);
-  ColdRecipe* recipe_ptr = nullptr;
-  auto found = ctx->cold_recipes.find(key);
-  if (found != ctx->cold_recipes.end()) {
-    recipe_ptr = found->second.get();
-  } else {
-    auto recipe = std::make_unique<ColdRecipe>(inputs.size() + outputs.size());
-    {
-      SynapseGraphBuilder builder("c" + digest.substr(0, 12), *recipe);
-      std::vector<synTensor> syn_inputs;
-      std::vector<synTensor> syn_outputs;
-      syn_inputs.reserve(inputs.size());
-      syn_outputs.reserve(outputs.size());
-      int ext_idx = 0;
-      for (const auto& t : inputs) {
-        syn_inputs.push_back(
-            builder.tensor(cast_type(t.scalar_type()).syn, to_syn_dims(t), ext_idx++));
-      }
-      for (const auto& t : outputs) {
-        syn_outputs.push_back(
-            builder.tensor(cast_type(t.scalar_type()).syn, to_syn_dims(t), ext_idx++));
-      }
-      build_fn(builder, syn_inputs, syn_outputs);
-      builder.compile(ctx->cache, key);
-    }
-    auto [it, inserted] = ctx->cold_recipes.emplace(key, std::move(recipe));
-    TORCH_CHECK(inserted, "GaudiRT: duplicate cold recipe");
-    recipe_ptr = it->second.get();
-  }
-
-  auto bindings = recipe_ptr->tensors;
-  size_t idx = 0;
-  for (const auto& t : inputs) {
-    bindings[idx].pTensorAddress = address_of(t, *ctx);
-    ctx->allocator.record_stream(bindings[idx].pTensorAddress, stream);
-    ++idx;
-  }
-  for (const auto& t : outputs) {
-    bindings[idx].pTensorAddress = address_of(t, *ctx);
-    ctx->allocator.record_stream(bindings[idx].pTensorAddress, stream);
-    ++idx;
-  }
-  std::unique_ptr<TemporaryDevice> workspace;
-  if (recipe_ptr->workspace) {
-    workspace = std::make_unique<TemporaryDevice>(*ctx, recipe_ptr->workspace);
-  }
-  TORCH_CHECK(synLaunch(stream, bindings.data(), bindings.size(),
-                        workspace ? workspace->address : 0, recipe_ptr->recipe, 0) == synSuccess,
-              "GaudiRT: cold recipe launch failed");
-}
+namespace {
 
 at::Tensor& copy_inplace(at::Tensor& self, const at::Tensor& value) {
   TORCH_CHECK(self.device() == value.device() && self.sizes() == value.sizes(),
               "GaudiRT: in-place or out tensor geometry mismatch");
   if (value.scalar_type() == self.scalar_type()) return copy(self, value, true);
   return copy(self, value.to(self.scalar_type()), true);
-}
-
-at::Tensor align_device_operand(const at::Tensor& tensor, const at::Tensor& peer,
-                                at::ScalarType dtype) {
-  if (tensor.device().is_cpu() && tensor.dim() == 0) {
-    auto scalar = at::empty({}, peer.options().dtype(dtype));
-    fill(scalar, tensor.item());
-    return scalar;
-  }
-  TORCH_CHECK(tensor.device() == peer.device() && tensor.device().type() == c10::kPrivateUse1,
-              "GaudiRT: binary operation requires same-device PrivateUse1 tensors");
-  return tensor.scalar_type() == dtype ? tensor : tensor.to(dtype);
-}
-
-at::Tensor scalar_to_device(const at::Tensor& peer, const at::Scalar& scalar,
-                            at::ScalarType dtype) {
-  auto out = at::empty({}, peer.options().dtype(dtype));
-  if (dtype == at::kInt && scalar.isIntegral(false)) {
-    const auto bits = static_cast<uint32_t>(scalar.toLong());
-    fill(out, at::Scalar(std::bit_cast<int32_t>(bits)));
-  } else {
-    fill(out, scalar);
-  }
-  return out;
 }
 
 at::Tensor unary_ewise_op(const at::Tensor& self, FxUnaryOp op_kind,
@@ -843,59 +763,6 @@ at::Tensor unary_ewise_op(const at::Tensor& self, FxUnaryOp op_kind,
       [&](SynapseGraphBuilder& builder, const std::vector<synTensor>& in,
           const std::vector<synTensor>& out_t) {
         emit_ewise_unary(builder, in[0], out_t[0], work.scalar_type(), syn_dims, op_code, alpha, beta);
-      });
-  return out;
-}
-
-at::Tensor binary_ewise_op(const at::Tensor& a, const at::Tensor& b, FxOp op,
-                           bool true_div = false) {
-  const auto& dev_peer = a.device().type() == c10::kPrivateUse1 ? a : b;
-  TORCH_CHECK(dev_peer.device().type() == c10::kPrivateUse1,
-              "GaudiRT: binary operation requires at least one PrivateUse1 tensor");
-  at::ScalarType dtype = at::result_type(a, b);
-  if (true_div && c10::isIntegralType(dtype, true)) dtype = at::kFloat;
-  if (op == FxOp::logical_and || op == FxOp::logical_or) dtype = at::kBool;
-  if (dtype == at::kBool && (op == FxOp::minimum || op == FxOp::maximum)) {
-    op = (op == FxOp::minimum) ? FxOp::logical_and : FxOp::logical_or;
-  }
-
-  auto left = align_device_operand(a, dev_peer, dtype);
-  auto right = align_device_operand(b, dev_peer, dtype);
-  TORCH_CHECK(left.dim() <= 5 && right.dim() <= 5,
-              "GaudiRT: binary operation requires tensor rank <= 5");
-  const auto inferred = at::infer_size(left.sizes(), right.sizes());
-  const std::vector<int64_t> shape(inferred.begin(), inferred.end());
-  auto out = at::empty(shape, dev_peer.options().dtype(dtype));
-  if (!out.numel()) return out;
-
-  if (dtype == at::kLong && op == FxOp::mul) {
-    return pointwise({left, right}, shape, dtype, "mult_fwd_i64",
-                     {syn_type_int64, syn_type_int64, syn_type_int64});
-  }
-  if (dtype == at::kLong && (op == FxOp::minimum || op == FxOp::maximum)) {
-    return gaudirt::generic::where(
-        compare(left, right, op == FxOp::minimum ? "less" : "greater"), left, right);
-  }
-  if (op == FxOp::bitwise_and || op == FxOp::bitwise_or) {
-    TORCH_CHECK(dtype == at::kInt || dtype == at::kBool,
-                "GaudiRT: bitwise op supports Int32 or Bool tensors");
-    if (dtype == at::kBool) {
-      op = (op == FxOp::bitwise_and) ? FxOp::logical_and : FxOp::logical_or;
-    }
-  }
-
-  const auto l_syn = to_syn_dims(left);
-  const auto r_syn = to_syn_dims(right);
-  const auto o_syn = to_syn_dims(out);
-  std::ostringstream sig;
-  sig << "bin_v1:" << static_cast<int>(op) << ":" << cast_type(dtype).name << ":"
-      << format_dims_key(l_syn) << ":" << format_dims_key(r_syn) << ":"
-      << format_dims_key(o_syn);
-  launch_cold_recipe(
-      "cold_bin", sig.str(), {left, right}, {out},
-      [&](SynapseGraphBuilder& builder, const std::vector<synTensor>& in,
-          const std::vector<synTensor>& out_t) {
-        emit_binary_pointwise(builder, op, in[0], in[1], out_t[0], dtype, l_syn, r_syn, o_syn);
       });
   return out;
 }
@@ -998,11 +865,15 @@ at::Tensor reduce_dims_impl(const at::Tensor& self, FxOp op,
   return cur;
 }
 
-at::Tensor rms_norm_common(const at::Tensor& input, const at::Tensor& weight,
-                           double epsilon, bool gemma) {
+}  // namespace
+
+at::Tensor rms_norm(const at::Tensor& input, const at::Tensor& weight, double epsilon,
+                   double weight_offset) {
   const float eps = static_cast<float>(epsilon);
-  TORCH_CHECK(std::isfinite(epsilon) && std::isfinite(eps) && eps > 0,
-              "GaudiRT: RMSNorm epsilon must be a positive finite FP32 value");
+  const float offset = static_cast<float>(weight_offset);
+  TORCH_CHECK(std::isfinite(epsilon) && std::isfinite(eps) && eps > 0 &&
+              std::isfinite(weight_offset) && std::isfinite(offset),
+              "GaudiRT: RMSNorm epsilon must be positive finite and weight_offset finite");
   TORCH_CHECK(input.device().type() == c10::kPrivateUse1 && weight.device() == input.device() &&
               input.scalar_type() == at::kBFloat16 && weight.scalar_type() == at::kBFloat16,
               "GaudiRT: RMSNorm requires same-device PrivateUse1 BF16 tensors");
@@ -1011,15 +882,13 @@ at::Tensor rms_norm_common(const at::Tensor& input, const at::Tensor& weight,
               "GaudiRT: invalid RMSNorm tensor geometry");
   if (!input.numel()) return at::empty(input.sizes(), input.options());
   if (input.size(0) <= kMaxBucketRows) {
-    const auto node = gemma ? FxNode::gemma_norm(0, 1, eps) : FxNode::norm(0, 1, eps);
-    BucketProgram program({1, 0}, {node});
+    BucketProgram program({1, 0}, {FxNode::norm(0, 1, eps, offset)});
     return program.run({input, weight})[0];
   }
   auto out = at::empty(input.sizes(), input.options());
   const auto syn_dims = to_syn_dims(input);
-  const float offset = gemma ? 1.0f : 0.0f;
   std::ostringstream sig;
-  sig << "rms_v1:" << (gemma ? 1 : 0) << ":" << std::bit_cast<uint32_t>(eps) << ":"
+  sig << "rms_v1:" << std::bit_cast<uint32_t>(offset) << ":" << std::bit_cast<uint32_t>(eps) << ":"
       << format_dims_key(syn_dims);
   launch_cold_recipe(
       "cold_rms", sig.str(), {input, weight}, {out},
@@ -1030,12 +899,14 @@ at::Tensor rms_norm_common(const at::Tensor& input, const at::Tensor& weight,
   return out;
 }
 
-std::tuple<at::Tensor, at::Tensor> fused_add_rms_norm_common(
+std::tuple<at::Tensor, at::Tensor> fused_add_rms_norm(
     const at::Tensor& input, const at::Tensor& residual, const at::Tensor& weight,
-    double epsilon, bool gemma) {
+    double epsilon, double weight_offset) {
   const float eps = static_cast<float>(epsilon);
-  TORCH_CHECK(std::isfinite(epsilon) && std::isfinite(eps) && eps > 0,
-              "GaudiRT: fused RMSNorm epsilon must be a positive finite FP32 value");
+  const float offset = static_cast<float>(weight_offset);
+  TORCH_CHECK(std::isfinite(epsilon) && std::isfinite(eps) && eps > 0 &&
+              std::isfinite(weight_offset) && std::isfinite(offset),
+              "GaudiRT: fused RMSNorm epsilon must be positive finite and weight_offset finite");
   TORCH_CHECK(input.device().type() == c10::kPrivateUse1 && residual.device() == input.device() &&
               weight.device() == input.device() && input.scalar_type() == at::kBFloat16 &&
               residual.scalar_type() == at::kBFloat16 && weight.scalar_type() == at::kBFloat16,
@@ -1048,18 +919,18 @@ std::tuple<at::Tensor, at::Tensor> fused_add_rms_norm_common(
             at::empty(residual.sizes(), residual.options())};
   }
   if (input.size(0) <= kMaxBucketRows) {
-    const auto node = gemma ? FxNode::fused_gemma_norm(0, 1, 2, eps)
-                            : FxNode::fused_norm(0, 1, 2, eps);
-    BucketProgram program({1, 1, 0}, {node, FxNode::unary(FxOp::fused_residual, 3)}, {3, 4});
+    BucketProgram program({1, 1, 0},
+                          {FxNode::fused_norm(0, 1, 2, eps, offset),
+                           FxNode::unary(FxOp::fused_residual, 3)},
+                          {3, 4});
     auto result = program.run({input, residual, weight});
     return {std::move(result[0]), std::move(result[1])};
   }
   auto out_norm = at::empty(input.sizes(), input.options());
   auto out_res = at::empty(residual.sizes(), residual.options());
   const auto syn_dims = to_syn_dims(input);
-  const float offset = gemma ? 1.0f : 0.0f;
   std::ostringstream sig;
-  sig << "frms_v1:" << (gemma ? 1 : 0) << ":" << std::bit_cast<uint32_t>(eps) << ":"
+  sig << "frms_v1:" << std::bit_cast<uint32_t>(offset) << ":" << std::bit_cast<uint32_t>(eps) << ":"
       << format_dims_key(syn_dims);
   launch_cold_recipe(
       "cold_frms", sig.str(), {input, residual, weight}, {out_norm, out_res},
@@ -1068,26 +939,6 @@ std::tuple<at::Tensor, at::Tensor> fused_add_rms_norm_common(
         emit_rms_norm(builder, in[0], in[1], in[2], out_t[0], out_t[1], syn_dims, eps, offset);
       });
   return {std::move(out_norm), std::move(out_res)};
-}
-
-}  // namespace
-
-at::Tensor rms_norm(const at::Tensor& input, const at::Tensor& weight, double epsilon) {
-  return rms_norm_common(input, weight, epsilon, false);
-}
-
-std::tuple<at::Tensor, at::Tensor> fused_add_rms_norm(
-    const at::Tensor& input, const at::Tensor& residual, const at::Tensor& weight, double epsilon) {
-  return fused_add_rms_norm_common(input, residual, weight, epsilon, false);
-}
-
-at::Tensor gemma_rms_norm(const at::Tensor& input, const at::Tensor& weight, double epsilon) {
-  return rms_norm_common(input, weight, epsilon, true);
-}
-
-std::tuple<at::Tensor, at::Tensor> fused_add_gemma_rms_norm(
-    const at::Tensor& input, const at::Tensor& residual, const at::Tensor& weight, double epsilon) {
-  return fused_add_rms_norm_common(input, residual, weight, epsilon, true);
 }
 
 at::Tensor gelu_and_mul(const at::Tensor& input, std::string_view approximate) {

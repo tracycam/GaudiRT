@@ -490,24 +490,26 @@ FxGeometry infer_fx_geometry(const std::vector<at::Tensor>& inputs, const std::v
     }
     const auto& b = specs[op.inputs[1]];
     TORCH_CHECK(a.dtype == b.dtype, "GaudiRT FX: input dtype mismatch");
-    if (op.op == FxOp::fused_add_rms_norm || op.op == FxOp::fused_add_gemma_rms_norm) {
+    if (op.op == FxOp::fused_add_rms_norm) {
       const auto& weight = specs[op.inputs[2]];
-      const float epsilon = std::get<FxEpsilon>(op.parameters).value;
+      const auto& rms = std::get<FxRmsNorm>(op.parameters);
       TORCH_CHECK(a.dtype == at::kBFloat16 && a.dynamic() && b.dynamic() &&
                   a.sizes.size() >= 2 && a.sizes.size() <= 5 &&
                   a.sizes == b.sizes && a.sizes.back() <= 8192 && !weight.dynamic() &&
                   weight.dtype == a.dtype && weight.sizes.size() == 1 &&
                   weight.sizes[0] == a.sizes.back() &&
-                  std::isfinite(epsilon) && epsilon > 0,
-                  "GaudiRT FX: invalid fused RMSNorm geometry or epsilon");
+                  std::isfinite(rms.epsilon) && rms.epsilon > 0 &&
+                  std::isfinite(rms.weight_offset),
+                  "GaudiRT FX: invalid fused RMSNorm geometry or parameters");
       specs.push_back(a);
-    } else if (op.op == FxOp::rms_norm || op.op == FxOp::gemma_rms_norm) {
-      const float epsilon = std::get<FxEpsilon>(op.parameters).value;
+    } else if (op.op == FxOp::rms_norm) {
+      const auto& rms = std::get<FxRmsNorm>(op.parameters);
       TORCH_CHECK(a.dtype == at::kBFloat16 && a.dynamic() &&
                   a.sizes.size() >= 2 && a.sizes.size() <= 5 &&
                   a.sizes.back() <= 8192 && !b.dynamic() && b.sizes.size() == 1 &&
-                  b.sizes[0] == a.sizes.back() && std::isfinite(epsilon) && epsilon > 0,
-                  "GaudiRT FX: invalid BF16 RMSNorm geometry or epsilon");
+                  b.sizes[0] == a.sizes.back() && std::isfinite(rms.epsilon) &&
+                  rms.epsilon > 0 && std::isfinite(rms.weight_offset),
+                  "GaudiRT FX: invalid BF16 RMSNorm geometry or parameters");
       specs.push_back(a);
     } else if (op.op == FxOp::linear) {
       const bool transposed = std::get<FxLinear>(op.parameters).transpose_weight;

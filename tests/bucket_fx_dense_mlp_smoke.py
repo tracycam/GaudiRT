@@ -124,10 +124,10 @@ def main():
     try:
         torch.ops.gaudirt.silu_and_mul.default(invalid)
     except RuntimeError as error:
-        assert "SiLU" in str(error)
+        assert "gated activation geometry" in str(error), str(error)
     else:
         raise AssertionError("odd gate/up width was accepted")
-    for invalid_m in (0, 4097):
+    for invalid_m in (0, gaudirt.MAX_BUCKET_ROWS + 1):
         invalid_rows = torch.empty((invalid_m, 256), dtype=torch.bfloat16, device="gaudirt:0")
         try:
             torch.ops.gaudirt.silu_and_mul.default(invalid_rows)

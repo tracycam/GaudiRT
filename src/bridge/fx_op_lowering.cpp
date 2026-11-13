@@ -177,21 +177,86 @@ synTensor emit_cast(SynapseGraphBuilder& builder, synTensor input,
 
 synTensor emit_broadcast_to(SynapseGraphBuilder& builder, synTensor input, synDataType dtype,
                             const std::vector<uint64_t>& src_syn_dims,
-                            const std::vector<uint64_t>& dst_syn_dims) {
-  if (src_syn_dims == dst_syn_dims) return input;
+                            const std::vector<uint64_t>& dst_syn_dims,
+                            synTensor target_out) {
+  if (src_syn_dims == dst_syn_dims) {
+    if (!target_out) return input;
+    add_single_out_node(builder, {input}, target_out, std::monostate{}, "reshape");
+    return target_out;
+  }
   auto current = input;
   auto cur_dims = src_syn_dims;
   if (cur_dims.size() < dst_syn_dims.size()) {
     while (cur_dims.size() < dst_syn_dims.size()) cur_dims.push_back(1);
-    auto reshaped = builder.tensor(dtype, cur_dims, -1);
+    const bool done = (cur_dims == dst_syn_dims);
+    auto reshaped = (done && target_out) ? target_out : builder.tensor(dtype, cur_dims, -1);
     add_single_out_node(builder, {current}, reshaped, std::monostate{}, "reshape");
+    if (done) return reshaped;
     current = reshaped;
   }
   TORCH_CHECK(cur_dims.size() == dst_syn_dims.size(), "GaudiRT: invalid broadcast rank");
-  if (cur_dims == dst_syn_dims) return current;
-  auto out = builder.tensor(dtype, dst_syn_dims, -1);
-  add_single_out_node(builder, {current}, out, std::monostate{}, "broadcast");
-  return out;
+  if (dtype != syn_type_int64) {
+    auto out = target_out ? target_out : builder.tensor(dtype, dst_syn_dims, -1);
+    add_single_out_node(builder, {current}, out, std::monostate{}, "broadcast");
+    return out;
+  }
+  // P-RT-92: Synapse "broadcast" on syn_type_int64 silently truncates the upper 32 bits;
+  // lower all int64 broadcasts via local "reinterpret_cast" to syn_type_int32 "broadcast".
+  if (cur_dims.size() <= 4) {
+    std::vector<uint64_t> in64_dims{1};
+    std::vector<uint64_t> in32_dims{2};
+    std::vector<uint64_t> out32_dims{2};
+    std::vector<uint64_t> out64_dims{1};
+    in64_dims.insert(in64_dims.end(), cur_dims.begin(), cur_dims.end());
+    in32_dims.insert(in32_dims.end(), cur_dims.begin(), cur_dims.end());
+    out32_dims.insert(out32_dims.end(), dst_syn_dims.begin(), dst_syn_dims.end());
+    out64_dims.insert(out64_dims.end(), dst_syn_dims.begin(), dst_syn_dims.end());
+    auto in64 = builder.tensor(syn_type_int64, in64_dims, -1);
+    auto in32 = builder.tensor(syn_type_int32, in32_dims, -1);
+    auto out32 = builder.tensor(syn_type_int32, out32_dims, -1);
+    auto out64 = builder.tensor(syn_type_int64, out64_dims, -1);
+    auto out = target_out ? target_out : builder.tensor(syn_type_int64, dst_syn_dims, -1);
+    add_single_out_node(builder, {current}, in64, std::monostate{}, "reshape");
+    add_single_out_node(builder, {in64}, in32, std::monostate{}, "reinterpret_cast");
+    add_single_out_node(builder, {in32}, out32, std::monostate{}, "broadcast");
+    add_single_out_node(builder, {out32}, out64, std::monostate{}, "reinterpret_cast");
+    add_single_out_node(builder, {out64}, out, std::monostate{}, "reshape");
+    return out;
+  }
+  TORCH_CHECK(cur_dims.size() == 5, "GaudiRT: int64 broadcast rank exceeds Synapse 5D limit");
+  if (cur_dims[0] != dst_syn_dims[0]) {
+    TORCH_CHECK(cur_dims[0] == 1, "GaudiRT: invalid int64 FCD broadcast");
+    const uint64_t rest = cur_dims[1] * cur_dims[2] * cur_dims[3] * cur_dims[4];
+    auto in64 = builder.tensor(syn_type_int64, {1, 1, rest}, -1);
+    auto in32 = builder.tensor(syn_type_int32, {2, 1, rest}, -1);
+    auto out32 = builder.tensor(syn_type_int32, {2, dst_syn_dims[0], rest}, -1);
+    auto out64 = builder.tensor(syn_type_int64, {1, dst_syn_dims[0], rest}, -1);
+    add_single_out_node(builder, {current}, in64, std::monostate{}, "reshape");
+    add_single_out_node(builder, {in64}, in32, std::monostate{}, "reinterpret_cast");
+    add_single_out_node(builder, {in32}, out32, std::monostate{}, "broadcast");
+    add_single_out_node(builder, {out32}, out64, std::monostate{}, "reinterpret_cast");
+    cur_dims[0] = dst_syn_dims[0];
+    const bool done = (cur_dims == dst_syn_dims);
+    auto reshaped = (done && target_out) ? target_out : builder.tensor(syn_type_int64, cur_dims, -1);
+    add_single_out_node(builder, {out64}, reshaped, std::monostate{}, "reshape");
+    if (done) return reshaped;
+    current = reshaped;
+  }
+  std::vector<uint64_t> in32_dims = cur_dims;
+  std::vector<uint64_t> out32_dims = dst_syn_dims;
+  in32_dims[0] *= 2;
+  out32_dims[0] *= 2;
+  auto cur_local = builder.tensor(syn_type_int64, cur_dims, -1);
+  auto in32 = builder.tensor(syn_type_int32, in32_dims, -1);
+  auto out32 = builder.tensor(syn_type_int32, out32_dims, -1);
+  auto out64 = builder.tensor(syn_type_int64, dst_syn_dims, -1);
+  add_single_out_node(builder, {current}, cur_local, std::monostate{}, "reshape");
+  add_single_out_node(builder, {cur_local}, in32, std::monostate{}, "reinterpret_cast");
+  add_single_out_node(builder, {in32}, out32, std::monostate{}, "broadcast");
+  add_single_out_node(builder, {out32}, out64, std::monostate{}, "reinterpret_cast");
+  if (!target_out) return out64;
+  add_single_out_node(builder, {out64}, target_out, std::monostate{}, "reshape");
+  return target_out;
 }
 
 void emit_ewise_unary(SynapseGraphBuilder& builder, synTensor input, synTensor output,
@@ -354,21 +419,28 @@ void emit_where(SynapseGraphBuilder& builder, synTensor cond, synTensor x, synTe
   auto x_b = emit_broadcast_to(builder, x, syn, x_dims, out_dims);
   auto y_b = emit_broadcast_to(builder, y, syn, y_dims, out_dims);
   if (dtype == at::kLong) {
-    std::vector<uint64_t> lanes_dims{2};
-    lanes_dims.insert(lanes_dims.end(), out_dims.begin(), out_dims.end());
-    std::vector<uint64_t> c_lanes_dims{1};
-    c_lanes_dims.insert(c_lanes_dims.end(), out_dims.begin(), out_dims.end());
+    uint64_t flat_elems = 1;
+    for (const auto d : out_dims) flat_elems *= d;
+    const std::vector<uint64_t> flat_i64_dims{1, flat_elems};
+    const std::vector<uint64_t> lanes_dims{2, flat_elems};
+    const std::vector<uint64_t> c_lanes_dims{1, flat_elems};
+    auto xf = builder.tensor(syn_type_int64, flat_i64_dims, -1);
+    auto yf = builder.tensor(syn_type_int64, flat_i64_dims, -1);
     auto xl = builder.tensor(syn_type_int32, lanes_dims, -1);
     auto yl = builder.tensor(syn_type_int32, lanes_dims, -1);
     auto c1 = builder.tensor(syn_type_uint8, c_lanes_dims, -1);
     auto cl = builder.tensor(syn_type_uint8, lanes_dims, -1);
     auto ol = builder.tensor(syn_type_int32, lanes_dims, -1);
-    add_single_out_node(builder, {x_b}, xl, std::monostate{}, "reshape");
-    add_single_out_node(builder, {y_b}, yl, std::monostate{}, "reshape");
+    auto of = builder.tensor(syn_type_int64, flat_i64_dims, -1);
+    add_single_out_node(builder, {x_b}, xf, std::monostate{}, "reshape");
+    add_single_out_node(builder, {y_b}, yf, std::monostate{}, "reshape");
+    add_single_out_node(builder, {xf}, xl, std::monostate{}, "reinterpret_cast");
+    add_single_out_node(builder, {yf}, yl, std::monostate{}, "reinterpret_cast");
     add_single_out_node(builder, {c_b}, c1, std::monostate{}, "reshape");
     add_single_out_node(builder, {c1}, cl, std::monostate{}, "broadcast");
     add_single_out_node(builder, {cl, xl, yl}, ol, std::monostate{}, "where_fwd_i32");
-    add_single_out_node(builder, {ol}, output, std::monostate{}, "reshape");
+    add_single_out_node(builder, {ol}, of, std::monostate{}, "reinterpret_cast");
+    add_single_out_node(builder, {of}, output, std::monostate{}, "reshape");
     return;
   }
   add_single_out_node(builder, {c_b, x_b, y_b}, output, std::monostate{},
