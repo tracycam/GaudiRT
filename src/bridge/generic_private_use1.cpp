@@ -471,6 +471,8 @@ TORCH_LIBRARY(gaudirt, m) {
   m.def("softcap_(Tensor(a!) logits, float cap) -> Tensor(a!)");
   m.def("sample_from_logits(Tensor logits, Tensor temperatures, Tensor top_ps, Tensor top_ks, Tensor min_ps, "
         "Tensor? seeds=None, Tensor? positions=None, bool nan_to_neg_inf=True) -> Tensor");
+  m.def("apply_token_bitmask_inplace_(Tensor(a!) logits, Tensor bitmask, Tensor? indices=None, "
+        "int vocab_size=-1, bool mask_tail=False) -> Tensor(a!)");
   m.def("_index_select_validated(Tensor input, int axis, Tensor indices) -> Tensor");
   m.def("_index_put_validated_(Tensor(a!) input, Tensor indices, Tensor values) -> Tensor(a!)");
   m.def("_advance_decode_lengths(Tensor seq_lens, Tensor orig_seq_lens) -> (Tensor, Tensor)");
@@ -490,6 +492,7 @@ TORCH_LIBRARY_IMPL(gaudirt, PrivateUse1, m) {
   m.impl("_rotary_embedding_validated", TORCH_FN(gaudirt::generic::rotary_embedding_validated));
   m.impl("softcap_", TORCH_FN(gaudirt::generic::softcap_));
   m.impl("sample_from_logits", TORCH_FN(gaudirt::generic::sample_from_logits));
+  m.impl("apply_token_bitmask_inplace_", TORCH_FN(gaudirt::generic::apply_token_bitmask_inplace_));
   m.impl("_index_select_validated", TORCH_FN(gaudirt::generic::index_select_validated));
   m.impl("_index_put_validated_", TORCH_FN(gaudirt::generic::index_put_validated));
   m.impl("_advance_decode_lengths", TORCH_FN(gaudirt::generic::advance_decode_lengths));
