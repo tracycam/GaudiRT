@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "communicator.hpp"
 
+#include "bucket_program.hpp"
 #include "graph_builder.hpp"
 #include "gaudirt/common/sha256.hpp"
 
@@ -19,9 +20,11 @@ namespace {
 ColdRecipe& rank_sum_recipe(Context& ctx, uint32_t bucket_elements, uint32_t world_size,
                             at::ScalarType dtype) {
   TORCH_CHECK(world_size >= 2 && world_size <= 8 &&
+              bucket_elements >= 1 &&
+              static_cast<uint64_t>(bucket_elements) * world_size <= static_cast<uint64_t>(INT32_MAX) &&
               (dtype == at::kBFloat16 || dtype == at::kFloat),
               "GaudiRT collective: unsupported rank_sum configuration");
-  const std::string structure = "tp_rank_sum_v1:" + std::to_string(world_size) + ":" +
+  const std::string structure = "tp_rank_sum_v2:" + std::to_string(world_size) + ":" +
                                 std::to_string(bucket_elements) + ":" +
                                 std::to_string(static_cast<int>(dtype));
   const auto digest = common::sha256_bytes(
@@ -31,37 +34,18 @@ ColdRecipe& rank_sum_recipe(Context& ctx, uint32_t bucket_elements, uint32_t wor
     return *found->second;
   }
 
-  auto recipe = std::make_unique<ColdRecipe>(world_size + 1);
+  auto recipe = std::make_unique<ColdRecipe>(2);
   const std::string prefix = "grsum_" + digest.substr(0, 10) + "_b" + std::to_string(bucket_elements);
   SynapseGraphBuilder builder(prefix, *recipe);
   const synDataType io_type = dtype == at::kBFloat16 ? syn_type_bf16 : syn_type_float;
+  const uint64_t w = static_cast<uint64_t>(world_size);
 
-  std::vector<synTensor> wide(world_size, nullptr);
-  ns_CastKernel::ParamsV3 cast_params{};
-  cast_params.round_mode = CAST_ROUND_HALF_NE;
-
-  for (uint32_t r = 0; r < world_size; ++r) {
-    synTensor in = builder.tensor(io_type, {bucket_elements}, static_cast<int>(r));
-    if (dtype == at::kBFloat16) {
-      synTensor w = builder.tensor(syn_type_float, {bucket_elements}, -1);
-      builder.node({"cast_bf16_to_f32", {in}, {w}, cast_params});
-      wide[r] = w;
-    } else {
-      wide[r] = in;
-    }
-  }
-
-  synTensor out = builder.tensor(io_type, {bucket_elements}, static_cast<int>(world_size));
-  synTensor acc = wide[0];
-  for (uint32_t r = 1; r < world_size; ++r) {
-    const bool final_fp32_out = (dtype == at::kFloat && r + 1 == world_size);
-    synTensor next = final_fp32_out ? out : builder.tensor(syn_type_float, {bucket_elements}, -1);
-    builder.node({"add_fwd_f32", {acc, wide[r]}, {next}, std::monostate{}});
-    acc = next;
-  }
-  if (dtype == at::kBFloat16) {
-    builder.node({"cast_f32_to_bf16", {acc}, {out}, cast_params});
-  }
+  synTensor gathered = builder.tensor(
+      io_type, {static_cast<uint64_t>(bucket_elements) * w}, 0, -1, 0, true, {w});
+  synTensor out = builder.tensor(
+      io_type, {static_cast<uint64_t>(bucket_elements)}, 1, -1, 0, true, {1});
+  builder.node({dtype == at::kBFloat16 ? "gk_rank_sum_bf16_v1" : "gk_rank_sum_f32_v1",
+                {gathered}, {out}, static_cast<int32_t>(world_size)});
 
   builder.compile(ctx.cache, key);
   auto [it, inserted] = ctx.cold_recipes.emplace(key, std::move(recipe));
@@ -91,9 +75,13 @@ ColdRecipe& gather_transpose_recipe(Context& ctx, uint64_t world_size, uint64_t 
       TORCH_CHECK(false, "GaudiRT collective: unsupported gather-transpose dtype");
   }
 
-  const std::string structure = "tp_gather_transpose_v1:" + std::to_string(world_size) + ":" +
-                                std::to_string(batch_rows) + ":" + std::to_string(width_units) + ":" +
-                                std::to_string(static_cast<int>(syn_dtype));
+  const uint64_t max_rows = static_cast<uint64_t>(kMaxBucketRows);
+  const bool dynamic_batch = batch_rows > 0 && batch_rows <= max_rows;
+  const std::string structure = dynamic_batch
+      ? ("tp_gather_transpose_v2:" + std::to_string(world_size) + ":" + std::to_string(max_rows) + ":" +
+         std::to_string(width_units) + ":" + std::to_string(static_cast<int>(syn_dtype)))
+      : ("tp_gather_transpose_v1:" + std::to_string(world_size) + ":" + std::to_string(batch_rows) + ":" +
+         std::to_string(width_units) + ":" + std::to_string(static_cast<int>(syn_dtype)));
   const auto digest = common::sha256_bytes(
       reinterpret_cast<const uint8_t*>(structure.data()), structure.size());
   const std::string key = "tp_gather_transpose_" + digest;
@@ -104,8 +92,14 @@ ColdRecipe& gather_transpose_recipe(Context& ctx, uint64_t world_size, uint64_t 
   auto recipe = std::make_unique<ColdRecipe>(2);
   const std::string prefix = "ggtr_" + digest.substr(0, 10);
   SynapseGraphBuilder builder(prefix, *recipe);
-  synTensor src = builder.tensor(syn_dtype, {width_units, batch_rows, world_size}, 0);
-  synTensor dst = builder.tensor(syn_dtype, {width_units, world_size, batch_rows}, 1);
+  synTensor src = dynamic_batch
+      ? builder.tensor(syn_dtype, {width_units, max_rows, world_size}, 0, -1, 0, true,
+                       {width_units, 1ULL, world_size})
+      : builder.tensor(syn_dtype, {width_units, batch_rows, world_size}, 0);
+  synTensor dst = dynamic_batch
+      ? builder.tensor(syn_dtype, {width_units, world_size, max_rows}, 1, -1, 0, true,
+                       {width_units, world_size, 1ULL})
+      : builder.tensor(syn_dtype, {width_units, world_size, batch_rows}, 1);
 
   synTransposeParams params{};
   params.tensorDim = 3;
@@ -384,6 +378,10 @@ bool CommunicatorRegistry::should_gather_reduce(uint64_t exact_elements, uint32_
   const uint64_t elem_size = c10::elementSize(dtype);
   const uint64_t exact_bytes = exact_elements * elem_size;
   if (exact_bytes % BlockCachingAllocator::kAlignment != 0) return false;
+  if (static_cast<uint64_t>(world_size) * static_cast<uint64_t>(bucket_elements) >
+      static_cast<uint64_t>(INT32_MAX)) {
+    return false;
+  }
   const uint64_t total_bucket_bytes =
       static_cast<uint64_t>(world_size) * static_cast<uint64_t>(bucket_elements) * elem_size;
   return total_bucket_bytes <= kMaxGatherReduceBytes;
@@ -393,18 +391,18 @@ void CommunicatorRegistry::launch_rank_sum(Context& ctx, uint64_t gathered_addr,
                                            uint64_t exact_elements, uint32_t bucket_elements,
                                            uint32_t world_size, at::ScalarType dtype,
                                            synStreamHandle stream) {
-  const uint64_t elem_size = c10::elementSize(dtype);
-  const uint64_t exact_bytes = exact_elements * elem_size;
+  TORCH_CHECK(exact_elements >= 1 && exact_elements <= bucket_elements,
+              "GaudiRT collective: invalid rank_sum extent");
   ColdRecipe* recipe = nullptr;
   {
     std::lock_guard lock(ctx.cold_mutex);
     recipe = &rank_sum_recipe(ctx, bucket_elements, world_size, dtype);
   }
   auto bindings = recipe->tensors;
-  for (uint32_t r = 0; r < world_size; ++r) {
-    bindings[r].pTensorAddress = gathered_addr + static_cast<uint64_t>(r) * exact_bytes;
-  }
-  bindings[world_size].pTensorAddress = dst_addr;
+  bindings[0].pTensorAddress = gathered_addr;
+  bindings[0].tensorSize[0] = exact_elements * static_cast<uint64_t>(world_size);
+  bindings[1].pTensorAddress = dst_addr;
+  bindings[1].tensorSize[0] = exact_elements;
   uint64_t workspace = 0;
   if (recipe->workspace > 0) {
     workspace = ctx.allocator.allocate(recipe->workspace, stream);
@@ -430,6 +428,10 @@ void CommunicatorRegistry::launch_gather_transpose(Context& ctx, uint64_t gather
   auto bindings = recipe->tensors;
   bindings[0].pTensorAddress = gathered_addr;
   bindings[1].pTensorAddress = dst_addr;
+  if (batch_rows > 0 && batch_rows <= static_cast<uint64_t>(kMaxBucketRows)) {
+    bindings[0].tensorSize[1] = batch_rows;
+    bindings[1].tensorSize[2] = batch_rows;
+  }
   uint64_t workspace = 0;
   if (recipe->workspace > 0) {
     workspace = ctx.allocator.allocate(recipe->workspace, stream);
