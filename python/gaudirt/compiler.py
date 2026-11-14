@@ -9,7 +9,7 @@ import torch
 import torch.fx.experimental._config
 
 from . import _C
-from .fx_passes import _fx_collective, _normalize_fx_graph
+from .fx_passes import _fx_collective, _fx_gather_rows, _normalize_fx_graph
 from .op_lowering import _program_backend
 from .partitioner import _SegmentExecution, _partition_backend
 
@@ -39,6 +39,7 @@ def gaudirt_backend(graph_module, example_inputs):
         torch.ops.gaudirt._paged_attn_validated,
         torch.ops.gaudirt._paged_attn_validated.default,
         _fx_collective,
+        _fx_gather_rows,
     ) for node in nodes):
         return _partition_backend(graph_module, example_inputs)
     return _program_backend(graph_module, example_inputs)

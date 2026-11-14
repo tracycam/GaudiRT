@@ -1201,7 +1201,7 @@ class _ProgramLoweringBuilder:
             if dynamic and dynamic != {0}:
                 raise RuntimeError("GaudiRT FX: only the outer token dimension may be dynamic")
             role = int(node.meta.get("gaudirt_dynamic", bool(dynamic)))
-            if self._active_tensor_args is not None and index not in self._active_tensor_args:
+            if not node.users or (self._active_tensor_args is not None and index not in self._active_tensor_args):
                 passthrough_placeholders.append((index, node, role, value))
             else:
                 placeholder_tensors.append((index, node, role, value))
@@ -1214,6 +1214,8 @@ class _ProgramLoweringBuilder:
             ref = ex if ex is not None else value
             shape = tuple(ref.shape)
             if role:
+                if self.dynamic_dim0_token is not None and self.dynamic_dim0_token != str(shape[0]):
+                    raise RuntimeError("GaudiRT FX: single BucketProgram segment supports only one dynamic outer extent")
                 self.dynamic_dim0_token = str(shape[0])
                 self.node_shapes[node] = (-1, *(int(s) for s in shape[1:]))
             else:

@@ -3,10 +3,16 @@
 
 #include "bridge_internal.hpp"
 #include "bucket_program.hpp"
+#include "cold_recipe.hpp"
+#include "eager_copy.hpp"
+#include "graph_builder.hpp"
 #include "paged_attention.hpp"
+#include "temporaries.hpp"
+#include "gaudirt/common/sha256.hpp"
 
 #include <ATen/Functions.h>
 #include <c10/util/Exception.h>
+#include <perf_lib_layer_params.h>
 
 #include <algorithm>
 #include <bit>
@@ -206,6 +212,106 @@ void launch_segment_collective(
   }
 }
 
+bool supported_gather_rows_dtype(at::ScalarType dtype) {
+  return dtype == at::kBFloat16 || dtype == at::kFloat || dtype == at::kInt;
+}
+
+ColdRecipe& dynamic_gather_rows_recipe(Context& ctx, uint64_t width, at::ScalarType src_dtype,
+                                       bool idx_is_i64) {
+  TORCH_CHECK(supported_gather_rows_dtype(src_dtype),
+              "GaudiRT FX: dynamic gather_rows supports only bf16, float32, and int32 sources");
+  const auto type = cast_type(src_dtype);
+  const std::string structure = "fx_dyn_gather_rows_v1:" + std::string(type.name) + ":" +
+                                std::to_string(width) + ":" + (idx_is_i64 ? "i64" : "i32");
+  const auto digest = common::sha256_bytes(
+      reinterpret_cast<const uint8_t*>(structure.data()), structure.size());
+  const std::string key = "fx_dyn_gather_rows_" + digest;
+  if (auto found = ctx.cold_recipes.find(key); found != ctx.cold_recipes.end()) {
+    return *found->second;
+  }
+  auto recipe = std::make_unique<ColdRecipe>(3);
+  SynapseGraphBuilder builder("dgath_" + digest.substr(0, 10), *recipe);
+  const uint64_t max_rows = static_cast<uint64_t>(kMaxBucketRows);
+  synTensor src = builder.tensor(type.syn, {width, max_rows}, 0, -1, 0, true, {width, 1ULL});
+  synTensor idx = builder.tensor(idx_is_i64 ? syn_type_int64 : syn_type_int32,
+                                 {max_rows}, 1, -1, 0, true, {1ULL});
+  synTensor dst = builder.tensor(type.syn, {width, max_rows}, 2, -1, 0, true, {width, 1ULL});
+  if (idx_is_i64) {
+    synTensor idx_i32 = builder.tensor(syn_type_int32, {max_rows}, -1, -1, 0, true, {1ULL});
+    ns_CastKernel::ParamsV3 cast{};
+    cast.round_mode = CAST_ROUND_HALF_NE;
+    builder.node(NodeSpec{"cast_i64_to_i32", {idx}, {idx_i32}, cast});
+    idx = idx_i32;
+  }
+  ns_GatherKernel::ParamsV2 params{};
+  params.axis = 1;
+  params.batchDims = 0;
+  builder.node(NodeSpec{"gather_fwd_" + std::string(type.name), {src, idx}, {dst}, params});
+  builder.compile(ctx.cache, key);
+  auto [it, inserted] = ctx.cold_recipes.emplace(key, std::move(recipe));
+  TORCH_CHECK(inserted, "GaudiRT FX: duplicate dynamic gather_rows recipe");
+  return *it->second;
+}
+
+at::Tensor launch_segment_gather_rows(Context& ctx, at::Tensor source, at::Tensor indices) {
+  TORCH_CHECK(source.device().type() == c10::kPrivateUse1 &&
+              source.device().index() == ctx.device_index &&
+              indices.device() == source.device(),
+              "GaudiRT FX: dynamic gather_rows tensors must live on the active device");
+  TORCH_CHECK(source.dim() == 2 && source.size(0) > 0 && source.size(0) <= kMaxBucketRows &&
+              source.size(1) > 0 && supported_gather_rows_dtype(source.scalar_type()),
+              "GaudiRT FX: invalid dynamic gather_rows source tensor");
+  TORCH_CHECK(indices.dim() == 1 && indices.size(0) > 0 && indices.size(0) <= kMaxBucketRows &&
+              (indices.scalar_type() == at::kInt || indices.scalar_type() == at::kLong),
+              "GaudiRT FX: invalid dynamic gather_rows index tensor");
+  const int64_t src_rows = source.size(0);
+  const int64_t width = source.size(1);
+  const int64_t idx_rows = indices.size(0);
+  if (!source.is_contiguous() || address_of(source, ctx) % runtime::BlockCachingAllocator::kAlignment != 0) {
+    auto staged = at::empty(source.sizes(), source.options());
+    copy(staged, source, true);
+    source = std::move(staged);
+  }
+  if (!indices.is_contiguous() || address_of(indices, ctx) % runtime::BlockCachingAllocator::kAlignment != 0) {
+    auto staged = at::empty(indices.sizes(), indices.options());
+    copy(staged, indices, true);
+    indices = std::move(staged);
+  }
+  const uint32_t out_bucket = std::bit_ceil(static_cast<uint32_t>(idx_rows));
+  auto output = bucket_output(source, source.scalar_type(), out_bucket, idx_rows, width);
+  const uint64_t src_addr = address_of(source, ctx);
+  const uint64_t idx_addr = address_of(indices, ctx);
+  const uint64_t dst_addr = address_of(output, ctx);
+  const bool idx_is_i64 = indices.scalar_type() == at::kLong;
+  ColdRecipe* recipe = nullptr;
+  {
+    std::lock_guard lock(ctx.cold_mutex);
+    recipe = &dynamic_gather_rows_recipe(ctx, static_cast<uint64_t>(width),
+                                         source.scalar_type(), idx_is_i64);
+  }
+  const auto stream = ctx.stream();
+  ctx.allocator.record_stream(src_addr, stream);
+  ctx.allocator.record_stream(idx_addr, stream);
+  ctx.allocator.record_stream(dst_addr, stream);
+  auto bindings = recipe->tensors;
+  bindings[0].pTensorAddress = src_addr;
+  bindings[0].tensorSize[0] = static_cast<uint64_t>(width);
+  bindings[0].tensorSize[1] = static_cast<uint64_t>(src_rows);
+  bindings[1].pTensorAddress = idx_addr;
+  bindings[1].tensorSize[0] = static_cast<uint64_t>(idx_rows);
+  bindings[2].pTensorAddress = dst_addr;
+  bindings[2].tensorSize[0] = static_cast<uint64_t>(width);
+  bindings[2].tensorSize[1] = static_cast<uint64_t>(idx_rows);
+  std::unique_ptr<TemporaryDevice> workspace;
+  if (recipe->workspace > 0) {
+    workspace = std::make_unique<TemporaryDevice>(ctx, recipe->workspace);
+  }
+  TORCH_CHECK(synLaunch(stream, bindings.data(), bindings.size(),
+                        workspace ? workspace->address : 0, recipe->recipe, 0) == synSuccess,
+              "GaudiRT FX: dynamic gather_rows launch failed");
+  return output;
+}
+
 }  // namespace
 
 SegmentOutputPool::Frame* SegmentOutputPool::acquire(uint64_t generation, synStreamHandle stream) {
@@ -331,6 +437,20 @@ size_t SegmentedRunner::add_collective_wait(uint32_t coll_id) {
   return out_slot;
 }
 
+size_t SegmentedRunner::add_gather_rows(size_t source_slot, size_t index_slot) {
+  TORCH_CHECK(uses_.empty() && source_slot < slots_ && index_slot < slots_,
+              "GaudiRT segments: invalid gather_rows slots");
+  Instruction step;
+  step.kind = StepKind::GatherRows;
+  step.inputs = {source_slot, index_slot};
+  step.trusted = {trusted_slots_[source_slot], trusted_slots_[index_slot]};
+  step.outputs.push_back(slots_++);
+  trusted_slots_.push_back(true);
+  const size_t out_slot = step.outputs[0];
+  instructions_.push_back(std::move(step));
+  return out_slot;
+}
+
 void SegmentedRunner::set_outputs(std::vector<size_t> outputs) {
   TORCH_CHECK(uses_.empty() && !outputs.empty(), "GaudiRT segments: invalid output plan");
   for (const auto& desc : collectives_) {
@@ -373,6 +493,7 @@ void SegmentedRunner::set_outputs(std::vector<size_t> outputs) {
       for (size_t k = start_idx + 1; k < idx; ++k) {
         const auto& mid = instructions_[k];
         if (mid.kind == StepKind::Attention ||
+            mid.kind == StepKind::GatherRows ||
             (mid.kind == StepKind::Program && mid.program != nullptr) ||
             (mid.kind == StepKind::CollectiveStart && mid.comm_id != step.comm_id)) {
           has_intervening_work = true;
@@ -402,6 +523,9 @@ std::vector<SegmentedRunner::ScheduleItem> SegmentedRunner::schedule_summary() c
         break;
       case StepKind::CollectiveWait:
         items.emplace_back("collective_wait", step.coll_id, step.use_comm_stream);
+        break;
+      case StepKind::GatherRows:
+        items.emplace_back("gather_rows", 0U, false);
         break;
     }
   }
@@ -493,6 +617,8 @@ SegmentedRunner::TracedResult SegmentedRunner::execute(const std::vector<at::Ten
         }
       }
       values[step.outputs[0]] = std::move(pending_collectives[step.coll_id]);
+    } else if (step.kind == StepKind::GatherRows) {
+      values[step.outputs[0]] = launch_segment_gather_rows(*ctx, arguments[0], arguments[1]);
     } else {
       auto computed = step.program ? step.program->run_internal(arguments, step.trusted,
           frame ? &frame->outputs : nullptr, &step.reusable_outputs) : std::vector<at::Tensor>{};

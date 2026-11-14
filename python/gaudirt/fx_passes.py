@@ -17,6 +17,10 @@ def _fx_shard_embedding(tokens, weight, org_start, org_end, added_start, added_e
     raise RuntimeError("GaudiRT FX: internal _fx_shard_embedding must be lowered")
 
 
+def _fx_gather_rows(source, indices):
+    raise RuntimeError("GaudiRT FX: internal _fx_gather_rows must be lowered")
+
+
 def _fold_vocab_parallel_embedding(graph: torch.fx.Graph) -> None:
     emb_targets = (torch.nn.functional.embedding, torch.ops.aten.embedding.default)
     ge_ops = (operator.ge, torch.ge, torch.ops.aten.ge.Scalar)
@@ -176,7 +180,63 @@ def _fold_vocab_parallel_embedding(graph: torch.fx.Graph) -> None:
                 graph.erase_node(n)
 
 
+def _match_dynamic_gather_rows(node: torch.fx.Node):
+    if node.op == "call_function" and node.target is operator.getitem:
+        if len(node.args) != 2 or node.kwargs:
+            return None
+        src, raw_idx = node.args
+        if isinstance(raw_idx, torch.fx.Node):
+            idx = raw_idx
+        elif (isinstance(raw_idx, (tuple, list)) and
+              ((len(raw_idx) == 1 and isinstance(raw_idx[0], torch.fx.Node)) or
+               (len(raw_idx) == 2 and isinstance(raw_idx[0], torch.fx.Node) and raw_idx[1] == slice(None)))):
+            idx = raw_idx[0]
+        else:
+            return None
+    elif node.op == "call_function" and node.target is torch.ops.aten.index.Tensor:
+        if len(node.args) != 2 or node.kwargs or not isinstance(node.args[1], (list, tuple)):
+            return None
+        if len(node.args[1]) != 1 or not isinstance(node.args[1][0], torch.fx.Node):
+            return None
+        src, idx = node.args[0], node.args[1][0]
+    elif ((node.op == "call_method" and node.target == "index_select") or
+          (node.op == "call_function" and node.target in (torch.index_select, torch.ops.aten.index_select.default))):
+        if len(node.args) != 3 or node.kwargs or node.args[1] != 0 or not isinstance(node.args[2], torch.fx.Node):
+            return None
+        src, idx = node.args[0], node.args[2]
+    else:
+        return None
+    if not isinstance(src, torch.fx.Node):
+        return None
+    src_ex = src.meta.get("example_value")
+    idx_ex = idx.meta.get("example_value")
+    if (not isinstance(src_ex, torch.Tensor) or src_ex.ndim != 2 or
+            not isinstance(src_ex.shape[1], int) or src_ex.shape[1] <= 0):
+        return None
+    if isinstance(src_ex.shape[0], int) and (src_ex.shape[0] <= 0 or src_ex.shape[0] > 8192):
+        return None
+    if (not isinstance(idx_ex, torch.Tensor) or idx_ex.ndim != 1 or
+            isinstance(idx_ex.shape[0], int) or
+            idx_ex.dtype not in (torch.int32, torch.int64)):
+        return None
+    return src, idx
+
+
+def _fold_dynamic_gather_rows(graph: torch.fx.Graph) -> None:
+    for node in list(graph.nodes):
+        matched = _match_dynamic_gather_rows(node)
+        if matched is None:
+            continue
+        src, idx = matched
+        with graph.inserting_before(node):
+            gathered = graph.call_function(_fx_gather_rows, args=(src, idx))
+        gathered.meta.update(node.meta)
+        node.replace_all_uses_with(gathered)
+        graph.erase_node(node)
+
+
 def _normalize_fx_graph(graph_module: torch.fx.GraphModule, example_inputs=None) -> None:
     _fold_vocab_parallel_embedding(graph_module.graph)
-    _normalize_collectives(graph_module.graph, extra_impure=(_fx_shard_embedding,))
-    decompose_and_canonicalize_fx(graph_module, example_inputs, extra_impure=(_fx_shard_embedding,))
+    _normalize_collectives(graph_module.graph, extra_impure=(_fx_shard_embedding, _fx_gather_rows))
+    decompose_and_canonicalize_fx(graph_module, example_inputs, extra_impure=(_fx_shard_embedding, _fx_gather_rows))
+    _fold_dynamic_gather_rows(graph_module.graph)

@@ -631,6 +631,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            pybind11::arg("softcap") = 0.0, pybind11::arg("sliding_window") = -1)
       .def("add_collective_start", &SegmentedRunner::add_collective_start)
       .def("add_collective_wait", &SegmentedRunner::add_collective_wait)
+      .def("add_gather_rows", &SegmentedRunner::add_gather_rows)
       .def("schedule_summary", &SegmentedRunner::schedule_summary)
       .def("set_outputs", &SegmentedRunner::set_outputs)
       .def("bind_static", &SegmentedRunner::bind_static)

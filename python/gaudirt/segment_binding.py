@@ -96,7 +96,9 @@ def bind(execution, guard_manager, frame_locals, globals_, outer_result):
     if (any(index not in static_values and index not in dynamic_positions
             for check in execution.token_checks for index in check[:2]) or
             any(index not in static_values and index not in dynamic_positions
-                for check in execution.row_checks for index in check)):
+                for check in execution.row_checks for index in check) or
+            any(index not in static_values and index not in dynamic_positions
+                for index, _ in getattr(execution, "static_row_checks", ()))):
         return None
     execution.runner.bind_static([indices.index(index) for index in static], [args[index] for index in static])
 
@@ -119,6 +121,9 @@ def bind(execution, guard_manager, frame_locals, globals_, outer_result):
                 raise RuntimeError("GaudiRT FX: embedding token IDs must pass batch metadata validation")
         for index, dynamic_index in execution.row_checks:
             if getattr(tensor_at(index), "_gaudirt_validated_rows", None) != tensor_at(dynamic_index).shape[0]:
+                raise RuntimeError("GaudiRT FX: row indices must pass batch metadata validation")
+        for index, expected_rows in getattr(execution, "static_row_checks", ()):
+            if getattr(tensor_at(index), "_gaudirt_validated_rows", None) != expected_rows:
                 raise RuntimeError("GaudiRT FX: row indices must pass batch metadata validation")
         if execution.tracing:
             result, traces = execution.runner.run_bound_traced(values, list(range(len(execution.records))))

@@ -107,6 +107,8 @@ def _fake_rms_norm(input, weight, epsilon, weight_offset=0.0):
 
 @torch.library.register_fake("gaudirt::fused_add_rms_norm")
 def _fake_fused_add_rms_norm(input, residual, weight, epsilon, weight_offset=0.0):
+    if input.ndim >= 1 and residual.ndim >= 1:
+        torch._check(residual.shape[0] == input.shape[0])
     return (torch.empty_like(input, memory_format=torch.contiguous_format),
             torch.empty_like(residual, memory_format=torch.contiguous_format))
 
@@ -134,6 +136,8 @@ def _fake_fp8_linear(input, weight, scales, bias=None):
 @torch.library.register_fake("gaudirt::paged_attn")
 def _fake_paged_attn(query, key, value, key_pool, value_pool, metadata, head_dim, scale,
                      softcap=0.0, sliding_window=-1):
+    torch._check(key.shape[0] == query.shape[0])
+    torch._check(value.shape[0] == query.shape[0])
     return torch.empty_like(query, memory_format=torch.contiguous_format)
 
 
@@ -141,17 +145,25 @@ def _fake_paged_attn(query, key, value, key_pool, value_pool, metadata, head_dim
 def _fake_paged_attn_validated(query, key, value, key_pool, value_pool, locations,
                                requests, positions, mapping, header, head_dim, scale,
                                softcap=0.0, sliding_window=-1):
+    torch._check(key.shape[0] == query.shape[0])
+    torch._check(value.shape[0] == query.shape[0])
+    torch._check(locations.shape[0] == query.shape[0])
+    torch._check(requests.shape[0] == query.shape[0])
+    torch._check(positions.shape[0] == query.shape[0])
     return torch.empty_like(query, memory_format=torch.contiguous_format)
 
 
 @torch.library.register_fake("gaudirt::rotary_embedding")
 def _fake_rotary_embedding(query, key, cache, metadata, head_dim, rotary_dim, is_neox):
+    torch._check(key.shape[0] == query.shape[0])
     return (torch.empty_like(query, memory_format=torch.contiguous_format),
             torch.empty_like(key, memory_format=torch.contiguous_format))
 
 
 @torch.library.register_fake("gaudirt::rotary_embedding_positions")
 def _fake_rotary_embedding_positions(query, key, cache, positions, head_dim, rotary_dim, is_neox):
+    torch._check(key.shape[0] == query.shape[0])
+    torch._check(positions.shape[0] == query.shape[0])
     return (torch.empty_like(query, memory_format=torch.contiguous_format),
             torch.empty_like(key, memory_format=torch.contiguous_format))
 
@@ -159,6 +171,8 @@ def _fake_rotary_embedding_positions(query, key, cache, positions, head_dim, rot
 @torch.library.register_fake("gaudirt::_rotary_embedding_validated")
 def _fake_rotary_embedding_validated(query, key, cache, positions, header, context,
                                      head_dim, rotary_dim, is_neox):
+    torch._check(key.shape[0] == query.shape[0])
+    torch._check(positions.shape[0] == query.shape[0])
     return (torch.empty_like(query, memory_format=torch.contiguous_format),
             torch.empty_like(key, memory_format=torch.contiguous_format))
 

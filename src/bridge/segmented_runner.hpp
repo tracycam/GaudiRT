@@ -65,6 +65,7 @@ class SegmentedRunner {
   uint32_t add_collective_start(uint32_t comm_id, CollectiveKind collective_kind,
                                 size_t input_slot, bool dynamic_output);
   size_t add_collective_wait(uint32_t coll_id);
+  size_t add_gather_rows(size_t source_slot, size_t index_slot);
   void set_outputs(std::vector<size_t> outputs);
   void bind_static(const std::vector<size_t>& slots, const std::vector<at::Tensor>& inputs);
   std::vector<at::Tensor> run(const std::vector<at::Tensor>& inputs) const;
@@ -86,6 +87,7 @@ class SegmentedRunner {
     Attention = 1,
     CollectiveStart = 2,
     CollectiveWait = 3,
+    GatherRows = 4,
   };
 
   struct CollectiveDescriptor {

@@ -6,7 +6,7 @@ import operator
 import torch
 
 from . import _C
-from .fx_passes import _fx_collective
+from .fx_passes import _fx_collective, _fx_gather_rows
 from .op_lowering import _program_backend
 
 
@@ -35,7 +35,8 @@ class _SegmentExecution:
         self.input_indices = input_indices
         self.input_sources = input_sources
         self.output_template = output_template
-        self.token_checks, self.row_checks = checks
+        self.token_checks, self.row_checks, *extra_checks = checks
+        self.static_row_checks = extra_checks[0] if extra_checks else ()
         self.records = records
         self.tracing = False
         self.trace_result = None
@@ -89,6 +90,9 @@ class _SegmentExecution:
         for index, dynamic in self.row_checks:
             if getattr(args[index], "_gaudirt_validated_rows", None) != args[dynamic].shape[0]:
                 raise RuntimeError("GaudiRT FX: row indices must pass batch metadata validation")
+        for index, expected_rows in self.static_row_checks:
+            if getattr(args[index], "_gaudirt_validated_rows", None) != expected_rows:
+                raise RuntimeError("GaudiRT FX: row indices must pass batch metadata validation")
         inputs = [args[index] for index in self.input_indices]
         if self.tracing:
             result, traces = self.runner.run_traced(inputs, list(range(len(self.records))))
@@ -113,9 +117,14 @@ def _segment_executor(split, example_inputs, paged):
     input_indices = tuple(index for index, value in enumerate(example_inputs) if isinstance(value, torch.Tensor))
     values = {placeholders[index]: slot for slot, index in enumerate(input_indices)}
     runner = _C.SegmentedRunner(len(input_indices))
-    token_checks, row_checks, records = set(), set(), []
+    token_checks, row_checks, static_row_checks, records = set(), set(), set(), []
     dynamic_inputs = [index for index in input_indices if placeholders[index].meta.get("gaudirt_dynamic")]
     dynamic_input = dynamic_inputs[0] if dynamic_inputs else None
+    extent_to_input = {}
+    for index in dynamic_inputs:
+        ex = placeholders[index].meta.get("example_value")
+        if isinstance(ex, torch.Tensor) and ex.ndim:
+            extent_to_input.setdefault(str(ex.shape[0]), index)
 
     def tensor_slot(value):
         if not isinstance(value, torch.fx.Node) or value not in values or isinstance(values[value], tuple):
@@ -194,6 +203,8 @@ def _segment_executor(split, example_inputs, paged):
         seg_nodes = tuple(segment.graph.nodes)
         if any(item.op == "call_function" and item.target is _fx_collective for item in seg_nodes):
             mod_kind[node] = "collective"
+        elif any(item.op == "call_function" and item.target is _fx_gather_rows for item in seg_nodes):
+            mod_kind[node] = "gather_rows"
         elif any(item.op == "call_function" and item.target in paged for item in seg_nodes):
             mod_kind[node] = "attention"
         else:
@@ -287,6 +298,42 @@ def _segment_executor(split, example_inputs, paged):
             available.add(node)
             return
 
+        if mod_kind[node] == "gather_rows":
+            gathers = [item for item in segment_nodes if item.op == "call_function" and item.target is _fx_gather_rows]
+            if len(gathers) != 1 or any(item.op not in ("placeholder", "output") and item is not gathers[0]
+                                        for item in segment_nodes):
+                raise RuntimeError("GaudiRT FX: invalid dynamic gather_rows partition")
+            gather = gathers[0]
+            if len(gather.args) != 2 or gather.kwargs:
+                raise RuntimeError("GaudiRT FX: unsupported dynamic gather_rows arguments")
+            try:
+                tensor_arguments = tuple(segment_inputs.index(item) for item in gather.args)
+            except ValueError as error:
+                raise RuntimeError("GaudiRT FX: dynamic gather_rows inputs must be segment inputs") from error
+            src_arg, idx_arg = (node.args[index] for index in tensor_arguments)
+            idx_ext = external_index(idx_arg)
+            src_dim0 = gather.meta.get("gaudirt_gather_src_dim0")
+            if src_dim0 is None:
+                seg_src_ex = gather.args[0].meta.get("example_value")
+                if not isinstance(seg_src_ex, torch.Tensor) or seg_src_ex.ndim != 2:
+                    raise RuntimeError("GaudiRT FX: dynamic gather_rows source must be 2D")
+                src_dim0 = seg_src_ex.shape[0]
+            if src_arg in positions:
+                row_checks.add((idx_ext, positions[src_arg]))
+            elif isinstance(src_dim0, int):
+                static_row_checks.add((idx_ext, int(src_dim0)))
+            else:
+                src_dim_ext = extent_to_input.get(str(src_dim0))
+                if src_dim_ext is None:
+                    raise RuntimeError("GaudiRT FX: missing dynamic source input for validated row indices")
+                row_checks.add((idx_ext, src_dim_ext))
+            slots = [tensor_slot(arg) for arg in (src_arg, idx_arg)]
+            values[node] = runner.add_gather_rows(slots[0], slots[1])
+            records.append((segment, host_arguments(node.args, tensor_arguments), tensor_arguments, True))
+            emit_getitem_children(node)
+            available.add(node)
+            return
+
         if not any(item.meta.get("gaudirt_dynamic") for item in segment_inputs):
             max_bucket_rows = int(getattr(_C, "_max_bucket_rows", 8192))
             for idx_in, item in enumerate(segment_inputs):
@@ -314,9 +361,17 @@ def _segment_executor(split, example_inputs, paged):
         for index, weight, is_sharded in token_bindings:
             token_checks.add((external_index(node.args[index]), external_index(node.args[weight]), is_sharded))
         for index, _ in row_bindings:
-            if dynamic_input is None:
+            seg_dyn_ext = next(
+                (str(item.meta.get("example_value").shape[0])
+                 for pos, item in enumerate(segment_inputs)
+                 if pos in tensor_arguments and item.meta.get("gaudirt_dynamic") and
+                 isinstance(item.meta.get("example_value"), torch.Tensor) and item.meta["example_value"].ndim > 0),
+                None,
+            )
+            bound_dynamic = extent_to_input.get(seg_dyn_ext, dynamic_input)
+            if bound_dynamic is None:
                 raise RuntimeError("GaudiRT FX: missing dynamic input for validated row indices")
-            row_checks.add((external_index(node.args[index]), dynamic_input))
+            row_checks.add((external_index(node.args[index]), bound_dynamic))
         records.append((segment, host_arguments(node.args, tensor_arguments), tensor_arguments, single))
         emit_getitem_children(node)
         available.add(node)
@@ -371,7 +426,8 @@ def _segment_executor(split, example_inputs, paged):
     runner.set_outputs(output_ids)
     sources = tuple(getattr(node.meta.get("gaudirt_source"), "name", None) for node in placeholders)
     return _SegmentExecution(split, runner, input_indices, sources, template,
-                             (tuple(sorted(token_checks)), tuple(sorted(row_checks))), records).forward
+                             (tuple(sorted(token_checks)), tuple(sorted(row_checks)),
+                              tuple(sorted(static_row_checks))), records).forward
 
 
 def _partition_backend(graph_module, example_inputs):
@@ -389,7 +445,7 @@ def _partition_backend(graph_module, example_inputs):
                           torch.ops.gaudirt.fused_add_rms_norm.default,
                           torch.ops.aten.native_layer_norm.default)
     paged = (torch.ops.gaudirt._paged_attn_validated, torch.ops.gaudirt._paged_attn_validated.default)
-    boundary_targets = (*paged, _fx_collective)
+    boundary_targets = (*paged, _fx_collective, _fx_gather_rows)
 
     def is_boundary(n):
         return n.op == "call_function" and n.target in boundary_targets
@@ -417,6 +473,11 @@ def _partition_backend(graph_module, example_inputs):
     for node in nodes:
         if node.op == "placeholder":
             continue
+        if node.op == "call_function" and node.target is _fx_gather_rows:
+            src_ex = node.args[0].meta.get("example_value")
+            if not isinstance(src_ex, torch.Tensor) or src_ex.ndim != 2:
+                raise RuntimeError("GaudiRT FX: dynamic gather_rows source must be 2D")
+            node.meta["gaudirt_gather_src_dim0"] = src_ex.shape[0]
         example = node.meta.get("example_value")
         if isinstance(example, torch.Tensor) and example.ndim:
             if node.op == "call_function" and node.target is _fx_collective and not isinstance(example.shape[0], int):
@@ -424,22 +485,25 @@ def _partition_backend(graph_module, example_inputs):
             node.meta["gaudirt_dynamic"] = str(example.shape[0]) in extents
 
     def is_consumer_helper(n):
+        def _non_boundary_users():
+            return bool(n.users and all(u.op != "output" and not is_boundary(u) for u in n.users))
+
         if n.op == "call_method" and n.target in ("t", "long") and len(n.args) == 1 and not n.kwargs:
-            return True
+            return _non_boundary_users()
         if (n.op == "call_function" and n.target is builtins.getattr and
                 len(n.args) == 2 and n.args[1] == "T" and not n.kwargs):
-            return True
+            return _non_boundary_users()
         if ((n.op == "call_method" and n.target == "transpose") or
                 (n.op == "call_function" and n.target in transpose_targets)):
             if len(n.args) == 3 and not n.kwargs:
                 ex = n.args[0].meta.get("example_value")
                 if isinstance(ex, torch.Tensor) and ex.ndim == 2 and (n.args[1] % 2) != (n.args[2] % 2):
-                    return True
+                    return _non_boundary_users()
         if (not n.meta.get("gaudirt_dynamic", False) and
                 ((n.op == "call_method" and n.target in ("to", "float", "bfloat16", "half")) or
                  (n.op == "call_function" and n.target in (
                      torch.ops.aten._to_copy.default, torch.ops.aten.to.dtype))) and
-                n.users and all(u.op != "output" and not is_boundary(u) for u in n.users)):
+                _non_boundary_users()):
             return True
         return False
 
