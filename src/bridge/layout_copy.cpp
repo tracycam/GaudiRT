@@ -99,8 +99,10 @@ void dma_copy(uint64_t dst, const Layout* dst_layout, uint64_t src,
               uint64_t item, synStreamHandle stream, synDmaDir direction) {
   std::array<uint64_t, 128> sources{}, sizes{}, destinations{};
   size_t used = 0;
+  bool had_multi_d2d = false;
   auto flush = [&] {
     if (!used) return;
+    if (used > 1 && direction == DRAM_TO_DRAM) had_multi_d2d = true;
     const auto status = used == 1
         ? synMemCopyAsync(stream, sources[0], sizes[0], destinations[0], direction)
         : synMemCopyAsyncMultiple(stream, sources.data(), sizes.data(), destinations.data(),
@@ -121,6 +123,11 @@ void dma_copy(uint64_t dst, const Layout* dst_layout, uint64_t src,
     done += count;
   }
   flush();
+  // Synapse 1.24.2 synMemCopyAsyncMultiple(DRAM_TO_DRAM) can race with an immediately
+  // following synMemCopyAsync(DRAM_TO_DRAM) on the same stream (P-RT-95).
+  if (had_multi_d2d && synStreamSynchronize(stream) != synSuccess) {
+    throw std::runtime_error("GaudiRT: strided D2D DMA stream sync failed");
+  }
 }
 
 bool try_pack_strided_2d(Context& ctx, uint64_t dst, uint64_t dst_capacity_bytes,
