@@ -75,34 +75,52 @@ bool supported_cast(at::ScalarType from, at::ScalarType to) {
       (to == at::kBool && (from == at::kBFloat16 || from == at::kFloat ||
                            from == at::kInt || from == at::kLong));
 }
-ColdRecipe& cast_recipe(Context& ctx, uint64_t count, at::ScalarType from, at::ScalarType to) {
+ColdRecipe& cast_recipe(Context& ctx, uint64_t max_count, at::ScalarType from, at::ScalarType to) {
   TORCH_CHECK(supported_cast(from, to), "GaudiRT: requested dtype conversion is not implemented");
   const auto input_type = cast_type(from);
   const auto output_type = cast_type(to);
-  const std::string key = "cold_cast_" + std::string(input_type.name) + "_" +
-                          output_type.name + "_" + std::to_string(count);
+  const std::string key = "cold_cast_v2_" + std::string(input_type.name) + "_" +
+                          output_type.name + "_" + std::to_string(max_count);
   auto found = ctx.cold_recipes.find(key);
   if (found != ctx.cold_recipes.end()) return *found->second;
-  auto recipe = std::make_unique<ColdRecipe>();
+  auto recipe = std::make_unique<ColdRecipe>(2);
   {
     SynapseGraphBuilder builder(key, *recipe);
-    auto in = builder.tensor(input_type.syn, {count}, 0);
-    auto out = builder.tensor(output_type.syn, {count}, 1);
+    auto in = builder.tensor(input_type.syn, {max_count}, 0, -1, 0, true, {1ULL});
+    auto out = builder.tensor(output_type.syn, {max_count}, 1, -1, 0, true, {1ULL});
     if (to == at::kBool) {
-      auto zero_val = builder.tensor(input_type.syn, {count}, -1);
-      auto is_zero = builder.tensor(syn_type_uint8, {count}, -1);
-      ns_ConstantKernel::ParamsV3 zero{};
-      builder.node(NodeSpec{"constant_" + std::string(input_type.name), {}, {zero_val}, zero});
-      builder.node(NodeSpec{"equal_fwd_" + std::string(input_type.name), {in, zero_val}, {is_zero}, {}});
-      builder.node(NodeSpec{"not_fwd_u8", {is_zero}, {out}, {}});
+      if (from == at::kLong) {
+        auto zero_i32 = builder.tensor(syn_type_int32, {1}, -1);
+        auto zero_i64 = builder.tensor(syn_type_int64, {1}, -1);
+        auto lt_neg = builder.tensor(syn_type_uint8, {max_count}, -1, -1, 0, true, {1ULL});
+        auto lt_pos = builder.tensor(syn_type_uint8, {max_count}, -1, -1, 0, true, {1ULL});
+        ns_ConstantKernel::ParamsV3 zero{};
+        builder.node(NodeSpec{"constant_i32", {}, {zero_i32}, zero});
+        ns_CastKernel::ParamsV3 cast{};
+        cast.round_mode = CAST_ROUND_ZERO;
+        builder.node(NodeSpec{"cast_i32_to_i64", {zero_i32}, {zero_i64}, cast});
+        builder.node(NodeSpec{"less_fwd_i64", {in, zero_i64}, {lt_neg}, {}});
+        builder.node(NodeSpec{"less_fwd_i64", {zero_i64, in}, {lt_pos}, {}});
+        builder.node(NodeSpec{"or_fwd_u8", {lt_neg, lt_pos}, {out}, {}});
+      } else {
+        auto zero_val = builder.tensor(input_type.syn, {1}, -1);
+        auto is_zero = builder.tensor(syn_type_uint8, {max_count}, -1, -1, 0, true, {1ULL});
+        ns_ConstantKernel::ParamsV3 zero{};
+        builder.node(NodeSpec{"constant_" + std::string(input_type.name), {}, {zero_val}, zero});
+        builder.node(NodeSpec{"equal_fwd_" + std::string(input_type.name), {in, zero_val}, {is_zero}, {}});
+        builder.node(NodeSpec{"not_fwd_u8", {is_zero}, {out}, {}});
+      }
     } else if (to == at::kInt && (from == at::kFloat || from == at::kBFloat16)) {
-      auto raw_i32 = builder.tensor(syn_type_int32, {count}, -1);
-      auto pos_thr = builder.tensor(input_type.syn, {count}, -1);
-      auto ovf_u8 = builder.tensor(syn_type_uint8, {count}, -1);
-      auto nan_u8 = builder.tensor(syn_type_uint8, {count}, -1);
-      auto bad_u8 = builder.tensor(syn_type_uint8, {count}, -1);
-      auto neg_f32 = builder.tensor(syn_type_float, {count}, -1);
-      auto sen_i32 = builder.tensor(syn_type_int32, {count}, -1);
+      auto raw_i32 = builder.tensor(syn_type_int32, {max_count}, -1, -1, 0, true, {1ULL});
+      auto pos_thr = builder.tensor(input_type.syn, {1}, -1);
+      auto ovf_u8 = builder.tensor(syn_type_uint8, {max_count}, -1, -1, 0, true, {1ULL});
+      auto nan_u8 = builder.tensor(syn_type_uint8, {max_count}, -1, -1, 0, true, {1ULL});
+      auto bad_u8 = builder.tensor(syn_type_uint8, {max_count}, -1, -1, 0, true, {1ULL});
+      auto neg_f32 = builder.tensor(syn_type_float, {1}, -1);
+      auto sen_1 = builder.tensor(syn_type_int32, {1}, -1);
+      auto zero_1 = builder.tensor(syn_type_int32, {1}, -1);
+      auto z_dyn = builder.tensor(syn_type_int32, {max_count}, -1, -1, 0, true, {1ULL});
+      auto sen_i32 = builder.tensor(syn_type_int32, {max_count}, -1, -1, 0, true, {1ULL});
       ns_CastKernel::ParamsV3 cast{};
       cast.round_mode = CAST_ROUND_ZERO;
       builder.node(NodeSpec{"cast_" + std::string(input_type.name) + "_to_i32", {in}, {raw_i32}, cast});
@@ -115,7 +133,11 @@ ColdRecipe& cast_recipe(Context& ctx, uint64_t count, at::ScalarType from, at::S
       ns_ConstantKernel::ParamsV3 negative{};
       negative.constant.f = -2147483648.0f;
       builder.node(NodeSpec{"constant_f32", {}, {neg_f32}, negative});
-      builder.node(NodeSpec{"cast_f32_to_i32", {neg_f32}, {sen_i32}, cast});
+      builder.node(NodeSpec{"cast_f32_to_i32", {neg_f32}, {sen_1}, cast});
+      ns_ConstantKernel::ParamsV3 zero{};
+      builder.node(NodeSpec{"constant_i32", {}, {zero_1}, zero});
+      builder.node(NodeSpec{"mult_fwd_i32", {raw_i32, zero_1}, {z_dyn}, {}});
+      builder.node(NodeSpec{"add_fwd_i32", {z_dyn, sen_1}, {sen_i32}, {}});
       builder.node(NodeSpec{"where_fwd_i32", {bad_u8, sen_i32, raw_i32}, {out}, {}});
     } else {
       ns_CastKernel::ParamsV3 params{};
@@ -266,8 +288,11 @@ void cast_direct(at::Tensor& dst, const at::Tensor& src, bool non_blocking) {
   auto source = address_of(src, *ctx);
   auto target = address_of(dst, *ctx);
   at::assert_no_overlap(dst, src);
+  const uint64_t count = static_cast<uint64_t>(src.numel());
+  TORCH_CHECK(count <= (1ULL << 30), "GaudiRT: cast tensor exceeds max supported elements");
+  const uint64_t max_count = std::max<uint64_t>(65536ULL, std::bit_ceil(count));
   std::lock_guard lock(ctx->cold_mutex);
-  auto& recipe = cast_recipe(*ctx, src.numel(), src.scalar_type(), dst.scalar_type());
+  auto& recipe = cast_recipe(*ctx, max_count, src.scalar_type(), dst.scalar_type());
   auto stream = ctx->stream();
   ctx->allocator.record_stream(source, stream);
   ctx->allocator.record_stream(target, stream);
@@ -283,7 +308,9 @@ void cast_direct(at::Tensor& dst, const at::Tensor& src, bool non_blocking) {
   if (recipe.workspace) workspace = std::make_unique<TemporaryDevice>(*ctx, recipe.workspace);
   auto tensors = recipe.tensors;
   tensors[0].pTensorAddress = input ? input->address : source;
+  tensors[0].tensorSize[0] = count;
   tensors[1].pTensorAddress = output ? output->address : target;
+  tensors[1].tensorSize[0] = count;
   TORCH_CHECK(synLaunch(stream, tensors.data(), tensors.size(),
                         workspace ? workspace->address : 0, recipe.recipe, 0) == synSuccess,
               "GaudiRT: cast launch failed");

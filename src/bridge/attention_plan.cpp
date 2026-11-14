@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "attention_plan.hpp"
 
+#include "bucket_program.hpp"
 #include "graph_builder.hpp"
 #include "layout_copy.hpp"
 #include "paged_kv_pool.hpp"
@@ -34,16 +35,17 @@ void release_attention_plan(void* pointer) {
 
 ColdRecipe& indices_recipe(Context& ctx, uint32_t rows, uint32_t tasks, uint64_t map_elements) {
   const uint64_t map_cap = std::max<uint64_t>(256 * kPagedKvDescriptorSlots, std::bit_ceil(map_elements));
-  std::string structure = "attention_indices_v1:" + std::to_string(rows) + ":" + std::to_string(tasks);
+  const uint64_t req_cap = std::max<uint64_t>(kMaxBucketRows, std::bit_ceil(static_cast<uint64_t>(rows)));
+  std::string structure = "attention_indices_v2:" + std::to_string(req_cap) + ":" + std::to_string(tasks);
   if (map_cap > 256 * kPagedKvDescriptorSlots) structure += ":" + std::to_string(map_cap);
   const auto digest = common::sha256_bytes(reinterpret_cast<const uint8_t*>(structure.data()), structure.size());
   const auto key = "attention_indices_" + digest;
   if (auto found = ctx.cold_recipes.find(key); found != ctx.cold_recipes.end()) return *found->second;
   auto recipe = std::make_unique<ColdRecipe>(5);
-  const auto prefix = "g" + digest.substr(0, 12) + "_b" + std::to_string(rows);
+  const auto prefix = "g" + digest.substr(0, 12) + "_t" + std::to_string(tasks);
   SynapseGraphBuilder graph(prefix, *recipe);
   auto map = graph.tensor(syn_type_int32, {map_cap}, 0, -1, 0, true);
-  auto requests = graph.tensor(syn_type_int32, {rows}, 1);
+  auto requests = graph.tensor(syn_type_int32, {req_cap}, 1, -1, 0, true);
   auto work = graph.tensor(syn_type_int32, {4, tasks}, 2);
   auto context = graph.tensor(syn_type_int32, {1}, 3);
   auto output = graph.tensor(syn_type_int32, {64, tasks}, 4);
@@ -346,6 +348,7 @@ at::Tensor PagedMetadata::attention_plan_for(int64_t query_heads, int64_t kv_hea
                                             address + context_offset, address};
     for (size_t i = 0; i < addresses.size(); ++i) bindings[i].pTensorAddress = addresses[i];
     bindings[0].tensorSize[0] = mapping_.numel();
+    bindings[1].tensorSize[0] = bucket_;
     TORCH_CHECK(synLaunch(compute, bindings.data(), bindings.size(), workspace ? workspace->address : 0,
                           recipe.recipe, 0) == synSuccess, "GaudiRT attention: tile-index launch failed");
   }

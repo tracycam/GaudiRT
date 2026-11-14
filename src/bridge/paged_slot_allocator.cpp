@@ -98,17 +98,11 @@ std::tuple<at::Tensor, int64_t> allocate_paged_slots(
               prefixes.size() <= (size_t{1} << 30) && prefixes.size() == lengths.size() &&
               last_slots.numel() == static_cast<int64_t>(prefixes.size()),
               "GaudiRT paged allocator: unsupported page size or request count");
-  const auto requests = std::bit_ceil(static_cast<uint32_t>(prefixes.size()));
-  std::vector<int32_t> metadata(static_cast<size_t>(requests) * 4, 0);
   int64_t total = 0, num_pages = 0;
   for (size_t i = 0; i < prefixes.size(); ++i) {
     const auto prefix = prefixes[i], length = lengths[i];
     TORCH_CHECK(prefix >= 0 && length >= 0 && prefix + length <= INT32_MAX,
                 "GaudiRT paged allocator: invalid request lengths");
-    metadata[4 * i] = static_cast<int32_t>(prefix);
-    metadata[4 * i + 1] = static_cast<int32_t>(length);
-    metadata[4 * i + 2] = static_cast<int32_t>(total);
-    metadata[4 * i + 3] = static_cast<int32_t>(num_pages);
     total += length;
     num_pages += (prefix + length + page_size - 1) / page_size - (prefix + page_size - 1) / page_size;
   }
@@ -118,10 +112,23 @@ std::tuple<at::Tensor, int64_t> allocate_paged_slots(
   if (page_size == 1) {
     return {free_pages.narrow(0, 0, total).clone(), total};
   }
-  const auto bucket = std::bit_ceil(static_cast<uint32_t>(total));
-  const auto pages_bucket = std::bit_ceil(static_cast<size_t>(std::max<int64_t>(1, num_pages)));
+  const auto bucket = std::max<uint32_t>({
+      std::bit_ceil(static_cast<uint32_t>(total)),
+      std::bit_ceil(static_cast<uint32_t>(prefixes.size())),
+      std::bit_ceil(static_cast<uint32_t>(std::max<int64_t>(1, num_pages)))});
+  std::vector<int32_t> metadata(static_cast<size_t>(bucket) * 4, 0);
+  int64_t offset = 0, page_offset = 0;
+  for (size_t i = 0; i < prefixes.size(); ++i) {
+    const auto prefix = prefixes[i], length = lengths[i];
+    metadata[4 * i] = static_cast<int32_t>(prefix);
+    metadata[4 * i + 1] = static_cast<int32_t>(length);
+    metadata[4 * i + 2] = static_cast<int32_t>(offset);
+    metadata[4 * i + 3] = static_cast<int32_t>(page_offset);
+    offset += length;
+    page_offset += (prefix + length + page_size - 1) / page_size - (prefix + page_size - 1) / page_size;
+  }
   const auto stream = ctx->stream();
-  TemporaryDevice last(*ctx, requests * sizeof(int64_t)), pages(*ctx, pages_bucket * sizeof(int64_t));
+  TemporaryDevice last(*ctx, bucket * sizeof(int64_t)), pages(*ctx, bucket * sizeof(int64_t));
   TemporaryDevice meta(*ctx, metadata.size() * sizeof(int32_t));
   const auto last_address = address_of(last_slots, *ctx);
   ctx->allocator.record_stream(last_address, stream);
@@ -137,8 +144,7 @@ std::tuple<at::Tensor, int64_t> allocate_paged_slots(
   ctx->allocator.record_stream(output, stream);
   {
     std::lock_guard lock(ctx->cold_mutex);
-    auto& recipe = alloc_recipe(*ctx, requests, bucket, static_cast<uint32_t>(pages_bucket),
-                                static_cast<int32_t>(page_size));
+    auto& recipe = alloc_recipe(*ctx, bucket, bucket, bucket, static_cast<int32_t>(page_size));
     launch(*ctx, recipe, std::array<uint64_t, 4>{last.address, pages.address, meta.address, output});
   }
   return {result.narrow(0, 0, total), num_pages};

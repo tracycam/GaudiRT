@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "bridge_internal.hpp"
+#include "bucket_program.hpp"
 #include "eager_copy.hpp"
 #include "eager_ops.hpp"
 #include "eager_index.hpp"
@@ -35,16 +36,44 @@
 namespace gaudirt::generic {
 using namespace runtime;
 
-ColdRecipe& invalid_reduce_recipe(Context& ctx, uint32_t count) {
-  const std::string key = "cold_index_check_" + std::to_string(count);
+ColdRecipe& validate_indices_recipe(Context& ctx, uint64_t max_count, bool wide) {
+  const std::string key = "cold_validate_indices_v2_" + std::string(wide ? "i64_" : "i32_") +
+                          std::to_string(max_count);
   auto found = ctx.cold_recipes.find(key);
   if (found != ctx.cold_recipes.end()) return *found->second;
-  auto recipe = std::make_unique<ColdRecipe>();
+  auto recipe = std::make_unique<ColdRecipe>(3);
   {
     SynapseGraphBuilder builder(key, *recipe);
-    auto in = builder.tensor(syn_type_float, {count}, 0);
-    auto out = builder.tensor(syn_type_float, {1}, 1);
-    builder.node(NodeSpec{"reduce_sum_f32", {in}, {out}, ns_Reduction::Params{0}});
+    auto idx = builder.tensor(wide ? syn_type_int64 : syn_type_int32, {max_count}, 0, -1, 0, true, {1ULL});
+    auto upper_i32 = builder.tensor(syn_type_int32, {1}, 1);
+    auto out_f32 = builder.tensor(syn_type_float, {1}, 2);
+    auto zero_i32 = builder.tensor(syn_type_int32, {1}, -1);
+    ns_ConstantKernel::ParamsV3 zero_p{};
+    builder.node(NodeSpec{"constant_i32", {}, {zero_i32}, zero_p});
+    synTensor zero_val = zero_i32;
+    synTensor upper_val = upper_i32;
+    if (wide) {
+      auto zero_i64 = builder.tensor(syn_type_int64, {1}, -1);
+      auto upper_i64 = builder.tensor(syn_type_int64, {1}, -1);
+      ns_CastKernel::ParamsV3 cast{};
+      cast.round_mode = CAST_ROUND_ZERO;
+      builder.node(NodeSpec{"cast_i32_to_i64", {zero_i32}, {zero_i64}, cast});
+      builder.node(NodeSpec{"cast_i32_to_i64", {upper_i32}, {upper_i64}, cast});
+      zero_val = zero_i64;
+      upper_val = upper_i64;
+    }
+    const std::string suffix = wide ? "i64" : "i32";
+    auto low = builder.tensor(syn_type_uint8, {max_count}, -1, -1, 0, true, {1ULL});
+    auto high = builder.tensor(syn_type_uint8, {max_count}, -1, -1, 0, true, {1ULL});
+    auto bad = builder.tensor(syn_type_uint8, {max_count}, -1, -1, 0, true, {1ULL});
+    auto bad_f32 = builder.tensor(syn_type_float, {max_count}, -1, -1, 0, true, {1ULL});
+    builder.node(NodeSpec{"less_fwd_" + suffix, {idx, zero_val}, {low}, {}});
+    builder.node(NodeSpec{"greater_equal_fwd_" + suffix, {idx, upper_val}, {high}, {}});
+    builder.node(NodeSpec{"or_fwd_u8", {low, high}, {bad}, {}});
+    ns_CastKernel::ParamsV3 u8_cast{};
+    u8_cast.round_mode = CAST_ROUND_HALF_NE;
+    builder.node(NodeSpec{"cast_u8_to_f32", {bad}, {bad_f32}, u8_cast});
+    builder.node(NodeSpec{"reduce_sum_f32", {bad_f32}, {out_f32}, ns_Reduction::Params{0}});
     builder.compile(ctx.cache, key);
   }
   auto [it, inserted] = ctx.cold_recipes.emplace(key, std::move(recipe));
@@ -54,78 +83,93 @@ ColdRecipe& invalid_reduce_recipe(Context& ctx, uint32_t count) {
 
 void validate_indices(const at::Tensor& index, int64_t upper) {
   if (!index.numel()) return;
-  TORCH_CHECK(index.numel() <= UINT32_MAX && upper >= 0 && upper <= INT32_MAX,
+  const uint64_t count = static_cast<uint64_t>(index.numel());
+  TORCH_CHECK(count <= (1ULL << 30) && upper >= 0 && upper <= INT32_MAX,
               "GaudiRT: index dimensions exceed the supported range");
-  auto low = compare_scalar(index, at::Scalar(0), "less");
-  auto high = compare_scalar(index, at::Scalar(upper), "greater_equal");
-  const std::vector<int64_t> shape(index.sizes().begin(), index.sizes().end());
-  auto invalid = pointwise({low, high}, shape, at::kBool, "or_fwd_u8",
-                           {syn_type_uint8, syn_type_uint8, syn_type_uint8});
-  auto values = invalid.to(at::kFloat);
+  TORCH_CHECK(index.scalar_type() == at::kInt || index.scalar_type() == at::kLong,
+              "GaudiRT: index validation requires int32 or int64 indices");
+  const bool wide = (index.scalar_type() == at::kLong);
+  const uint64_t max_count = std::max<uint64_t>(65536ULL, std::bit_ceil(count));
   auto ctx = current();
-  std::lock_guard lock(ctx->cold_mutex);
-  auto& recipe = invalid_reduce_recipe(*ctx, index.numel());
   auto stream = ctx->stream();
-  const auto input = address_of(values, *ctx);
-  ctx->allocator.record_stream(input, stream);
-  TemporaryDevice result(*ctx, sizeof(float));
-  std::unique_ptr<TemporaryDevice> workspace;
-  if (recipe.workspace) workspace = std::make_unique<TemporaryDevice>(*ctx, recipe.workspace);
-  auto bindings = recipe.tensors;
-  bindings[0].pTensorAddress = input;
-  bindings[1].pTensorAddress = result.address;
-  TORCH_CHECK(synLaunch(stream, bindings.data(), bindings.size(),
-                        workspace ? workspace->address : 0, recipe.recipe, 0) == synSuccess,
-              "GaudiRT: index check launch failed");
+  auto h2d = ctx->device.h2d_stream();
+  const auto src_addr = address_of(index, *ctx);
+  ctx->allocator.record_stream(src_addr, stream);
+  std::unique_ptr<TemporaryDevice> staged;
+  uint64_t idx_addr = src_addr;
+  if (!index.is_contiguous() || src_addr % BlockCachingAllocator::kAlignment != 0) {
+    staged = std::make_unique<TemporaryDevice>(*ctx, index.nbytes());
+    ctx->allocator.record_stream(staged->address, stream);
+    const Layout layout(index);
+    dma_copy(staged->address, nullptr, src_addr, &layout, 0, count, index.element_size(),
+             stream, DRAM_TO_DRAM);
+    idx_addr = staged->address;
+  }
+  TemporaryDevice scratch(*ctx, 512);
+  TemporaryHost host(*ctx, 256);
+  const int32_t upper32 = static_cast<int32_t>(upper);
+  std::memcpy(host.address, &upper32, sizeof(upper32));
+  ctx->allocator.record_stream(scratch.address, h2d);
+  auto& reusable = ctx->streams.state(active_stream_id).h2d_reusable;
+  reusable.record_and_wait(stream, h2d);
+  ctx->pinned.copy_h2d(scratch.address, host.address, sizeof(upper32), h2d, true);
+  auto& ready = ctx->streams.state(active_stream_id).h2d_ready;
+  ready.record_and_wait(h2d, stream);
+  ctx->allocator.record_stream(scratch.address, stream);
+  {
+    std::lock_guard lock(ctx->cold_mutex);
+    auto& recipe = validate_indices_recipe(*ctx, max_count, wide);
+    std::unique_ptr<TemporaryDevice> workspace;
+    if (recipe.workspace) workspace = std::make_unique<TemporaryDevice>(*ctx, recipe.workspace);
+    auto bindings = recipe.tensors;
+    bindings[0].pTensorAddress = idx_addr;
+    bindings[0].tensorSize[0] = count;
+    bindings[1].pTensorAddress = scratch.address;
+    bindings[2].pTensorAddress = scratch.address + 256;
+    TORCH_CHECK(synLaunch(stream, bindings.data(), bindings.size(),
+                          workspace ? workspace->address : 0, recipe.recipe, 0) == synSuccess,
+                "GaudiRT: index check launch failed");
+  }
   auto d2h = ctx->device.d2h_stream();
-  auto& ready = ctx->streams.state(active_stream_id).d2h_reusable;
-  ready.record_and_wait(stream, d2h);
-  ctx->allocator.record_stream(result.address, d2h);
-  TemporaryHost host(*ctx, sizeof(float));
-  ctx->pinned.copy_d2h(host.address, result.address, sizeof(float), d2h, false);
-  float failures;
+  auto& d2h_ready = ctx->streams.state(active_stream_id).d2h_reusable;
+  d2h_ready.record_and_wait(stream, d2h);
+  ctx->allocator.record_stream(scratch.address, d2h);
+  ctx->pinned.copy_d2h(host.address, scratch.address + 256, sizeof(float), d2h, false);
+  float failures = 0.0f;
   std::memcpy(&failures, host.address, sizeof(failures));
   TORCH_CHECK(std::isfinite(failures) && failures == 0.0f, "GaudiRT: index out of bounds");
 }
 
-ColdRecipe& gather_recipe(Context& ctx, const at::Tensor& input, const at::Tensor& output,
-                          uint32_t indices, int64_t axis, bool wide_indices) {
-  std::string signature = std::to_string(static_cast<int>(input.scalar_type())) + ":" +
-                          std::to_string(axis) + ":" + std::to_string(indices) + ":" +
+ColdRecipe& gather_recipe(Context& ctx, at::ScalarType src_dtype, const std::vector<uint64_t>& in_max_dims,
+                          const std::vector<uint64_t>& in_min_dims, uint64_t idx_max,
+                          const std::vector<uint64_t>& out_max_dims,
+                          const std::vector<uint64_t>& out_min_dims, int64_t axis, bool wide_indices) {
+  std::string signature = "gather_v2:" + std::to_string(static_cast<int>(src_dtype)) + ":" +
+                          std::to_string(axis) + ":" + std::to_string(idx_max) + ":" +
                           std::to_string(wide_indices);
-  for (auto size : input.sizes()) signature += ":" + std::to_string(size);
+  for (auto size : in_max_dims) signature += ":" + std::to_string(size);
   const auto hash = common::sha256_bytes(reinterpret_cast<const uint8_t*>(signature.data()),
                                           signature.size());
-  const std::string key = "cold_gather_" + hash;
+  const std::string key = "cold_gather_v2_" + hash;
   auto found = ctx.cold_recipes.find(key);
   if (found != ctx.cold_recipes.end()) return *found->second;
   auto recipe = std::make_unique<ColdRecipe>(3);
   {
-    auto synapse_dims = [](const at::Tensor& shaped) {
-      std::vector<uint64_t> dims(shaped.dim());
-      for (int64_t dim = 0; dim < shaped.dim(); ++dim) {
-        const auto size = static_cast<uint64_t>(shaped.size(shaped.dim() - dim - 1));
-        TORCH_CHECK(size <= UINT32_MAX, "GaudiRT: gather dimension too large");
-        dims[dim] = size;
-      }
-      return dims;
-    };
-    const auto in_dims = synapse_dims(input);
-    const auto out_dims = synapse_dims(output);
-    const auto type = cast_type(input.scalar_type());
-    SynapseGraphBuilder builder(key, *recipe);
-    auto in = builder.tensor(type.syn, in_dims, 0);
-    auto idx = builder.tensor(wide_indices ? syn_type_int64 : syn_type_int32, {indices}, 1);
-    auto out = builder.tensor(type.syn, out_dims, 2);
+    const auto type = cast_type(src_dtype);
+    SynapseGraphBuilder builder("gath_" + hash.substr(0, 12), *recipe);
+    auto in = builder.tensor(type.syn, in_max_dims, 0, -1, 0, true, in_min_dims);
+    auto idx = builder.tensor(wide_indices ? syn_type_int64 : syn_type_int32, {idx_max}, 1, -1, 0, true,
+                              {1ULL});
+    auto out = builder.tensor(type.syn, out_max_dims, 2, -1, 0, true, out_min_dims);
     if (wide_indices) {
-      auto idx_i32 = builder.tensor(syn_type_int32, {indices}, -1);
+      auto idx_i32 = builder.tensor(syn_type_int32, {idx_max}, -1, -1, 0, true, {1ULL});
       ns_CastKernel::ParamsV3 cast{};
       cast.round_mode = CAST_ROUND_HALF_NE;
       builder.node(NodeSpec{"cast_i64_to_i32", {idx}, {idx_i32}, cast});
       idx = idx_i32;
     }
     ns_GatherKernel::ParamsV2 params{};
-    params.axis = input.dim() - axis - 1;
+    params.axis = static_cast<unsigned>(in_max_dims.size() - static_cast<size_t>(axis) - 1);
     params.batchDims = 0;
     builder.node(NodeSpec{"gather_fwd_" + std::string(type.name), {in, idx}, {out}, params});
     builder.compile(ctx.cache, key);
@@ -149,6 +193,9 @@ at::Tensor index_select_impl(const at::Tensor& input, int64_t axis, const at::Te
   shape[axis] = count;
   auto result = at::empty(shape, input.options());
   if (!result.numel()) return result;
+  TORCH_CHECK(static_cast<uint64_t>(count) <= (1ULL << 30) &&
+              static_cast<uint64_t>(input.size(axis)) <= (1ULL << 30),
+              "GaudiRT: gather dimension exceeds supported range");
   auto ctx = current();
   auto source = input;
   auto source_address = address_of(source, *ctx);
@@ -166,13 +213,41 @@ at::Tensor index_select_impl(const at::Tensor& input, int64_t axis, const at::Te
     copy(staged, ids, true);
     ids = std::move(staged);
   }
+  auto synapse_dims = [](const at::Tensor& shaped) {
+    std::vector<uint64_t> dims(shaped.dim());
+    for (int64_t dim = 0; dim < shaped.dim(); ++dim) {
+      const auto size = static_cast<uint64_t>(shaped.size(shaped.dim() - dim - 1));
+      TORCH_CHECK(size <= UINT32_MAX, "GaudiRT: gather dimension too large");
+      dims[dim] = size;
+    }
+    return dims;
+  };
+  const auto in_dims = synapse_dims(source);
+  const size_t syn_axis = static_cast<size_t>(source.dim() - axis - 1);
+  auto in_max_dims = in_dims;
+  auto in_min_dims = in_dims;
+  in_max_dims[syn_axis] = std::max<uint64_t>(65536ULL, std::bit_ceil(in_dims[syn_axis]));
+  in_min_dims[syn_axis] = 1ULL;
+  const uint64_t idx_max = std::max<uint64_t>(65536ULL, std::bit_ceil(static_cast<uint64_t>(count)));
+  auto out_max_dims = in_dims;
+  auto out_min_dims = in_dims;
+  out_max_dims[syn_axis] = idx_max;
+  out_min_dims[syn_axis] = 1ULL;
   std::lock_guard lock(ctx->cold_mutex);
-  auto& recipe = gather_recipe(*ctx, source, result, count, axis, ids.scalar_type() == at::kLong);
+  auto& recipe = gather_recipe(*ctx, source.scalar_type(), in_max_dims, in_min_dims, idx_max,
+                               out_max_dims, out_min_dims, axis, ids.scalar_type() == at::kLong);
   auto stream = ctx->stream();
   auto bindings = recipe.tensors;
   bindings[0].pTensorAddress = address_of(source, *ctx);
+  for (int64_t d = 0; d < source.dim(); ++d) {
+    bindings[0].tensorSize[d] = static_cast<uint64_t>(source.size(source.dim() - d - 1));
+  }
   bindings[1].pTensorAddress = address_of(ids, *ctx);
+  bindings[1].tensorSize[0] = static_cast<uint64_t>(count);
   bindings[2].pTensorAddress = address_of(result, *ctx);
+  for (int64_t d = 0; d < result.dim(); ++d) {
+    bindings[2].tensorSize[d] = static_cast<uint64_t>(result.size(result.dim() - d - 1));
+  }
   for (const auto& binding : bindings) ctx->allocator.record_stream(binding.pTensorAddress, stream);
   std::unique_ptr<TemporaryDevice> workspace;
   if (recipe.workspace) workspace = std::make_unique<TemporaryDevice>(*ctx, recipe.workspace);
@@ -190,25 +265,27 @@ at::Tensor index_select_validated(const at::Tensor& input, int64_t axis, const a
   return index_select_impl(input, axis, index, true);
 }
 
-ColdRecipe& index_put_recipe(Context& ctx, uint32_t count, uint32_t slots, bool wide_indices) {
-  const auto key = "cold_index_put_i64_" + std::to_string(count) + "_" + std::to_string(slots) +
+ColdRecipe& index_put_recipe(Context& ctx, uint32_t slots, bool wide_indices) {
+  const auto key = "cold_index_put_i64_v2_" + std::to_string(slots) +
                    (wide_indices ? "_idx64" : "_idx32");
   auto found = ctx.cold_recipes.find(key);
   if (found != ctx.cold_recipes.end()) return *found->second;
   auto compiled = std::make_unique<ColdRecipe>(3);
   {
-    SynapseGraphBuilder builder(key, *compiled);
-    auto idx = builder.tensor(wide_indices ? syn_type_int64 : syn_type_int32, {count}, 0);
-    auto vals = builder.tensor(syn_type_int32, {2, count}, 1);
+    constexpr uint64_t kMaxIndexPutCount = 4096;
+    SynapseGraphBuilder builder("iput_" + key.substr(19), *compiled);
+    auto idx = builder.tensor(wide_indices ? syn_type_int64 : syn_type_int32, {kMaxIndexPutCount}, 0,
+                              -1, 0, true, {1ULL});
+    auto vals = builder.tensor(syn_type_int32, {2, kMaxIndexPutCount}, 1, -1, 0, true, {2ULL, 1ULL});
     auto out = builder.tensor(syn_type_int32, {2, slots}, 2);
     if (wide_indices) {
-      auto idx_i32 = builder.tensor(syn_type_int32, {count}, -1);
+      auto idx_i32 = builder.tensor(syn_type_int32, {kMaxIndexPutCount}, -1, -1, 0, true, {1ULL});
       ns_CastKernel::ParamsV3 cast{};
       cast.round_mode = CAST_ROUND_HALF_NE;
       builder.node(NodeSpec{"cast_i64_to_i32", {idx}, {idx_i32}, cast});
       idx = idx_i32;
     }
-    builder.node(NodeSpec{"gk_index_put_i64_v1", {idx, vals}, {out}, {}});
+    builder.node(NodeSpec{"gk_index_put_i64_v1", {idx, vals}, {out}, static_cast<int32_t>(slots)});
     builder.compile(ctx.cache, key);
   }
   auto [it, inserted] = ctx.cold_recipes.emplace(key, std::move(compiled));
@@ -274,11 +351,17 @@ at::Tensor& index_put_impl(at::Tensor& self, const c10::List<std::optional<at::T
   }
   {
     std::lock_guard lock(ctx->cold_mutex);
-    auto& recipe = index_put_recipe(*ctx, index.numel(), self.numel(), ids.scalar_type() == at::kLong);
+    const uint64_t count = static_cast<uint64_t>(index.numel());
+    TORCH_CHECK(self.numel() > 0 && self.numel() <= INT32_MAX,
+                "GaudiRT: index put target size exceeds supported range");
+    auto& recipe = index_put_recipe(*ctx, static_cast<uint32_t>(self.numel()), ids.scalar_type() == at::kLong);
     auto stream = ctx->stream();
     auto bindings = recipe.tensors;
     bindings[0].pTensorAddress = id_address;
+    bindings[0].tensorSize[0] = count;
     bindings[1].pTensorAddress = source_address;
+    bindings[1].tensorSize[0] = 2;
+    bindings[1].tensorSize[1] = count;
     bindings[2].pTensorAddress = output_address;
     for (const auto& binding : bindings) ctx->allocator.record_stream(binding.pTensorAddress, stream);
     std::unique_ptr<TemporaryDevice> workspace;
@@ -473,22 +556,48 @@ at::Tensor argmax(const at::Tensor& input, std::optional<int64_t> dimension, boo
     auto scores = matches.to(at::kFloat);
     return gaudirt::generic::argmax(scores, axis, true).view(shape);
   }
+  const bool vocabulary = source.dim() == 2 && axis == 1 && source.size(0) > 0 &&
+                          source.size(1) > 0 && source.size(1) <= INT_MAX - 127 &&
+                          (source.scalar_type() == at::kFloat || source.scalar_type() == at::kBFloat16);
+  const int64_t rows = vocabulary ? source.size(0) : 0;
+  const int64_t width = vocabulary ? source.size(1) : 0;
+  const int64_t row_bucket = (vocabulary && rows <= kMaxBucketRows)
+      ? static_cast<int64_t>(std::bit_ceil(static_cast<uint64_t>(rows)))
+      : rows;
   std::vector<int64_t> reduced_shape(source.sizes().begin(), source.sizes().end());
   reduced_shape[axis] = 1;
+  if (vocabulary && row_bucket > rows) {
+    reduced_shape[0] = row_bucket;
+  }
   auto reduced = at::empty(reduced_shape, source.options().dtype(at::kLong));
   auto ctx = current();
   auto source_address = address_of(source, *ctx);
-  if (source_address % BlockCachingAllocator::kAlignment) {
+  if (vocabulary && row_bucket > rows) {
+    const uint64_t required_bytes = static_cast<uint64_t>(row_bucket) * static_cast<uint64_t>(width) *
+                                    static_cast<uint64_t>(source.element_size());
+    const uint64_t base = reinterpret_cast<uint64_t>(source.storage().data());
+    const uint64_t storage = source.storage().nbytes();
+    const bool has_tail = source.is_contiguous() &&
+                          (source_address % BlockCachingAllocator::kAlignment == 0) &&
+                          source_address >= base && source_address - base <= storage &&
+                          required_bytes <= storage - (source_address - base) &&
+                          ctx->allocator.contains_live_range(source_address, required_bytes);
+    if (!has_tail) {
+      auto staged = at::empty({row_bucket, width}, source.options());
+      auto staged_head = staged.narrow(0, 0, rows);
+      gaudirt::generic::copy(staged_head, source, true);
+      source = std::move(staged);
+    }
+  } else if (source_address % BlockCachingAllocator::kAlignment) {
     auto staged = at::empty(source.sizes(), source.options());
     copy(staged, source, true);
     source = std::move(staged);
   }
   {
     std::lock_guard lock(ctx->cold_mutex);
-    const bool vocabulary = source.dim() == 2 && axis == 1 && source.size(1) <= INT_MAX - 127 &&
-                            (source.scalar_type() == at::kFloat || source.scalar_type() == at::kBFloat16);
-    auto& recipe = vocabulary ? vocabulary_argmax_recipe(*ctx, source)
-                              : argmax_recipe(*ctx, source, reduced, axis);
+    auto& recipe = vocabulary
+        ? vocabulary_argmax_recipe(*ctx, width, row_bucket, source.scalar_type() == at::kBFloat16)
+        : argmax_recipe(*ctx, source, reduced, axis);
     auto stream = ctx->stream();
     auto bindings = recipe.tensors;
     bindings[0].pTensorAddress = address_of(source, *ctx);
@@ -500,7 +609,7 @@ at::Tensor argmax(const at::Tensor& input, std::optional<int64_t> dimension, boo
                           workspace ? workspace->address : 0, recipe.recipe, 0) == synSuccess,
                 "GaudiRT: argmax launch failed");
   }
-  return reduced.view(shape);
+  return (vocabulary && row_bucket > rows ? reduced.narrow(0, 0, rows) : reduced).view(shape);
 }
 
 }  // namespace gaudirt::generic

@@ -10,7 +10,9 @@
 #include <ATen/ATen.h>
 #include <perf_lib_layer_params.h>
 
+#include <algorithm>
 #include <array>
+#include <bit>
 #include <climits>
 #include <memory>
 #include <string>
@@ -18,15 +20,16 @@
 namespace gaudirt::generic {
 using namespace runtime;
 
-static ColdRecipe& decode_lengths_recipe(Context& ctx, uint32_t count) {
-  const auto key = "cold_decode_lengths_v1_" + std::to_string(count);
+static ColdRecipe& decode_lengths_recipe(Context& ctx, uint64_t max_count) {
+  const auto key = "cold_decode_lengths_v2_" + std::to_string(max_count);
   if (auto found = ctx.cold_recipes.find(key); found != ctx.cold_recipes.end()) return *found->second;
   auto recipe = std::make_unique<ColdRecipe>(4);
   {
     SynapseGraphBuilder builder(key, *recipe);
     std::array<synTensor, 4> ext{};
     for (size_t i = 0; i < ext.size(); ++i)
-      ext[i] = builder.tensor(i % 2 == 0 ? syn_type_int64 : syn_type_int32, {count}, static_cast<int>(i));
+      ext[i] = builder.tensor(i % 2 == 0 ? syn_type_int64 : syn_type_int32, {max_count},
+                              static_cast<int>(i), -1, 0, true, {1ULL});
     auto one_i32 = builder.tensor(syn_type_int32, {1}, -1);
     auto one_i64 = builder.tensor(syn_type_int64, {1}, -1);
     ns_ConstantKernel::ParamsV3 one{};
@@ -54,17 +57,21 @@ std::tuple<at::Tensor, at::Tensor> advance_decode_lengths(const at::Tensor& seq_
               "GaudiRT decode lengths: expected matching contiguous int64 and int32 vectors");
   auto next = at::empty_like(seq_lens), orig_next = at::empty_like(orig_seq_lens);
   if (!seq_lens.numel()) return {next, orig_next};
+  const uint64_t count = static_cast<uint64_t>(seq_lens.numel());
+  TORCH_CHECK(count <= (1ULL << 30), "GaudiRT decode lengths: count exceeds supported range");
+  const uint64_t max_count = std::max<uint64_t>(65536ULL, std::bit_ceil(count));
   auto ctx = current();
   const std::array<at::Tensor, 4> values{seq_lens, orig_seq_lens, next, orig_next};
   auto stream = ctx->stream();
   std::lock_guard lock(ctx->cold_mutex);
-  auto& recipe = decode_lengths_recipe(*ctx, seq_lens.numel());
+  auto& recipe = decode_lengths_recipe(*ctx, max_count);
   auto bindings = recipe.tensors;
   for (size_t i = 0; i < values.size(); ++i) {
     const auto address = address_of(values[i], *ctx);
     TORCH_CHECK(address % BlockCachingAllocator::kAlignment == 0,
                 "GaudiRT decode lengths: inputs must be 256-byte aligned");
     bindings[i].pTensorAddress = address;
+    bindings[i].tensorSize[0] = count;
     ctx->allocator.record_stream(address, stream);
   }
   std::unique_ptr<TemporaryDevice> workspace;

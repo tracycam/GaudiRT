@@ -10,13 +10,11 @@
 
 namespace gaudirt::generic {
 
-ColdRecipe& vocabulary_argmax_recipe(Context& ctx, const at::Tensor& input) {
-  const auto width = input.size(1), rows = input.size(0);
+ColdRecipe& vocabulary_argmax_recipe(Context& ctx, int64_t width, int64_t rows, bool bf16) {
   const int64_t total_blocks = (width + 127) / 128;
   const int32_t target_parts = std::min<int64_t>(24, total_blocks);
   const int32_t blocks = (total_blocks + target_parts - 1) / target_parts;
   const int32_t parts = (total_blocks + blocks - 1) / blocks;
-  const bool bf16 = input.scalar_type() == at::kBFloat16;
   const auto key = "cold_vocab_argmax_v1_" + std::string(bf16 ? "bf16_" : "f32_") +
                    std::to_string(width) + "_" + std::to_string(rows);
   if (auto found = ctx.cold_recipes.find(key); found != ctx.cold_recipes.end()) return *found->second;

@@ -151,6 +151,114 @@ void launch_cold_recipe(const std::string& prefix, const std::string& raw_signat
               "GaudiRT: cold recipe launch failed");
 }
 
+template <typename BuildFn>
+void launch_dynamic_1d_cold_recipe(const std::string& prefix, const std::string& raw_signature,
+                                   std::vector<at::Tensor> inputs,
+                                   const std::vector<bool>& input_dynamic,
+                                   const std::vector<at::Tensor>& outputs,
+                                   uint64_t max_count, uint64_t actual_count,
+                                   BuildFn&& build_fn) {
+  TORCH_CHECK(inputs.size() == input_dynamic.size(),
+              "GaudiRT: dynamic cold recipe input mask mismatch");
+  TORCH_CHECK(actual_count > 0 && actual_count <= max_count,
+              "GaudiRT: dynamic cold recipe actual count out of bounds");
+  auto ctx = current();
+  auto stream = ctx->stream();
+  std::vector<std::pair<uint64_t, uint64_t>> regions;
+  regions.reserve(inputs.size() + outputs.size());
+  for (const auto& out : outputs) {
+    TORCH_CHECK(out.device().type() == c10::kPrivateUse1 &&
+                out.device().index() == ctx->device_index && out.is_contiguous(),
+                "GaudiRT: dynamic cold recipe outputs must be contiguous on the active device");
+    TORCH_CHECK(static_cast<uint64_t>(out.numel()) == actual_count,
+                "GaudiRT: dynamic cold recipe output size mismatch");
+    const auto addr = address_of(out, *ctx);
+    TORCH_CHECK(addr % BlockCachingAllocator::kAlignment == 0,
+                "GaudiRT: dynamic cold recipe outputs must be aligned");
+    regions.emplace_back(addr, out.nbytes());
+  }
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    auto& input = inputs[i];
+    TORCH_CHECK(input.device().type() == c10::kPrivateUse1 &&
+                input.device().index() == ctx->device_index,
+                "GaudiRT: dynamic cold recipe inputs must reside on the active device");
+    TORCH_CHECK(static_cast<uint64_t>(input.numel()) == (input_dynamic[i] ? actual_count : 1ULL),
+                "GaudiRT: dynamic cold recipe input size mismatch");
+    auto addr = address_of(input, *ctx);
+    const bool overlaps = std::any_of(regions.begin(), regions.end(), [&](const auto& region) {
+      return addr < region.first + region.second && region.first < addr + input.nbytes();
+    });
+    if (!input.is_contiguous() || addr % BlockCachingAllocator::kAlignment != 0 || overlaps) {
+      auto staged = at::empty(input.sizes(), input.options());
+      copy(staged, input, true);
+      input = std::move(staged);
+      addr = address_of(input, *ctx);
+    }
+    regions.emplace_back(addr, input.nbytes());
+  }
+
+  const auto digest = common::sha256_bytes(
+      reinterpret_cast<const uint8_t*>(raw_signature.data()), raw_signature.size());
+  const std::string key = prefix + "_" + digest;
+
+  std::lock_guard lock(ctx->cold_mutex);
+  ColdRecipe* recipe_ptr = nullptr;
+  auto found = ctx->cold_recipes.find(key);
+  if (found != ctx->cold_recipes.end()) {
+    recipe_ptr = found->second.get();
+  } else {
+    auto recipe = std::make_unique<ColdRecipe>(inputs.size() + outputs.size());
+    {
+      SynapseGraphBuilder builder("d" + digest.substr(0, 12), *recipe);
+      std::vector<synTensor> syn_inputs;
+      std::vector<synTensor> syn_outputs;
+      syn_inputs.reserve(inputs.size());
+      syn_outputs.reserve(outputs.size());
+      int ext_idx = 0;
+      for (size_t i = 0; i < inputs.size(); ++i) {
+        const auto syn_t = cast_type(inputs[i].scalar_type()).syn;
+        if (input_dynamic[i]) {
+          syn_inputs.push_back(
+              builder.tensor(syn_t, {max_count}, ext_idx++, -1, 0, true, {1ULL}));
+        } else {
+          syn_inputs.push_back(builder.tensor(syn_t, {1ULL}, ext_idx++));
+        }
+      }
+      for (const auto& out : outputs) {
+        syn_outputs.push_back(builder.tensor(cast_type(out.scalar_type()).syn, {max_count},
+                                             ext_idx++, -1, 0, true, {1ULL}));
+      }
+      build_fn(builder, syn_inputs, syn_outputs);
+      builder.compile(ctx->cache, key);
+    }
+    auto [it, inserted] = ctx->cold_recipes.emplace(key, std::move(recipe));
+    TORCH_CHECK(inserted, "GaudiRT: duplicate dynamic cold recipe");
+    recipe_ptr = it->second.get();
+  }
+
+  auto bindings = recipe_ptr->tensors;
+  size_t idx = 0;
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    bindings[idx].pTensorAddress = address_of(inputs[i], *ctx);
+    ctx->allocator.record_stream(bindings[idx].pTensorAddress, stream);
+    if (input_dynamic[i]) bindings[idx].tensorSize[0] = actual_count;
+    ++idx;
+  }
+  for (const auto& out : outputs) {
+    bindings[idx].pTensorAddress = address_of(out, *ctx);
+    ctx->allocator.record_stream(bindings[idx].pTensorAddress, stream);
+    bindings[idx].tensorSize[0] = actual_count;
+    ++idx;
+  }
+  std::unique_ptr<TemporaryDevice> workspace;
+  if (recipe_ptr->workspace) {
+    workspace = std::make_unique<TemporaryDevice>(*ctx, recipe_ptr->workspace);
+  }
+  TORCH_CHECK(synLaunch(stream, bindings.data(), bindings.size(),
+                        workspace ? workspace->address : 0, recipe_ptr->recipe, 0) == synSuccess,
+              "GaudiRT: dynamic cold recipe launch failed");
+}
+
 at::Tensor align_device_operand(const at::Tensor& tensor, const at::Tensor& peer,
                                 at::ScalarType dtype) {
   if (tensor.device().is_cpu() && tensor.dim() == 0) {
@@ -173,6 +281,110 @@ at::Tensor scalar_to_device(const at::Tensor& peer, const at::Scalar& scalar,
     fill(out, scalar);
   }
   return out;
+}
+
+void emit_binary_1d_dynamic(SynapseGraphBuilder& builder, FxOp op, synTensor lhs, synTensor rhs,
+                            synTensor output, at::ScalarType in_dtype, uint64_t max_count,
+                            bool l_dyn, bool r_dyn) {
+  const auto type = cast_type(in_dtype);
+  if (op == FxOp::add) {
+    builder.node(NodeSpec{"add_fwd_" + std::string(type.name), {lhs, rhs}, {output}, {}});
+    return;
+  }
+  if (op == FxOp::sub) {
+    if (in_dtype == at::kLong) {
+      auto minus_one = emit_constant(builder, at::kLong, {1ULL}, 0.f, -1, true);
+      auto neg_rhs = r_dyn ? builder.tensor(syn_type_int64, {max_count}, -1, -1, 0, true, {1ULL})
+                           : builder.tensor(syn_type_int64, {1ULL}, -1);
+      builder.node(NodeSpec{"mult_fwd_i64", {rhs, minus_one}, {neg_rhs}, {}});
+      builder.node(NodeSpec{"add_fwd_i64", {lhs, neg_rhs}, {output}, {}});
+      return;
+    }
+    builder.node(NodeSpec{"sub_fwd_" + std::string(type.name), {lhs, rhs}, {output}, {}});
+    return;
+  }
+  if (op == FxOp::mul) {
+    builder.node(NodeSpec{"mult_fwd_" + std::string(type.name), {lhs, rhs}, {output}, {}});
+    return;
+  }
+  if (op == FxOp::div) {
+    if (in_dtype == at::kBFloat16) {
+      ns_CastKernel::ParamsV3 cast{};
+      cast.round_mode = CAST_ROUND_HALF_NE;
+      auto cast_1d = [&](synTensor t, bool is_dyn) -> synTensor {
+        auto res = is_dyn ? builder.tensor(syn_type_float, {max_count}, -1, -1, 0, true, {1ULL})
+                          : builder.tensor(syn_type_float, {1ULL}, -1);
+        builder.node(NodeSpec{"cast_bf16_to_f32", {t}, {res}, cast});
+        return res;
+      };
+      auto nl = cast_1d(lhs, l_dyn);
+      auto nr = cast_1d(rhs, r_dyn);
+      auto q = builder.tensor(syn_type_float, {max_count}, -1, -1, 0, true, {1ULL});
+      builder.node(NodeSpec{"div_fwd_f32", {nl, nr}, {q}, {}});
+      builder.node(NodeSpec{"cast_f32_to_bf16", {q}, {output}, cast});
+      return;
+    }
+    builder.node(NodeSpec{"div_fwd_f32", {lhs, rhs}, {output}, {}});
+    return;
+  }
+  if (op == FxOp::minimum || op == FxOp::maximum) {
+    const std::string base = op == FxOp::minimum ? "min_fwd_" : "max_fwd_";
+    builder.node(NodeSpec{base + type.name, {lhs, rhs}, {output}, {}});
+    return;
+  }
+  if (op == FxOp::logical_and || (op == FxOp::bitwise_and && in_dtype == at::kBool)) {
+    builder.node(NodeSpec{"and_fwd_u8", {lhs, rhs}, {output}, {}});
+    return;
+  }
+  if (op == FxOp::logical_or || (op == FxOp::bitwise_or && in_dtype == at::kBool)) {
+    builder.node(NodeSpec{"or_fwd_u8", {lhs, rhs}, {output}, {}});
+    return;
+  }
+  if (op == FxOp::bitwise_and) {
+    builder.node(NodeSpec{"bitwise_and_fwd_i32", {lhs, rhs}, {output}, {}});
+    return;
+  }
+  if (op == FxOp::bitwise_or) {
+    builder.node(NodeSpec{"bitwise_or_fwd_i32", {lhs, rhs}, {output}, {}});
+    return;
+  }
+  if (in_dtype == at::kLong && (op == FxOp::eq || op == FxOp::ne) && !(l_dyn && r_dyn)) {
+    // Synapse ComplexGUID equal_fwd_i64 rejects mixed {dynamic} vs {1} static operands.
+    auto lt1 = builder.tensor(syn_type_uint8, {max_count}, -1, -1, 0, true, {1ULL});
+    auto lt2 = builder.tensor(syn_type_uint8, {max_count}, -1, -1, 0, true, {1ULL});
+    builder.node(NodeSpec{"less_fwd_i64", {lhs, rhs}, {lt1}, {}});
+    builder.node(NodeSpec{"less_fwd_i64", {rhs, lhs}, {lt2}, {}});
+    if (op == FxOp::ne) {
+      builder.node(NodeSpec{"or_fwd_u8", {lt1, lt2}, {output}, {}});
+    } else {
+      auto ne_u8 = builder.tensor(syn_type_uint8, {max_count}, -1, -1, 0, true, {1ULL});
+      builder.node(NodeSpec{"or_fwd_u8", {lt1, lt2}, {ne_u8}, {}});
+      builder.node(NodeSpec{"not_fwd_u8", {ne_u8}, {output}, {}});
+    }
+    return;
+  }
+  if (op == FxOp::ne) {
+    auto eq_u8 = builder.tensor(syn_type_uint8, {max_count}, -1, -1, 0, true, {1ULL});
+    builder.node(NodeSpec{"equal_fwd_" + std::string(type.name), {lhs, rhs}, {eq_u8}, {}});
+    builder.node(NodeSpec{"not_fwd_u8", {eq_u8}, {output}, {}});
+    return;
+  }
+  if (in_dtype == at::kLong) {
+    if (op == FxOp::gt) {
+      builder.node(NodeSpec{"less_fwd_i64", {rhs, lhs}, {output}, {}});
+      return;
+    }
+    if (op == FxOp::le) {
+      builder.node(NodeSpec{"greater_equal_fwd_i64", {rhs, lhs}, {output}, {}});
+      return;
+    }
+  }
+  const char* prefix = op == FxOp::eq   ? "equal_fwd_"
+                       : op == FxOp::lt ? "less_fwd_"
+                       : op == FxOp::le ? "less_equal_fwd_"
+                       : op == FxOp::gt ? "greater_fwd_"
+                                        : "greater_equal_fwd_";
+  builder.node(NodeSpec{std::string(prefix) + type.name, {lhs, rhs}, {output}, {}});
 }
 
 at::Tensor binary_ewise_op(const at::Tensor& a, const at::Tensor& b, FxOp op,
@@ -209,6 +421,40 @@ at::Tensor binary_ewise_op(const at::Tensor& a, const at::Tensor& b, FxOp op,
     if (dtype == at::kBool) {
       op = (op == FxOp::bitwise_and) ? FxOp::logical_and : FxOp::logical_or;
     }
+  }
+
+  const uint64_t count = static_cast<uint64_t>(out.numel());
+  const bool left_same = (left.sizes() == out.sizes());
+  const bool right_same = (right.sizes() == out.sizes());
+  if (count <= (1ULL << 30) && (left_same || left.numel() == 1) &&
+      (right_same || right.numel() == 1)) {
+    const uint64_t max_count = std::max<uint64_t>(65536ULL, std::bit_ceil(count));
+    const bool l_dyn = left_same || (count == 1 && !right_same);
+    const bool r_dyn = right_same;
+    auto make_flat = [&](at::Tensor t, bool is_dyn) -> at::Tensor {
+      const int64_t flat_len = is_dyn ? static_cast<int64_t>(count) : 1LL;
+      if (!t.is_contiguous()) {
+        auto staged = at::empty(t.sizes(), t.options());
+        copy(staged, t, true);
+        t = std::move(staged);
+      }
+      return t.view({flat_len});
+    };
+    auto flat_left = make_flat(std::move(left), l_dyn);
+    auto flat_right = make_flat(std::move(right), r_dyn);
+    auto flat_out = out.view({static_cast<int64_t>(count)});
+    std::ostringstream sig;
+    sig << "bin_v2:" << static_cast<int>(op) << ":" << cast_type(dtype).name << ":"
+        << max_count << ":" << (l_dyn ? 'd' : '1') << ":" << (r_dyn ? 'd' : '1');
+    launch_dynamic_1d_cold_recipe(
+        "cold_bin", sig.str(), {std::move(flat_left), std::move(flat_right)}, {l_dyn, r_dyn},
+        {flat_out}, max_count, count,
+        [&](SynapseGraphBuilder& builder, const std::vector<synTensor>& in,
+            const std::vector<synTensor>& out_t) {
+          emit_binary_1d_dynamic(builder, op, in[0], in[1], out_t[0], dtype,
+                                 max_count, l_dyn, r_dyn);
+        });
+    return out;
   }
 
   const auto l_syn = to_syn_dims(left);
@@ -265,15 +511,16 @@ at::Tensor cat(const at::ITensorListRef& tensors, int64_t axis) {
     copy(result, active.front(), true);
     return result;
   }
-  // One-dimensional concatenation is a sequence of copies into disjoint
-  // output ranges.  Keeping it on the compute stream avoids a shape-specific
-  // graph for changing metadata lengths, and also handles strided inputs.
-  if (reference->dim() == 1) {
+  // Outermost-dimension concatenation (axis == 0) is a sequence of copies into
+  // disjoint row-contiguous output ranges. Keeping it on the compute stream avoids
+  // shape-specific graphs for varying batch/metadata lengths and handles strided inputs.
+  if (axis == 0) {
     int64_t offset = 0;
     for (const auto& tensor : active) {
-      auto slice = result.narrow(0, offset, tensor.numel());
+      const int64_t len = tensor.size(0);
+      auto slice = result.narrow(0, offset, len);
       copy(slice, tensor, true);
-      offset += tensor.numel();
+      offset += len;
     }
     return result;
   }
@@ -554,6 +801,29 @@ at::Tensor pointwise(std::vector<at::Tensor> inputs, const std::vector<int64_t>&
       expanded = std::move(staged);
     }
     flat_inputs.push_back(expanded.view({static_cast<int64_t>(count)}));
+  }
+  if (count <= (1ULL << 30)) {
+    const uint64_t max_count = std::max<uint64_t>(65536ULL, std::bit_ceil(count));
+    std::ostringstream sig;
+    sig << "pw_v2:" << op << ":" << max_count;
+    for (auto type : types) sig << ":" << static_cast<int>(type);
+    std::vector<bool> input_dynamic(flat_inputs.size(), true);
+    launch_dynamic_1d_cold_recipe(
+        "cold_pw", sig.str(), std::move(flat_inputs), input_dynamic,
+        {result.view({static_cast<int64_t>(count)})}, max_count, count,
+        [&](SynapseGraphBuilder& builder, const std::vector<synTensor>& in,
+            const std::vector<synTensor>& out_t) {
+          if (op.rfind("not_equal_fwd_", 0) == 0) {
+            auto eq_u8 = builder.tensor(syn_type_uint8, {max_count}, -1, -1, 0, true, {1ULL});
+            builder.node(NodeSpec{"equal_fwd_" + op.substr(std::strlen("not_equal_fwd_")),
+                                  std::vector<synTensor>(in.begin(), in.end()), {eq_u8}, {}});
+            builder.node(NodeSpec{"not_fwd_u8", {eq_u8}, {out_t[0]}, {}});
+          } else {
+            builder.node(
+                NodeSpec{op, std::vector<synTensor>(in.begin(), in.end()), {out_t[0]}, {}});
+          }
+        });
+    return result;
   }
   std::ostringstream sig;
   sig << "pw_v1:" << op << ":" << count;
